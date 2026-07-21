@@ -1,0 +1,382 @@
+"""Typed configuration with reputation-preserving defaults."""
+
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from typing import Literal
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+
+from autocontribute.exceptions import ConfigurationError
+
+_ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_IMAGE_DIGEST = re.compile(r"@sha256:[0-9a-fA-F]{64}$")
+_DEFAULT_SANDBOX_IMAGE = (
+    "python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a"
+)
+
+
+class StrictModel(BaseModel):
+    """Configuration base model that rejects silent misspellings."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+
+class IdentityConfig(StrictModel):
+    name: str = ""
+    email: str = ""
+
+
+class GitHubConfig(StrictModel):
+    auth: Literal["gh", "token"] = "gh"
+    token_env: str = "AUTOCONTRIBUTE_GITHUB_TOKEN"
+    api_url: HttpUrl = HttpUrl("https://api.github.com")
+    repositories: list[str] = Field(default_factory=list)
+    owners: list[str] = Field(default_factory=list)
+    include_labels: list[str] = Field(default_factory=lambda: ["help wanted", "good first issue"])
+    exclude_labels: list[str] = Field(
+        default_factory=lambda: [
+            "security",
+            "breaking change",
+            "needs design",
+            "discussion",
+            "blocked",
+        ]
+    )
+    min_stars: int = Field(default=1_000, ge=0)
+    repository_limit_per_owner: int = Field(default=8, ge=1, le=30)
+    issue_limit_per_repository: int = Field(default=10, ge=1, le=50)
+    require_unassigned: bool = True
+    max_issue_age_days: int = Field(default=365, ge=1, le=3_650)
+
+    @field_validator("token_env")
+    @classmethod
+    def token_env_is_a_name(cls, value: str) -> str:
+        if not _ENV_NAME.fullmatch(value):
+            raise ValueError("token_env must be an environment variable name, not a token")
+        return value
+
+    @field_validator("api_url")
+    @classmethod
+    def api_url_is_secure(cls, value: HttpUrl) -> HttpUrl:
+        if value.scheme != "https":
+            raise ValueError("api_url must use HTTPS")
+        if value.username is not None or value.password is not None:
+            raise ValueError("api_url cannot contain credentials")
+        if value.query is not None or value.fragment is not None:
+            raise ValueError("api_url cannot contain a query string or fragment")
+        return value
+
+    @field_validator("repositories")
+    @classmethod
+    def repositories_are_full_names(cls, values: list[str]) -> list[str]:
+        invalid = [value for value in values if not _REPOSITORY.fullmatch(value)]
+        if invalid:
+            raise ValueError(f"repositories must use owner/name syntax: {invalid}")
+        return list(dict.fromkeys(values))
+
+
+class ModelProfile(StrictModel):
+    provider: Literal["openai", "openai_compatible"] = "openai"
+    model: str = "gpt-5.6"
+    api_key_env: str = "OPENAI_API_KEY"
+    base_url: HttpUrl | None = None
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = "high"
+    reasoning_mode: Literal["standard", "pro"] | None = "standard"
+    max_output_tokens: int = Field(default=40_000, ge=1_000, le=128_000)
+    timeout_seconds: float = Field(default=900, ge=10, le=3_600)
+
+    @field_validator("api_key_env")
+    @classmethod
+    def api_key_env_is_a_name(cls, value: str) -> str:
+        if not _ENV_NAME.fullmatch(value):
+            raise ValueError("api_key_env must be an environment variable name, not a key")
+        return value
+
+    @field_validator("base_url")
+    @classmethod
+    def base_url_is_secure(cls, value: HttpUrl | None) -> HttpUrl | None:
+        if value is None:
+            return None
+        if value.scheme != "https":
+            raise ValueError("base_url must use HTTPS")
+        if value.username is not None or value.password is not None:
+            raise ValueError("base_url cannot contain credentials")
+        if value.query is not None or value.fragment is not None:
+            raise ValueError("base_url cannot contain a query string or fragment")
+        return value
+
+    @model_validator(mode="after")
+    def compatible_provider_has_url(self) -> ModelProfile:
+        if self.provider == "openai_compatible" and self.base_url is None:
+            raise ValueError("openai_compatible profiles require base_url")
+        if self.provider == "openai_compatible" and self.reasoning_mode == "pro":
+            raise ValueError(
+                "openai_compatible profiles cannot portably enforce pro reasoning mode; "
+                "use standard or null"
+            )
+        return self
+
+    def require_api_key(self) -> str:
+        value = os.environ.get(self.api_key_env)
+        if not value:
+            raise ConfigurationError(
+                f"Model credential is missing; set environment variable {self.api_key_env}"
+            )
+        return value
+
+
+class ModelsConfig(StrictModel):
+    scout: ModelProfile = Field(
+        default_factory=lambda: ModelProfile(reasoning_mode="standard", reasoning_effort="high")
+    )
+    builder: ModelProfile = Field(
+        default_factory=lambda: ModelProfile(reasoning_mode="standard", reasoning_effort="high")
+    )
+    critic: ModelProfile = Field(
+        default_factory=lambda: ModelProfile(reasoning_mode="pro", reasoning_effort="high")
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def apply_role_reasoning_defaults(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        result = dict(value)
+        for role, mode in (("scout", "standard"), ("builder", "standard"), ("critic", "pro")):
+            profile = result.get(role)
+            if isinstance(profile, dict) and "reasoning_mode" not in profile:
+                normalized = dict(profile)
+                normalized["reasoning_mode"] = mode
+                result[role] = normalized
+        return result
+
+
+class SandboxConfig(StrictModel):
+    backend: Literal["docker", "local"] = "docker"
+    image: str = _DEFAULT_SANDBOX_IMAGE
+    network: Literal["none"] = "none"
+    command_timeout_seconds: int = Field(default=900, ge=10, le=3_600)
+    memory: str = "4g"
+    cpus: float = Field(default=2.0, gt=0, le=16)
+    pids_limit: int = Field(default=256, ge=32, le=4_096)
+    allow_unsafe_local: bool = False
+    max_commands: int = Field(default=8, ge=1, le=30)
+
+    @field_validator("image")
+    @classmethod
+    def image_is_a_single_reference(cls, value: str) -> str:
+        if (
+            not value
+            or value.startswith("-")
+            or "\0" in value
+            or any(character.isspace() for character in value)
+        ):
+            raise ValueError("image must be one Docker image reference")
+        return value
+
+    @model_validator(mode="after")
+    def backend_safety_requirements(self) -> SandboxConfig:
+        if self.backend == "local" and not self.allow_unsafe_local:
+            raise ValueError("local sandbox requires allow_unsafe_local: true")
+        if self.backend == "docker" and not _IMAGE_DIGEST.search(self.image):
+            raise ValueError("docker sandbox image must be pinned with @sha256:<64 hex digits>")
+        return self
+
+
+class PolicyConfig(StrictModel):
+    require_maintainer_signal: bool = True
+    require_contribution_guidelines: bool = True
+    allow_assigned_issues: bool = False
+    allow_security_issues: bool = False
+    allow_dependency_changes: bool = False
+    allow_workflow_changes: bool = False
+    ai_disclosure: str = (
+        "This contribution was prepared with AI assistance and independently validated by "
+        "the contributor."
+    )
+
+
+class QualityConfig(StrictModel):
+    min_candidate_score: int = Field(default=85, ge=0, le=100)
+    min_readiness_score: int = Field(default=90, ge=0, le=100)
+    min_dimension_score: int = Field(default=80, ge=0, le=100)
+    max_files_changed: int = Field(default=8, ge=1, le=100)
+    max_changed_lines: int = Field(default=400, ge=1, le=10_000)
+    max_context_files: int = Field(default=20, ge=1, le=100)
+    max_context_characters: int = Field(default=160_000, ge=10_000, le=2_000_000)
+    require_validation_commands: bool = True
+    require_regression_evidence_for_bugfix: bool = True
+    forbidden_paths: list[str] = Field(
+        default_factory=lambda: [
+            ".github/workflows/**",
+            ".github/actions/**",
+            "**/*.pem",
+            "**/*.key",
+            "**/generated/**",
+            "vendor/**",
+        ]
+    )
+
+
+class PublishingConfig(StrictModel):
+    mode: Literal["review_required", "auto"] = "review_required"
+    approval_expires_hours: int = Field(default=24, ge=1, le=168)
+    branch_prefix: str = "autocontribute"
+    draft: bool = False
+    max_new_pull_requests_per_day: int = Field(default=1, ge=1, le=5)
+    max_open_pull_requests: int = Field(default=2, ge=1, le=20)
+    repository_cooldown_days: int = Field(default=7, ge=0, le=365)
+    auto_publish_env: str = "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH"
+
+    @field_validator("auto_publish_env")
+    @classmethod
+    def auto_publish_env_is_a_name(cls, value: str) -> str:
+        if not _ENV_NAME.fullmatch(value):
+            raise ValueError("auto_publish_env must be an environment variable name")
+        return value
+
+
+class BudgetConfig(StrictModel):
+    max_model_calls_per_run: int = Field(default=6, ge=3, le=30)
+    max_candidates_per_run: int = Field(default=25, ge=1, le=200)
+
+
+class StorageConfig(StrictModel):
+    path: Path = Path(".autocontribute")
+
+
+class AutocontributeConfig(StrictModel):
+    identity: IdentityConfig = Field(default_factory=IdentityConfig)
+    github: GitHubConfig = Field(default_factory=GitHubConfig)
+    models: ModelsConfig = Field(default_factory=ModelsConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    policy: PolicyConfig = Field(default_factory=PolicyConfig)
+    quality: QualityConfig = Field(default_factory=QualityConfig)
+    publishing: PublishingConfig = Field(default_factory=PublishingConfig)
+    budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    storage: StorageConfig = Field(default_factory=StorageConfig)
+
+    def model_for(self, role: Literal["scout", "builder", "critic"]) -> ModelProfile:
+        if role == "scout":
+            return self.models.scout
+        if role == "builder":
+            return self.models.builder
+        return self.models.critic
+
+
+def load_config(path: Path) -> AutocontributeConfig:
+    """Load and validate a YAML configuration without resolving secret values."""
+
+    config_path = path.expanduser().resolve()
+    if not config_path.is_file():
+        raise ConfigurationError(
+            f"Configuration file not found: {config_path}. Run `autocontribute init`."
+        )
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigurationError(f"Could not read {config_path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigurationError("The configuration root must be a YAML mapping")
+    try:
+        config = AutocontributeConfig.model_validate(raw)
+    except ValueError as exc:
+        raise ConfigurationError(str(exc)) from exc
+    if not config.storage.path.is_absolute():
+        config.storage.path = (config_path.parent / config.storage.path).resolve()
+    return config
+
+
+def example_config() -> str:
+    """Return a documented starter configuration with no embedded credentials."""
+
+    return """# Credentials are read only from the named environment variables.
+identity:
+  name: "Your Name"
+  email: "your-handle@users.noreply.github.com"
+
+github:
+  auth: gh                         # use `gh auth login`, or change to `token`
+  token_env: AUTOCONTRIBUTE_GITHUB_TOKEN
+  repositories:                   # explicit repositories are safest
+    - facebookresearch/hydra
+    - google/python-fire
+    - NVIDIA-NeMo/Guardrails
+  owners: []                       # optional discovery across selected owners
+  include_labels: ["help wanted", "good first issue"]
+  exclude_labels: ["security", "breaking change", "needs design", "blocked"]
+  min_stars: 1000
+  require_unassigned: true
+
+models:
+  scout: &builder_model
+    provider: openai
+    model: gpt-5.6
+    api_key_env: OPENAI_API_KEY
+    reasoning_effort: high
+    reasoning_mode: standard
+    max_output_tokens: 40000
+    timeout_seconds: 900
+  builder: *builder_model
+  critic:
+    <<: *builder_model
+    reasoning_mode: pro
+
+sandbox:
+  backend: docker
+  image: >-                         # override with a digest-pinned ecosystem image as needed
+    python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a
+  network: none
+  command_timeout_seconds: 900
+  memory: 4g
+  cpus: 2
+
+policy:
+  require_maintainer_signal: true
+  require_contribution_guidelines: true
+  allow_security_issues: false
+  allow_dependency_changes: false
+  allow_workflow_changes: false
+  ai_disclosure: >-
+    This contribution was prepared with AI assistance and independently
+    validated by the contributor.
+
+quality:
+  min_candidate_score: 85
+  min_readiness_score: 90
+  min_dimension_score: 80
+  max_files_changed: 8
+  max_changed_lines: 400
+  require_validation_commands: true
+  require_regression_evidence_for_bugfix: true
+
+publishing:
+  mode: review_required             # `auto` also requires an environment kill-switch
+  approval_expires_hours: 24
+  draft: false
+  max_new_pull_requests_per_day: 1
+  max_open_pull_requests: 2
+  repository_cooldown_days: 7
+  auto_publish_env: AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH
+
+budget:
+  max_model_calls_per_run: 6
+  max_candidates_per_run: 25
+
+storage:
+  path: .autocontribute
+"""
+
+
+__all__ = [
+    "AutocontributeConfig",
+    "GitHubConfig",
+    "ModelProfile",
+    "example_config",
+    "load_config",
+]

@@ -1,0 +1,18 @@
+.DS_Store
+.env
+.venv/
+.local/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Local credentials, private overrides, state, and generated contribution artifacts.
+autocontribute.local.yml
+.autocontribute/

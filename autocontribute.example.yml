@@ -1,0 +1,75 @@
+# Copy this file to autocontribute.yml. Never put API keys or GitHub tokens here.
+identity:
+  name: "Your Name"
+  email: "your-handle@users.noreply.github.com"
+
+github:
+  auth: gh
+  token_env: AUTOCONTRIBUTE_GITHUB_TOKEN
+  repositories:
+    - facebookresearch/hydra
+    - google/python-fire
+    - NVIDIA-NeMo/Guardrails
+  owners: []
+  include_labels: ["help wanted", "good first issue"]
+  exclude_labels: ["security", "breaking change", "needs design", "blocked"]
+  min_stars: 1000
+  require_unassigned: true
+
+models:
+  scout: &builder_model
+    provider: openai
+    model: gpt-5.6
+    api_key_env: OPENAI_API_KEY
+    reasoning_effort: high
+    reasoning_mode: standard
+    max_output_tokens: 40000
+    timeout_seconds: 900
+  builder: *builder_model
+  critic:
+    <<: *builder_model
+    reasoning_mode: pro
+
+sandbox:
+  backend: docker
+  image: >-
+    python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a
+  network: none
+  command_timeout_seconds: 900
+  memory: 4g
+  cpus: 2
+
+policy:
+  require_maintainer_signal: true
+  require_contribution_guidelines: true
+  allow_security_issues: false
+  allow_dependency_changes: false
+  allow_workflow_changes: false
+  ai_disclosure: >-
+    This contribution was prepared with AI assistance and independently
+    validated by the contributor.
+
+quality:
+  min_candidate_score: 85
+  min_readiness_score: 90
+  min_dimension_score: 80
+  max_files_changed: 8
+  max_changed_lines: 400
+  require_validation_commands: true
+  require_regression_evidence_for_bugfix: true
+
+publishing:
+  mode: review_required
+  approval_expires_hours: 24
+  draft: false
+  max_new_pull_requests_per_day: 1
+  max_open_pull_requests: 2
+  repository_cooldown_days: 7
+  auto_publish_env: AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH
+
+budget:
+  max_model_calls_per_run: 6
+  max_candidates_per_run: 25
+
+storage:
+  path: .autocontribute
