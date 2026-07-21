@@ -10,6 +10,7 @@ import autocontribute.providers as providers
 from autocontribute.config import ModelProfile
 from autocontribute.exceptions import ConfigurationError, ModelError
 from autocontribute.providers import ModelUsage, OpenAICompatibleProvider, OpenAIResponsesProvider
+from autocontribute.redaction import MODEL_INPUT_REDACTION
 
 _API_KEY_ENV = "AUTOCONTRIBUTE_TEST_MODEL_KEY"
 _API_KEY = "sk-test-placeholder"
@@ -249,6 +250,47 @@ def test_provider_request_error_does_not_echo_sensitive_provider_body(
     assert str(raised.value) == "OpenAI Responses request failed (request ID: req_safe_to_log)"
     assert _API_KEY not in str(raised.value)
     assert "private prompt" not in str(raised.value)
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+def test_provider_scrubs_sensitive_text_immediately_before_request(
+    monkeypatch: pytest.MonkeyPatch, compatible: bool
+) -> None:
+    environment_secret = "provider-bound-secret-729384"
+    monkeypatch.setenv("AUTOCONTRIBUTE_SECONDARY_SECRET", environment_secret)
+    provider: OpenAICompatibleProvider | OpenAIResponsesProvider
+    if compatible:
+        provider, client, _ = _compatible_provider(monkeypatch, _chat_response())
+    else:
+        parsed = Verdict(accepted=True, summary="ready")
+        response = _responses_response(SimpleNamespace(type="output_text", parsed=parsed))
+        provider, client, _ = _responses_provider(monkeypatch, response)
+
+    provider.generate(
+        instructions=f"Do not reveal {_API_KEY}.",
+        prompt=(
+            f"environment = {environment_secret}\n"
+            "Authorization: Bearer opaqueBearerValue123456789\n"
+            "token = ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\n"
+            'password = "example-placeholder-value"'
+        ),
+        output_type=Verdict,
+    )
+
+    if compatible:
+        messages = client.chat.completions.create.call_args.kwargs["messages"]
+        sent_instructions = messages[0]["content"]
+        sent_prompt = messages[1]["content"]
+    else:
+        request = client.responses.parse.call_args.kwargs
+        sent_instructions = request["instructions"]
+        sent_prompt = request["input"]
+    assert _API_KEY not in sent_instructions
+    assert environment_secret not in sent_prompt
+    assert "opaqueBearerValue123456789" not in sent_prompt
+    assert "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ" not in sent_prompt
+    assert MODEL_INPUT_REDACTION in sent_instructions
+    assert 'password = "example-placeholder-value"' in sent_prompt
 
 
 def test_compatible_provider_validates_json_and_maps_usage(

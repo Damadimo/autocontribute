@@ -13,7 +13,7 @@ from urllib.parse import quote, urljoin, urlparse
 import httpx
 
 from autocontribute.config import GitHubConfig
-from autocontribute.domain import IssueCandidate, RepositoryInfo
+from autocontribute.domain import IssueCandidate, IssueComment, RepositoryInfo
 from autocontribute.exceptions import ConfigurationError, GitHubError
 
 
@@ -187,7 +187,62 @@ class GitHubClient:
         )
         if "pull_request" in data:
             raise GitHubError(f"{repository}#{number} is a pull request, not an issue")
-        return _parse_issue(data, repository)
+        issue = _parse_issue(data, repository)
+        if issue.comments:
+            issue.discussion = self.get_issue_comments(
+                issue.repository,
+                issue.number,
+                expected_count=issue.comments,
+            )
+        return issue
+
+    def get_issue_comments(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_count: int | None = None,
+        max_comments: int = 500,
+    ) -> list[IssueComment]:
+        """Fetch the complete bounded issue discussion or fail closed when it is too large."""
+
+        if max_comments < 1 or max_comments > 1_000:
+            raise ValueError("max_comments must be between 1 and 1,000")
+        if expected_count is not None and expected_count > max_comments:
+            raise GitHubError(
+                f"Issue has {expected_count} comments, above the safe discussion limit "
+                f"of {max_comments}; candidate review is incomplete"
+            )
+
+        comments: list[IssueComment] = []
+        pages = (max_comments + 99) // 100
+        for page in range(1, pages + 1):
+            data = cast(
+                "list[dict[str, Any]]",
+                self._request(
+                    "GET",
+                    f"/repos/{quote(repository, safe='/')}/issues/{number}/comments",
+                    params={"per_page": 100, "page": page},
+                ),
+            )
+            comments.extend(_parse_issue_comment(item) for item in data)
+            if len(comments) > max_comments:
+                raise GitHubError("Issue discussion exceeded the safe comment limit")
+            if len(data) < 100:
+                break
+            if expected_count is not None and len(comments) >= expected_count:
+                break
+        else:
+            if expected_count is None or len(comments) < expected_count:
+                raise GitHubError(
+                    "Issue discussion reached the pagination limit; candidate review is incomplete"
+                )
+
+        if expected_count is not None and len(comments) != expected_count:
+            raise GitHubError(
+                "Issue comment count changed while it was fetched; retry before selecting it"
+            )
+        return comments
 
     def search_issues(
         self, repository: str, *, labels: Iterable[str], limit: int
@@ -384,6 +439,17 @@ def _parse_issue(data: dict[str, Any], repository: str) -> IssueCandidate:
         labels=[str(label.get("name") or "") for label in data.get("labels", [])],
         assignees=[str(user.get("login") or "") for user in data.get("assignees", [])],
         comments=int(data.get("comments", 0)),
+        created_at=_parse_datetime(data.get("created_at")) or datetime.min.replace(tzinfo=UTC),
+        updated_at=_parse_datetime(data.get("updated_at")) or datetime.min.replace(tzinfo=UTC),
+    )
+
+
+def _parse_issue_comment(data: dict[str, Any]) -> IssueComment:
+    return IssueComment(
+        author=str((data.get("user") or {}).get("login") or "unknown"),
+        author_association=str(data.get("author_association") or "NONE").upper(),
+        body=str(data.get("body") or ""),
+        html_url=str(data.get("html_url") or ""),
         created_at=_parse_datetime(data.get("created_at")) or datetime.min.replace(tzinfo=UTC),
         updated_at=_parse_datetime(data.get("updated_at")) or datetime.min.replace(tzinfo=UTC),
     )

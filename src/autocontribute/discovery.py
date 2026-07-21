@@ -24,6 +24,19 @@ _AI_PROHIBITION = re.compile(
     r"(AI|LLM|artificial intelligence|generated code)\b",
     re.I | re.S,
 )
+_WORK_CLAIM = re.compile(
+    r"\b(?:i(?:'m| am|\u2019m) working on (?:this|it)|"
+    r"i(?:'ll| will) (?:take|work on) (?:this|it)|"
+    r"working on (?:a |the )?(?:fix|pull request|pr)|"
+    r"please assign (?:this|it) to me)\b",
+    re.I,
+)
+_MAINTAINER_STOP = re.compile(
+    r"\b(?:do not|don't|please (?:do not|don't)|stop|hold off|not accepting|"
+    r"already (?:being )?worked on|no (?:pull request|pr)s? needed)\b",
+    re.I,
+)
+_MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 
 _GUIDANCE_PATHS = (
     "CONTRIBUTING.md",
@@ -72,6 +85,9 @@ class DiscoveryService:
                 limit=self.config.github.issue_limit_per_repository,
             )
             for issue in issues:
+                # Search results omit the discussion and may contain a shortened body. Fetch the
+                # canonical issue before spending model budget or deciding that work is unclaimed.
+                issue = self.github.get_issue(repository.full_name, issue.number)
                 if self.store.has_active_candidate(issue.repository, issue.number):
                     continue
                 eligibility = self.evaluate(issue, repository)
@@ -123,7 +139,31 @@ class DiscoveryService:
         ):
             blockers.append("issue may concern a vulnerability and requires private handling")
 
+        claimed_by = sorted(
+            {comment.author for comment in issue.discussion if _WORK_CLAIM.search(comment.body)}
+        )
+        if claimed_by:
+            blockers.append(f"issue discussion indicates claimed work by {', '.join(claimed_by)}")
+
+        maintainer_stops = [
+            comment
+            for comment in issue.discussion
+            if comment.author_association in _MAINTAINER_ASSOCIATIONS
+            and _MAINTAINER_STOP.search(comment.body)
+        ]
+        if maintainer_stops:
+            blockers.append(
+                "maintainer discussion asks contributors to stop, hold off, or avoid a pull request"
+            )
+
         evidence: dict[str, str] = {}
+        maintainer_comments = sum(
+            comment.author_association in _MAINTAINER_ASSOCIATIONS for comment in issue.discussion
+        )
+        evidence["discussion"] = (
+            f"loaded={len(issue.discussion)}/{issue.comments}, "
+            f"maintainer_comments={maintainer_comments}, claims={len(claimed_by)}"
+        )
         signal = 25 if labels.intersection(include) else 0
         evidence["maintainer_signal"] = (
             f"{signal}/25: labels={sorted(labels.intersection(include))}"
@@ -182,10 +222,17 @@ class DiscoveryService:
         )
 
     def _repository_baseline(self, repository: RepositoryInfo) -> bool:
+        pushed_at = repository.pushed_at
+        active = (
+            pushed_at is not None
+            and (datetime.now(UTC) - pushed_at).days
+            <= self.config.github.max_repository_inactivity_days
+        )
         return (
             not repository.private
             and not repository.archived
             and not repository.disabled
+            and active
             and repository.stars >= self.config.github.min_stars
         )
 

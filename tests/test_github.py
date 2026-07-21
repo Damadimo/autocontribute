@@ -130,3 +130,73 @@ def test_oversized_issue_timeline_fails_closed() -> None:
         github.search_competing_pull_requests("example/project", 42)
 
     assert calls == 10
+
+
+def test_get_issue_fetches_complete_discussion() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "user": {"login": "maintainer"},
+                        "author_association": "MEMBER",
+                        "body": "Please include the parser regression test.",
+                        "html_url": "https://github.com/example/project/issues/42#issuecomment-1",
+                        "created_at": "2026-07-20T12:00:00Z",
+                        "updated_at": "2026-07-20T12:00:00Z",
+                    }
+                ],
+            )
+        return httpx.Response(
+            200,
+            json={
+                "number": 42,
+                "title": "Fix parser",
+                "body": "Reproduction steps and expected behavior",
+                "html_url": "https://github.com/example/project/issues/42",
+                "state": "open",
+                "user": {"login": "reporter"},
+                "labels": [{"name": "help wanted"}],
+                "assignees": [],
+                "comments": 1,
+                "created_at": "2026-07-19T12:00:00Z",
+                "updated_at": "2026-07-20T12:00:00Z",
+            },
+        )
+
+    with _client(handler) as github:
+        issue = github.get_issue("example/project", 42)
+
+    assert paths == [
+        "/repos/example/project/issues/42",
+        "/repos/example/project/issues/42/comments",
+    ]
+    assert issue.discussion[0].author == "maintainer"
+    assert issue.discussion[0].author_association == "MEMBER"
+
+
+def test_issue_discussion_above_bound_fails_closed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "number": 42,
+                "title": "Busy issue",
+                "body": "body",
+                "html_url": "https://github.com/example/project/issues/42",
+                "state": "open",
+                "user": {"login": "reporter"},
+                "labels": [],
+                "assignees": [],
+                "comments": 501,
+                "created_at": "2026-07-19T12:00:00Z",
+                "updated_at": "2026-07-20T12:00:00Z",
+            },
+        )
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="discussion limit"):
+        github.get_issue("example/project", 42)

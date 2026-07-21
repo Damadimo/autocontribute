@@ -87,6 +87,50 @@ def test_command_budget_is_enforced(tmp_path: Path) -> None:
         runner.run(tmp_path, "true")
 
 
+def test_isolated_command_cannot_mutate_authoritative_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    tracked = workspace / "tracked.txt"
+    tracked.write_text("authoritative\n", encoding="utf-8")
+    runner = SandboxRunner(
+        SandboxConfig(
+            backend="local",
+            allow_unsafe_local=True,
+            command_timeout_seconds=10,
+        )
+    )
+
+    result = runner.run_isolated(
+        workspace,
+        "printf 'mutated\\n' > tracked.txt; printf 'generated\\n' > untracked.txt",
+    )
+
+    assert result.passed
+    assert tracked.read_text(encoding="utf-8") == "authoritative\n"
+    assert not (workspace / "untracked.txt").exists()
+
+
+def test_each_isolated_command_receives_a_fresh_workspace_copy(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runner = SandboxRunner(
+        SandboxConfig(
+            backend="local",
+            allow_unsafe_local=True,
+            command_timeout_seconds=10,
+        )
+    )
+
+    results = runner.run_all_isolated(
+        workspace,
+        ["touch command-one-generated", "test ! -e command-one-generated"],
+        stop_on_failure=False,
+    )
+
+    assert all(result.passed for result in results)
+    assert not (workspace / "command-one-generated").exists()
+
+
 def test_workspace_symlink_is_rejected(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

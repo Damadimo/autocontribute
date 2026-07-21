@@ -26,13 +26,24 @@ GitHub read API ──> discovery/policy ──> model planner ──> exact edi
 
 The issue, repository, contribution documents, package metadata, command output, and model output are
 all untrusted. Repository text is quoted as data in prompts and cannot change the control policy.
-Model output must match strict Pydantic schemas. File edits use exact, unique search/replace operations
-and paths that cannot escape the workspace.
+Every dynamic prompt section uses the same static JSON envelope with an explicit `untrusted` marker;
+XML metacharacters are Unicode-escaped so repository text cannot forge section boundaries. Derived
+plans and review findings remain untrusted when passed into later stages. Immediately before each API
+request, likely credentials and conventionally sensitive file contents are redacted. Model output must
+match strict Pydantic schemas. File edits use exact, unique search/replace operations and paths that
+cannot escape the workspace.
 
-Model and GitHub credentials exist only in the control process. Docker receives a read/write bind of
-the target working tree, a read-only `.git` directory, a fresh temporary home, no inherited
-environment, no network, no capabilities, no Docker socket, and explicit CPU/memory/PID/time limits.
-Local command execution is rejected unless the user opts into `allow_unsafe_local: true`.
+Model and GitHub credentials exist only in the control process. Each validation command receives a
+fresh disposable copy of the target working tree; mutations never become part of the authoritative
+patch or leak into later checks. Docker receives a read/write bind of that copy, a read-only `.git`
+directory, a fresh temporary home, no inherited environment, no network, no capabilities, no Docker
+socket, and explicit CPU/memory/PID/time limits. Local command execution is rejected unless the user
+opts into `allow_unsafe_local: true`.
+
+Mandatory commands are operator-owned and resolved by canonical repository name before model work.
+Model-proposed commands are supplementary. The complete suite must fit the command budget and every
+required command must be observed passing; the orchestrator never truncates checks to manufacture a
+successful result.
 
 The publication broker is the only component with GitHub mutation methods. The model cannot invoke
 it. In review mode, the broker requires an unexpired user approval over a canonical hash of the

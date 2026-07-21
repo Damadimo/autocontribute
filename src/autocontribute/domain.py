@@ -110,6 +110,17 @@ class RepositoryInfo(DomainModel):
     license_spdx: str | None
 
 
+class IssueComment(DomainModel):
+    """One bounded issue-discussion entry used as untrusted planning evidence."""
+
+    author: str
+    author_association: str
+    body: str
+    html_url: str
+    created_at: datetime
+    updated_at: datetime
+
+
 class IssueCandidate(DomainModel):
     repository: str
     number: int
@@ -121,6 +132,7 @@ class IssueCandidate(DomainModel):
     labels: list[str]
     assignees: list[str]
     comments: int
+    discussion: list[IssueComment] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
     score: int = 0
@@ -311,6 +323,7 @@ __all__ = [
     "FileEdit",
     "GateResult",
     "IssueCandidate",
+    "IssueComment",
     "PatchProposal",
     "QualityReport",
     "RepositoryInfo",

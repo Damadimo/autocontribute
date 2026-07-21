@@ -93,6 +93,46 @@ _GENERIC_SECRET = re.compile(
 _OBVIOUS_PLACEHOLDER = re.compile(
     r"(?i)(?:example|dummy|placeholder|change[-_]?me|test|fake|your[-_]?|x{4,})"
 )
+_INVALID_BASELINE_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("the validation command was not installed", re.compile(r"\bcommand not found\b", re.I)),
+    (
+        "a required file or executable was missing",
+        re.compile(r"\b(?:no such file or directory|file or directory not found)\b", re.I),
+    ),
+    (
+        "the test runner discovered no tests",
+        re.compile(
+            r"\b(?:no tests (?:ran|found|collected)|collected 0 items?|ran 0 tests?)\b",
+            re.I,
+        ),
+    ),
+    ("a Python module was unavailable", re.compile(r"\bModuleNotFoundError\b", re.I)),
+    ("a package script was missing", re.compile(r"\bmissing script\b", re.I)),
+    (
+        "the validation command lacked permission",
+        re.compile(
+            r"\b(?:permission denied|operation not permitted|access is denied|EACCES)\b",
+            re.I,
+        ),
+    ),
+    (
+        "network name resolution failed",
+        re.compile(
+            r"\b(?:temporary failure in name resolution|name or service not known|"
+            r"could not resolve host(?:name)?|getaddrinfo (?:failed|error)|gaierror|"
+            r"EAI_AGAIN|EAI_NONAME|nodename nor servname provided)\b",
+            re.I,
+        ),
+    ),
+    (
+        "the validation command failed because the network was unavailable",
+        re.compile(
+            r"\b(?:network is unreachable|failed to establish a new connection|"
+            r"connection refused|ENETUNREACH|ECONNREFUSED)\b",
+            re.I,
+        ),
+    ),
+)
 
 
 @dataclass
@@ -127,6 +167,7 @@ class QualityEvaluator:
         *,
         diff: str,
         command_results: Sequence[CommandResult],
+        required_commands: Sequence[str],
         review: CriticReview,
         baseline_result: CommandResult | None = None,
         contribution_kind: str | None = None,
@@ -233,19 +274,46 @@ class QualityEvaluator:
             ),
         )
 
+        required = list(dict.fromkeys(required_commands))
+        missing_required: list[str] = []
+        failed_required: list[str] = []
+        for command in required:
+            matching_results = [result for result in command_results if result.command == command]
+            if not matching_results:
+                missing_required.append(command)
+            elif not any(result.passed for result in matching_results):
+                failed_required.append(command)
+        passed_required = len(required) - len(missing_required) - len(failed_required)
+        required_evidence = (
+            f"{passed_required}/{len(required)} operator-required validation command(s) passed"
+        )
+        if missing_required:
+            required_evidence += "; not executed: " + ", ".join(
+                repr(command) for command in missing_required
+            )
+        if failed_required:
+            required_evidence += "; failed: " + ", ".join(
+                repr(command) for command in failed_required
+            )
+        if not required:
+            required_evidence += "; no operator-required commands were supplied"
+        gate(
+            "required_validation",
+            bool(required) and not missing_required and not failed_required,
+            required_evidence,
+        )
+
         passed_commands = sum(result.passed for result in command_results)
         failed_indexes = [
             str(index) for index, result in enumerate(command_results, start=1) if not result.passed
         ]
-        validation_required = self.config.quality.require_validation_commands
-        validation_ok = bool(command_results) or not validation_required
-        validation_ok = validation_ok and passed_commands == len(command_results)
+        validation_ok = bool(command_results) and passed_commands == len(command_results)
         validation_evidence = (
             f"{passed_commands}/{len(command_results)} validation command(s) passed"
         )
         if failed_indexes:
             validation_evidence += f"; failed command index(es): {', '.join(failed_indexes)}"
-        elif not command_results and validation_required:
+        elif not command_results:
             validation_evidence += "; at least one command is required"
         gate("validation", validation_ok, validation_evidence)
 
@@ -261,20 +329,26 @@ class QualityEvaluator:
                 ),
                 None,
             )
-            regression_ok = (
-                baseline_result is not None
-                and not baseline_result.passed
-                and patched_reproduction is not None
-                and patched_reproduction.passed
-            )
+            regression_ok = False
+            if baseline_result is None:
+                regression_evidence = "no pristine-upstream reproduction result was recorded"
+            elif baseline_result.passed:
+                regression_evidence = "the reproduction unexpectedly passed on pristine upstream"
+            elif rejection := _baseline_failure_rejection(baseline_result):
+                regression_evidence = f"baseline failure rejected: {rejection}"
+            elif patched_reproduction is None:
+                regression_evidence = "the same reproduction command was not run with the patch"
+            elif not patched_reproduction.passed:
+                regression_evidence = "the reproduction still failed with the patch"
+            else:
+                regression_ok = True
+                regression_evidence = (
+                    "same reproduction failed on pristine upstream and passed with the patch"
+                )
             gate(
                 "regression_evidence",
                 regression_ok,
-                (
-                    "same reproduction failed on pristine upstream and passed with the patch"
-                    if regression_ok
-                    else "bugfix lacks fail-on-base/pass-with-patch reproduction evidence"
-                ),
+                regression_evidence,
             )
 
         gate(
@@ -332,6 +406,7 @@ def evaluate_quality(
     *,
     diff: str,
     command_results: Sequence[CommandResult],
+    required_commands: Sequence[str],
     review: CriticReview,
     config: AutocontributeConfig,
     baseline_result: CommandResult | None = None,
@@ -342,10 +417,25 @@ def evaluate_quality(
     return QualityEvaluator(config).evaluate(
         diff=diff,
         command_results=command_results,
+        required_commands=required_commands,
         review=review,
         baseline_result=baseline_result,
         contribution_kind=contribution_kind,
     )
+
+
+def _baseline_failure_rejection(result: CommandResult) -> str | None:
+    if result.timed_out:
+        return "the baseline command timed out"
+    if result.exit_code in {126, 127}:
+        return (
+            f"exit code {result.exit_code} indicates an unavailable command or permission failure"
+        )
+    output = f"{result.stdout}\n{result.stderr}"
+    for reason, pattern in _INVALID_BASELINE_FAILURE_PATTERNS:
+        if pattern.search(output):
+            return reason
+    return None
 
 
 def _parse_git_diff(diff: str) -> list[_DiffFile]:

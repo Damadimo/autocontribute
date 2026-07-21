@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from autocontribute.config import AutocontributeConfig
 from autocontribute.domain import CommandResult, CriticReview, ReviewScores
 from autocontribute.quality import evaluate_quality
@@ -32,9 +34,12 @@ def _review(
     )
 
 
-def _passing_command() -> CommandResult:
+REQUIRED_COMMAND = "pytest tests/test_math.py"
+
+
+def _passing_command(command: str = REQUIRED_COMMAND) -> CommandResult:
     return CommandResult(
-        command="pytest tests/test_math.py",
+        command=command,
         exit_code=0,
         duration_seconds=1.2,
         stdout="1 passed",
@@ -44,6 +49,12 @@ def _passing_command() -> CommandResult:
 
 def _gate_map(report: object) -> dict[str, bool]:
     return {gate.gate: gate.passed for gate in report.gates}  # type: ignore[attr-defined]
+
+
+def _gate_evidence(report: object, name: str) -> str:
+    return next(  # type: ignore[attr-defined]
+        gate.evidence for gate in report.gates if gate.gate == name
+    )
 
 
 CLEAN_DIFF = """\
@@ -68,6 +79,7 @@ def test_clean_diff_passes_all_quality_gates() -> None:
     report = evaluate_quality(
         diff=CLEAN_DIFF,
         command_results=[_passing_command()],
+        required_commands=[REQUIRED_COMMAND],
         review=_review(),
         config=AutocontributeConfig(),
     )
@@ -85,6 +97,7 @@ def test_bugfix_requires_same_reproduction_to_fail_then_pass() -> None:
     report = evaluate_quality(
         diff=CLEAN_DIFF,
         command_results=[patched],
+        required_commands=[REQUIRED_COMMAND],
         baseline_result=baseline,
         contribution_kind="bugfix",
         review=_review(),
@@ -96,6 +109,7 @@ def test_bugfix_requires_same_reproduction_to_fail_then_pass() -> None:
     missing = evaluate_quality(
         diff=CLEAN_DIFF,
         command_results=[patched],
+        required_commands=[REQUIRED_COMMAND],
         contribution_kind="bugfix",
         review=_review(),
         config=AutocontributeConfig(),
@@ -110,6 +124,7 @@ def test_scope_limits_are_hard_gates() -> None:
     report = evaluate_quality(
         diff=CLEAN_DIFF,
         command_results=[_passing_command()],
+        required_commands=[REQUIRED_COMMAND],
         review=_review(),
         config=config,
     )
@@ -157,6 +172,7 @@ def test_unsafe_diff_fails_file_and_policy_gates_without_leaking_secret() -> Non
     report = evaluate_quality(
         diff=UNSAFE_DIFF,
         command_results=[_passing_command()],
+        required_commands=[REQUIRED_COMMAND],
         review=_review(),
         config=AutocontributeConfig(),
     )
@@ -199,6 +215,7 @@ index 3333333..4444444 100644
     report = evaluate_quality(
         diff=diff,
         command_results=[_passing_command()],
+        required_commands=[REQUIRED_COMMAND],
         review=_review(),
         config=config,
     )
@@ -221,6 +238,7 @@ def test_validation_and_critic_evidence_are_independent_gates() -> None:
     report = evaluate_quality(
         diff=CLEAN_DIFF,
         command_results=[failed_validation],
+        required_commands=["pytest"],
         review=_review(
             score=79,
             verdict="reject",
@@ -239,6 +257,90 @@ def test_validation_and_critic_evidence_are_independent_gates() -> None:
     assert not gates["readiness_score"]
 
 
+def test_required_validation_fails_when_no_trusted_commands_are_supplied() -> None:
+    report = evaluate_quality(
+        diff=CLEAN_DIFF,
+        command_results=[_passing_command("model-suggested-check")],
+        required_commands=[],
+        review=_review(),
+        config=AutocontributeConfig(),
+    )
+
+    gates = _gate_map(report)
+    assert gates["validation"]
+    assert not gates["required_validation"]
+    assert "no operator-required commands" in _gate_evidence(report, "required_validation")
+
+
+def test_required_validation_fails_when_a_required_command_was_skipped() -> None:
+    report = evaluate_quality(
+        diff=CLEAN_DIFF,
+        command_results=[_passing_command("trusted-one")],
+        required_commands=["trusted-one", "trusted-two"],
+        review=_review(),
+        config=AutocontributeConfig(),
+    )
+
+    assert not _gate_map(report)["required_validation"]
+    assert "not executed: 'trusted-two'" in _gate_evidence(report, "required_validation")
+
+
+def test_required_validation_fails_when_a_required_command_failed() -> None:
+    failed = _passing_command("trusted-check").model_copy(
+        update={"exit_code": 1, "stdout": "", "stderr": "test failed"}
+    )
+    report = evaluate_quality(
+        diff=CLEAN_DIFF,
+        command_results=[failed],
+        required_commands=["trusted-check"],
+        review=_review(),
+        config=AutocontributeConfig(),
+    )
+
+    gates = _gate_map(report)
+    assert not gates["required_validation"]
+    assert not gates["validation"]
+    assert "failed: 'trusted-check'" in _gate_evidence(report, "required_validation")
+
+
+@pytest.mark.parametrize(
+    ("update", "reason"),
+    [
+        ({"exit_code": 124, "timed_out": True}, "timed out"),
+        ({"exit_code": 126}, "exit code 126"),
+        ({"exit_code": 127}, "exit code 127"),
+        ({"stderr": "sh: tool: command not found"}, "not installed"),
+        ({"stderr": "No such file or directory"}, "file or executable was missing"),
+        ({"stdout": "no tests collected"}, "discovered no tests"),
+        ({"stderr": "ModuleNotFoundError: No module named 'suite'"}, "module was unavailable"),
+        ({"stderr": "npm ERR! Missing script: test"}, "script was missing"),
+        ({"stderr": "Permission denied"}, "lacked permission"),
+        ({"stderr": "curl: Could not resolve host: example.test"}, "name resolution failed"),
+        ({"stderr": "OSError: Network is unreachable"}, "network was unavailable"),
+    ],
+)
+def test_infrastructure_failures_are_not_regression_evidence(
+    update: dict[str, object], reason: str
+) -> None:
+    patched = _passing_command()
+    baseline = patched.model_copy(update={"exit_code": 1, "stdout": "", "stderr": "", **update})
+
+    report = evaluate_quality(
+        diff=CLEAN_DIFF,
+        command_results=[patched],
+        required_commands=[REQUIRED_COMMAND],
+        baseline_result=baseline,
+        contribution_kind="bugfix",
+        review=_review(),
+        config=AutocontributeConfig(),
+    )
+
+    assert not _gate_map(report)["regression_evidence"]
+    evidence = _gate_evidence(report, "regression_evidence")
+    assert "baseline failure rejected" in evidence
+    assert reason in evidence
+
+
 def test_missing_validation_and_unsafe_paths_fail_closed() -> None:
     diff = """\
 diff --git a/../outside.py b/../outside.py
@@ -252,6 +354,7 @@ index 1111111..2222222 100644
     report = evaluate_quality(
         diff=diff,
         command_results=[],
+        required_commands=[REQUIRED_COMMAND],
         review=_review(),
         config=AutocontributeConfig(),
     )
@@ -266,6 +369,7 @@ def test_empty_or_unparseable_diff_never_becomes_ready() -> None:
     report = evaluate_quality(
         diff="not a git diff",
         command_results=[_passing_command()],
+        required_commands=[REQUIRED_COMMAND],
         review=_review(),
         config=AutocontributeConfig(),
     )
@@ -291,6 +395,7 @@ index 1111111..2222222 100644
     report = evaluate_quality(
         diff=diff,
         command_results=[_passing_command()],
+        required_commands=[REQUIRED_COMMAND],
         review=_review(),
         config=AutocontributeConfig(),
     )

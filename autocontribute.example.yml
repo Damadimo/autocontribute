@@ -15,6 +15,7 @@ github:
   exclude_labels: ["security", "breaking change", "needs design", "blocked"]
   min_stars: 1000
   require_unassigned: true
+  max_repository_inactivity_days: 180
 
 models:
   scout: &builder_model
@@ -39,6 +40,17 @@ sandbox:
   memory: 4g
   cpus: 2
 
+validation:
+  # These commands are operator-owned and mandatory. Replace them with each repository's canonical
+  # checks and use a digest-pinned image that already contains the required toolchain/dependencies.
+  required_commands:
+    facebookresearch/hydra:
+      - python -m pytest
+    google/python-fire:
+      - python -m pytest
+    nvidia-nemo/guardrails:
+      - python -m pytest
+
 policy:
   require_maintainer_signal: true
   require_contribution_guidelines: true
@@ -46,8 +58,9 @@ policy:
   allow_dependency_changes: false
   allow_workflow_changes: false
   ai_disclosure: >-
-    This contribution was prepared with AI assistance and independently
-    validated by the contributor.
+    This contribution was prepared autonomously by an AI agent. Its validation
+    evidence comes from Autocontribute's configured automated checks; no human
+    review is implied.
 
 quality:
   min_candidate_score: 85
@@ -61,7 +74,7 @@ quality:
 publishing:
   mode: review_required
   approval_expires_hours: 24
-  draft: false
+  draft: true
   max_new_pull_requests_per_day: 1
   max_open_pull_requests: 2
   repository_cooldown_days: 7

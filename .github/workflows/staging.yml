@@ -1,0 +1,85 @@
+name: Staging shadow run
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: "Issue in the dedicated staging repository (owner/repository#number)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autocontribute-staging-${{ github.repository_id }}
+  cancel-in-progress: false
+
+jobs:
+  shadow-run:
+    if: vars.AUTOCONTRIBUTE_STAGING_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out control repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --locked
+      - name: Enforce staging-only configuration
+        env:
+          EXPECTED_REPOSITORY: ${{ vars.AUTOCONTRIBUTE_STAGING_REPOSITORY }}
+          REQUESTED_ISSUE: ${{ inputs.issue }}
+        run: |
+          uv run python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          from autocontribute.config import load_config
+
+          expected = os.environ.get("EXPECTED_REPOSITORY", "")
+          issue = os.environ.get("REQUESTED_ISSUE", "")
+          if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", expected):
+              raise SystemExit("AUTOCONTRIBUTE_STAGING_REPOSITORY must be owner/repository")
+          if not re.fullmatch(re.escape(expected) + r"#[1-9][0-9]*", issue, re.IGNORECASE):
+              raise SystemExit("The requested issue must belong to the configured staging repository")
+
+          settings = load_config(Path("autocontribute.staging.yml"))
+          configured = [name.casefold() for name in settings.github.repositories]
+          if configured != [expected.casefold()] or settings.github.owners:
+              raise SystemExit("Staging must use exactly one explicit repository and no owner discovery")
+          if settings.publishing.mode != "review_required" or not settings.publishing.draft:
+              raise SystemExit("Staging must remain review_required with draft publication enabled")
+          PY
+      - name: Preload configured sandbox image
+        run: |
+          image="$(uv run python -c 'from pathlib import Path; from autocontribute.config import load_config; print(load_config(Path("autocontribute.staging.yml")).sandbox.image)')"
+          docker pull "$image"
+      - name: Validate live staging dependencies
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AUTOCONTRIBUTE_STAGING_GITHUB_TOKEN: ${{ secrets.AUTOCONTRIBUTE_STAGING_GITHUB_TOKEN }}
+        run: uv run autocontribute doctor --config autocontribute.staging.yml --non-interactive
+      - name: Prepare shadow contribution
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AUTOCONTRIBUTE_STAGING_GITHUB_TOKEN: ${{ secrets.AUTOCONTRIBUTE_STAGING_GITHUB_TOKEN }}
+          REQUESTED_ISSUE: ${{ inputs.issue }}
+        run: uv run autocontribute run --config autocontribute.staging.yml --issue "$REQUESTED_ISSUE"
+      - name: Upload staging evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: autocontribute-staging-${{ github.run_id }}
+          path: .autocontribute-staging/runs/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
+

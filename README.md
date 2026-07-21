@@ -23,10 +23,13 @@ base commit, diff, commit message, and PR text before publication.
   fresh evidence rather than trusting the builder's claims.
 - Deterministic gates: diff size, forbidden paths, secrets, binaries, validation results, minimum
   dimension scores, and upstream freshness cannot be waived by a model.
+- Operator-owned checks: every allowlisted repository has mandatory validation commands that model
+  output can supplement but never replace or skip.
 - Red/green evidence: behavioral fixes must use the same reproduction command that fails on pristine
-  upstream and passes with the patch.
+  upstream and passes with the patch; missing tools, files, tests, permissions, or networking do not
+  count as a reproduced defect.
 - Credential isolation: model calls happen in the control process; repository commands run in a
-  credential-free Docker sandbox with networking disabled.
+  credential-free Docker sandbox with networking disabled and a disposable working-tree copy.
 - Exact approval: an expiring hash binds approval to the complete outbound artifact. Any drift
   invalidates it.
 - Provider choice: first-class OpenAI Responses API support and an OpenAI-compatible structured-output
@@ -59,9 +62,11 @@ uv run autocontribute publish RUN_ID
 ```
 
 Copy [`autocontribute.example.yml`](autocontribute.example.yml) to `autocontribute.yml` and replace
-the example repositories with projects you understand. Configuration stores environment-variable
-*names* only; never place tokens in YAML. Docker images must be pinned by digest so scheduled checks
-cannot silently change toolchains between runs.
+the example repositories with projects you understand. Define `validation.required_commands` for
+every explicit repository; those commands and the pinned Docker image must provide its complete
+offline toolchain. Configuration stores environment-variable *names* only; never place tokens in
+YAML. Docker images must be pinned by digest so scheduled checks cannot silently change toolchains
+between runs.
 
 ## The contribution pipeline
 
@@ -77,6 +82,8 @@ reasoning and credentials are never recorded.
 
 The default state machine intentionally ends many runs as `skipped` or `rejected`. A contribution
 becomes `ready_for_approval` only when all hard gates and the configured readiness threshold pass.
+Issue discussions are included in the evidence, and explicit work claims or maintainer stop requests
+block selection before model work.
 
 ## Models
 
@@ -121,7 +128,7 @@ See [SECURITY.md](SECURITY.md) before enabling a schedule and [CONTRIBUTING.md](
 working on the agent itself.
 
 Design details live in [Architecture](docs/architecture.md), [Quality policy](docs/quality-policy.md),
-and [Scheduled operation](docs/scheduled-operation.md).
+[Staging](docs/staging.md), and [Scheduled operation](docs/scheduled-operation.md).
 
 ## Development
 
@@ -132,8 +139,9 @@ uv run mypy src
 uv run pytest --cov=autocontribute --cov-report=term-missing
 ```
 
-The test suite never creates a real public PR. Live provider smoke tests, when added, must be explicit
-opt-ins and are not part of CI.
+The test suite never creates a real public PR. A weekly security workflow exercises Docker isolation
+without credentials. Live GitHub/provider shadow runs are manual opt-ins and restricted to an
+operator-owned fixture repository; see [Staging](docs/staging.md).
 
 ## License
 

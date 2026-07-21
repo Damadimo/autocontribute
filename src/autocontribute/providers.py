@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 
 from autocontribute.config import ModelProfile
 from autocontribute.exceptions import ModelError
+from autocontribute.redaction import redact_model_input
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 
@@ -120,6 +121,7 @@ class OpenAIResponsesProvider:
         prompt: str,
         output_type: type[OutputT],
     ) -> ModelResult[OutputT]:
+        instructions, prompt = _scrub_request_text(self.profile, instructions, prompt)
         reasoning: Reasoning = {"effort": self.profile.reasoning_effort}
         if self.profile.reasoning_mode:
             reasoning["mode"] = self.profile.reasoning_mode
@@ -196,6 +198,7 @@ class OpenAICompatibleProvider:
         prompt: str,
         output_type: type[OutputT],
     ) -> ModelResult[OutputT]:
+        instructions, prompt = _scrub_request_text(self.profile, instructions, prompt)
         schema = output_type.model_json_schema()
         try:
             response = self.client.chat.completions.create(
@@ -246,6 +249,14 @@ class OpenAICompatibleProvider:
             model=model,
             usage=_chat_usage(getattr(response, "usage", None)),
         )
+
+
+def _scrub_request_text(profile: ModelProfile, instructions: str, prompt: str) -> tuple[str, str]:
+    secret_names = (profile.api_key_env,)
+    return (
+        redact_model_input(instructions, secret_env_names=secret_names),
+        redact_model_input(prompt, secret_env_names=secret_names),
+    )
 
 
 def create_provider(profile: ModelProfile) -> ModelProvider:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -79,6 +80,45 @@ class SandboxRunner:
         results: list[CommandResult] = []
         for command in commands:
             result = self.run(workspace, command)
+            results.append(result)
+            if stop_on_failure and not result.passed:
+                break
+        return results
+
+    def run_isolated(
+        self,
+        workspace: RepositoryWorkspace | Path,
+        command: str,
+    ) -> CommandResult:
+        """Run one command against a disposable copy of the exact working tree."""
+
+        root = _workspace_path(workspace)
+        with tempfile.TemporaryDirectory(
+            prefix=".autocontribute-validation-", dir=root.parent
+        ) as temporary:
+            isolated = Path(temporary) / "workspace"
+            try:
+                shutil.copytree(root, isolated, symlinks=True)
+            except (OSError, shutil.Error) as exc:
+                raise SandboxError("Could not create an isolated validation workspace") from exc
+            return self.run(isolated, command)
+
+    def run_all_isolated(
+        self,
+        workspace: RepositoryWorkspace | Path,
+        commands: Sequence[str],
+        *,
+        stop_on_failure: bool = True,
+    ) -> list[CommandResult]:
+        """Run each command on a fresh copy so checks cannot mutate shared evidence."""
+
+        if len(commands) > self.config.max_commands - self._commands_run:
+            raise SandboxError(
+                f"Validation requested more than the {self.config.max_commands}-command budget"
+            )
+        results: list[CommandResult] = []
+        for command in commands:
+            result = self.run_isolated(workspace, command)
             results.append(result)
             if stop_on_failure and not result.passed:
                 break

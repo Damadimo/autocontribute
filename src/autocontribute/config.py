@@ -52,6 +52,7 @@ class GitHubConfig(StrictModel):
     issue_limit_per_repository: int = Field(default=10, ge=1, le=50)
     require_unassigned: bool = True
     max_issue_age_days: int = Field(default=365, ge=1, le=3_650)
+    max_repository_inactivity_days: int = Field(default=180, ge=1, le=3_650)
 
     @field_validator("token_env")
     @classmethod
@@ -188,6 +189,45 @@ class SandboxConfig(StrictModel):
         return self
 
 
+class ValidationConfig(StrictModel):
+    """Operator-owned validation commands keyed by canonical repository name."""
+
+    required_commands: dict[str, list[str]] = Field(default_factory=dict)
+
+    @field_validator("required_commands")
+    @classmethod
+    def required_commands_are_safe(cls, values: dict[str, list[str]]) -> dict[str, list[str]]:
+        normalized: dict[str, list[str]] = {}
+        for repository, commands in values.items():
+            if not _REPOSITORY.fullmatch(repository):
+                raise ValueError("validation.required_commands keys must use owner/name syntax")
+            cleaned: list[str] = []
+            for command in commands:
+                value = command.strip()
+                if not value or "\0" in value:
+                    raise ValueError("trusted validation commands must be non-empty and NUL-free")
+                if len(value) > 20_000:
+                    raise ValueError("trusted validation command exceeds 20,000 characters")
+                if value not in cleaned:
+                    cleaned.append(value)
+            if not cleaned:
+                raise ValueError(
+                    f"validation.required_commands[{repository!r}] must contain a command"
+                )
+            key = repository.casefold()
+            if key in normalized:
+                raise ValueError(
+                    f"duplicate validation repository after case-folding: {repository}"
+                )
+            normalized[key] = cleaned
+        return normalized
+
+    def commands_for(self, repository: str) -> list[str]:
+        """Return a copy of the operator-owned commands for one repository."""
+
+        return list(self.required_commands.get(repository.casefold(), []))
+
+
 class PolicyConfig(StrictModel):
     require_maintainer_signal: bool = True
     require_contribution_guidelines: bool = True
@@ -196,8 +236,8 @@ class PolicyConfig(StrictModel):
     allow_dependency_changes: bool = False
     allow_workflow_changes: bool = False
     ai_disclosure: str = (
-        "This contribution was prepared with AI assistance and independently validated by "
-        "the contributor."
+        "This contribution was prepared autonomously by an AI agent. Its validation evidence "
+        "comes from Autocontribute's configured automated checks; no human review is implied."
     )
 
 
@@ -209,7 +249,7 @@ class QualityConfig(StrictModel):
     max_changed_lines: int = Field(default=400, ge=1, le=10_000)
     max_context_files: int = Field(default=20, ge=1, le=100)
     max_context_characters: int = Field(default=160_000, ge=10_000, le=2_000_000)
-    require_validation_commands: bool = True
+    require_validation_commands: Literal[True] = True
     require_regression_evidence_for_bugfix: bool = True
     forbidden_paths: list[str] = Field(
         default_factory=lambda: [
@@ -227,7 +267,7 @@ class PublishingConfig(StrictModel):
     mode: Literal["review_required", "auto"] = "review_required"
     approval_expires_hours: int = Field(default=24, ge=1, le=168)
     branch_prefix: str = "autocontribute"
-    draft: bool = False
+    draft: bool = True
     max_new_pull_requests_per_day: int = Field(default=1, ge=1, le=5)
     max_open_pull_requests: int = Field(default=2, ge=1, le=20)
     repository_cooldown_days: int = Field(default=7, ge=0, le=365)
@@ -255,11 +295,36 @@ class AutocontributeConfig(StrictModel):
     github: GitHubConfig = Field(default_factory=GitHubConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    validation: ValidationConfig = Field(default_factory=ValidationConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     quality: QualityConfig = Field(default_factory=QualityConfig)
     publishing: PublishingConfig = Field(default_factory=PublishingConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+
+    @model_validator(mode="after")
+    def trusted_validation_is_complete(self) -> AutocontributeConfig:
+        missing = [
+            repository
+            for repository in self.github.repositories
+            if not self.validation.commands_for(repository)
+        ]
+        if missing:
+            raise ValueError(
+                "explicit repositories require validation.required_commands entries: "
+                + ", ".join(missing)
+            )
+        oversized = [
+            repository
+            for repository, commands in self.validation.required_commands.items()
+            if len(commands) > self.sandbox.max_commands
+        ]
+        if oversized:
+            raise ValueError(
+                "trusted validation commands exceed sandbox.max_commands for: "
+                + ", ".join(oversized)
+            )
+        return self
 
     def model_for(self, role: Literal["scout", "builder", "critic"]) -> ModelProfile:
         if role == "scout":
@@ -312,6 +377,7 @@ github:
   exclude_labels: ["security", "breaking change", "needs design", "blocked"]
   min_stars: 1000
   require_unassigned: true
+  max_repository_inactivity_days: 180
 
 models:
   scout: &builder_model
@@ -336,6 +402,15 @@ sandbox:
   memory: 4g
   cpus: 2
 
+validation:
+  required_commands:               # operator-owned; model commands are supplementary only
+    facebookresearch/hydra:
+      - python -m pytest
+    google/python-fire:
+      - python -m pytest
+    nvidia-nemo/guardrails:
+      - python -m pytest
+
 policy:
   require_maintainer_signal: true
   require_contribution_guidelines: true
@@ -343,8 +418,9 @@ policy:
   allow_dependency_changes: false
   allow_workflow_changes: false
   ai_disclosure: >-
-    This contribution was prepared with AI assistance and independently
-    validated by the contributor.
+    This contribution was prepared autonomously by an AI agent. Its validation
+    evidence comes from Autocontribute's configured automated checks; no human
+    review is implied.
 
 quality:
   min_candidate_score: 85
@@ -358,7 +434,7 @@ quality:
 publishing:
   mode: review_required             # `auto` also requires an environment kill-switch
   approval_expires_hours: 24
-  draft: false
+  draft: true
   max_new_pull_requests_per_day: 1
   max_open_pull_requests: 2
   repository_cooldown_days: 7
@@ -377,6 +453,7 @@ __all__ = [
     "AutocontributeConfig",
     "GitHubConfig",
     "ModelProfile",
+    "ValidationConfig",
     "example_config",
     "load_config",
 ]

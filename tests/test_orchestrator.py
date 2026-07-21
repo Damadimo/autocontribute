@@ -20,7 +20,11 @@ from autocontribute.domain import (
 from autocontribute.orchestrator import Orchestrator
 from autocontribute.providers import ModelResult, ModelUsage
 from autocontribute.repository import RepositoryWorkspace
+from autocontribute.sandbox import SandboxRunner
 from autocontribute.store import RunStore
+
+REPRODUCTION_COMMAND = "python -c 'from app import value; assert value() == 2'"
+TRUSTED_COMMAND = "python -m pytest"
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -123,10 +127,14 @@ class FixedProvider:
 
 
 class PassingSandbox:
-    def run(self, workspace: RepositoryWorkspace, command: str) -> CommandResult:
-        # A reproduction is arbitrary repository code and may dirty its checkout. The orchestrator
-        # must isolate this mutation from the workspace that becomes the contribution patch.
-        (workspace.path / "baseline-generated.txt").write_text("discard me\n", encoding="utf-8")
+    def __init__(self, *, remaining_commands: int = 8) -> None:
+        self.remaining_commands = remaining_commands
+        self.baseline_commands: list[str] = []
+        self.validation_batches: list[list[str]] = []
+
+    def run_isolated(self, workspace: RepositoryWorkspace, command: str) -> CommandResult:
+        self.baseline_commands.append(command)
+        self.remaining_commands -= 1
         return CommandResult(
             command=command,
             exit_code=1,
@@ -135,13 +143,15 @@ class PassingSandbox:
             stderr="AssertionError",
         )
 
-    def run_all(
+    def run_all_isolated(
         self,
         workspace: RepositoryWorkspace,
         commands: list[str],
         *,
         stop_on_failure: bool = True,
     ) -> list[CommandResult]:
+        self.validation_batches.append(list(commands))
+        self.remaining_commands -= len(commands)
         return [
             CommandResult(
                 command=command,
@@ -154,7 +164,12 @@ class PassingSandbox:
         ]
 
 
-def _providers() -> dict[str, FixedProvider]:
+def _providers(
+    *,
+    validation_commands: list[str] | None = None,
+    reproduction_command: str = REPRODUCTION_COMMAND,
+) -> dict[str, FixedProvider]:
+    commands = [TRUSTED_COMMAND] if validation_commands is None else validation_commands
     plan = ContributionPlan(
         decision="proceed",
         decision_reason="The requested bug fix is narrow and testable.",
@@ -163,8 +178,8 @@ def _providers() -> dict[str, FixedProvider]:
         acceptance_criteria=["value() returns 2"],
         implementation_steps=["Correct the returned value", "Run the focused test"],
         files_to_read=["app.py"],
-        reproduction_command="python -c 'from app import value; assert value() == 2'",
-        validation_commands=["python -m pytest"],
+        reproduction_command=reproduction_command,
+        validation_commands=commands,
         risks=["Behavior is intentionally changed only at the boundary"],
         maintainer_fit="Directly resolves the labeled issue.",
     )
@@ -180,7 +195,7 @@ def _providers() -> dict[str, FixedProvider]:
                 rationale="Match the documented boundary behavior.",
             )
         ],
-        validation_commands=["python -m pytest"],
+        validation_commands=commands,
         commit_message="Fix documented boundary value",
         pull_request_title="Fix documented boundary value",
         pull_request_body="Fixes #42. Corrects the boundary return value.",
@@ -228,24 +243,28 @@ def test_full_prepare_pipeline_reaches_exact_approval_boundary(tmp_path: Path, m
     config = AutocontributeConfig.model_validate(
         {
             "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
             "storage": {"path": tmp_path / "state"},
         }
     )
     store = RunStore(config.storage.path)
     github = FakeGitHub(_issue(), _repository(sha), sha)
+    sandbox = PassingSandbox()
 
     with Orchestrator(
         config,
         store=store,
         github=github,  # type: ignore[arg-type]
         providers=_providers(),  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
         manifest = orchestrator.run(issue_reference="example/project#42")
 
     assert manifest.status == RunStatus.READY_FOR_APPROVAL
     assert manifest.quality and manifest.quality.ready
     assert manifest.model_calls == 3
+    assert sandbox.baseline_commands == [REPRODUCTION_COMMAND]
+    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
     patch = (store.artifact_dir(manifest.run_id) / "contribution.patch").read_text()
     assert "+    return 2" in patch
     assert "baseline-generated" not in patch
@@ -253,11 +272,164 @@ def test_full_prepare_pipeline_reaches_exact_approval_boundary(tmp_path: Path, m
     assert (store.artifact_dir(manifest.run_id) / "report.md").is_file()
 
 
+def test_operator_required_commands_run_when_models_omit_them(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": ["trusted-project-check"]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    sandbox = PassingSandbox()
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=_providers(validation_commands=[]),  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.READY_FOR_APPROVAL
+    assert sandbox.validation_batches == [["trusted-project-check", REPRODUCTION_COMMAND]]
+    assert manifest.quality
+    assert next(
+        gate for gate in manifest.quality.gates if gate.gate == "required_validation"
+    ).passed
+
+
+def test_missing_dynamic_repository_validation_fails_before_model_work(tmp_path: Path) -> None:
+    sha = "a" * 40
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"owners": ["example"]},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+
+    with Orchestrator(
+        config,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.FAILED
+    assert "no operator-owned validation.required_commands" in (manifest.error or "")
+    assert all(provider.calls == 0 for provider in providers.values())
+
+
+def test_insufficient_command_budget_fails_without_truncating_required_checks(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "sandbox": {"max_commands": 2},
+            "validation": {
+                "required_commands": {"example/project": ["trusted-check-one", "trusted-check-two"]}
+            },
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    sandbox = PassingSandbox(remaining_commands=2)
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=_providers(validation_commands=[]),  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.FAILED
+    assert "refusing to truncate validation" in (manifest.error or "")
+    assert sandbox.validation_batches == []
+
+
+def test_isolated_validation_files_never_enter_the_contribution_patch(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    mutating_reproduction = (
+        "python -c 'from pathlib import Path; from app import value; "
+        'Path("validation-generated.txt").write_text("discard"); assert value() == 2\''
+    )
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "sandbox": {"backend": "local", "allow_unsafe_local": True},
+            "validation": {"required_commands": {"example/project": [mutating_reproduction]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=_providers(validation_commands=[], reproduction_command=mutating_reproduction),  # type: ignore[arg-type]
+        sandbox=SandboxRunner(config.sandbox),
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.READY_FOR_APPROVAL
+    patch = (store.artifact_dir(manifest.run_id) / "contribution.patch").read_text()
+    assert "validation-generated.txt" not in patch
+    assert not (
+        store.workspace_dir(manifest.run_id) / "repository" / "validation-generated.txt"
+    ).exists()
+
+
 def test_ineligible_explicit_issue_skips_without_spending_model_tokens(tmp_path: Path) -> None:
     sha = "a" * 40
     config = AutocontributeConfig.model_validate(
         {
             "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
             "storage": {"path": tmp_path / "state"},
         }
     )
@@ -282,6 +454,7 @@ def test_explicit_issue_cannot_bypass_repository_allowlist(tmp_path: Path) -> No
     config = AutocontributeConfig.model_validate(
         {
             "github": {"repositories": ["approved/project"]},
+            "validation": {"required_commands": {"approved/project": [TRUSTED_COMMAND]}},
             "storage": {"path": tmp_path / "state"},
         }
     )

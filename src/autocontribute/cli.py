@@ -16,6 +16,7 @@ from autocontribute.config import example_config, load_config
 from autocontribute.discovery import DiscoveryService
 from autocontribute.doctor import run_doctor
 from autocontribute.domain import CommandResult, RunManifest, RunStatus
+from autocontribute.evaluation import EvaluationStore, EvaluationVerdict
 from autocontribute.exceptions import AutocontributeError, ConfigurationError
 from autocontribute.github import GitHubClient
 from autocontribute.orchestrator import Orchestrator
@@ -30,8 +31,13 @@ app = typer.Typer(
 )
 runs_app = typer.Typer(help="Inspect durable contribution runs.", no_args_is_help=True)
 config_app = typer.Typer(help="Inspect configuration safely.", no_args_is_help=True)
+evaluation_app = typer.Typer(
+    help="Record expert shadow-run grades and inspect rollout gates.",
+    no_args_is_help=True,
+)
 app.add_typer(runs_app, name="runs")
 app.add_typer(config_app, name="config")
+app.add_typer(evaluation_app, name="eval")
 
 console = Console()
 DEFAULT_CONFIG = Path("autocontribute.yml")
@@ -269,6 +275,78 @@ def show_config(config: ConfigOption = DEFAULT_CONFIG) -> None:
 
     settings = _config(config)
     console.print(yaml.safe_dump(settings.model_dump(mode="json"), sort_keys=False))
+
+
+@evaluation_app.command(name="record")
+def record_evaluation(
+    run_id: Annotated[
+        str,
+        typer.Argument(help="Run identifier whose exact artifact was reviewed."),
+    ],
+    reviewer: Annotated[str, typer.Option(help="Expert reviewer identity for the audit record.")],
+    verdict: Annotated[
+        EvaluationVerdict,
+        typer.Option(help="Independent judgment of the prepared artifact or abstention."),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG,
+    notes: Annotated[str, typer.Option(help="Concise evidence supporting the judgment.")] = "",
+    policy_failure: Annotated[
+        bool,
+        typer.Option(help="Mark any repository-policy or legal-process failure."),
+    ] = False,
+    security_failure: Annotated[
+        bool,
+        typer.Option(help="Mark any credential, isolation, or security failure."),
+    ] = False,
+    etiquette_failure: Annotated[
+        bool,
+        typer.Option(help="Mark spam, claimed-work, disclosure, or maintainer-time harm."),
+    ] = False,
+) -> None:
+    """Bind one immutable expert grade to a shadow-run artifact."""
+
+    settings = _config(config)
+    try:
+        evaluation = EvaluationStore(RunStore(settings.storage.path)).record(
+            run_id,
+            reviewer=reviewer,
+            verdict=verdict,
+            notes=notes,
+            policy_failure=policy_failure,
+            security_failure=security_failure,
+            etiquette_failure=etiquette_failure,
+        )
+    except (AutocontributeError, ValueError) as exc:
+        _fail(str(exc))
+    console.print(
+        f"[green]Recorded[/green] {evaluation.verdict.value} for `{evaluation.run_id}` "
+        f"(subject `{evaluation.subject_hash}`)."
+    )
+
+
+@evaluation_app.command(name="report")
+def evaluation_report(
+    config: ConfigOption = DEFAULT_CONFIG,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the machine-readable summary."),
+    ] = False,
+) -> None:
+    """Report whether measured evidence satisfies the conservative shadow gate."""
+
+    settings = _config(config)
+    try:
+        summary = EvaluationStore(RunStore(settings.storage.path)).summary()
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    if json_output:
+        console.print(summary.model_dump_json(indent=2), markup=False)
+        return
+    marker = "PASS" if summary.shadow_gate_passed else "NOT READY"
+    color = "green" if summary.shadow_gate_passed else "yellow"
+    console.print(f"[{color}]Shadow rollout gate: {marker}[/{color}]")
+    for evidence in summary.gate_evidence:
+        console.print(f"- {evidence}")
 
 
 @app.command()

@@ -13,7 +13,64 @@ def test_example_config_is_valid() -> None:
     assert config.models.builder.model == "gpt-5.6"
     assert config.models.critic.reasoning_mode == "pro"
     assert config.publishing.mode == "review_required"
+    assert config.publishing.draft is True
     assert config.sandbox.network == "none"
+    assert all(
+        config.validation.commands_for(repository) for repository in config.github.repositories
+    )
+
+
+def test_defaults_disclose_autonomous_work_without_claiming_human_validation() -> None:
+    config = AutocontributeConfig()
+    disclosure = config.policy.ai_disclosure.casefold()
+
+    assert "autonomously" in disclosure
+    assert "automated checks" in disclosure
+    assert "independently validated" not in disclosure
+    assert "validated by the contributor" not in disclosure
+    assert config.publishing.draft is True
+    assert config.github.max_repository_inactivity_days == 180
+
+
+@pytest.mark.parametrize("days", [0, 3_651])
+def test_repository_inactivity_window_is_bounded(days: int) -> None:
+    with pytest.raises(ValueError, match="max_repository_inactivity_days"):
+        AutocontributeConfig.model_validate({"github": {"max_repository_inactivity_days": days}})
+
+
+def test_explicit_repositories_require_operator_owned_validation_commands() -> None:
+    with pytest.raises(ValueError, match="explicit repositories require"):
+        AutocontributeConfig.model_validate({"github": {"repositories": ["example/project"]}})
+
+
+def test_trusted_validation_commands_must_not_be_empty() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        AutocontributeConfig.model_validate(
+            {
+                "github": {"repositories": ["example/project"]},
+                "validation": {"required_commands": {"example/project": ["  "]}},
+            }
+        )
+
+
+def test_validation_cannot_be_disabled() -> None:
+    with pytest.raises(ValueError, match="require_validation_commands"):
+        AutocontributeConfig.model_validate({"quality": {"require_validation_commands": False}})
+
+
+def test_required_validation_commands_must_fit_the_sandbox_budget() -> None:
+    with pytest.raises(ValueError, match=r"exceed sandbox\.max_commands"):
+        AutocontributeConfig.model_validate(
+            {
+                "github": {"repositories": ["example/project"]},
+                "sandbox": {"max_commands": 1},
+                "validation": {
+                    "required_commands": {
+                        "example/project": ["python -m pytest", "python -m ruff check ."]
+                    }
+                },
+            }
+        )
 
 
 def test_load_config_resolves_storage_relative_to_config(tmp_path: Path) -> None:

@@ -240,7 +240,7 @@ def test_authenticated_account_drift_invalidates_human_approval(tmp_path: Path) 
 
 @pytest.mark.parametrize(
     ("change", "value"),
-    [("base_branch", "next"), ("draft", True)],
+    [("base_branch", "next"), ("draft", False)],
 )
 def test_publication_behavior_drift_invalidates_human_approval(
     tmp_path: Path,

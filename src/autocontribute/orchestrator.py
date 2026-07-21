@@ -4,10 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
-from pathlib import Path
 from typing import Literal, TypeVar, cast
 
 from pydantic import BaseModel
@@ -155,6 +153,13 @@ class Orchestrator:
             reason="candidate passed deterministic eligibility",
         )
 
+        required_validation_commands = self.config.validation.commands_for(repository.full_name)
+        if not required_validation_commands:
+            raise PolicyError(
+                "Repository has no operator-owned validation.required_commands entry: "
+                f"{repository.full_name}"
+            )
+
         base_sha = self.github.default_branch_sha(repository.full_name, repository.default_branch)
         manifest.base_sha = base_sha
         workspace_root = self.store.workspace_dir(manifest.run_id) / "repository"
@@ -197,19 +202,9 @@ class Orchestrator:
         if plan.contribution_kind == "bugfix":
             if not plan.reproduction_command:
                 raise PolicyError("Bugfix plan omitted a baseline reproduction command")
-            # Reproduction code is untrusted and may write into its checkout. Run it in a disposable
-            # clone so generated files or malicious mutations cannot leak into the proposed patch.
-            with tempfile.TemporaryDirectory(
-                prefix="baseline-", dir=self.store.workspace_dir(manifest.run_id)
-            ) as baseline_parent:
-                baseline_workspace = RepositoryWorkspace.clone(
-                    repository.clone_url,
-                    base_sha,
-                    Path(baseline_parent) / "repository",
-                )
-                manifest.baseline_validation = self._run_command(
-                    baseline_workspace, plan.reproduction_command
-                )
+            manifest.baseline_validation = self._run_command_isolated(
+                workspace, plan.reproduction_command
+            )
             self.store.save(
                 manifest,
                 event="baseline.reproduced",
@@ -242,7 +237,12 @@ class Orchestrator:
         )
 
         self.store.transition(manifest, RunStatus.VALIDATING, reason="running isolated checks")
-        commands[:] = self._validate(workspace, plan, proposal)
+        commands[:] = self._validate(
+            workspace,
+            plan,
+            proposal,
+            required_commands=required_validation_commands,
+        )
         self.store.save(
             manifest,
             event="validation.completed",
@@ -293,7 +293,12 @@ class Orchestrator:
                 RunStatus.VALIDATING,
                 reason="revalidating repaired patch",
             )
-            commands[:] = self._validate(workspace, plan, proposal)
+            commands[:] = self._validate(
+                workspace,
+                plan,
+                proposal,
+                required_commands=required_validation_commands,
+            )
             self.store.transition(
                 manifest,
                 RunStatus.CRITIQUING,
@@ -305,6 +310,7 @@ class Orchestrator:
         quality = QualityEvaluator(self.config).evaluate(
             diff=diff,
             command_results=commands,
+            required_commands=required_validation_commands,
             review=review,
             baseline_result=manifest.baseline_validation,
             contribution_kind=plan.contribution_kind,
@@ -365,28 +371,32 @@ class Orchestrator:
         workspace: RepositoryWorkspace,
         plan: ContributionPlan,
         proposal: PatchProposal,
+        *,
+        required_commands: Sequence[str],
     ) -> list[CommandResult]:
-        commands = list(dict.fromkeys([*plan.validation_commands, *proposal.validation_commands]))
-        if plan.reproduction_command:
-            commands.insert(0, plan.reproduction_command)
-            commands = list(dict.fromkeys(commands))
-        remaining = getattr(self.sandbox, "remaining_commands", self.config.sandbox.max_commands)
-        commands = commands[:remaining]
+        commands = list(
+            dict.fromkeys(
+                [
+                    *required_commands,
+                    *([plan.reproduction_command] if plan.reproduction_command else []),
+                    *plan.validation_commands,
+                    *proposal.validation_commands,
+                ]
+            )
+        )
         if not commands:
-            return [
-                CommandResult(
-                    command="repository validation command required",
-                    exit_code=2,
-                    duration_seconds=0,
-                    stdout="",
-                    stderr="The plan supplied no repository-specific validation command.",
-                )
-            ]
-        results = self.sandbox.run_all(workspace, commands, stop_on_failure=True)
+            raise PolicyError("No operator-owned validation commands are configured")
+        remaining = getattr(self.sandbox, "remaining_commands", self.config.sandbox.max_commands)
+        if len(commands) > remaining:
+            raise PolicyError(
+                f"Complete validation suite requires {len(commands)} command(s), but only "
+                f"{remaining} sandbox command(s) remain; refusing to truncate validation"
+            )
+        results = self.sandbox.run_all_isolated(workspace, commands, stop_on_failure=True)
         return [self._scrub_command(result) for result in results]
 
-    def _run_command(self, workspace: RepositoryWorkspace, command: str) -> CommandResult:
-        return self._scrub_command(self.sandbox.run(workspace, command))
+    def _run_command_isolated(self, workspace: RepositoryWorkspace, command: str) -> CommandResult:
+        return self._scrub_command(self.sandbox.run_isolated(workspace, command))
 
     def _scrub_command(self, result: CommandResult) -> CommandResult:
         secret_names = self._secret_env_names()

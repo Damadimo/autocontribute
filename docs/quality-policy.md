@@ -1,15 +1,17 @@
 # Quality policy
 
 No system can honestly guarantee that a maintainer will accept a contribution. Autocontribute calls
-its scores *readiness* scores and treats merge/revision outcomes as future calibration data, not
-model-predicted acceptance probabilities.
+its scores *readiness* scores rather than model-predicted acceptance probabilities. Expert shadow
+grades are stored separately from model scores and drive the rollout gate.
 
 ## Candidate readiness
 
-A candidate needs a public, active, non-archived allowlisted repository; contribution guidance; an
-open, unassigned, maintainer-signaled issue; no excluded/security label; no likely competing PR; clear
-acceptance language; recent activity; and a score of at least 85 by default. Security-sensitive,
-assigned, stale, broad, or policy-incompatible work is skipped before a model call whenever possible.
+A candidate needs a public, recently active, non-archived allowlisted repository; contribution
+guidance; an open, unassigned, maintainer-signaled issue; no excluded/security label; no likely
+competing PR; clear acceptance language; recent activity; and a score of at least 85 by default. The
+complete issue discussion is loaded before selection. Claimed work, maintainer stop requests,
+security-sensitive work, stale issues, broad scope, and policy conflicts are skipped before a model
+call whenever possible.
 
 The deterministic score is:
 
@@ -30,7 +32,10 @@ All gates must pass. A high model score cannot override one.
 - No binaries, symlinks, submodules, file-mode changes, unsafe paths, generated/vendor files, secrets,
   dependency/lock changes, or CI workflow changes unless the global owner explicitly changes policy.
 - For a bugfix, the same bounded reproduction must fail on pristine upstream and pass with the patch.
-- Every configured repository validation command passes in the offline sandbox.
+  Missing tools/files/modules, no-test discovery, timeouts, permission errors, and unavailable
+  networking are infrastructure failures rather than regression evidence.
+- Every operator-owned repository validation command passes in a disposable offline sandbox copy;
+  model-suggested commands cannot replace it and command-budget truncation fails closed.
 - A fresh-context critic reports no blocker or missing issue requirement.
 - Every critic dimension is at least 80 and weighted readiness is at least 90.
 - Commit and PR text are bounded, credential-free, non-broadcast, and contain the configured
@@ -51,3 +56,11 @@ never force-pushes.
 “No suitable contribution,” “could not reproduce,” and “validation environment unavailable” are
 healthy outcomes. The project must never optimize for daily PR count, profile activity, company
 prestige, or stars at the expense of maintainer value.
+
+## Shadow rollout gate
+
+Use `autocontribute eval record` to bind one immutable expert judgment to each exact run artifact and
+`autocontribute eval report` to inspect aggregate evidence. Autonomous rollout remains blocked until
+there are at least 100 reviewed shadow cases, at least 20 prepared cases, at least 95% accept-as-is
+precision among prepared cases, and zero policy, security, or etiquette failures. Passing this gate
+permits a controlled pilot; it is not permission for owner-wide or quota-driven publication.

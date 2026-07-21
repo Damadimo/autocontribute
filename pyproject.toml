@@ -46,6 +46,11 @@ autocontribute = "autocontribute.cli:app"
 Homepage = "https://github.com/Damadimo/autocontribute"
 Issues = "https://github.com/Damadimo/autocontribute/issues"
 
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/autocontribute"]
 

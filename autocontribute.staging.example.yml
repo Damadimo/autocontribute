@@ -1,0 +1,89 @@
+# Shadow-run configuration for a repository owned by the operator.
+identity:
+  name: "Staging Operator"
+  email: "your-handle@users.noreply.github.com"
+
+github:
+  auth: token
+  token_env: AUTOCONTRIBUTE_STAGING_GITHUB_TOKEN
+  repositories:
+    - YOUR_ACCOUNT/autocontribute-staging-fixture
+  owners: []
+  include_labels: ["autocontribute-e2e"]
+  exclude_labels: ["security", "blocked", "needs design"]
+  min_stars: 0
+  repository_limit_per_owner: 1
+  issue_limit_per_repository: 10
+  require_unassigned: true
+  max_issue_age_days: 365
+  max_repository_inactivity_days: 365
+
+models:
+  scout: &staging_model
+    provider: openai
+    model: gpt-5.6
+    api_key_env: OPENAI_API_KEY
+    reasoning_effort: high
+    reasoning_mode: standard
+    max_output_tokens: 40000
+    timeout_seconds: 900
+  builder: *staging_model
+  critic:
+    <<: *staging_model
+    reasoning_mode: pro
+
+sandbox:
+  backend: docker
+  # The first fixture intentionally uses only Python's standard library. Replace this image with a
+  # digest-pinned, dependency-complete image before adding another repository ecosystem.
+  image: >-
+    python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a
+  network: none
+  command_timeout_seconds: 300
+  memory: 2g
+  cpus: 2
+  pids_limit: 128
+  max_commands: 6
+
+validation:
+  required_commands:
+    YOUR_ACCOUNT/autocontribute-staging-fixture:
+      - python -m unittest discover -v
+
+policy:
+  require_maintainer_signal: true
+  require_contribution_guidelines: true
+  allow_assigned_issues: false
+  allow_security_issues: false
+  allow_dependency_changes: false
+  allow_workflow_changes: false
+  ai_disclosure: >-
+    This contribution was prepared autonomously by an AI agent. Its validation evidence comes from
+    Autocontribute's configured automated checks; no human review is implied.
+
+quality:
+  min_candidate_score: 85
+  min_readiness_score: 90
+  min_dimension_score: 80
+  max_files_changed: 5
+  max_changed_lines: 200
+  max_context_files: 20
+  max_context_characters: 120000
+  require_validation_commands: true
+  require_regression_evidence_for_bugfix: true
+
+publishing:
+  mode: review_required
+  approval_expires_hours: 12
+  draft: true
+  max_new_pull_requests_per_day: 1
+  max_open_pull_requests: 1
+  repository_cooldown_days: 30
+  auto_publish_env: AUTOCONTRIBUTE_STAGING_AUTO_PUBLISH_DISABLED
+
+budget:
+  max_model_calls_per_run: 6
+  max_candidates_per_run: 10
+
+storage:
+  path: .autocontribute-staging
