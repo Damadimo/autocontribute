@@ -89,10 +89,9 @@ def render_run_report(
                 f"**{manifest.proposal.pull_request_title}**",
                 "",
                 manifest.proposal.pull_request_body,
-                "",
-                f"Commit: `{manifest.proposal.commit_message}`",
             ]
         )
+        _append_exact_text(lines, "Commit message", manifest.proposal.commit_message)
     if commands:
         lines.extend(["", "## Validation evidence", ""])
         if manifest.baseline_validation:

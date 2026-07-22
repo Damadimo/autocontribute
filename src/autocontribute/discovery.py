@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
 
-from autocontribute.config import AutocontributeConfig
+from autocontribute.config import AutocontributeConfig, LegalAttestation
 from autocontribute.domain import EligibilityResult, IssueCandidate, RepositoryInfo
-from autocontribute.exceptions import CircuitBreakerTrigger, GitHubError, StateError
+from autocontribute.exceptions import CircuitBreakerTrigger, GitHubError, PolicyError, StateError
 from autocontribute.github import GitHubClient
 from autocontribute.store import RunStore
 
@@ -52,16 +55,25 @@ _AUTOMATION_PROHIBITION = re.compile(
     r"not accept(?:ed|ing)?|not allowed|will be closed)\b)",
     re.I | re.S,
 )
-_LEGAL_ATTESTATION = re.compile(
-    r"(?:\b(?:must|required|requires?|need(?:ed)? to)\b.{0,100}"
-    r"\b(?:signed-off-by|developer certificate of origin|\bDCO\b|"
-    r"contributor license agreement|\bCLA\b)\b|"
-    r"\b(?:signed-off-by|developer certificate of origin|\bDCO\b|"
-    r"contributor license agreement|\bCLA\b)\b.{0,100}"
-    r"\b(?:must|required|requires?|need(?:ed)? to|sign|agree)\b|"
-    r"\bby submitting\b.{0,120}\b(?:developer certificate of origin|\bDCO\b|"
-    r"contributor license agreement|\bCLA\b)\b)",
-    re.I | re.S,
+_CLA_TERM = r"(?:contributor(?:['\u2019]s)? license agreement|\bCLA\b)"
+_DCO_TERM = r"(?:signed[- ]off[- ]by|developer(?:['\u2019]s)? certificate of origin|\bDCO\b)"
+_CLA_REFERENCE = re.compile(rf"\b{_CLA_TERM}\b", re.I)
+_DCO_REFERENCE = re.compile(rf"\b{_DCO_TERM}\b", re.I)
+_LEGAL_SEGMENT_SPLIT = re.compile(r"(?:\r?\n)+|(?<=[.!?])\s+")
+_LEGAL_NEGATION_CONTRAST = re.compile(r"\b(?:although|but|except|however|unless|yet)\b", re.I)
+_LEGAL_NEGATED_PREFIX = re.compile(
+    r"(?:\b(?:(?:do|does|did|will)\s+not|don't|doesn't|didn't|won't|never)\s+"
+    r"(?:add|enforce|include|need|request|require|use)[^.!?]{0,80}|"
+    r"\bno\s+(?:(?:legal\s+)?(?:need|requirement)\b[^.!?]{0,80}|(?:an?\s+)?))$",
+    re.I,
+)
+_LEGAL_NEGATED_SUFFIX = re.compile(
+    r"^\s*(?:(?:requirements?|signoffs?|trailers?|lines?)\s+)?"
+    r"(?:(?:is|are|was|were|should|must)\s+)?(?:not|never|no\s+longer)\s+"
+    r"(?:added|applicable|enforced|included|needed|required|requested|used)\b|"
+    r"^\s*(?:requirements?\s+)?do(?:es)?\s+not\s+apply\b|"
+    r"^\s*(?:is|are)\s+optional\b",
+    re.I,
 )
 _WORK_CLAIM = re.compile(
     r"\b(?:i(?:'m| am|\u2019m) working on (?:this|it)|"
@@ -120,11 +132,19 @@ _AI_POLICY_PATHS = (
 _LEGAL_POLICY_PATHS = (
     "CONTRIBUTING.md",
     ".github/CONTRIBUTING.md",
+    "DCO",
     "DCO.md",
     ".github/DCO.md",
+    ".github/dco.yml",
+    ".github/dco.yaml",
     "docs/DCO.md",
+    "CLA",
     "CLA.md",
     ".github/CLA.md",
+    ".github/cla.yml",
+    ".github/cla.yaml",
+    ".github/cla-assistant.yml",
+    ".clabot",
     "docs/CLA.md",
     "CONTRIBUTOR_LICENSE_AGREEMENT.md",
     "DEVELOPER_CERTIFICATE_OF_ORIGIN.md",
@@ -161,6 +181,32 @@ _ALL_POLICY_PATHS = tuple(
     )
 )
 POLICY_SOURCES_EVIDENCE_KEY = "policy_sources_sha256"
+POLICY_REPOSITORY_REF_EVIDENCE_KEY = "policy_repository_ref"
+POLICY_ORGANIZATION_REF_EVIDENCE_KEY = "policy_organization_ref"
+LEGAL_REQUIREMENTS_EVIDENCE_KEY = "legal_requirements"
+LEGAL_ATTESTATION_EVIDENCE_KEY = "legal_attestation_sha256"
+LEGAL_POLICY_EVIDENCE_KEY = "legal_policy_sha256"
+_LEGAL_ATTESTATION_FINGERPRINT_DOMAIN = b"autocontribute.legal-attestation.v1\x00"
+_LEGAL_POLICY_FINGERPRINT_DOMAIN = b"autocontribute.legal-policy-surface.v1\x00"
+
+
+@dataclass(frozen=True, slots=True)
+class PolicySnapshot:
+    """One bounded repository and organization policy view at immutable refs."""
+
+    repository: str
+    repository_ref: str
+    organization_repository: str
+    organization_ref: str | None
+    repository_paths: tuple[str, ...]
+    organization_paths: tuple[str, ...]
+    policy_sources_sha256: str
+    legal_policy_sha256: str
+    legal_requirements: tuple[str, ...]
+
+    @property
+    def organization_ref_evidence(self) -> str:
+        return self.organization_ref or "absent"
 
 
 class DiscoveryService:
@@ -344,38 +390,26 @@ class DiscoveryService:
         evidence["policy_fit"] = f"{policy_fit}/10"
 
         if check_remote_policy:
-            pinned_repository_ref = self._pin_repository_ref(
+            snapshot = self.policy_snapshot(
                 repository,
                 repository_ref=repository_ref,
             )
-            owner_policy_repository = f"{repository.full_name.split('/', 1)[0]}/.github"
-            organization_ref = self._organization_policy_ref(owner_policy_repository)
-            repository_policy_paths = self._policy_paths(
-                repository.full_name,
-                pinned_repository_ref,
-            )
-            organization_policy_paths = self._policy_paths(
-                owner_policy_repository,
-                organization_ref,
-            )
-            evidence[POLICY_SOURCES_EVIDENCE_KEY] = self._policy_sources_fingerprint(
-                repository.full_name,
-                pinned_repository_ref,
-                owner_policy_repository,
-                organization_ref,
-                repository_policy_paths,
-                organization_policy_paths,
-            )
+            evidence[POLICY_SOURCES_EVIDENCE_KEY] = snapshot.policy_sources_sha256
+            evidence[POLICY_REPOSITORY_REF_EVIDENCE_KEY] = snapshot.repository_ref
+            evidence[POLICY_ORGANIZATION_REF_EVIDENCE_KEY] = snapshot.organization_ref_evidence
+            evidence[LEGAL_POLICY_EVIDENCE_KEY] = snapshot.legal_policy_sha256
             contribution_policy = self._first_existing_file(
                 repository.full_name,
-                pinned_repository_ref,
-                tuple(path for path in repository_policy_paths if _is_contribution_guidance(path)),
+                snapshot.repository_ref,
+                tuple(
+                    path for path in snapshot.repository_paths if _is_contribution_guidance(path)
+                ),
             )
             organization_contribution_policy = self._first_existing_file(
-                owner_policy_repository,
-                organization_ref,
+                snapshot.organization_repository,
+                snapshot.organization_ref,
                 tuple(
-                    path for path in organization_policy_paths if _is_contribution_guidance(path)
+                    path for path in snapshot.organization_paths if _is_contribution_guidance(path)
                 ),
             )
             if (
@@ -388,13 +422,13 @@ class DiscoveryService:
                 evidence["policy_fit"] = "0/10: contribution guidelines missing"
             ai_policy = self._combined_existing_files(
                 repository.full_name,
-                pinned_repository_ref,
-                repository_policy_paths,
+                snapshot.repository_ref,
+                snapshot.repository_paths,
             )
             organization_ai_policy = self._combined_existing_files(
-                owner_policy_repository,
-                organization_ref,
-                organization_policy_paths,
+                snapshot.organization_repository,
+                snapshot.organization_ref,
+                snapshot.organization_paths,
             )
             combined_ai_policy = f"{ai_policy}\n{organization_ai_policy}"
             if combined_ai_policy and _AI_PROHIBITION.search(combined_ai_policy):
@@ -406,24 +440,24 @@ class DiscoveryService:
                 policy_fit = 0
                 evidence["policy_fit"] = "0/10: contribution automation prohibition detected"
 
-            legal_policy = self._combined_existing_files(
-                repository.full_name,
-                pinned_repository_ref,
-                repository_policy_paths,
-            )
-            organization_legal_policy = self._combined_existing_files(
-                owner_policy_repository,
-                organization_ref,
-                organization_policy_paths,
-            )
-            legal_policy = f"{legal_policy}\n{organization_legal_policy}"
-            if legal_policy and _LEGAL_ATTESTATION.search(legal_policy):
-                blockers.append(
-                    "repository appears to require a CLA/DCO or signed-off legal attestation; "
-                    "autonomous completion is not configured"
-                )
-                policy_fit = 0
-                evidence["policy_fit"] = "0/10: unresolved CLA/DCO attestation requirement"
+            if snapshot.legal_requirements:
+                evidence[LEGAL_REQUIREMENTS_EVIDENCE_KEY] = ",".join(snapshot.legal_requirements)
+                attestation = self.config.policy.legal_attestation_for(repository.full_name)
+                mismatch = _legal_attestation_mismatch(snapshot, attestation)
+                if mismatch is None:
+                    assert attestation is not None
+                    evidence[LEGAL_ATTESTATION_EVIDENCE_KEY] = legal_attestation_fingerprint(
+                        repository.full_name, attestation
+                    )
+                else:
+                    blockers.append(
+                        "CLA/DCO requirements lack an exact current repository attestation: "
+                        + mismatch
+                    )
+                    policy_fit = 0
+                    evidence["policy_fit"] = "0/10: unresolved repository-bound legal attestation"
+            else:
+                evidence[LEGAL_REQUIREMENTS_EVIDENCE_KEY] = "none"
 
         competing = self.github.search_competing_pull_requests(repository.full_name, issue.number)
         if competing:
@@ -456,6 +490,104 @@ class DiscoveryService:
             and not repository.disabled
             and active
             and repository.stars >= self.config.github.min_stars
+        )
+
+    def policy_snapshot(
+        self,
+        repository: RepositoryInfo,
+        *,
+        repository_ref: str | None = None,
+    ) -> PolicySnapshot:
+        """Read and hash the complete bounded policy surface at immutable refs."""
+
+        pinned_repository_ref = self._pin_repository_ref(
+            repository,
+            repository_ref=repository_ref,
+        )
+        owner_policy_repository = f"{repository.full_name.split('/', 1)[0]}/.github"
+        organization_ref = self._organization_policy_ref(owner_policy_repository)
+        repository_paths = self._policy_paths(
+            repository.full_name,
+            pinned_repository_ref,
+        )
+        organization_paths = self._policy_paths(
+            owner_policy_repository,
+            organization_ref,
+        )
+        policy_sources_sha256 = self._policy_sources_fingerprint(
+            repository.full_name,
+            pinned_repository_ref,
+            owner_policy_repository,
+            organization_ref,
+            repository_paths,
+            organization_paths,
+        )
+        legal_policy_sha256 = self._legal_policy_fingerprint(
+            repository.full_name,
+            pinned_repository_ref,
+            owner_policy_repository,
+            organization_ref,
+            repository_paths,
+            organization_paths,
+        )
+        legal_policy = "\n".join(
+            (
+                self._combined_existing_files(
+                    repository.full_name,
+                    pinned_repository_ref,
+                    repository_paths,
+                ),
+                self._combined_existing_files(
+                    owner_policy_repository,
+                    organization_ref,
+                    organization_paths,
+                ),
+            )
+        )
+        legal_requirements: list[str] = []
+        policy_sources = (
+            (repository.full_name, pinned_repository_ref, repository_paths),
+            (owner_policy_repository, organization_ref, organization_paths),
+        )
+
+        def explicit_policy_requires_review(
+            path_matches: Callable[[str], bool],
+            reference: re.Pattern[str],
+        ) -> bool:
+            for source_repository, ref, paths in policy_sources:
+                for path in paths:
+                    if not path_matches(path):
+                        continue
+                    content = self._remote_file(source_repository, path, ref)
+                    if content is not None and (
+                        reference.search(content) is None
+                        or _legal_reference_requires_review(content, reference)
+                    ):
+                        return True
+            return False
+
+        explicit_cla_policy = explicit_policy_requires_review(
+            _is_explicit_cla_policy_path,
+            _CLA_REFERENCE,
+        )
+        explicit_dco_policy = explicit_policy_requires_review(
+            _is_explicit_dco_policy_path,
+            _DCO_REFERENCE,
+        )
+        if _legal_reference_requires_review(legal_policy, _CLA_REFERENCE) or explicit_cla_policy:
+            legal_requirements.append("cla")
+        if _legal_reference_requires_review(legal_policy, _DCO_REFERENCE) or explicit_dco_policy:
+            legal_requirements.append("dco")
+        return PolicySnapshot(
+            repository=repository.full_name,
+            repository_ref=pinned_repository_ref,
+            organization_repository=owner_policy_repository,
+            organization_ref=organization_ref,
+            repository_paths=repository_paths,
+            organization_paths=organization_paths,
+            policy_sources_sha256=policy_sources_sha256,
+            legal_policy_sha256=legal_policy_sha256,
+            legal_requirements=tuple(legal_requirements),
         )
 
     def pinned_repository_ref(self, repository: str) -> str:
@@ -649,10 +781,248 @@ class DiscoveryService:
             )
         return hashlib.sha256(payload).hexdigest()
 
+    def _legal_policy_fingerprint(
+        self,
+        repository: str,
+        repository_ref: str,
+        organization_repository: str,
+        organization_ref: str | None,
+        repository_paths: tuple[str, ...],
+        organization_paths: tuple[str, ...],
+    ) -> str:
+        """Hash policy presence, inventories, and contents without moving commit refs."""
+
+        sources: dict[str, str | None] = {}
+        total_bytes = 0
+        for source_repository, ref, paths in (
+            (repository, repository_ref, repository_paths),
+            (organization_repository, organization_ref, organization_paths),
+        ):
+            source_key = source_repository.casefold()
+            entries: tuple[tuple[str, str | None], ...] = (
+                (
+                    f"{source_key}:__policy_repository_presence__",
+                    "present" if ref is not None else "absent",
+                ),
+                (
+                    f"{source_key}:__policy_path_inventory__",
+                    json.dumps(paths, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+            for key, value in entries:
+                total_bytes = _bounded_policy_source_size(total_bytes, key, value)
+                sources[key] = value
+            for path in paths:
+                key = f"{source_key}:{path.casefold()}"
+                value = self._remote_file(source_repository, path, ref)
+                total_bytes = _bounded_policy_source_size(total_bytes, key, value)
+                sources[key] = value
+        payload = json.dumps(
+            sources,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(payload) > MAX_POLICY_TOTAL_BYTES:
+            raise GitHubError(
+                f"Repository legal-policy evidence exceeds the {MAX_POLICY_TOTAL_BYTES}-byte limit"
+            )
+        return hashlib.sha256(_LEGAL_POLICY_FINGERPRINT_DOMAIN + payload).hexdigest()
+
 
 def _is_contribution_guidance(path: str) -> bool:
     name = PurePosixPath(path.casefold()).name
     return name.startswith(("contributing", "contribution_guideline"))
+
+
+def _is_explicit_cla_policy_path(path: str) -> bool:
+    parsed = PurePosixPath(path.casefold())
+    if parsed.suffix not in {"", ".json", ".markdown", ".md", ".rst", ".txt", ".yaml", ".yml"}:
+        return False
+    stem = parsed.stem.lstrip(".")
+    return (
+        stem == "cla"
+        or stem.startswith(("cla-", "cla_"))
+        or stem
+        in {
+            "cla-assistant",
+            "cla_assistant",
+            "clabot",
+            "contributor-license-agreement",
+            "contributor_license_agreement",
+        }
+    )
+
+
+def _is_explicit_dco_policy_path(path: str) -> bool:
+    parsed = PurePosixPath(path.casefold())
+    if parsed.suffix not in {"", ".json", ".markdown", ".md", ".rst", ".txt", ".yaml", ".yml"}:
+        return False
+    stem = parsed.stem.lstrip(".")
+    return (
+        stem == "dco"
+        or stem.startswith(("dco-", "dco_"))
+        or stem
+        in {
+            "developer-certificate-of-origin",
+            "developer_certificate_of_origin",
+        }
+    )
+
+
+def _legal_reference_requires_review(policy: str, reference: re.Pattern[str]) -> bool:
+    """Treat every non-negated or ambiguous legal reference as requiring review."""
+
+    for segment in _LEGAL_SEGMENT_SPLIT.split(policy):
+        matches = list(reference.finditer(segment))
+        if not matches:
+            continue
+        if len(matches) != 1 or _LEGAL_NEGATION_CONTRAST.search(segment):
+            return True
+        match = matches[0]
+        if not (
+            _LEGAL_NEGATED_PREFIX.search(segment[: match.start()])
+            or _LEGAL_NEGATED_SUFFIX.search(segment[match.end() :])
+        ):
+            return True
+    return False
+
+
+def legal_attestation_fingerprint(
+    repository: str,
+    attestation: LegalAttestation,
+) -> str:
+    """Hash the exact repository-scoped assertion copied into durable run evidence."""
+
+    payload = json.dumps(
+        {
+            "schema_version": 1,
+            "repository": repository.casefold(),
+            "attestation": attestation.model_dump(mode="json"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(_LEGAL_ATTESTATION_FINGERPRINT_DOMAIN + payload).hexdigest()
+
+
+def _legal_attestation_mismatch(
+    snapshot: PolicySnapshot,
+    attestation: LegalAttestation | None,
+) -> str | None:
+    if attestation is None:
+        return "no attestation is configured for this repository"
+    if attestation.legal_policy_sha256 != snapshot.legal_policy_sha256:
+        return "bounded policy inventories or contents changed"
+    if tuple(attestation.legal_requirements) != snapshot.legal_requirements:
+        return "detected legal requirement set changed"
+    missing: list[str] = []
+    if "cla" in snapshot.legal_requirements and attestation.cla is None:
+        missing.append("completed account-level CLA authorization")
+    if "dco" in snapshot.legal_requirements and attestation.dco is None:
+        missing.append("named DCO signoff authorization")
+    if missing:
+        return "missing " + " and ".join(missing)
+    return None
+
+
+def _legal_requirements_from_evidence(eligibility: EligibilityResult) -> tuple[str, ...]:
+    raw = eligibility.evidence.get(LEGAL_REQUIREMENTS_EVIDENCE_KEY)
+    if raw == "none":
+        return ()
+    if raw is None:
+        raise PolicyError("Run is missing durable legal-requirement evidence")
+    requirements = tuple(raw.split(","))
+    if not requirements or any(value not in {"cla", "dco"} for value in requirements):
+        raise PolicyError("Run contains invalid legal-requirement evidence")
+    if requirements != tuple(value for value in ("cla", "dco") if value in requirements):
+        raise PolicyError("Run contains non-canonical legal-requirement evidence")
+    return requirements
+
+
+def _attestation_from_evidence(
+    config: AutocontributeConfig,
+    eligibility: EligibilityResult,
+    repository: str,
+) -> LegalAttestation:
+    attestation = config.policy.legal_attestation_for(repository)
+    recorded = eligibility.evidence.get(LEGAL_ATTESTATION_EVIDENCE_KEY)
+    if attestation is None or recorded is None:
+        raise PolicyError("Run lacks its exact repository-bound legal attestation")
+    current = legal_attestation_fingerprint(repository, attestation)
+    if not hmac.compare_digest(recorded, current):
+        raise PolicyError("Repository legal attestation changed after candidate discovery")
+    return attestation
+
+
+def apply_legal_commit_message(
+    config: AutocontributeConfig,
+    eligibility: EligibilityResult,
+    repository: str,
+    commit_message: str,
+) -> str:
+    """Append an authorized DCO trailer before preparation evidence is sealed."""
+
+    if (
+        not commit_message
+        or commit_message != commit_message.strip()
+        or "\r" in commit_message
+        or "\n" in commit_message
+        or re.search(r"signed-off-by\s*:", commit_message, re.I)
+    ):
+        raise PolicyError(
+            "Model commit subject must be one canonical line and cannot safely supply a legal "
+            "signoff"
+        )
+    requirements = _legal_requirements_from_evidence(eligibility)
+    if not requirements:
+        return commit_message
+    attestation = _attestation_from_evidence(config, eligibility, repository)
+    if "dco" not in requirements:
+        return commit_message
+    if attestation.dco is None:
+        raise PolicyError("Run lacks its named DCO signoff authorization")
+    return f"{commit_message}\n\n{attestation.dco.trailer}"
+
+
+def validate_legal_publication(
+    config: AutocontributeConfig,
+    eligibility: EligibilityResult,
+    *,
+    repository: str,
+    publishing_login: str,
+    commit_message: str,
+) -> None:
+    """Revalidate attesting account, authorization, and exact signoff before mutation."""
+
+    requirements = _legal_requirements_from_evidence(eligibility)
+    if not requirements:
+        if re.search(r"signed-off-by\s*:", commit_message, re.I):
+            raise PolicyError("Commit contains an unauthorized legal signoff trailer")
+        return
+    attestation = _attestation_from_evidence(config, eligibility, repository)
+    if attestation.attested_by != publishing_login.strip().casefold():
+        raise PolicyError(
+            "Authenticated publishing account differs from the legal attesting identity"
+        )
+    if "cla" in requirements and attestation.cla is None:
+        raise PolicyError("Run lacks its completed account-level CLA authorization")
+    if "dco" in requirements:
+        if attestation.dco is None:
+            raise PolicyError("Run lacks its named DCO signoff authorization")
+        parts = commit_message.split("\n\n")
+        if (
+            len(parts) != 2
+            or not parts[0]
+            or "\r" in commit_message
+            or "\n" in parts[0]
+            or parts[1] != attestation.dco.trailer
+        ):
+            raise PolicyError("Commit does not contain the exact authorized DCO signoff trailer")
+    elif re.search(r"signed-off-by\s*:", commit_message, re.I):
+        raise PolicyError("Commit contains a DCO signoff without a detected DCO requirement")
 
 
 def _immutable_ref(value: object, *, field: str) -> str:
@@ -691,6 +1061,8 @@ def _is_pull_request_template(path: str) -> bool:
 def _is_policy_path(path: str) -> bool:
     lowered = path.casefold().strip("/")
     name = PurePosixPath(lowered).name
+    if _is_explicit_cla_policy_path(path) or _is_explicit_dco_policy_path(path):
+        return True
     if not name.endswith((".md", ".markdown", ".rst", ".txt")):
         return False
     if _is_pull_request_template(path):
@@ -731,11 +1103,20 @@ def parse_issue_reference(value: str) -> tuple[str, int]:
 
 
 __all__ = [
+    "LEGAL_ATTESTATION_EVIDENCE_KEY",
+    "LEGAL_POLICY_EVIDENCE_KEY",
+    "LEGAL_REQUIREMENTS_EVIDENCE_KEY",
     "MAX_POLICY_FILES_PER_REPOSITORY",
     "MAX_POLICY_FILE_BYTES",
     "MAX_POLICY_INVENTORY_FILES",
     "MAX_POLICY_TOTAL_BYTES",
+    "POLICY_ORGANIZATION_REF_EVIDENCE_KEY",
+    "POLICY_REPOSITORY_REF_EVIDENCE_KEY",
     "POLICY_SOURCES_EVIDENCE_KEY",
     "DiscoveryService",
+    "PolicySnapshot",
+    "apply_legal_commit_message",
+    "legal_attestation_fingerprint",
     "parse_issue_reference",
+    "validate_legal_publication",
 ]

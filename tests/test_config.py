@@ -1,10 +1,18 @@
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 import yaml
 
-from autocontribute.config import AutocontributeConfig, ModelPricing, example_config, load_config
+from autocontribute.config import (
+    CLA_ATTESTATION_STATEMENT,
+    DCO_ATTESTATION_STATEMENT,
+    AutocontributeConfig,
+    ModelPricing,
+    example_config,
+    load_config,
+)
 from autocontribute.exceptions import ConfigurationError
 
 
@@ -51,6 +59,159 @@ def test_ready_for_review_requires_draft_staging() -> None:
     with pytest.raises(ValueError, match=r"publishing\.draft must be true"):
         AutocontributeConfig.model_validate(
             {"publishing": {"draft": False, "ready_for_review": True}}
+        )
+
+
+def _legal_attestation(**updates: object) -> dict[str, object]:
+    value: dict[str, object] = {
+        "repository": "example/project",
+        "reviewed_repository_ref": "a" * 40,
+        "reviewed_organization_policy_ref": "absent",
+        "legal_policy_sha256": "b" * 64,
+        "legal_requirements": ["cla"],
+        "attested_by": "octocat",
+        "attested_at": "2026-07-22T12:00:00Z",
+        "cla": {"statement": CLA_ATTESTATION_STATEMENT},
+    }
+    value.update(updates)
+    return value
+
+
+def test_legal_attestation_requires_exact_fixed_statement_and_repository_key() -> None:
+    with pytest.raises(ValueError, match="exact fixed attestation"):
+        AutocontributeConfig.model_validate(
+            {
+                "policy": {
+                    "legal_attestations": {
+                        "example/project": _legal_attestation(
+                            cla={"statement": "I agree to whatever the repository says."}
+                        )
+                    }
+                }
+            }
+        )
+    with pytest.raises(ValueError, match="owner/name"):
+        AutocontributeConfig.model_validate(
+            {"policy": {"legal_attestations": {"*/*": _legal_attestation()}}}
+        )
+    with pytest.raises(ValueError, match="mapping key must exactly match"):
+        AutocontributeConfig.model_validate(
+            {"policy": {"legal_attestations": {"other/project": _legal_attestation()}}}
+        )
+
+
+def test_legal_attestation_authorizations_must_match_requirement_set() -> None:
+    with pytest.raises(ValueError, match="exactly match"):
+        AutocontributeConfig.model_validate(
+            {
+                "policy": {
+                    "legal_attestations": {
+                        "example/project": _legal_attestation(legal_requirements=["cla", "dco"])
+                    }
+                }
+            }
+        )
+
+
+def test_dco_signatory_must_match_explicit_git_identity() -> None:
+    dco = {
+        "statement": DCO_ATTESTATION_STATEMENT,
+        "signoff_name": "Example Signer",
+        "signoff_email": "signer@example.invalid",
+    }
+    with pytest.raises(ValueError, match="DCO signatory must exactly match"):
+        AutocontributeConfig.model_validate(
+            {
+                "identity": {
+                    "name": "Different Signer",
+                    "email": "different@example.invalid",
+                },
+                "policy": {
+                    "legal_attestations": {
+                        "example/project": _legal_attestation(
+                            legal_requirements=["dco"],
+                            cla=None,
+                            dco=dco,
+                        )
+                    }
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("signoff_name", "Example\tSigner"),
+        ("signoff_name", "Example\x7fSigner"),
+        ("signoff_email", "signer@@example.invalid"),
+        ("signoff_email", "signer @example.invalid"),
+        ("signoff_email", "signer\t@example.invalid"),
+        ("signoff_email", "@example.invalid"),
+        ("signoff_email", "signer@"),
+    ],
+)
+def test_dco_signatory_rejects_noncanonical_identity(field: str, value: str) -> None:
+    dco = {
+        "statement": DCO_ATTESTATION_STATEMENT,
+        "signoff_name": "Example Signer",
+        "signoff_email": "signer@example.invalid",
+    }
+    dco[field] = value
+
+    with pytest.raises(ValueError, match="canonical"):
+        AutocontributeConfig.model_validate(
+            {
+                "identity": {
+                    "name": dco["signoff_name"],
+                    "email": dco["signoff_email"],
+                },
+                "policy": {
+                    "legal_attestations": {
+                        "example/project": _legal_attestation(
+                            legal_requirements=["dco"],
+                            cla=None,
+                            dco=dco,
+                        )
+                    }
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "attested_at",
+    [
+        "2026-07-22T08:00:00-04:00",
+        "2026-07-22T12:00:00",
+        1_753_184_000,
+    ],
+)
+def test_legal_attestation_requires_canonical_utc_timestamp(attested_at: object) -> None:
+    with pytest.raises(ValueError, match="attested_at"):
+        AutocontributeConfig.model_validate(
+            {
+                "policy": {
+                    "legal_attestations": {
+                        "example/project": _legal_attestation(attested_at=attested_at)
+                    }
+                }
+            }
+        )
+
+
+def test_legal_attestation_rejects_materially_future_timestamp() -> None:
+    future = (datetime.now(UTC) + timedelta(days=1)).isoformat().replace("+00:00", "Z")
+
+    with pytest.raises(ValueError, match="materially in the future"):
+        AutocontributeConfig.model_validate(
+            {
+                "policy": {
+                    "legal_attestations": {
+                        "example/project": _legal_attestation(attested_at=future)
+                    }
+                }
+            }
         )
 
 

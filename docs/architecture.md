@@ -118,6 +118,16 @@ and organization policy path read by the selector, including missing files; the 
 produce the same digest. It also requires the repository identity/default branch and tested base SHA
 to remain unchanged.
 
+Legal onboarding uses a second domain-separated digest. It includes the exact target repository,
+organization-policy repository presence, bounded policy inventories, and policy contents/absences,
+but excludes moving commit IDs. A repository-scoped CLA/DCO attestation binds that stable digest and
+the detected requirement set; immutable refs remain audit and per-run freshness evidence. This keeps
+an attestation valid across unrelated source commits without allowing any policy-path, content,
+organization-presence, requirement, configured identity, or publishing-account drift. Authorized DCO
+trailers are added before the preparation and approval fingerprints are computed.
+The inventory includes named CLA/DCO Markdown, text, YAML, JSON, and extensionless policy/configuration
+files. Every non-negated or ambiguous legal reference fails closed for explicit operator review.
+
 ## Run state
 
 ```text

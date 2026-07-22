@@ -346,6 +346,7 @@ class RunManifest(DomainModel):
     publication_compensation_reason: (
         Literal[
             "pre_pr_base_moved",
+            "pre_pr_policy_stale",
             "created_pr_base_moved",
         ]
         | None

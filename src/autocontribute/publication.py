@@ -30,8 +30,15 @@ from autocontribute.coordination import (
     LeaseHeartbeatGuard,
 )
 from autocontribute.deployment import validate_deployment_fingerprint
-from autocontribute.discovery import POLICY_SOURCES_EVIDENCE_KEY, DiscoveryService
-from autocontribute.domain import RunManifest, RunStatus
+from autocontribute.discovery import (
+    LEGAL_ATTESTATION_EVIDENCE_KEY,
+    LEGAL_POLICY_EVIDENCE_KEY,
+    LEGAL_REQUIREMENTS_EVIDENCE_KEY,
+    POLICY_SOURCES_EVIDENCE_KEY,
+    DiscoveryService,
+    validate_legal_publication,
+)
+from autocontribute.domain import EligibilityResult, RunManifest, RunStatus
 from autocontribute.evaluation import EvaluationStore
 from autocontribute.exceptions import (
     GitHubError,
@@ -94,7 +101,7 @@ def validate_publication_text(
         "pull request title": proposal.pull_request_title,
         "pull request body": proposal.pull_request_body,
     }
-    limits = {"commit message": 200, "pull request title": 200, "pull request body": 50_000}
+    limits = {"commit message": 750, "pull request title": 200, "pull request body": 50_000}
     for name, value in values.items():
         if not value.strip():
             raise PolicyError(f"{name} cannot be blank")
@@ -104,8 +111,18 @@ def validate_publication_text(
             raise PolicyError(f"{name} appears to contain a credential")
         if "@everyone" in value.casefold() or "@here" in value.casefold():
             raise PolicyError(f"{name} contains a broadcast mention")
-    if "\n" in proposal.commit_message or "\r" in proposal.commit_message:
-        raise PolicyError("commit message must be one line")
+    if "\r" in proposal.commit_message:
+        raise PolicyError("commit message contains a carriage return")
+    if "\n" in proposal.commit_message:
+        if not re.fullmatch(
+            r"[^\n]{1,200}\n\nSigned-off-by: [^<>\n]{1,200} <[^<>\n]{3,320}>",
+            proposal.commit_message,
+        ):
+            raise PolicyError(
+                "multiline commit message must be one subject and one exact DCO signoff trailer"
+            )
+    elif len(proposal.commit_message) > 200:
+        raise PolicyError("commit message subject exceeds the 200-character limit")
     if required_disclosure is not None:
         if not required_disclosure.strip():
             raise PolicyError("policy.ai_disclosure cannot be blank")
@@ -394,6 +411,15 @@ def build_approval_review(
         api_origin=canonical_api_origin(config.github.api_url),
     )
     _bind_publication_context(manifest, context, allow_new=True)
+    if manifest.eligibility is None or manifest.proposal is None or manifest.candidate is None:
+        raise PolicyError("Run is missing durable legal-publication evidence")
+    validate_legal_publication(
+        config,
+        manifest.eligibility,
+        repository=manifest.candidate.repository,
+        publishing_login=context.login,
+        commit_message=manifest.proposal.commit_message,
+    )
     approval_manifest = build_approval_manifest(
         manifest,
         diff=patch,
@@ -684,6 +710,15 @@ class Publisher:
                     },
                 )
         login = context.login
+        if manifest.eligibility is None or manifest.proposal is None:
+            raise PolicyError("Run is missing durable legal-publication evidence")
+        validate_legal_publication(
+            self.config,
+            manifest.eligibility,
+            repository=manifest.candidate.repository,
+            publishing_login=login,
+            commit_message=manifest.proposal.commit_message,
+        )
         if not recovering and self.config.publishing.mode == "review_required":
             assert manifest.approval is not None
             approval_manifest = build_approval_manifest(
@@ -893,6 +928,45 @@ class Publisher:
                 "The upstream base branch moved after the contribution branch was pushed; "
                 "the exact remote branch was removed and validation and approval must be rerun"
             )
+
+        try:
+            self._check_pre_pull_request_policy_freshness(manifest)
+        except PolicyError as exc:
+            self.store.assert_circuit_breaker_clear()
+            lease_guard.assert_owned()
+            manifest.publication_compensation_reason = "pre_pr_policy_stale"
+            self.store.save(
+                manifest,
+                event="publication.policy_stale_before_pull_request",
+                details={
+                    "repository": manifest.candidate.repository,
+                    "fork": fork,
+                    "branch": branch,
+                    "commit_sha": commit_sha,
+                },
+            )
+            self._compensate_branch_only(
+                manifest,
+                fork=fork,
+                branch=branch,
+                commit_sha=commit_sha,
+                lease_guard=lease_guard,
+            )
+            lease_guard.assert_owned()
+            self.store.finalize_publication_compensation(
+                manifest,
+                reason="verified pre-PR policy-race compensation completed",
+                evidence={
+                    "repository": manifest.candidate.repository,
+                    "fork": fork,
+                    "branch": branch,
+                    "commit_sha": commit_sha,
+                },
+            )
+            raise PolicyError(
+                "Repository policy changed after the contribution branch was pushed; the exact "
+                "remote branch was removed and preparation must be rerun"
+            ) from exc
 
         proposal = manifest.proposal
         assert proposal is not None
@@ -1630,7 +1704,7 @@ class Publisher:
         ):
             raise StateError("Started publication compensation lacks durable evidence")
         expected_fork = f"{login}/{manifest.candidate.repository.split('/', 1)[1]}"
-        if reason == "pre_pr_base_moved":
+        if reason in {"pre_pr_base_moved", "pre_pr_policy_stale"}:
             if manifest.pull_request_url is not None or existing_pr is not None:
                 self._trip_publication_breaker(
                     source="publication:unexpected_pr_during_pre_pr_compensation",
@@ -1652,7 +1726,7 @@ class Publisher:
                 manifest,
                 login=login,
                 head=head,
-                reason="verified recovery of pre-PR base-race compensation",
+                reason=f"verified recovery of {reason.replace('_', '-')} compensation",
                 lease_guard=lease_guard,
             )
 
@@ -2102,19 +2176,7 @@ class Publisher:
             repository,
             repository_ref=current_sha,
         )
-        if manifest.eligibility is None:
-            raise PolicyError("Run is missing its recorded eligibility evidence")
-        recorded_policy = manifest.eligibility.evidence.get(POLICY_SOURCES_EVIDENCE_KEY)
-        current_policy = eligibility.evidence.get(POLICY_SOURCES_EVIDENCE_KEY)
-        if not recorded_policy or not current_policy:
-            raise PolicyError("Run is missing complete repository-policy freshness evidence")
-        if recorded_policy != current_policy:
-            raise PolicyError(
-                "Repository or organization contribution policy changed; approval is stale"
-            )
-        if not eligibility.eligible:
-            reasons = "; ".join(eligibility.blockers)
-            raise PolicyError(f"Candidate no longer passes deterministic eligibility: {reasons}")
+        self._assert_current_eligibility_evidence(manifest, eligibility)
 
         changed_issue_evidence: list[str] = []
         if issue.title != manifest.candidate.title:
@@ -2146,6 +2208,51 @@ class Publisher:
                 "The upstream base branch moved while policy evidence was fetched; "
                 "retry publication"
             )
+
+    def _check_pre_pull_request_policy_freshness(self, manifest: RunManifest) -> None:
+        """Re-read policy after branch push and before the pull-request mutation."""
+
+        assert manifest.candidate and manifest.repository and manifest.base_sha
+        eligibility = DiscoveryService(self.config, self.github, self.store).evaluate(
+            manifest.candidate,
+            manifest.repository,
+            repository_ref=manifest.base_sha,
+        )
+        self._assert_current_eligibility_evidence(
+            manifest,
+            eligibility,
+            require_eligible=False,
+        )
+
+    @staticmethod
+    def _assert_current_eligibility_evidence(
+        manifest: RunManifest,
+        eligibility: EligibilityResult,
+        *,
+        require_eligible: bool = True,
+    ) -> None:
+        if manifest.eligibility is None:
+            raise PolicyError("Run is missing its recorded eligibility evidence")
+        recorded_policy = manifest.eligibility.evidence.get(POLICY_SOURCES_EVIDENCE_KEY)
+        current_policy = eligibility.evidence.get(POLICY_SOURCES_EVIDENCE_KEY)
+        if not recorded_policy or not current_policy:
+            raise PolicyError("Run is missing complete repository-policy freshness evidence")
+        if recorded_policy != current_policy:
+            raise PolicyError(
+                "Repository or organization contribution policy changed; approval is stale"
+            )
+        for key in (
+            LEGAL_POLICY_EVIDENCE_KEY,
+            LEGAL_REQUIREMENTS_EVIDENCE_KEY,
+            LEGAL_ATTESTATION_EVIDENCE_KEY,
+        ):
+            if manifest.eligibility.evidence.get(key) != eligibility.evidence.get(key):
+                raise PolicyError(
+                    "Repository legal requirements or attestation changed; approval is stale"
+                )
+        if require_eligible and not eligibility.eligible:
+            reasons = "; ".join(eligibility.blockers)
+            raise PolicyError(f"Candidate no longer passes deterministic eligibility: {reasons}")
 
     def _check_account_limits(self, login: str, manifest: RunManifest) -> None:
         assert manifest.candidate

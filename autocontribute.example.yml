@@ -67,6 +67,10 @@ policy:
   allow_security_issues: false
   allow_dependency_changes: false
   allow_workflow_changes: false
+  # Never hand-author broad legal assent. If a configured repository requires a CLA/DCO, run
+  # `autocontribute policy inspect owner/repository`, then the explicitly confirmed `policy attest`
+  # command. It emits one repository-scoped record bound to the stable legal-policy digest.
+  legal_attestations: {}
   ai_disclosure: >-
     This contribution was prepared autonomously by an AI agent. Its validation
     evidence comes from Autocontribute's configured automated checks; no human

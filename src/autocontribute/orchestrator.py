@@ -24,11 +24,16 @@ from autocontribute.context import (
 )
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.deployment import compute_deployment_fingerprint
-from autocontribute.discovery import DiscoveryService, parse_issue_reference
+from autocontribute.discovery import (
+    DiscoveryService,
+    apply_legal_commit_message,
+    parse_issue_reference,
+)
 from autocontribute.domain import (
     CommandResult,
     ContributionPlan,
     CriticReview,
+    EligibilityResult,
     IssueCandidate,
     ModelBudgetReservation,
     PatchProposal,
@@ -445,7 +450,11 @@ class Orchestrator:
             ),
             output_type=PatchProposal,
         )
-        proposal = self._with_disclosure(proposal_result.output)
+        proposal = self._with_legal_commit_message(
+            self._with_disclosure(proposal_result.output),
+            eligibility=eligibility,
+            repository=repository.full_name,
+        )
         manifest.proposal = proposal
         self._assert_guidance_accounted_for_paths(
             workspace,
@@ -525,9 +534,11 @@ class Orchestrator:
                 ),
                 output_type=PatchProposal,
             )
-            proposal = self._with_disclosure(repair_result.output).model_copy(
-                update={"validation_commands": initial_proposal_validation_commands}
-            )
+            proposal = self._with_legal_commit_message(
+                self._with_disclosure(repair_result.output),
+                eligibility=eligibility,
+                repository=repository.full_name,
+            ).model_copy(update={"validation_commands": initial_proposal_validation_commands})
             manifest.proposal = proposal
             self._assert_guidance_accounted_for_paths(
                 workspace,
@@ -1218,6 +1229,23 @@ class Orchestrator:
                 + disclosure
             }
         )
+
+    def _with_legal_commit_message(
+        self,
+        proposal: PatchProposal,
+        *,
+        eligibility: EligibilityResult,
+        repository: str,
+    ) -> PatchProposal:
+        commit_message = apply_legal_commit_message(
+            self.config,
+            eligibility,
+            repository,
+            proposal.commit_message,
+        )
+        if commit_message == proposal.commit_message:
+            return proposal
+        return proposal.model_copy(update={"commit_message": commit_message})
 
     def _write_artifacts(self, manifest: RunManifest, commands: list[CommandResult]) -> None:
         secret_names = self._secret_env_names()

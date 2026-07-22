@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import quote
 
 import typer
 import yaml
@@ -18,7 +20,10 @@ from rich.text import Text
 from autocontribute import __version__
 from autocontribute.backup import create_state_bundle, restore_state_bundle
 from autocontribute.config import (
+    CLA_ATTESTATION_STATEMENT,
+    DCO_ATTESTATION_STATEMENT,
     AutocontributeConfig,
+    LegalAttestation,
     auto_publish_opt_in_enabled,
     example_config,
     load_config,
@@ -30,7 +35,7 @@ from autocontribute.coordination import (
     LeaseHeartbeatGuard,
 )
 from autocontribute.deployment import compute_deployment_fingerprint
-from autocontribute.discovery import DiscoveryService
+from autocontribute.discovery import DiscoveryService, PolicySnapshot
 from autocontribute.doctor import run_doctor
 from autocontribute.domain import RunManifest, RunStatus
 from autocontribute.evaluation import (
@@ -46,6 +51,7 @@ from autocontribute.exceptions import (
     StateError,
 )
 from autocontribute.github import GitHubClient
+from autocontribute.github_origin import web_origin_for_api
 from autocontribute.lifecycle import LifecycleSyncResult, sync_open_pull_requests
 from autocontribute.orchestrator import Orchestrator
 from autocontribute.publication import Publisher, approve_run, build_approval_review
@@ -76,12 +82,17 @@ safety_app = typer.Typer(
     help="Inspect or explicitly change the persistent operational circuit breaker.",
     no_args_is_help=True,
 )
+policy_app = typer.Typer(
+    help="Inspect immutable repository policy and create scoped legal attestations.",
+    no_args_is_help=True,
+)
 app.add_typer(runs_app, name="runs")
 app.add_typer(config_app, name="config")
 app.add_typer(evaluation_app, name="eval")
 app.add_typer(state_app, name="state")
 app.add_typer(lifecycle_app, name="lifecycle")
 app.add_typer(safety_app, name="safety")
+app.add_typer(policy_app, name="policy")
 
 console = Console()
 DEFAULT_CONFIG = Path("autocontribute.yml")
@@ -89,6 +100,7 @@ ConfigOption = Annotated[
     Path,
     typer.Option("--config", "-c", help="Path to the YAML configuration."),
 ]
+_REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 @app.command()
@@ -353,6 +365,152 @@ def show_config(config: ConfigOption = DEFAULT_CONFIG) -> None:
 
     settings = _config(config)
     console.print(yaml.safe_dump(settings.model_dump(mode="json"), sort_keys=False))
+
+
+@policy_app.command(name="inspect")
+def inspect_policy(
+    repository: Annotated[
+        str,
+        typer.Argument(help="Exact configured owner/repository to inspect."),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Show the immutable policy refs, digest, and detected legal requirements."""
+
+    settings = _config(config)
+    _require_configured_policy_target(settings, repository)
+    store = RunStore(settings.storage.path)
+    try:
+        with _github_client(settings, store) as github:
+            metadata = github.get_repository(repository)
+            if metadata.full_name.casefold() != repository.casefold():
+                raise ConfigurationError("GitHub resolved a different repository identity")
+            snapshot = DiscoveryService(settings, github, store).policy_snapshot(metadata)
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    console.print(
+        _render_policy_snapshot(
+            snapshot,
+            web_origin=web_origin_for_api(settings.github.api_url),
+        ),
+        markup=False,
+        soft_wrap=True,
+    )
+
+
+@policy_app.command(name="attest")
+def attest_policy(
+    repository: Annotated[
+        str,
+        typer.Argument(help="Exact configured owner/repository to attest for."),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG,
+    cla_completed: Annotated[
+        bool,
+        typer.Option(
+            "--cla-completed",
+            help="Attest that all account-level CLA enrollment is already complete.",
+        ),
+    ] = False,
+    authorize_dco_signoff: Annotated[
+        bool,
+        typer.Option(
+            "--authorize-dco-signoff",
+            help="Authorize the configured identity's exact Signed-off-by trailer.",
+        ),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Make the displayed legal attestation non-interactively.",
+        ),
+    ] = False,
+) -> None:
+    """Preview and emit a config stanza for one exact legal-policy snapshot."""
+
+    settings = _config(config)
+    _require_configured_policy_target(settings, repository)
+    store = RunStore(settings.storage.path)
+    try:
+        with _github_client(settings, store) as github:
+            metadata = github.get_repository(repository)
+            if metadata.full_name.casefold() != repository.casefold():
+                raise ConfigurationError("GitHub resolved a different repository identity")
+            snapshot = DiscoveryService(settings, github, store).policy_snapshot(metadata)
+            login = github.authenticated_login().strip().casefold()
+    except AutocontributeError as exc:
+        _fail(str(exc))
+
+    console.print(
+        _render_policy_snapshot(
+            snapshot,
+            web_origin=web_origin_for_api(settings.github.api_url),
+        ),
+        markup=False,
+        soft_wrap=True,
+    )
+    required = set(snapshot.legal_requirements)
+    if not required:
+        _fail("No CLA or DCO requirement was detected in this exact policy snapshot")
+    if ("cla" in required) != cla_completed:
+        option = "--cla-completed" if "cla" in required else "omit --cla-completed"
+        _fail(f"Exact detected requirements require you to {option}")
+    if ("dco" in required) != authorize_dco_signoff:
+        option = "--authorize-dco-signoff" if "dco" in required else "omit --authorize-dco-signoff"
+        _fail(f"Exact detected requirements require you to {option}")
+    if "dco" in required and (not settings.identity.name or not settings.identity.email):
+        _fail("DCO authorization requires explicit identity.name and identity.email in the config")
+
+    console.print("Exact legal authorization to be recorded:", markup=False)
+    if "cla" in required:
+        console.print(f"CLA: {CLA_ATTESTATION_STATEMENT}", markup=False)
+    if "dco" in required:
+        console.print(f"DCO: {DCO_ATTESTATION_STATEMENT}", markup=False)
+        console.print(
+            f"Trailer: Signed-off-by: {settings.identity.name} <{settings.identity.email}>",
+            markup=False,
+        )
+    console.print(f"Attesting GitHub account: {login}", markup=False)
+    if not yes and not typer.confirm(
+        "I personally make every displayed legal attestation for only this repository and snapshot"
+    ):
+        raise typer.Abort()
+
+    raw_attestation: dict[str, object] = {
+        "repository": snapshot.repository.casefold(),
+        "reviewed_repository_ref": snapshot.repository_ref,
+        "reviewed_organization_policy_ref": snapshot.organization_ref_evidence,
+        "legal_policy_sha256": snapshot.legal_policy_sha256,
+        "legal_requirements": list(snapshot.legal_requirements),
+        "attested_by": login,
+        "attested_at": datetime.now(UTC),
+    }
+    if "cla" in required:
+        raw_attestation["cla"] = {"statement": CLA_ATTESTATION_STATEMENT}
+    if "dco" in required:
+        raw_attestation["dco"] = {
+            "statement": DCO_ATTESTATION_STATEMENT,
+            "signoff_name": settings.identity.name,
+            "signoff_email": settings.identity.email,
+        }
+    try:
+        attestation = LegalAttestation.model_validate(raw_attestation)
+    except ValueError as exc:
+        _fail(f"Generated legal attestation is invalid: {exc}")
+    snippet = {
+        "policy": {
+            "legal_attestations": {
+                snapshot.repository.casefold(): attestation.model_dump(mode="json")
+            }
+        }
+    }
+    console.print(
+        "Merge this exact stanza into your configuration, replacing any stale record for the "
+        "repository:",
+        markup=False,
+    )
+    console.print(yaml.safe_dump(snippet, sort_keys=False), markup=False)
 
 
 @evaluation_app.command(name="record")
@@ -839,6 +997,62 @@ def _render_evaluation_preview(evaluation: EvaluationRevision) -> str:
             "",
         ]
     )
+
+
+def _require_configured_policy_target(
+    settings: AutocontributeConfig,
+    repository: str,
+) -> None:
+    normalized = repository.casefold()
+    configured_repositories = {value.casefold() for value in settings.github.repositories}
+    configured_owners = {value.casefold() for value in settings.github.owners}
+    if not _REPOSITORY.fullmatch(repository):
+        _fail("repository must use owner/name syntax")
+    owner = normalized.split("/", 1)[0]
+    if normalized not in configured_repositories and owner not in configured_owners:
+        _fail("repository is outside the configured repository/owner allowlist")
+
+
+def _render_policy_snapshot(snapshot: PolicySnapshot, *, web_origin: str) -> str:
+    requirements = ", ".join(snapshot.legal_requirements) or "none"
+    lines = [
+        "# Immutable contribution-policy snapshot",
+        f"Repository: {snapshot.repository}",
+        f"Repository policy ref: {snapshot.repository_ref}",
+        f"Organization policy repository: {snapshot.organization_repository}",
+        f"Organization policy ref: {snapshot.organization_ref_evidence}",
+        f"Policy sources SHA-256: {snapshot.policy_sources_sha256}",
+        f"Stable legal-policy SHA-256: {snapshot.legal_policy_sha256}",
+        f"Repository policy files: {len(snapshot.repository_paths)}",
+        f"Organization policy files: {len(snapshot.organization_paths)}",
+        f"Detected legal requirements: {requirements}",
+        "Repository policy review URLs:",
+        *_immutable_policy_urls(
+            web_origin,
+            snapshot.repository,
+            snapshot.repository_ref,
+            snapshot.repository_paths,
+        ),
+        "Organization policy review URLs:",
+        *_immutable_policy_urls(
+            web_origin,
+            snapshot.organization_repository,
+            snapshot.organization_ref,
+            snapshot.organization_paths,
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def _immutable_policy_urls(
+    web_origin: str,
+    repository: str,
+    ref: str | None,
+    paths: tuple[str, ...],
+) -> list[str]:
+    if ref is None or not paths:
+        return ["  (none)"]
+    return [f"  - {web_origin}/{repository}/blob/{ref}/{quote(path, safe='/')}" for path in paths]
 
 
 def _config(path: Path):  # type: ignore[no-untyped-def]

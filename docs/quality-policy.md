@@ -71,6 +71,16 @@ All gates must pass. A high model score cannot override one.
 - Every bounded repository and organization contribution-policy input (including a file's absence)
   is hashed into eligibility evidence. Publication rereads those sources and requires the digest to
   match, so even a policy edit that does not trigger a known prohibition requires fresh preparation.
+- A detected CLA/DCO requirement needs a fixed, explicit attestation for exactly one repository.
+  The record binds a ref-independent digest of repository identity, organization-policy presence,
+  bounded path inventories and contents/absences, plus the exact detected requirement set. Unrelated
+  commits therefore preserve onboarding, while policy-surface or requirement drift invalidates it.
+  Named Markdown, text, YAML, JSON, and extensionless legal files are inventoried; non-negated or
+  ambiguous CLA/DCO references require review rather than being guessed away.
+  Reviewed refs remain audit evidence. Publication also requires the authenticated GitHub login to
+  equal the attesting identity. DCO authorization binds the configured Git identity and exact
+  `Signed-off-by` trailer sealed into the proposal; account-level CLA authorization is accepted only
+  when the operator attests that no per-contribution signature or assent remains.
 
 Critic dimensions are weighted as follows: correctness 25%, issue alignment 25%, tests 15%, repository
 conventions 15%, diff/security hygiene 10%, and maintainer clarity 10%.

@@ -11,9 +11,11 @@ import autocontribute.cli as cli
 from autocontribute.cli import app
 from autocontribute.config import load_config
 from autocontribute.deployment import compute_deployment_fingerprint
+from autocontribute.discovery import LEGAL_REQUIREMENTS_EVIDENCE_KEY
 from autocontribute.domain import (
     CommandResult,
     CriticReview,
+    EligibilityResult,
     FileEdit,
     GateResult,
     IssueCandidate,
@@ -57,6 +59,53 @@ class _ReviewGitHub:
 
     def authenticated_login(self) -> str:
         return "octocat"
+
+
+class _PolicyGitHub(_ReviewGitHub):
+    def get_repository(self, repository: str) -> RepositoryInfo:
+        return RepositoryInfo(
+            full_name=repository,
+            html_url=f"https://github.com/{repository}",
+            clone_url=f"https://github.com/{repository}.git",
+            default_branch="main",
+            stars=10_000,
+            archived=False,
+            disabled=False,
+            private=False,
+            pushed_at=datetime.now(UTC),
+            license_spdx="MIT",
+        )
+
+    def default_branch_sha(self, repository: str, branch: str) -> str:
+        del repository, branch
+        return "a" * 40
+
+    def default_branch_sha_if_exists(self, repository: str) -> str | None:
+        del repository
+        return None
+
+    def list_repository_files(
+        self,
+        repository: str,
+        *,
+        ref: str,
+        max_files: int,
+    ) -> list[str]:
+        del ref, max_files
+        return ["CONTRIBUTING.md"] if repository == "example/project" else []
+
+    def get_file(
+        self,
+        repository: str,
+        path: str,
+        *,
+        ref: str,
+        max_bytes: int,
+    ) -> str | None:
+        del ref, max_bytes
+        if repository == "example/project" and path == "CONTRIBUTING.md":
+            return "Contributors must complete our Contributor License Agreement before a PR."
+        return None
 
 
 def _ready_review_run(tmp_path: Path) -> tuple[Path, RunStore, str]:
@@ -113,6 +162,12 @@ def _ready_review_run(tmp_path: Path) -> tuple[Path, RunStore, str]:
         private=False,
         pushed_at=now,
         license_spdx="MIT",
+    )
+    manifest.eligibility = EligibilityResult(
+        eligible=True,
+        score=100,
+        evidence={LEGAL_REQUIREMENTS_EVIDENCE_KEY: "none"},
+        blockers=[],
     )
     manifest.base_sha = "a" * 40
     edit = FileEdit(
@@ -305,6 +360,106 @@ def test_init_does_not_overwrite_without_force(tmp_path: Path) -> None:
 
     assert result.exit_code == 1
     assert config.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_policy_inspection_and_explicit_cla_attestation_preview(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(
+        "github:\n"
+        "  repositories: [example/project]\n"
+        "validation:\n"
+        "  required_commands:\n"
+        "    example/project: [python -m pytest]\n"
+        f"storage:\n  path: {tmp_path / 'state'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_github_client", lambda *_: _PolicyGitHub())
+
+    inspected = runner.invoke(
+        app,
+        ["policy", "inspect", "example/project", "--config", str(config)],
+    )
+    missing_authorization = runner.invoke(
+        app,
+        ["policy", "attest", "example/project", "--yes", "--config", str(config)],
+    )
+    attested = runner.invoke(
+        app,
+        [
+            "policy",
+            "attest",
+            "example/project",
+            "--cla-completed",
+            "--yes",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert inspected.exit_code == 0, inspected.output
+    assert "Repository policy ref: " + "a" * 40 in inspected.output
+    assert "Organization policy ref: absent" in inspected.output
+    assert "Stable legal-policy SHA-256:" in inspected.output
+    assert "Detected legal requirements: cla" in inspected.output
+    assert (
+        "https://github.com/example/project/blob/" + "a" * 40 + "/CONTRIBUTING.md"
+        in inspected.output
+    )
+    assert missing_authorization.exit_code == 1
+    assert "require you to --cla-completed" in missing_authorization.output
+    assert attested.exit_code == 0, attested.output
+    assert "legal_attestations:" in attested.output
+    assert "repository: example/project" in attested.output
+    assert "reviewed_repository_ref: " + "a" * 40 in attested.output
+    assert "reviewed_organization_policy_ref: absent" in attested.output
+    assert "legal_policy_sha256:" in attested.output
+    assert "legal_requirements:" in attested.output
+    assert "attested_by: octocat" in attested.output
+    assert "statement:" in attested.output
+
+
+def test_policy_attestation_requires_interactive_personal_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(
+        "github:\n"
+        "  repositories: [example/project]\n"
+        "validation:\n"
+        "  required_commands:\n"
+        "    example/project: [python -m pytest]\n"
+        f"storage:\n  path: {tmp_path / 'state'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_github_client", lambda *_: _PolicyGitHub())
+    confirmations: list[str] = []
+
+    def decline(prompt: str, **_: object) -> bool:
+        confirmations.append(prompt)
+        return False
+
+    monkeypatch.setattr(cli.typer, "confirm", decline)
+
+    result = runner.invoke(
+        app,
+        [
+            "policy",
+            "attest",
+            "example/project",
+            "--cla-completed",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert len(confirmations) == 1
+    assert "personally make" in confirmations[0]
+    assert "legal_attestations:" not in result.output
 
 
 def test_expert_evaluation_cli_records_and_reports_shadow_gate(tmp_path: Path) -> None:

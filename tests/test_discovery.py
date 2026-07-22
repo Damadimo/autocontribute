@@ -2,17 +2,26 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from autocontribute.config import AutocontributeConfig
+from autocontribute.config import (
+    CLA_ATTESTATION_STATEMENT,
+    DCO_ATTESTATION_STATEMENT,
+    AutocontributeConfig,
+)
 from autocontribute.discovery import (
+    LEGAL_ATTESTATION_EVIDENCE_KEY,
+    LEGAL_POLICY_EVIDENCE_KEY,
     MAX_POLICY_FILE_BYTES,
     MAX_POLICY_FILES_PER_REPOSITORY,
     MAX_POLICY_TOTAL_BYTES,
     POLICY_SOURCES_EVIDENCE_KEY,
     DiscoveryService,
+    PolicySnapshot,
+    apply_legal_commit_message,
     parse_issue_reference,
+    validate_legal_publication,
 )
 from autocontribute.domain import IssueCandidate, IssueComment, RepositoryInfo
-from autocontribute.exceptions import GitHubError, StateError
+from autocontribute.exceptions import GitHubError, PolicyError, StateError
 from autocontribute.store import RunStore
 
 REPOSITORY_REF = "a" * 40
@@ -95,6 +104,40 @@ def _issue(**updates: object) -> IssueCandidate:
     }
     values.update(updates)
     return IssueCandidate.model_validate(values)
+
+
+def _legal_config(
+    snapshot: PolicySnapshot,
+    *,
+    repository: str = "example/project",
+) -> AutocontributeConfig:
+    requirements = set(snapshot.legal_requirements)
+    attestation: dict[str, object] = {
+        "repository": repository,
+        "reviewed_repository_ref": snapshot.repository_ref,
+        "reviewed_organization_policy_ref": snapshot.organization_ref_evidence,
+        "legal_policy_sha256": snapshot.legal_policy_sha256,
+        "legal_requirements": list(snapshot.legal_requirements),
+        "attested_by": "octocat",
+        "attested_at": "2026-07-22T12:00:00Z",
+    }
+    if "cla" in requirements:
+        attestation["cla"] = {"statement": CLA_ATTESTATION_STATEMENT}
+    if "dco" in requirements:
+        attestation["dco"] = {
+            "statement": DCO_ATTESTATION_STATEMENT,
+            "signoff_name": "Example Signer",
+            "signoff_email": "signer@example.invalid",
+        }
+    return AutocontributeConfig.model_validate(
+        {
+            "identity": {
+                "name": "Example Signer" if "dco" in requirements else "",
+                "email": "signer@example.invalid" if "dco" in requirements else "",
+            },
+            "policy": {"legal_attestations": {repository: attestation}},
+        }
+    )
 
 
 def test_clear_maintainer_signaled_issue_passes(tmp_path) -> None:
@@ -285,6 +328,413 @@ def test_unresolved_dco_attestation_fails_closed(tmp_path) -> None:
 
     assert not result.eligible
     assert "CLA/DCO" in " ".join(result.blockers)
+
+
+@pytest.mark.parametrize(
+    ("path", "policy", "requirement"),
+    [
+        (
+            "PULL_REQUEST_TEMPLATE.md",
+            "- [ ] I have signed the Contributor License Agreement.",
+            "cla",
+        ),
+        (
+            "CONTRIBUTING.md",
+            "Add a Signed-off-by: Name <email> line to every commit.",
+            "dco",
+        ),
+        (
+            "docs/DCO.md",
+            "Developer's Certificate of Origin, Version 1.1",
+            "dco",
+        ),
+    ],
+)
+def test_common_legal_policy_forms_fail_closed(
+    tmp_path,
+    path: str,
+    policy: str,
+    requirement: str,
+) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub({("example/project", path): policy})
+
+    result = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path)
+    ).evaluate(_issue(), _repository())
+
+    assert not result.eligible
+    assert result.evidence["legal_requirements"] == requirement
+    assert "CLA/DCO" in " ".join(result.blockers)
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        "This repository does not require a Contributor License Agreement.",
+        "Signed-off-by trailers are not required for contributions.",
+    ],
+)
+def test_unambiguously_negated_legal_reference_does_not_create_requirement(
+    tmp_path,
+    policy: str,
+) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub({("example/project", "CONTRIBUTING.md"): policy})
+
+    result = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path)
+    ).evaluate(_issue(), _repository())
+
+    assert result.eligible
+    assert result.evidence["legal_requirements"] == "none"
+
+
+def test_unambiguously_negated_named_legal_policy_does_not_create_requirement(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): "Contribution guidelines.",
+            ("example/project", "CLA.md"): "The CLA is no longer required.",
+        }
+    )
+
+    result = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path)
+    ).evaluate(_issue(), _repository())
+
+    assert result.eligible
+    assert result.evidence["legal_requirements"] == "none"
+
+
+def test_ambiguous_legal_reference_fails_closed_for_personal_review(tmp_path) -> None:
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "Before participating, consult the Contributor License Agreement policy."
+            )
+        }
+    )
+
+    result = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path)
+    ).evaluate(_issue(), _repository())
+
+    assert not result.eligible
+    assert result.evidence["legal_requirements"] == "cla"
+    assert "CLA/DCO" in " ".join(result.blockers)
+
+
+def test_negation_for_one_legal_term_does_not_suppress_another(tmp_path) -> None:
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "No CLA; consult the DCO requirements before contributing."
+            )
+        }
+    )
+
+    result = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path)
+    ).evaluate(_issue(), _repository())
+
+    assert not result.eligible
+    assert result.evidence["legal_requirements"] == "dco"
+
+
+@pytest.mark.parametrize(
+    ("path", "contents", "requirement"),
+    [
+        (".github/dco.yml", "enabled: true", "dco"),
+        (".github/cla.yaml", "enabled: true", "cla"),
+        ("DCO", "Version 1.1", "dco"),
+        (".clabot", '{"contributors": []}', "cla"),
+    ],
+)
+def test_legal_configuration_and_extensionless_policy_paths_are_inventoried(
+    tmp_path,
+    path: str,
+    contents: str,
+    requirement: str,
+) -> None:  # type: ignore[no-untyped-def]
+    class InventoryLegalGitHub(PolicyGitHub):
+        def list_repository_files(
+            self,
+            repository: str,
+            *,
+            ref: str,
+            max_files: int,
+        ) -> list[str]:
+            del ref, max_files
+            return ["CONTRIBUTING.md", path] if repository == "example/project" else []
+
+    github = InventoryLegalGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): "Contribution guidelines.",
+            ("example/project", path): contents,
+        }
+    )
+
+    result = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path)
+    ).evaluate(_issue(), _repository())
+
+    assert not result.eligible
+    assert result.evidence["legal_requirements"] == requirement
+    assert "CLA/DCO" in " ".join(result.blockers)
+
+
+def test_exact_repository_bound_cla_attestation_unblocks_snapshot(tmp_path) -> None:
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "Contributors must complete our Contributor License Agreement before opening a PR."
+            )
+        }
+    )
+    snapshot = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path / "preview")
+    ).policy_snapshot(_repository(), repository_ref=REPOSITORY_REF)
+    config = _legal_config(snapshot)
+
+    result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref=REPOSITORY_REF
+    )
+
+    assert result.eligible
+    assert result.evidence[LEGAL_POLICY_EVIDENCE_KEY] == snapshot.legal_policy_sha256
+    assert len(result.evidence[LEGAL_ATTESTATION_EVIDENCE_KEY]) == 64
+
+
+def test_attestation_does_not_cross_repository_boundary(tmp_path) -> None:
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "Contributors must complete our Contributor License Agreement before opening a PR."
+            )
+        }
+    )
+    snapshot = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path / "preview")
+    ).policy_snapshot(_repository(), repository_ref=REPOSITORY_REF)
+    config = _legal_config(snapshot, repository="other/project")
+
+    result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref=REPOSITORY_REF
+    )
+
+    assert not result.eligible
+    assert "no attestation is configured" in " ".join(result.blockers)
+
+
+def test_legal_attestation_survives_unrelated_repository_commit(tmp_path) -> None:
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "Contributors must complete our Contributor License Agreement before opening a PR."
+            )
+        }
+    )
+    original = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path / "preview")
+    ).policy_snapshot(_repository(), repository_ref=REPOSITORY_REF)
+    config = _legal_config(original)
+    new_ref = "c" * 40
+
+    result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref=new_ref
+    )
+
+    assert result.eligible
+    assert result.evidence[LEGAL_POLICY_EVIDENCE_KEY] == original.legal_policy_sha256
+    assert result.evidence[POLICY_SOURCES_EVIDENCE_KEY] != original.policy_sources_sha256
+
+
+def test_legal_policy_content_change_invalidates_attestation(tmp_path) -> None:
+    files = {
+        ("example/project", "CONTRIBUTING.md"): (
+            "Contributors must complete our Contributor License Agreement before opening a PR."
+        )
+    }
+    github = PolicyGitHub(files)
+    snapshot = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path / "preview")
+    ).policy_snapshot(_repository(), repository_ref=REPOSITORY_REF)
+    config = _legal_config(snapshot)
+    files[("example/project", "CONTRIBUTING.md")] += " Organization approval is also required."
+
+    result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref="c" * 40
+    )
+
+    assert not result.eligible
+    assert "inventories or contents changed" in " ".join(result.blockers)
+
+
+def test_benign_legal_policy_inventory_change_invalidates_attestation(tmp_path) -> None:
+    class InventoryLegalGitHub(PolicyGitHub):
+        def __init__(self, files: dict[tuple[str, str], str]) -> None:
+            super().__init__(files)
+            self.repository_paths = ["CONTRIBUTING.md"]
+
+        def list_repository_files(
+            self,
+            repository: str,
+            *,
+            ref: str,
+            max_files: int,
+        ) -> list[str]:
+            del ref, max_files
+            return list(self.repository_paths) if repository == "example/project" else []
+
+    github = InventoryLegalGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "Contributors must complete our Contributor License Agreement before opening a PR."
+            ),
+            ("example/project", "docs/AI_POLICY.md"): "AI contributions receive normal review.",
+        }
+    )
+    snapshot = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path / "preview")
+    ).policy_snapshot(_repository(), repository_ref=REPOSITORY_REF)
+    config = _legal_config(snapshot)
+    github.repository_paths.append("docs/AI_POLICY.md")
+
+    result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref="c" * 40
+    )
+
+    assert not result.eligible
+    assert "inventories or contents changed" in " ".join(result.blockers)
+
+
+def test_organization_policy_repository_appearance_invalidates_absence_attestation(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    class MutableOrganizationGitHub(PolicyGitHub):
+        organization_ref: str | None = None
+
+        def default_branch_sha_if_exists(self, repository: str) -> str | None:
+            del repository
+            return self.organization_ref
+
+    github = MutableOrganizationGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "Contributors must complete our Contributor License Agreement before opening a PR."
+            )
+        }
+    )
+    snapshot = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path / "preview")
+    ).policy_snapshot(_repository(), repository_ref=REPOSITORY_REF)
+    assert snapshot.organization_ref_evidence == "absent"
+    config = _legal_config(snapshot)
+    github.organization_ref = ORGANIZATION_REF
+
+    result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref="c" * 40
+    )
+
+    assert not result.eligible
+    assert "inventories or contents changed" in " ".join(result.blockers)
+
+
+def test_dco_authorization_produces_and_revalidates_exact_signoff(tmp_path) -> None:
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "All commits must include a Signed-off-by line under the Developer Certificate "
+                "of Origin."
+            )
+        }
+    )
+    snapshot = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path / "preview")
+    ).policy_snapshot(_repository(), repository_ref=REPOSITORY_REF)
+    config = _legal_config(snapshot)
+    result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref=REPOSITORY_REF
+    )
+
+    message = apply_legal_commit_message(
+        config,
+        result,
+        "example/project",
+        "Fix documented parser boundary",
+    )
+    validate_legal_publication(
+        config,
+        result,
+        repository="example/project",
+        publishing_login="octocat",
+        commit_message=message,
+    )
+
+    assert result.eligible
+    assert message == (
+        "Fix documented parser boundary\n\nSigned-off-by: Example Signer <signer@example.invalid>"
+    )
+    with pytest.raises(PolicyError, match="publishing account"):
+        validate_legal_publication(
+            config,
+            result,
+            repository="example/project",
+            publishing_login="different-user",
+            commit_message=message,
+        )
+
+
+def test_dco_authorization_rejects_model_supplied_legal_trailer(tmp_path) -> None:
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "All commits must include a Signed-off-by line under the DCO."
+            )
+        }
+    )
+    snapshot = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path / "preview")
+    ).policy_snapshot(_repository(), repository_ref=REPOSITORY_REF)
+    config = _legal_config(snapshot)
+    result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref=REPOSITORY_REF
+    )
+
+    with pytest.raises(PolicyError, match="cannot safely supply"):
+        apply_legal_commit_message(
+            config,
+            result,
+            "example/project",
+            "Fix parser\n\nSigned-off-by: Invented Person <invented@example.invalid>",
+        )
+
+
+@pytest.mark.parametrize(
+    "commit_message",
+    [
+        "Fix parser\n\nSigned-off-by: Invented Person <invented@example.invalid>",
+        "Fix parser Signed-off-by : Invented Person <invented@example.invalid>",
+        "Fix parser\nwith an unauthorized body",
+    ],
+)
+def test_preparation_rejects_model_supplied_multiline_or_signoff_without_dco(
+    tmp_path,
+    commit_message: str,
+) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub({("example/project", "CONTRIBUTING.md"): "Contribution guidelines"})
+    config = AutocontributeConfig()
+    result = DiscoveryService(config, github, RunStore(tmp_path)).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref=REPOSITORY_REF
+    )
+
+    with pytest.raises(PolicyError, match="cannot safely supply"):
+        apply_legal_commit_message(
+            config,
+            result,
+            "example/project",
+            commit_message,
+        )
 
 
 def test_organization_automation_prohibition_fails_closed(tmp_path) -> None:

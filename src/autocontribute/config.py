@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -15,6 +16,12 @@ from autocontribute.exceptions import ConfigurationError
 
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_GIT_OBJECT_ID = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+_GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+_CANONICAL_UTC_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z$"
+)
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _IMAGE_DIGEST = re.compile(r"@sha256:[0-9a-fA-F]{64}$")
 _DEFAULT_SANDBOX_IMAGE = (
@@ -32,6 +39,19 @@ _GUARDED_AUTO_FORBIDDEN_PATHS = frozenset(
 )
 _AUTO_PUBLISH_ENABLED_VALUES = frozenset({"1", "true", "yes"})
 _DEDICATED_AUTO_PUBLISH_ENV = "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH"
+
+CLA_ATTESTATION_STATEMENT = (
+    "I attest that the GitHub account named by attested_by has completed every account-level "
+    "Contributor License Agreement action required by the reviewed policy surface for this "
+    "repository; no per-contribution signature or assent remains, and I authorize Autocontribute "
+    "to rely on that completed enrollment."
+)
+DCO_ATTESTATION_STATEMENT = (
+    "I have reviewed the Developer Certificate of Origin policy surface for this repository, "
+    "certify that each contribution Autocontribute publishes under this attestation is eligible "
+    "for certification by the named signatory, and explicitly authorize Autocontribute to append "
+    "that signatory's exact Signed-off-by trailer."
+)
 
 
 def validate_model_identifier(value: object) -> str:
@@ -319,6 +339,167 @@ class ValidationConfig(StrictModel):
         return list(self.required_commands.get(repository.casefold(), []))
 
 
+class CLAAuthorization(StrictModel):
+    """Explicit confirmation of a completed, account-level CLA enrollment."""
+
+    statement: str
+
+    @field_validator("statement")
+    @classmethod
+    def statement_is_exact(cls, value: str) -> str:
+        if value != CLA_ATTESTATION_STATEMENT:
+            raise ValueError("CLA authorization must use the exact fixed attestation statement")
+        return value
+
+
+class DCOAuthorization(StrictModel):
+    """Explicit authority to append one exact repository-scoped DCO signoff."""
+
+    statement: str
+    signoff_name: str
+    signoff_email: str
+
+    @field_validator("statement")
+    @classmethod
+    def statement_is_exact(cls, value: str) -> str:
+        if value != DCO_ATTESTATION_STATEMENT:
+            raise ValueError("DCO authorization must use the exact fixed attestation statement")
+        return value
+
+    @field_validator("signoff_name")
+    @classmethod
+    def signoff_name_is_canonical(cls, value: str) -> str:
+        if (
+            not value
+            or value != value.strip()
+            or len(value) > 200
+            or not value.isprintable()
+            or any(character in value for character in ("<", ">"))
+        ):
+            raise ValueError("DCO signoff_name must be a printable canonical single-line name")
+        return value
+
+    @field_validator("signoff_email")
+    @classmethod
+    def signoff_email_is_canonical(cls, value: str) -> str:
+        if (
+            not value
+            or value != value.strip()
+            or len(value) > 320
+            or value.count("@") != 1
+            or any(not character.isprintable() or character.isspace() for character in value)
+            or any(character in value for character in ("<", ">"))
+        ):
+            raise ValueError("DCO signoff_email must be a canonical email address")
+        local_part, domain = value.split("@", 1)
+        if not local_part or not domain:
+            raise ValueError("DCO signoff_email must be a canonical email address")
+        return value
+
+    @property
+    def trailer(self) -> str:
+        return f"Signed-off-by: {self.signoff_name} <{self.signoff_email}>"
+
+
+class LegalAttestation(StrictModel):
+    """One operator assertion bound to one reviewed repository-policy surface."""
+
+    repository: str
+    reviewed_repository_ref: str
+    reviewed_organization_policy_ref: str
+    legal_policy_sha256: str
+    legal_requirements: list[Literal["cla", "dco"]]
+    attested_by: str
+    attested_at: datetime
+    cla: CLAAuthorization | None = None
+    dco: DCOAuthorization | None = None
+
+    @field_validator("repository")
+    @classmethod
+    def repository_is_exact(cls, value: str) -> str:
+        if not _REPOSITORY.fullmatch(value):
+            raise ValueError("legal attestation repository must use owner/name syntax")
+        return value.casefold()
+
+    @field_validator("reviewed_repository_ref")
+    @classmethod
+    def repository_ref_is_immutable(cls, value: str) -> str:
+        if not _GIT_OBJECT_ID.fullmatch(value):
+            raise ValueError("reviewed_repository_ref must be a full immutable Git object ID")
+        return value.casefold()
+
+    @field_validator("reviewed_organization_policy_ref")
+    @classmethod
+    def organization_ref_is_explicit(cls, value: str) -> str:
+        if value == "absent":
+            return value
+        if not _GIT_OBJECT_ID.fullmatch(value):
+            raise ValueError(
+                "reviewed_organization_policy_ref must be a full immutable Git object ID or "
+                "'absent'"
+            )
+        return value.casefold()
+
+    @field_validator("legal_policy_sha256")
+    @classmethod
+    def policy_digest_is_sha256(cls, value: str) -> str:
+        if not _SHA256.fullmatch(value):
+            raise ValueError("legal_policy_sha256 must be a SHA-256 hex digest")
+        return value.casefold()
+
+    @field_validator("legal_requirements")
+    @classmethod
+    def requirements_are_exact_and_canonical(
+        cls, values: list[Literal["cla", "dco"]]
+    ) -> list[Literal["cla", "dco"]]:
+        canonical = [value for value in ("cla", "dco") if value in values]
+        if not values or values != canonical:
+            raise ValueError("legal_requirements must be a non-empty canonical CLA/DCO set")
+        return values
+
+    @field_validator("attested_by")
+    @classmethod
+    def attesting_login_is_canonical(cls, value: str) -> str:
+        canonical = value.strip().casefold()
+        if not _GITHUB_LOGIN.fullmatch(canonical):
+            raise ValueError("attested_by must be a canonical GitHub login")
+        return canonical
+
+    @field_validator("attested_at", mode="before")
+    @classmethod
+    def attestation_time_has_canonical_input(cls, value: object) -> object:
+        if isinstance(value, str) and not _CANONICAL_UTC_TIMESTAMP.fullmatch(value):
+            raise ValueError("attested_at string must use canonical RFC 3339 UTC (`Z`) format")
+        if not isinstance(value, (str, datetime)):
+            raise ValueError("attested_at must be a canonical UTC timestamp")
+        return value
+
+    @field_validator("attested_at")
+    @classmethod
+    def attestation_time_is_current_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() != timedelta(0):
+            raise ValueError("attested_at must use UTC")
+        canonical = value.astimezone(UTC)
+        if canonical > datetime.now(UTC) + timedelta(minutes=5):
+            raise ValueError("attested_at cannot be materially in the future")
+        return canonical
+
+    @model_validator(mode="after")
+    def includes_an_explicit_authorization(self) -> LegalAttestation:
+        if self.cla is None and self.dco is None:
+            raise ValueError("legal attestation must include an explicit CLA or DCO authorization")
+        authorized = [
+            name
+            for name, authorization in (("cla", self.cla), ("dco", self.dco))
+            if authorization is not None
+        ]
+        if authorized != self.legal_requirements:
+            raise ValueError(
+                "legal authorizations must exactly match the attested legal_requirements"
+            )
+        return self
+
+
 class PolicyConfig(StrictModel):
     require_maintainer_signal: bool = True
     require_contribution_guidelines: bool = True
@@ -326,10 +507,35 @@ class PolicyConfig(StrictModel):
     allow_security_issues: bool = False
     allow_dependency_changes: bool = False
     allow_workflow_changes: bool = False
+    legal_attestations: dict[str, LegalAttestation] = Field(default_factory=dict)
     ai_disclosure: str = (
         "This contribution was prepared autonomously by an AI agent. Its validation evidence "
         "comes from Autocontribute's configured automated checks; no human review is implied."
     )
+
+    @field_validator("legal_attestations")
+    @classmethod
+    def legal_attestations_are_repository_scoped(
+        cls, values: dict[str, LegalAttestation]
+    ) -> dict[str, LegalAttestation]:
+        normalized: dict[str, LegalAttestation] = {}
+        for repository, attestation in values.items():
+            if not _REPOSITORY.fullmatch(repository):
+                raise ValueError("policy.legal_attestations keys must use owner/name syntax")
+            key = repository.casefold()
+            if key in normalized:
+                raise ValueError(
+                    f"duplicate legal-attestation repository after case-folding: {repository}"
+                )
+            if attestation.repository != key:
+                raise ValueError(
+                    "legal-attestation mapping key must exactly match its repository field"
+                )
+            normalized[key] = attestation
+        return normalized
+
+    def legal_attestation_for(self, repository: str) -> LegalAttestation | None:
+        return self.legal_attestations.get(repository.casefold())
 
 
 class QualityConfig(StrictModel):
@@ -439,6 +645,17 @@ class AutocontributeConfig(StrictModel):
                 "trusted validation commands exceed sandbox.max_commands for: "
                 + ", ".join(oversized)
             )
+        for repository, attestation in self.policy.legal_attestations.items():
+            if attestation.dco is None:
+                continue
+            if (
+                self.identity.name != attestation.dco.signoff_name
+                or self.identity.email != attestation.dco.signoff_email
+            ):
+                raise ValueError(
+                    "DCO signatory must exactly match identity.name and identity.email for "
+                    + repository
+                )
         profiles = (
             ("scout", self.models.scout),
             ("builder", self.models.builder),
@@ -668,6 +885,7 @@ policy:
   allow_security_issues: false
   allow_dependency_changes: false
   allow_workflow_changes: false
+  legal_attestations: {}            # generate only with `autocontribute policy attest`
   ai_disclosure: >-
     This contribution was prepared autonomously by an AI agent. Its validation
     evidence comes from Autocontribute's configured automated checks; no human
@@ -706,8 +924,13 @@ storage:
 
 
 __all__ = [
+    "CLA_ATTESTATION_STATEMENT",
+    "DCO_ATTESTATION_STATEMENT",
     "AutocontributeConfig",
+    "CLAAuthorization",
+    "DCOAuthorization",
     "GitHubConfig",
+    "LegalAttestation",
     "ModelPricing",
     "ModelProfile",
     "ValidationConfig",

@@ -57,6 +57,9 @@ uv run autocontribute doctor
 uv run autocontribute discover
 uv run autocontribute run --issue owner/repository#123
 
+# If that repository has a CLA or DCO, inspect its exact policy snapshot first.
+uv run autocontribute policy inspect owner/repository
+
 # Inspect the generated evidence, then explicitly attest and publish.
 uv run autocontribute runs show RUN_ID
 uv run autocontribute approve RUN_ID
@@ -219,6 +222,45 @@ The publication recheck refetches the complete issue and repository, reruns dete
 eligibility, and requires the sealed issue title/body/labels/discussion to be unchanged. Repository
 and organization policy files are reread and compared through a digest recorded at discovery, so a
 new or edited policy stops the run even when it contains no recognized prohibition phrase.
+
+### CLA and DCO onboarding
+
+Any non-negated or ambiguous CLA/DCO reference, legal checklist, or named legal policy/configuration
+file blocks discovery unless the operator has created an exact repository-scoped attestation.
+Autocontribute never treats repository prose, a PR-template checkbox, a generic boolean, or an
+owner-wide setting as legal assent. Start with the read-only inspection above. After personally
+reviewing the displayed policy surface, use only the flags that match its detected requirements:
+
+```bash
+# Account-level CLA enrollment must already be complete outside Autocontribute.
+uv run autocontribute policy attest owner/repository --cla-completed
+
+# DCO requires explicit identity.name/email and authorizes that exact commit trailer.
+uv run autocontribute policy attest owner/repository --authorize-dco-signoff
+
+# Supply both flags only when both requirements are detected.
+```
+
+The command displays fixed authorization language, the authenticated GitHub account, current
+immutable repository/organization refs and review URLs, the detected requirement set, and a stable
+legal-policy digest before asking for personal confirmation. It does not edit configuration. Read
+every linked policy file, then paste its generated record under `policy.legal_attestations` only after
+confirming that no per-contribution CLA signature or assent remains. Consult the policy owner or
+qualified counsel when the effect is unclear.
+
+The stable digest binds the exact repository, organization-policy repository presence, complete
+bounded policy-path inventories, and every policy file's contents or absence. Moving source commits
+with an identical policy surface do not force repeated assent; any policy path/content change,
+organization-policy repository appearance, or detected CLA/DCO requirement change does. The refs
+reviewed during onboarding remain audit fields, while every run records its newly observed immutable
+refs and the existing ref-sensitive freshness digest. Publication re-fetches that evidence and also
+requires the current publishing login, attestation fingerprint, and detected requirements to match.
+
+For DCO repositories, the model may supply only a one-line commit subject. Autocontribute appends the
+configured signatory's exact `Signed-off-by` trailer before preparation is fingerprinted, displays it
+in approval, and verifies the exact committed message before pushing. A model-supplied, altered, or
+unauthorized trailer fails closed. Removing or changing the attestation or Git identity invalidates
+prepared work.
 
 Immediately before the first GitHub mutation, the worker transactionally consumes a durable SQLite
 publication reservation. Those reservations—not eventually consistent GitHub Search results—are the

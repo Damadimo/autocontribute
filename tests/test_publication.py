@@ -11,10 +11,16 @@ from pathlib import Path
 
 import pytest
 
-from autocontribute.config import AutocontributeConfig, ModelPricing
+from autocontribute.config import (
+    CLA_ATTESTATION_STATEMENT,
+    DCO_ATTESTATION_STATEMENT,
+    AutocontributeConfig,
+    LegalAttestation,
+    ModelPricing,
+)
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.deployment import compute_deployment_fingerprint
-from autocontribute.discovery import DiscoveryService
+from autocontribute.discovery import DiscoveryService, apply_legal_commit_message
 from autocontribute.domain import (
     CommandResult,
     CriticReview,
@@ -71,6 +77,9 @@ def _git(repository: Path, *arguments: str) -> str:
 
 
 class _FixtureEligibilityGitHub:
+    def __init__(self, policy_text: str = "Contribution guidelines") -> None:
+        self.policy_text = policy_text
+
     def search_competing_pull_requests(self, repository: str, issue_number: int) -> list[str]:
         return []
 
@@ -83,7 +92,7 @@ class _FixtureEligibilityGitHub:
         max_bytes: int = 1_000_000,
     ) -> str | None:
         del repository, ref, max_bytes
-        return "Contribution guidelines" if path == "CONTRIBUTING.md" else None
+        return self.policy_text if path == "CONTRIBUTING.md" else None
 
     def default_branch_sha_if_exists(self, repository: str) -> str | None:
         del repository
@@ -95,6 +104,7 @@ def _ready_run(
     *,
     guarded_auto: bool = False,
     ready_for_review: bool = False,
+    legal_policy: str | None = None,
 ) -> tuple[AutocontributeConfig, RunStore, str, IssueCandidate]:
     config = AutocontributeConfig.model_validate(
         {
@@ -108,7 +118,6 @@ def _ready_run(
     elif ready_for_review:
         config.publishing.ready_for_review = True
     store = RunStore(config.storage.path)
-    run = store.create_run(deployment_fingerprint=compute_deployment_fingerprint(config))
     source = tmp_path / "source"
     source.mkdir()
     _git(source, "init", "--quiet")
@@ -118,23 +127,6 @@ def _ready_run(
     _git(source, "add", ".")
     _git(source, "commit", "--quiet", "-m", "base")
     sha = _git(source, "rev-parse", "HEAD")
-    workspace = RepositoryWorkspace.clone(
-        str(source),
-        sha,
-        store.workspace_dir(run.run_id) / "repository",
-        allow_local_source=True,
-    )
-    edit = FileEdit(
-        operation="replace",
-        path="fix.py",
-        find="answer = 1\n",
-        replace="answer = 2\n",
-        content=None,
-        rationale="Resolve the issue.",
-    )
-    workspace.apply_edit(edit)
-    patch = workspace.diff()
-    store.write_artifact(run.run_id, "contribution.patch", patch)
     now = datetime.now(UTC)
     issue = IssueCandidate(
         repository="example/project",
@@ -166,6 +158,56 @@ def _ready_run(
         pushed_at=now,
         license_spdx="MIT",
     )
+    eligibility_github = _FixtureEligibilityGitHub(legal_policy or "Contribution guidelines")
+    if legal_policy is not None:
+        snapshot = DiscoveryService(  # type: ignore[arg-type]
+            config,
+            eligibility_github,
+            store,
+        ).policy_snapshot(repository, repository_ref=sha)
+        requirements = set(snapshot.legal_requirements)
+        attestation: dict[str, object] = {
+            "repository": repository.full_name,
+            "reviewed_repository_ref": snapshot.repository_ref,
+            "reviewed_organization_policy_ref": snapshot.organization_ref_evidence,
+            "legal_policy_sha256": snapshot.legal_policy_sha256,
+            "legal_requirements": list(snapshot.legal_requirements),
+            "attested_by": "octocat",
+            "attested_at": "2026-07-22T12:00:00Z",
+        }
+        if "cla" in requirements:
+            attestation["cla"] = {"statement": CLA_ATTESTATION_STATEMENT}
+        if "dco" in requirements:
+            config.identity.name = "Example Signer"
+            config.identity.email = "signer@example.invalid"
+            attestation["dco"] = {
+                "statement": DCO_ATTESTATION_STATEMENT,
+                "signoff_name": config.identity.name,
+                "signoff_email": config.identity.email,
+            }
+        config.policy.legal_attestations = {
+            "example/project": LegalAttestation.model_validate(attestation)
+        }
+        config = AutocontributeConfig.model_validate(config.model_dump(mode="python"))
+        store = RunStore(config.storage.path)
+    run = store.create_run(deployment_fingerprint=compute_deployment_fingerprint(config))
+    workspace = RepositoryWorkspace.clone(
+        str(source),
+        sha,
+        store.workspace_dir(run.run_id) / "repository",
+        allow_local_source=True,
+    )
+    edit = FileEdit(
+        operation="replace",
+        path="fix.py",
+        find="answer = 1\n",
+        replace="answer = 2\n",
+        content=None,
+        rationale="Resolve the issue.",
+    )
+    workspace.apply_edit(edit)
+    patch = workspace.diff()
+    store.write_artifact(run.run_id, "contribution.patch", patch)
     proposal = PatchProposal(
         summary="Correct the answer.",
         edits=[edit],
@@ -197,13 +239,19 @@ def _ready_run(
     run.repository = repository
     run.eligibility = DiscoveryService(
         config,
-        _FixtureEligibilityGitHub(),  # type: ignore[arg-type]
+        eligibility_github,  # type: ignore[arg-type]
         store,
     ).evaluate(issue, repository, repository_ref=sha)
     assert run.eligibility.eligible
     issue.score = run.eligibility.score
     issue.score_evidence = run.eligibility.evidence
     run.base_sha = sha
+    proposal.commit_message = apply_legal_commit_message(
+        config,
+        run.eligibility,
+        repository.full_name,
+        proposal.commit_message,
+    )
     run.proposal = proposal
     run.quality = QualityReport(
         ready=True,
@@ -330,12 +378,14 @@ class FakePublishingGitHub:
         login: str = "octocat",
         existing_pr: str | None = None,
         branch_sha: str | None = None,
+        policy_text: str = "Contribution guidelines",
     ) -> None:
         self.issue = issue
         self.sha = sha
         self.login = login
         self.existing_pr = existing_pr
         self.branch_sha = branch_sha
+        self.policy_text = policy_text
         self.mutated = False
         self.calls: list[str] = []
         self.last_head = f"{login}:autocontribute/issue-42-fixture"
@@ -430,7 +480,7 @@ class FakePublishingGitHub:
     ) -> str | None:
         del repository, ref, max_bytes
         self.calls.append("get_file")
-        return "Contribution guidelines" if path == "CONTRIBUTING.md" else None
+        return self.policy_text if path == "CONTRIBUTING.md" else None
 
     def default_branch_sha(self, repository: str, branch: str) -> str:
         self.calls.append("default_branch_sha")
@@ -530,6 +580,44 @@ def test_publisher_commits_and_opens_exact_approved_artifact(tmp_path: Path, mon
         "pull_request.creation.started"
     )
     assert publisher.publish(run_id).pull_request_url == published.pull_request_url
+
+
+def test_publisher_commits_exact_authorized_dco_trailer(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    policy = (
+        "All commits must include a Signed-off-by line under the Developer Certificate of Origin."
+    )
+    config, store, run_id, issue = _ready_run(tmp_path, legal_policy=policy)
+    manifest = store.get(run_id)
+    assert manifest.proposal is not None
+    expected_message = (
+        "Correct documented answer\n\nSigned-off-by: Example Signer <signer@example.invalid>"
+    )
+    assert manifest.proposal.commit_message == expected_message
+    github = FakePublishingGitHub(
+        issue,
+        manifest.base_sha or "",
+        policy_text=policy,
+    )
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+
+    def push(workspace: Path, fork: str, branch: str, commit_sha: str) -> None:
+        del workspace, fork, branch
+        github.branch_sha = commit_sha
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+
+    published = publisher.publish(run_id)
+
+    assert published.commit_sha is not None
+    committed_message = _git(
+        store.workspace_dir(run_id) / "repository",
+        "show",
+        "--no-patch",
+        "--format=%B",
+        published.commit_sha,
+    )
+    assert committed_message == expected_message
 
 
 def test_workspace_reconstruction_rejects_stored_cross_origin_clone_before_git(
@@ -996,6 +1084,86 @@ def test_benign_policy_source_drift_stops_before_any_github_mutation(
 
     assert not github.mutated
     assert all(event["event_type"] != "publication.reserved" for event in store.events(run_id))
+
+
+def test_legal_policy_drift_invalidates_attestation_before_github_mutation(
+    tmp_path: Path,
+) -> None:
+    policy = "Contributors must complete our Contributor License Agreement before opening a PR."
+    config, store, run_id, issue = _ready_run(tmp_path, legal_policy=policy)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(
+        issue,
+        manifest.base_sha or "",
+        policy_text=policy + " The enrollment process has changed.",
+    )
+
+    with pytest.raises(PolicyError, match="contribution policy changed"):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert not github.mutated
+    assert all(event["event_type"] != "publication.reserved" for event in store.events(run_id))
+
+
+def test_legal_policy_drift_after_push_recovers_compensation_before_pull_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = "Contributors must complete our Contributor License Agreement before opening a PR."
+    config, store, run_id, issue = _ready_run(tmp_path, legal_policy=policy)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(
+        issue,
+        manifest.base_sha or "",
+        policy_text=policy,
+    )
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    deleted: list[tuple[str, str, str]] = []
+    original_finalize = store.finalize_publication_compensation
+
+    def push(workspace: Path, fork: str, branch: str, commit_sha: str) -> None:
+        del workspace, fork, branch
+        github.branch_sha = commit_sha
+        github.policy_text = policy + " The enrollment process has changed."
+
+    def delete(
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> None:
+        lease_guard.assert_owned()
+        deleted.append((fork, branch, commit_sha))
+        github.branch_sha = None
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+    monkeypatch.setattr(publisher, "_delete_remote_branch", delete)
+    monkeypatch.setattr(
+        store,
+        "finalize_publication_compensation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("crash before policy compensation finalization")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="policy compensation"):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    assert durable.status == RunStatus.SUBMITTING
+    assert durable.publication_compensation_reason == "pre_pr_policy_stale"
+    assert deleted == [("octocat/project", durable.branch_name, durable.commit_sha)]
+    assert "create_pull_request" not in github.calls
+
+    monkeypatch.setattr(store, "finalize_publication_compensation", original_finalize)
+    reconciled = publisher.reconcile_submitting(run_id)
+
+    assert reconciled.status == RunStatus.FAILED
+    assert any(
+        event["event_type"] == "publication.compensation.verified" for event in store.events(run_id)
+    )
 
 
 def test_repository_no_longer_eligible_stops_before_any_github_mutation(
