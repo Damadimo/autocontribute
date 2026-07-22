@@ -75,9 +75,7 @@ def test_scheduler_persistence_keeps_evaluations_with_every_state_copy(
         "workflow",
         "lineage_variable",
         "state_token",
-        "key_prefix",
-        "v4_key_prefix",
-        "v3_key_prefix",
+        "key_stem",
         "claim_expression",
     ),
     [
@@ -85,18 +83,14 @@ def test_scheduler_persistence_keeps_evaluations_with_every_state_copy(
             "autocontribute.yml",
             "AUTOCONTRIBUTE_STATE_LINEAGE",
             "${{ secrets.AUTOCONTRIBUTE_STATE_TOKEN }}",
-            "autocontribute-state-v5-",
-            "autocontribute-state-v4-",
-            "autocontribute-state-v3-",
+            "autocontribute-state-",
             "in-progress:v2:$final_prefix:$RUN_ID:$RUN_ATTEMPT:$PARENT_KEY:$NEW_KEY",
         ),
         (
             "staging.yml",
             "AUTOCONTRIBUTE_STAGING_STATE_LINEAGE",
             "${{ secrets.AUTOCONTRIBUTE_STAGING_STATE_TOKEN }}",
-            "autocontribute-staging-state-v5-",
-            "autocontribute-staging-state-v4-",
-            "autocontribute-staging-state-v3-",
+            "autocontribute-staging-state-",
             "in-progress:v2:committed:$RUN_ID:$RUN_ATTEMPT:$PARENT_KEY:$NEW_KEY",
         ),
     ],
@@ -105,9 +99,7 @@ def test_scheduler_cache_uses_externally_committed_exact_lineage(
     workflow: str,
     lineage_variable: str,
     state_token: str,
-    key_prefix: str,
-    v4_key_prefix: str,
-    v3_key_prefix: str,
+    key_stem: str,
     claim_expression: str,
 ) -> None:
     document = yaml.safe_load((ROOT / ".github" / "workflows" / workflow).read_text())
@@ -150,15 +142,20 @@ def test_scheduler_cache_uses_externally_committed_exact_lineage(
     assert 'current" != "$RESOLVED_LINEAGE' in claim["run"]
     assert 'echo "claim=$claim"' in claim["run"]
     lineage_suffix = "${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
-    assert f'v5_lineage_pattern="^committed:{key_prefix}{lineage_suffix}"' in resolve["run"]
-    assert f'v4_lineage_pattern="^committed:{v4_key_prefix}{lineage_suffix}"' in resolve["run"]
-    assert f'v3_lineage_pattern="^committed:{v3_key_prefix}{lineage_suffix}"' in resolve["run"]
-    assert '[[ "$current" =~ $v5_lineage_pattern ]]' in resolve["run"]
-    assert '[[ "$current" =~ $v4_lineage_pattern ]]' in resolve["run"]
-    assert '[[ "$current" =~ $v3_lineage_pattern ]]' in resolve["run"]
+    for version in (3, 4, 5, 6):
+        assert (
+            f'v{version}_lineage_pattern="^committed:{key_stem}v{version}-'
+            f'{lineage_suffix}"'
+        ) in resolve["run"]
+        assert f'[[ "$current" =~ $v{version}_lineage_pattern ]]' in resolve["run"]
+        assert f'parent_schema="v{version}"' in resolve["run"]
+    assert "v2_lineage_pattern" not in resolve["run"]
     assert "== committed:" not in resolve["run"]
     assert 'echo "parent_schema=$parent_schema"' in resolve["run"]
-    assert f'new_key="{key_prefix}$RUNNER_OS-$REPOSITORY_ID-$RUN_ID-$RUN_ATTEMPT"' in resolve["run"]
+    assert (
+        f'new_key="{key_stem}v6-$RUNNER_OS-$REPOSITORY_ID-$RUN_ID-$RUN_ATTEMPT"'
+        in resolve["run"]
+    )
     assert restore["with"]["key"] == "${{ steps.state_lineage.outputs.parent_key }}"
     assert "restore-keys" not in restore["with"]
     assert save["with"]["key"] == "${{ steps.state_lineage.outputs.new_key }}"
@@ -173,7 +170,7 @@ def test_scheduler_cache_uses_externally_committed_exact_lineage(
     assert "CURRENT_SCHEMA_VERSION" in confirm["run"]
     assert "RunStore" in confirm["run"]
     assert confirm["env"]["PARENT_SCHEMA"] == "${{ steps.state_lineage.outputs.parent_schema }}"
-    assert '"bootstrap": 5, "v3": 3, "v4": 4, "v5": 5' in confirm["run"]
+    assert '"bootstrap": 6, "v3": 3, "v4": 4, "v5": 5, "v6": 6' in confirm["run"]
     assert "cache schema does not match its committed lineage" in confirm["run"]
     assert steps.index(confirm) < steps.index(claim)
     assert "${{ github.token }}" not in (ROOT / ".github" / "workflows" / workflow).read_text()
@@ -393,6 +390,11 @@ def test_hosted_lineage_recovery_requires_exact_claim_and_exact_retained_evidenc
     artifact_restore = next(
         step for step in steps if step.get("name") == "Restore exact claimant evidence artifact"
     )
+    schema_validation = next(
+        step
+        for step in steps
+        if step.get("name") == "Validate recovery configuration and source schema"
+    )
 
     assert document["permissions"] == {"actions": "read", "contents": "read"}
     assert job["timeout-minutes"] == 45
@@ -401,7 +403,12 @@ def test_hosted_lineage_recovery_requires_exact_claim_and_exact_retained_evidenc
     assert '"${claim_parts[1]}" == "v2"' in resolve["run"]
     assert 'candidate_key="${claim_parts[6]}"' in resolve["run"]
     assert 'candidate_key="${KEY_PREFIX}v5-' in resolve["run"]
-    assert 'candidate_key" != "$expected_candidate' in resolve["run"]
+    assert 'candidate_pattern="^${KEY_PREFIX}v(5|6)-' in resolve["run"]
+    assert '[[ ! "$candidate_key" =~ $candidate_pattern ]]' in resolve["run"]
+    assert 'candidate_schema="v${BASH_REMATCH[1]}"' in resolve["run"]
+    assert '^${KEY_PREFIX}v(3|4|5|6)-' in resolve["run"]
+    assert 'recovery_key="${KEY_PREFIX}v6-' in resolve["run"]
+    assert 'echo "candidate_schema=$candidate_schema"' in resolve["run"]
     assert "requires an explicit committed or handoff intent" in resolve["run"]
     assert claimant_probe["with"]["key"] == "${{ steps.recovery_lineage.outputs.candidate_key }}"
     assert claimant_probe["with"]["lookup-only"] is True
@@ -418,6 +425,11 @@ def test_hosted_lineage_recovery_requires_exact_claim_and_exact_retained_evidenc
     assert "steps.claimant_artifact.outputs.artifact-hit == 'true'" in artifact_restore["if"]
     assert 'gh run download "$CLAIM_RUN_ID"' in artifact_restore["run"]
     assert ' --name "$ARTIFACT_NAME"' in artifact_restore["run"]
+    assert schema_validation["env"]["CANDIDATE_SCHEMA"] == (
+        "${{ steps.recovery_lineage.outputs.candidate_schema }}"
+    )
+    assert '"v3": 3, "v4": 4, "v5": 5, "v6": 6' in schema_validation["run"]
+    assert "Recovery lineage did not declare a supported source schema" in schema_validation["run"]
 
 
 def test_hosted_lineage_recovery_persists_safe_generation_before_stale_claim_cas() -> None:

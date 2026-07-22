@@ -62,6 +62,7 @@ jobs:
             echo "GitHub supplied an invalid staging lineage component" >&2
             exit 1
           fi
+          v6_lineage_pattern="^committed:autocontribute-staging-state-v6-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
           v5_lineage_pattern="^committed:autocontribute-staging-state-v5-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
           v4_lineage_pattern="^committed:autocontribute-staging-state-v4-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
           v3_lineage_pattern="^committed:autocontribute-staging-state-v3-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
@@ -75,6 +76,9 @@ jobs:
             parent_key="bootstrap"
             parent_schema="bootstrap"
             bootstrap=true
+          elif [[ "$current" =~ $v6_lineage_pattern ]]; then
+            parent_key="${current#committed:}"
+            parent_schema="v6"
           elif [[ "$current" =~ $v5_lineage_pattern ]]; then
             parent_key="${current#committed:}"
             parent_schema="v5"
@@ -91,7 +95,7 @@ jobs:
             echo "Staging lineage variable has an unsupported value" >&2
             exit 1
           fi
-          new_key="autocontribute-staging-state-v5-$RUNNER_OS-$REPOSITORY_ID-$RUN_ID-$RUN_ATTEMPT"
+          new_key="autocontribute-staging-state-v6-$RUNNER_OS-$REPOSITORY_ID-$RUN_ID-$RUN_ATTEMPT"
           {
             echo "bootstrap=$bootstrap"
             echo "new_key=$new_key"
@@ -217,7 +221,7 @@ jobs:
           from autocontribute.store import CURRENT_SCHEMA_VERSION, RunStore
 
           storage = Path(".autocontribute-staging")
-          expected = {"bootstrap": 5, "v3": 3, "v4": 4, "v5": 5}.get(
+          expected = {"bootstrap": 6, "v3": 3, "v4": 4, "v5": 5, "v6": 6}.get(
               os.environ["PARENT_SCHEMA"]
           )
           if expected is None:

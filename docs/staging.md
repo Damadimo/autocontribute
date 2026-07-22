@@ -72,10 +72,10 @@ The matching `state restore --complete` verifies and promotes SQLite, run bundle
 one generation into an absent storage root. The hosted workflow continues to use SQLite-only mode
 because its immutable cache and evidence artifact already persist all three parts together.
 
-The staging cache writes unique `autocontribute-staging-state-v5-...` keys and restores only the key
-named by the external lineage variable. Exact repository- and runner-bound v4 or v3 keys already
+The staging cache writes unique `autocontribute-staging-state-v6-...` keys and restores only the key
+named by the external lineage variable. Exact repository- and runner-bound v5, v4, or v3 keys already
 committed in that variable are one-way legacy inputs: the workflow checks that each snapshot matches
-its declared schema, migrates it, and saves the replacement under a v5 key. It never falls back to a stale
+its declared schema, migrates it, and saves the replacement under a v6 key. It never falls back to a stale
 prefix or accepts arbitrary legacy keys. Never use `bootstrap_state=true` or edit the variable to
 bypass a failed save, migration, or missing lineage. Although the shadow workflow never publishes,
 preserve the matching snapshot, run bundles, and evaluation records together for any later

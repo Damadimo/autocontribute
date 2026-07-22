@@ -170,15 +170,16 @@ jobs:
             echo "Hosted-state claim has an invalid run identity" >&2
             exit 1
           fi
-          expected_candidate="${KEY_PREFIX}v5-${RUNNER_OS}-${REPOSITORY_ID}-${claim_run_id}-${claim_run_attempt}"
-          if [[ "$candidate_key" != "$expected_candidate" ]]; then
+          candidate_pattern="^${KEY_PREFIX}v(5|6)-${RUNNER_OS}-${REPOSITORY_ID}-${claim_run_id}-${claim_run_attempt}$"
+          if [[ ! "$candidate_key" =~ $candidate_pattern ]]; then
             echo "Hosted-state claim destination is not the exact claimant generation" >&2
             exit 1
           fi
+          candidate_schema="v${BASH_REMATCH[1]}"
 
           if [[ "$parent_key" == "bootstrap" ]]; then
             parent_schema="bootstrap"
-          elif [[ "$parent_key" =~ ^${KEY_PREFIX}v(3|4|5)-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$ ]]; then
+          elif [[ "$parent_key" =~ ^${KEY_PREFIX}v(3|4|5|6)-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$ ]]; then
             parent_schema="v${BASH_REMATCH[1]}"
           else
             echo "Hosted-state claim has an unsupported parent generation" >&2
@@ -199,10 +200,11 @@ jobs:
             fi
           fi
 
-          recovery_key="${KEY_PREFIX}v5-${RUNNER_OS}-${REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          recovery_key="${KEY_PREFIX}v6-${RUNNER_OS}-${REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           source_artifact="${SOURCE_ARTIFACT_PREFIX}-${claim_run_id}-${claim_run_attempt}"
           {
             echo "candidate_key=$candidate_key"
+            echo "candidate_schema=$candidate_schema"
             echo "claim_format=$claim_format"
             echo "claim_run_id=$claim_run_id"
             echo "final_prefix=$final_prefix"
@@ -363,6 +365,7 @@ jobs:
         run: uv sync --locked
       - name: Validate recovery configuration and source schema
         env:
+          CANDIDATE_SCHEMA: ${{ steps.recovery_lineage.outputs.candidate_schema }}
           CONFIG_PATH: ${{ inputs.config_path }}
           PARENT_SCHEMA: ${{ steps.recovery_lineage.outputs.parent_schema }}
           RECOVERY_ACTION: ${{ inputs.recovery_action }}
@@ -389,13 +392,18 @@ jobs:
           ):
               raise SystemExit("Hosted recovery requires the isolated Docker configuration")
 
-          if os.environ["RECOVERY_ACTION"] == "promote_claimed":
-              expected_schema = 5
-          else:
-              parent_schema = os.environ["PARENT_SCHEMA"]
-              if parent_schema == "bootstrap":
-                  raise SystemExit(0)
-              expected_schema = int(parent_schema.removeprefix("v"))
+          source_schema = (
+              os.environ["CANDIDATE_SCHEMA"]
+              if os.environ["RECOVERY_ACTION"] == "promote_claimed"
+              else os.environ["PARENT_SCHEMA"]
+          )
+          if source_schema == "bootstrap":
+              raise SystemExit(0)
+          expected_schema = {"v3": 3, "v4": 4, "v5": 5, "v6": 6}.get(
+              source_schema
+          )
+          if expected_schema is None:
+              raise SystemExit("Recovery lineage did not declare a supported source schema")
           database = storage / "snapshots" / "state.sqlite3"
           with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
               row = connection.execute(

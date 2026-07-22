@@ -335,20 +335,25 @@ Actions cache as the durability boundary for autonomous publication.
 The hosted review workflow uses `AUTOCONTRIBUTE_STATE_LINEAGE` as an external fail-closed pointer to
 one exact cache generation. It advances that pointer only after a verified snapshot is saved and
 the evidence artifact uploads, and refuses both stale prefix fallback and unfinished generations.
-It accepts exact, repository-bound v4 or v3 cache keys only as one-way migration sources, checks
-that each key and snapshot schema agree, and writes the next generation under a v5 key. Its
+It accepts the exact current v6 key or exact, repository-bound v5, v4, or v3 keys as one-way
+migration sources, checks that each key and snapshot schema agree, and writes every new generation
+under a v6 key. Its
 explicit handoff is one-way: after state is downloaded for publication, continue on persistent
 operator-managed storage rather than restarting the hosted schedule from an older cache.
 
-The current state/cache lineage is schema v5. Restore accepts an exact canonical v5, v4, v3, or v2
-snapshot for migration on the next command that opens the store. Schema v3 introduced durable
+The current state/cache lineage is schema v6. Restore accepts an exact canonical v6, v5, v4, v3, or
+v2 snapshot; older schemas migrate when the next command opens the store. Schema v3 introduced durable
 publication reservations; v4 added atomic per-run event anchors, persistent lease generations, and
 crash-persistent evaluation-gate holds. Schema v5 adds durable manifest-artifact synchronization and
-cross-checks reservation/hold rows against their hash-chained ledger evidence. The upgrade is an
-offline, one-way cutover: stop all older workers before opening restored state with v5, never restart
-them against the migrated lineage, and take a fresh v5 backup before continuing. Never resume
+cross-checks reservation/hold rows against their hash-chained ledger evidence. Schema v6 adds
+`publication_gate_holds.outcome_corpus_cursor`: every new automatic hold atomically binds both
+evaluation and outcome cursors, while migrated v2-v5 holds retain a null outcome cursor and cannot
+authorize automatic recovery. The upgrade is an offline, one-way cutover: stop all older workers
+before opening restored state with v6, never restart them against the migrated lineage, and take a
+fresh v6 backup before continuing. Never resume
 automatic publication from a stale or partial restore, because missing reservation, gate-hold,
-artifact-sync, evaluation-anchor, or lease-generation history can invalidate safety decisions.
+outcome-cursor, artifact-sync, evaluation-anchor, or lease-generation history can invalidate safety
+decisions.
 
 Autocontribute never autonomously creates issues, comments, reactions, reviews, stars, merges, or
 maintainer messages. Follow-up changes require a fresh evidence bundle and approval.

@@ -89,7 +89,7 @@ publishing:
   mode: review_required # guarded `auto` is limited to the one configured repository
   approval_expires_hours: 24
   draft: true
-  # Daily/cooldown capacity is durably reserved in schema-v5 SQLite before GitHub mutation.
+  # Daily/cooldown capacity is durably reserved in schema-v6 SQLite before GitHub mutation.
   # Never delete or roll back state to reclaim a failed or ambiguous attempt's reservation.
   max_new_pull_requests_per_day: 1
   max_open_pull_requests: 2

@@ -176,7 +176,7 @@ mismatched grade fails corpus validation.
 The build/lock component is a required, schema-validated `_build_identity.json` shipped inside the
 package. CI verifies its `pyproject.toml` and `uv.lock` SHA-256 values before building, so source and
 wheel installs use the same explicit identity without searching or trusting unrelated ancestor files.
-An online SQLite snapshot captures committed WAL pages and verifies integrity, the exact v5 schema,
+An online SQLite snapshot captures committed WAL pages and verifies integrity, the exact v6 schema,
 and every event chain against its durable count/head anchor, but it does not include either
 directory. `state backup --complete` additionally copies both directories, validates their run
 manifests and evaluation anchors against that snapshot, inventories every file by size and SHA-256,
@@ -206,21 +206,25 @@ descriptor-relative; an identity mismatch is restored without deletion. The coll
 symlink-resistant, rejects nested mounts, and is bounded by both retention age and an inspection
 limit. It removes only the checkout; the database, evidence bundle, and evaluation lineage remain.
 
-The current SQLite schema is v5. `state restore` accepts only exact canonical v2, v3, v4, or v5 schemas,
+The current SQLite schema is v6. `state restore` accepts only exact canonical v2, v3, v4, v5, or v6 schemas,
 rejecting unexpected tables, indexes, views, and triggers as well as missing objects, and refuses to
-replace live SQLite state. A v4/v5 snapshot's complete event ledger and run anchors are validated before
-atomic promotion. A v2 or v3 snapshot is structurally validated and promoted unchanged; the next
-command that constructs `RunStore` migrates it transactionally through v3, v4, and v5. The v2-to-v3 step
+replace live SQLite state. A v4, v5, or v6 snapshot's complete event ledger, run anchors, and
+publication state are validated before atomic promotion. A v2 or v3 snapshot receives its exact
+historical structural and evidence validation and is promoted unchanged; the next command that
+constructs `RunStore` migrates it transactionally through v3, v4, v5, and v6. The v2-to-v3 step
 conservatively backfills reservations for durable `submitting` and `pr_open` runs at migration time.
 The v3-to-v4 step first verifies every legacy hash chain, then backfills event count/head anchors,
 seeds persistent generation counters from active leases, and conservatively holds the evaluation
 corpus for ambiguous submitting publications. The v4-to-v5 step adds an explicit manifest-artifact
-sync outbox and reconciles materialized reservation/hold rows with their hash-chained evidence.
-Because older schemas did not retain every v5 invariant after
-a clean release, the cutover must be offline and one-way: quiesce every older worker before the first
-v5 open and never let one resume against the migrated lineage. A stale restore can omit reservations,
-gate holds, artifact-sync intent, evaluation anchors, event heads, or lease generations, so SQLite integrity alone does not make it a
-safe autonomous-publication recovery point.
+sync outbox and reconciles materialized reservation/hold rows with their hash-chained evidence. The
+v5-to-v6 step adds `publication_gate_holds.outcome_corpus_cursor`. New automatic holds atomically
+bind that cursor with the evaluation cursor; migrated v2-v5 holds retain a null outcome cursor and
+cannot confer automatic recovery authority. Because older schemas did not retain every
+v6 invariant after a clean release, the cutover must be offline and one-way: quiesce every older
+worker before the first v6 open and never let one resume against the migrated lineage. A stale
+restore can omit reservations, gate holds, outcome cursors, artifact-sync intent, evaluation anchors,
+event heads, or lease generations, so SQLite integrity alone does not make it a safe
+autonomous-publication recovery point.
 
 Automatic publication computes an exact cursor over the globally ordered, hash-chained evaluation
 anchors. Reservation and cursor hold are one SQLite transaction, so an evaluation commit either wins
