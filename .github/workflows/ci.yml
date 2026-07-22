@@ -114,7 +114,7 @@ jobs:
           trap cleanup_workspace_quota_smoke EXIT
 
           for required_command in \
-            fallocate findmnt losetup mkfs.ext4 mount mountpoint realpath systemd-run umount; do
+            findmnt losetup mkfs.ext4 mount mountpoint realpath systemd-run truncate umount; do
             command -v "$required_command" >/dev/null
           done
           unset required_command
@@ -126,13 +126,15 @@ jobs:
           workspace_image="${smoke_root}/workspace.ext4"
           workspace_mount="${smoke_root}/state/workspaces"
           install -d -m 0700 "$workspace_mount"
-          fallocate --length 64M "$workspace_image"
+          # A sparse loop image is acceptable only for this disposable integration fixture. Its
+          # logical capacity exercises the production free-space and fixed-inode floors.
+          truncate --size 5G "$workspace_image"
           loop_device="$(sudo losetup --find --show "$workspace_image")"
           if [[ ! "$loop_device" =~ ^/dev/loop[0-9]+$ ]]; then
             echo "losetup returned an unexpected loop-device path" >&2
             exit 1
           fi
-          sudo mkfs.ext4 -q -N 8192 "$loop_device"
+          sudo mkfs.ext4 -q -N 131072 "$loop_device"
           sudo mount -t ext4 -o nodev,nosuid -- "$loop_device" "$workspace_mount"
 
           service_uid="$(id --user)"
@@ -159,7 +161,7 @@ jobs:
             --property=ProtectSystem=strict \
             --property=RestrictSUIDSGID=yes \
             --property="ReadWritePaths=$smoke_root" \
-            /usr/local/libexec/autocontribute-workspace-quota-check "$workspace_mount"
+            /usr/local/libexec/autocontribute-workspace-quota-check --headroom "$workspace_mount"
       - name: Verify system and timer units
         shell: bash
         env:

@@ -530,16 +530,19 @@ def test_ci_exercises_workspace_quota_preflight_on_a_real_hardened_mount() -> No
     assert job["runs-on"] == "ubuntu-24.04"
     assert steps.index(install) < steps.index(smoke)
     assert 'test "$(cat /proc/1/comm)" = systemd' in script
-    assert 'fallocate --length 64M "$workspace_image"' in script
+    assert 'truncate --size 5G "$workspace_image"' in script
     assert 'sudo losetup --find --show "$workspace_image"' in script
-    assert 'sudo mkfs.ext4 -q -N 8192 "$loop_device"' in script
+    assert 'sudo mkfs.ext4 -q -N 131072 "$loop_device"' in script
     assert 'sudo mount -t ext4 -o nodev,nosuid -- "$loop_device" "$workspace_mount"' in script
     assert 'test "$service_uid" -ne 0' in script
     assert "sudo systemd-run" in script
     assert "--property=PrivateDevices=yes" in script
     assert "--property=ProtectSystem=strict" in script
     assert '--property="ReadWritePaths=$smoke_root"' in script
-    assert '/usr/local/libexec/autocontribute-workspace-quota-check "$workspace_mount"' in script
+    assert (
+        "/usr/local/libexec/autocontribute-workspace-quota-check "
+        '--headroom "$workspace_mount"' in script
+    )
     assert "trap cleanup_workspace_quota_smoke EXIT" in script
     assert 'sudo umount -- "$workspace_mount"' in script
     assert 'sudo losetup --detach "$loop_device"' in script

@@ -157,6 +157,23 @@ Production backup and migration procedures should quiesce writers and use this c
 the SQLite-only mode remains for hosted-workflow persistence that already carries the two directories
 in the same immutable cache and artifact.
 
+Repository checkouts under `workspaces/<run-id>/` are deliberately outside that durable generation.
+Workspace collection first validates the run's hash chain and exact `manifest.json`; a prepared run
+must also retain a matching patch and validation sidecar. Nonterminal runs are never eligible. In
+particular, `submitting` can hold the only local Git object that permits an exact retry after an
+uncertain push, so neither age nor a stored remote-looking identifier makes it disposable. A
+non-published terminal run with any publication intent, branch, commit, PR, compensation, or active
+gate-hold evidence is likewise retained. `pr_open` is the sole publication-bearing terminal state
+eligible for collection, and only after its hash-chained ledger proves ordered publication intent,
+canonical PR persistence/reconciliation, and the `submitting -> pr_open` transition, and its
+canonical repository, PR URL, branch, base/head commits, publishing identity, and prepared artifacts
+verify. Lifecycle recovery thereafter uses that durable PR URL and commit identity, while complete
+backups validate the patch and validation sidecar without the checkout. Deletion atomically moves
+the selected device/inode into a private random quarantine, re-inspects it, and removes it
+descriptor-relative; an identity mismatch is restored without deletion. The collector is
+symlink-resistant, rejects nested mounts, and is bounded by both retention age and an inspection
+limit. It removes only the checkout; the database, evidence bundle, and evaluation lineage remain.
+
 The current SQLite schema is v5. `state restore` accepts only exact canonical v2, v3, v4, or v5 schemas,
 rejecting unexpected tables, indexes, views, and triggers as well as missing objects, and refuses to
 replace live SQLite state. A v4/v5 snapshot's complete event ledger and run anchors are validated before

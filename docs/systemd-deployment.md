@@ -2,8 +2,10 @@
 
 This bundle runs one persistent Autocontribute installation on a Linux host. It schedules the
 worker at 09:17 and 21:17 UTC, creates one verified complete backup at 03:17 UTC, and checks the
-freshness of both. The worker and backup take the same local `flock`, so they cannot read or change
-the state lineage concurrently.
+freshness of both. Before each scheduled attempt, the worker inspects at most 25 terminal workspaces
+older than seven days and removes only those that pass the durable-evidence checks below.
+The worker and backup take the same local `flock`, so they cannot read or change the state lineage
+concurrently.
 
 The units are intentionally inert until an operator installs them. They do not enable automatic
 publication. Begin with `publishing.mode: review_required`; the automatic-publishing gate and its
@@ -36,9 +38,13 @@ only an exact, non-bind ext4 mount backed by one whole block device, mounted now
 `rw,nodev,nosuid`, at most 20 GiB of addressable blocks, and at most 524,288 fixed inodes. This is an
 aggregate hard ceiling across durable repositories and disposable validation copies. It prevents
 workspace writes from exhausting the filesystem that holds SQLite, evidence, or the service home.
-It is not a per-run fairness limit: a full workspace filesystem makes the worker fail safely and
-requires operator cleanup. The wrapper checks the mount before reading any credential and binds the
-Python store to that exact path; a configuration that redirects storage around it is rejected.
+It is not a per-run fairness limit. The wrapper first performs its structural mount and ceiling
+checks, then binds the Python store to that exact path and runs credential-free workspace cleanup.
+It repeats the check in headroom mode and requires at least 4 GiB available to the service account
+and 65,536 free inodes before it reads credentials or begins billable/model work. A configuration
+that redirects storage around the verified mount is rejected. Cleanup can retain recovery-critical
+trees; if the remaining filesystem still lacks that fixed headroom, the worker fails safely before
+starting a new attempt and requires operator review.
 `doctor` creates its writable Docker probe below the same bounded mount. Capacity for the rootless
 Docker daemon's own image and metadata store remains a separate operator-managed host concern; use
 only pre-pulled digest-pinned images and monitor that store as part of host capacity. Sandbox and
@@ -127,8 +133,9 @@ UUID=UUID_FROM_BLKID /var/lib/autocontribute/state/workspaces ext4 rw,nodev,nosu
 ```
 
 Mount it, set the mounted filesystem root's ownership (not merely the covered directory), and verify
-the actual byte and inode totals. The reference 16 GiB/262,144-inode format is below the worker's hard
-ceilings of 21,474,836,480 bytes and 524,288 inodes.
+the actual byte and inode totals and current non-root availability. The reference 16
+GiB/262,144-inode format is below the worker's hard ceilings of 21,474,836,480 bytes and 524,288 inodes
+and leaves room above the 4 GiB/65,536-inode start-of-run floors.
 
 ```bash
 sudo mount /var/lib/autocontribute/state/workspaces
@@ -136,12 +143,15 @@ sudo chown autocontribute:autocontribute /var/lib/autocontribute/state/workspace
 sudo chmod 0700 /var/lib/autocontribute/state/workspaces
 findmnt --target /var/lib/autocontribute/state/workspaces \
   --output TARGET,SOURCE,FSTYPE,OPTIONS
-stat --file-system --format='block_size=%S blocks=%b inodes=%c' \
+stat --file-system \
+  --format='block_size=%S blocks=%b inodes=%c available_blocks=%a free_inodes=%d' \
   /var/lib/autocontribute/state/workspaces
 ```
 
-The preflight rejects a missing mount, a bind or shared-device mount, another filesystem type,
-missing `nodev`/`nosuid`, unsafe ownership or mode, and either actual capacity above its hard ceiling.
+The structural preflight rejects a missing mount, a bind, alias, mixed-device layer, or shared-device
+mount, another filesystem type, missing `nodev`/`nosuid`, unsafe ownership or mode, and either actual
+capacity above its hard ceiling. The post-cleanup headroom pass additionally rejects fewer than 4
+GiB of blocks available to the non-root service or fewer than 65,536 free inodes.
 Ext4 is required because its inode table is fixed at format time; a current `df -i` total on a
 dynamically allocating filesystem would not prove an inode ceiling. A private systemd tmpfs is also
 not sufficient: the separately running rootless Docker daemon resolves bind sources in the host
@@ -397,8 +407,9 @@ sudo systemctl enable --now \
 sudo systemctl list-timers 'autocontribute-*'
 ```
 
-The first worker command is a real, billable attempt. A safe skip is success and refreshes the worker
-stamp. A rejected or failed attempt is a service failure. The complete-backup command verifies the
+After structural validation, credential-free cleanup, and the headroom gate, the scheduled run is
+the worker's first credentialed and potentially billable command. A safe skip is success and
+refreshes the worker stamp. A rejected or failed attempt is a service failure. The complete-backup command verifies the
 SQLite snapshot, event chains, run manifests, evidence, evaluations, file sizes, and SHA-256 hashes
 before it publishes the uniquely named bundle. It receives no credentials and has no network.
 
@@ -432,8 +443,9 @@ backup is older than 36 hours. Every worker, backup, doctor, or health failure i
 those events to the existing host alerting system, or add another `OnFailure=` target in a drop-in.
 An on-host stamp alone is not a page and is lost with the host.
 
-Alert on workspace byte or inode consumption before either reaches 80%. Space exhaustion is a safe
-worker failure, but it can prevent publication recovery that still depends on a local commit. Stop
+Alert on workspace byte or inode consumption before either reaches 75%; this precedes the fixed
+start-of-run floors on the reference filesystem. Space exhaustion is a safe worker failure, but it
+can prevent publication recovery that still depends on a local commit. Stop
 the worker timer and service before removing workspaces. Inspect each run's durable status first;
 never remove a `submitting` workspace unless remote reconciliation has proven the exact commit exists
 or the contribution is being abandoned through the incident procedure. Complete state bundles
@@ -542,13 +554,62 @@ sudo -u autocontribute /usr/bin/flock --exclusive \
 Do not resume merely to clear monitoring. Review all active trigger evidence and use the exact
 trigger-set hash as described in [Scheduled operation](scheduled-operation.md).
 
+## Workspace retention
+
+After structurally verifying the dedicated workspace mount, the checked-in worker runs the
+equivalent of this command before it reads credential files or starts the scheduled contribution,
+while the shared operation lock is held:
+
+```bash
+autocontribute state gc-workspaces \
+  --config /etc/autocontribute/autocontribute.yml \
+  --older-than-days 7 \
+  --limit 25 \
+  --execute
+```
+
+For an operator review, omit `--execute`; dry run is the CLI default. The report is deterministic by
+terminal update time and run ID, includes the inspected entry/byte counts, and reports how many old
+candidates were deferred by the bound. Candidate discovery validates the complete supported run
+corpus and fails above its 10,000-run integrity bound, so older runs without workspaces cannot hide a
+newer eligible entry. `--json` produces the same report as structured JSON. An
+unsafe path, symlink workspace entry, nested mount, changed state, or invalid recovery artifact is
+retained and makes the command fail so systemd failure signaling can alert the operator.
+
+Cleanup never deletes SQLite rows, run evidence, patches, validation sidecars, or evaluations. It
+never selects `queued` through `submitting`, `ready_for_approval`, or `approved` workspaces. This is
+critical for `submitting`: after Git has created a commit but before GitHub confirms the branch, the
+workspace may contain the only byte-for-byte object that can safely resume the approved push. A
+failed, cancelled, rejected, or skipped run that contains any publication-intent event or stored
+publishing identity, branch, commit, PR, compensation, or active evaluation hold is also retained
+for reconciliation. A `pr_open` workspace is eligible only when the hash-chained ledger proves, in
+order, `publication.intent.begun`, canonical PR persistence or reconciliation, and the
+`submitting -> pr_open` transition, and when the canonical PR/base/head and publishing identity,
+manifest artifact, patch fingerprint, and validation artifact all agree. Lifecycle recovery then
+uses the durable PR URL and commit identity; complete backups continue to validate the same patch
+and validation evidence after the checkout is gone.
+
+Execution atomically renames the selected inode into a private random quarantine below the already
+opened workspace root, verifies its device/inode identity, and repeats the bounded tree and mount
+inspection there before descriptor-relative recursive deletion. If the selected directory was
+swapped, it is restored without deletion. A recursive deletion error after isolation preserves the
+quarantine and fails the service for operator review; automatic cleanup never adopts that orphan.
+
+The collector does not infer ownership of filesystem entries absent from durable run state and does
+not remove such orphan entries. Inspect those manually with the worker stopped; preserve or move
+them as forensic data until their origin is understood. Do not use `rm -rf` as a response to a full
+workspace filesystem while a publication is ambiguous.
+
 ## Backups and recovery drills
 
 The backup timer retains every successful local generation; it deliberately performs no automatic
 deletion. The service account can still delete its own `0400` files, so replicate each new bundle to
 versioned, access-controlled off-host storage with retention lock. Monitor that replication and keep
 more than one generation. Configuration, encrypted credential sources, rootless Docker data, and
-target workspaces are excluded and require separate secure recovery procedures.
+target workspaces are excluded and require separate secure recovery procedures. The collector's
+eligibility checks mirror the portable-evidence boundary: a prepared terminal workspace is not
+removed unless its patch and validation artifact can be verified without the checkout. A complete
+bundle taken afterward still validates the retained durable generation.
 
 At least once per release, restore a copied bundle into a fresh path on a non-production host using
 the same packaged version and configuration except for `storage.path`. The restore target must not

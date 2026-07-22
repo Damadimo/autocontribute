@@ -267,6 +267,20 @@ Target-repository workspaces are not included. If a `submitting` run already has
 complete backup fails closed because that exact Git object cannot be reconstructed from the bundle;
 reconcile or finish publication on the persistent worker before retrying the backup.
 
+Repository workspaces are therefore collected separately with
+`autocontribute state gc-workspaces`. The command is a bounded dry run unless `--execute` is passed.
+It never deletes run manifests, patches, validation evidence, evaluations, or SQLite state. It also
+never collects a nonterminal run. Old `pr_open` workspaces are eligible only after their hash-chained
+ledger proves the ordered publication intent, canonical PR persistence/reconciliation, and
+`submitting -> pr_open` transition, and its canonical PR/commit identity, manifest, patch, and
+validation artifact all verify. Any non-published terminal run carrying commit, branch, PR,
+publication-hold, or other
+publication reconstruction evidence is retained. Unsafe paths, symlink workspace entries, nested
+mounts, incomplete artifacts, and ambiguous state fail closed and are reported instead of followed.
+The systemd worker collects at most 25 eligible workspaces older than seven days before each
+scheduled run, without credentials, then requires 4 GiB and 65,536 free inodes before loading secrets
+or beginning model work. Operators can run the dry form first at any time under the shared lock.
+
 The included GitHub-hosted Actions workflow permanently requires
 `publishing.mode: review_required`; setting the auto-publish environment opt-in does not bypass that
 check. A guarded `auto` pilot must run on an operator-managed, non-ephemeral worker whose live SQLite

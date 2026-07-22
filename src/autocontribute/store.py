@@ -1163,6 +1163,37 @@ class RunStore:
             resource="submitting",
         )
 
+    def has_active_publication_gate_hold(self, run_id: str) -> bool:
+        """Return whether one run still owns crash-persistent publication capacity."""
+
+        normalized_run_id = _lease_identity(run_id, field="publication run id")
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM publication_gate_holds WHERE run_id = ?",
+                (normalized_run_id,),
+            ).fetchone()
+        return row is not None
+
+    def has_publication_reconstruction_evidence(self, run_id: str) -> bool:
+        """Return whether the ledger contains state relevant to publication recovery."""
+
+        normalized_run_id = _lease_identity(run_id, field="publication run id")
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM events
+                WHERE run_id = ? AND (
+                    event_type GLOB 'publication.*'
+                    OR event_type GLOB 'commit.*'
+                    OR event_type GLOB 'branch.*'
+                    OR event_type GLOB 'pull_request.*'
+                )
+                LIMIT 1
+                """,
+                (normalized_run_id,),
+            ).fetchone()
+        return row is not None
+
     def _list_runs_with_status(
         self,
         status: RunStatus,

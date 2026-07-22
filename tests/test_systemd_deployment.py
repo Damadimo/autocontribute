@@ -193,6 +193,7 @@ exit "$TEST_DOCKER_EXIT"
 def _run_workspace_quota_check(
     case_directory: Path,
     *,
+    check_mode: str = "--headroom",
     mount_target: str | None = None,
     mount_device: str = "253:7",
     filesystem_type: str = "ext4",
@@ -208,6 +209,8 @@ def _run_workspace_quota_check(
     block_size: str = "4096",
     total_blocks: str = "4194304",
     total_inodes: str = "262144",
+    available_blocks: str = "3145728",
+    available_inodes: str = "196608",
 ) -> subprocess.CompletedProcess[str]:
     case_directory.mkdir()
     workspace = case_directory / "workspace"
@@ -264,10 +267,12 @@ fi
         """#!/bin/sh
 set -eu
 if [ "$1" = '--file-system' ]; then
-  [ "$2" = '--format=%S:%b:%c' ]
+  [ "$2" = '--format=%S:%b:%c:%a:%d' ]
   [ "$3" = '--' ]
   [ "$4" = "$TEST_WORKSPACE" ]
-  printf '%s:%s:%s\n' "$TEST_BLOCK_SIZE" "$TEST_TOTAL_BLOCKS" "$TEST_TOTAL_INODES"
+  printf '%s:%s:%s:%s:%s\n' \
+    "$TEST_BLOCK_SIZE" "$TEST_TOTAL_BLOCKS" "$TEST_TOTAL_INODES" \
+    "$TEST_AVAILABLE_BLOCKS" "$TEST_AVAILABLE_INODES"
   exit 0
 fi
 [ "$2" = '--' ]
@@ -285,6 +290,8 @@ esac
 
     environment = {
         **os.environ,
+        "TEST_AVAILABLE_BLOCKS": available_blocks,
+        "TEST_AVAILABLE_INODES": available_inodes,
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "TEST_BLOCK_SIZE": block_size,
         "TEST_FILESYSTEM_ROOT": filesystem_root,
@@ -311,6 +318,7 @@ esac
         [
             "bash",
             os.fspath(test_script),
+            check_mode,
             os.fspath(workspace),
         ],
         check=False,
@@ -400,6 +408,20 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
 
     helper = (SYSTEMD / "libexec" / "autocontribute-worker").read_text(encoding="utf-8")
     assert 'run --scheduled --config "$config"' in helper
+    assert "state gc-workspaces" in helper
+    assert "--older-than-days 7" in helper
+    assert "--limit 25" in helper
+    assert "--execute" in helper
+    gc_call = helper.index("state gc-workspaces")
+    run_call = helper.index('run --scheduled --config "$config"')
+    credential_read = helper.index('credential_value="$(<"$credential_path")"')
+    structural_call = '"$workspace_quota_check" --structural "$workspace_root"'
+    headroom_call = '"$workspace_quota_check" --headroom "$workspace_root"'
+    marker_export = 'export AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT="$workspace_root"'
+    assert structural_call in helper
+    assert headroom_call in helper
+    assert helper.index(structural_call) < helper.index(marker_export) < gc_call
+    assert gc_call < helper.index(headroom_call) < credential_read < run_call
     assert 'runtime_directory="/run/user/$UID"' in helper
     assert 'export DOCKER_HOST="unix://$docker_socket"' in helper
     assert (
@@ -416,11 +438,8 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
     assert "DOCKER_*" in helper
     assert "credential_value" in helper
     assert "set -euo pipefail" in helper
-    quota_call = '"$workspace_quota_check" "$workspace_root"'
-    assert quota_call in helper
-    assert helper.index(quota_call) < helper.index(check_call)
-    assert helper.index(quota_call) < helper.index('credential_value="$(<"$credential_path")"')
-    assert 'export AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT="$workspace_root"' in helper
+    assert helper.index(headroom_call) < helper.index(check_call)
+    assert helper.index(headroom_call) < credential_read
 
 
 def test_workspace_quota_check_accepts_bounded_dedicated_ext4_mount(tmp_path: Path) -> None:
@@ -441,6 +460,24 @@ def test_workspace_quota_check_accepts_same_target_namespace_layers(tmp_path: Pa
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_workspace_structural_check_allows_cleanup_below_headroom_floor(tmp_path: Path) -> None:
+    structural = _run_workspace_quota_check(
+        tmp_path / "structural-low-headroom",
+        check_mode="--structural",
+        available_blocks="0",
+        available_inodes="0",
+    )
+    headroom = _run_workspace_quota_check(
+        tmp_path / "headroom-low-headroom",
+        available_blocks="0",
+        available_inodes="0",
+    )
+
+    assert structural.returncode == 0, structural.stderr
+    assert headroom.returncode != 0
+    assert "available-byte floor" in headroom.stderr
 
 
 @pytest.mark.parametrize(
@@ -477,6 +514,53 @@ def test_workspace_quota_check_accepts_same_target_namespace_layers(tmp_path: Pa
         ("same-device", {"parent_device": "2049"}, "separate filesystem"),
         ("too-many-blocks", {"total_blocks": "5242881"}, "byte ceiling"),
         ("too-many-inodes", {"total_inodes": "524289"}, "inode ceiling"),
+        (
+            "too-few-available-blocks",
+            {"available_blocks": "1048575"},
+            "4 GiB available-byte floor",
+        ),
+        (
+            "too-few-available-inodes",
+            {"available_inodes": "65535"},
+            "65,536 free-inode floor",
+        ),
+        (
+            "impossible-available-blocks",
+            {"available_blocks": "4194305"},
+            "invalid availability",
+        ),
+        (
+            "impossible-available-inodes",
+            {"available_inodes": "262145"},
+            "invalid availability",
+        ),
+        ("leading-zero-block-size", {"block_size": "04096"}, "invalid limits"),
+        ("leading-zero-total-blocks", {"total_blocks": "04194304"}, "invalid limits"),
+        ("leading-zero-total-inodes", {"total_inodes": "0262144"}, "invalid limits"),
+        (
+            "leading-zero-available-blocks",
+            {"available_blocks": "03145728"},
+            "invalid limits",
+        ),
+        (
+            "leading-zero-available-inodes",
+            {"available_inodes": "0196608"},
+            "invalid limits",
+        ),
+        ("long-block-size", {"block_size": "123456789012"}, "invalid limits"),
+        ("long-total-blocks", {"total_blocks": "123456789012"}, "invalid limits"),
+        ("long-total-inodes", {"total_inodes": "12345678"}, "invalid limits"),
+        (
+            "long-available-blocks",
+            {"available_blocks": "123456789012"},
+            "invalid limits",
+        ),
+        (
+            "long-available-inodes",
+            {"available_inodes": "12345678"},
+            "invalid limits",
+        ),
+        ("invalid-mode", {"check_mode": "--unknown"}, "invalid mode"),
         ("invalid-limits", {"block_size": "not-a-number"}, "invalid limits"),
     ),
 )

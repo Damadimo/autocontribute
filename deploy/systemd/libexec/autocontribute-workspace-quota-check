@@ -3,9 +3,12 @@ set -euo pipefail
 
 umask 077
 
-readonly workspace_root="${1:-}"
+readonly check_mode="${1:-}"
+readonly workspace_root="${2:-}"
 readonly maximum_bytes=21474836480
 readonly maximum_inodes=524288
+readonly minimum_available_bytes=4294967296
+readonly minimum_available_inodes=65536
 
 fail() {
   printf '%s\n' "$1" >&2
@@ -13,14 +16,15 @@ fail() {
 }
 
 if [[
-  $# -ne 1 ||
+  $# -ne 2 ||
+  ( "$check_mode" != --structural && "$check_mode" != --headroom ) ||
   "$workspace_root" != /* ||
   "$workspace_root" == / ||
   "$workspace_root" == *$'\n'* ||
   "$workspace_root" == */../* ||
   "$workspace_root" == */./*
 ]]; then
-  fail 'Autocontribute workspace quota check received an invalid path or arguments'
+  fail 'Autocontribute workspace quota check received an invalid mode, path, or arguments'
 fi
 if [[ "$UID" == 0 ]]; then
   fail 'Autocontribute workspace quota check must not run as root'
@@ -137,22 +141,47 @@ if [[ "$workspace_stat_device" == "$parent_device" ]]; then
 fi
 
 filesystem_limits="$(
-  stat --file-system --format=%S:%b:%c -- "$workspace_root"
+  stat --file-system --format=%S:%b:%c:%a:%d -- "$workspace_root"
 )" || fail 'Autocontribute could not inspect workspace filesystem limits'
 readonly filesystem_limits
-IFS=: read -r block_size total_blocks total_inodes trailing <<< "$filesystem_limits"
-readonly block_size total_blocks total_inodes trailing
+IFS=: read -r \
+  block_size total_blocks total_inodes available_blocks available_inodes trailing \
+  <<< "$filesystem_limits"
+readonly block_size total_blocks total_inodes available_blocks available_inodes trailing
 if [[
   ! "$block_size" =~ ^[1-9][0-9]*$ ||
   ! "$total_blocks" =~ ^[1-9][0-9]*$ ||
   ! "$total_inodes" =~ ^[1-9][0-9]*$ ||
+  ! "$available_blocks" =~ ^(0|[1-9][0-9]*)$ ||
+  ! "$available_inodes" =~ ^(0|[1-9][0-9]*)$ ||
+  "${#block_size}" -gt 11 ||
+  "${#total_blocks}" -gt 11 ||
+  "${#total_inodes}" -gt 7 ||
+  "${#available_blocks}" -gt 11 ||
+  "${#available_inodes}" -gt 7 ||
   -n "$trailing"
 ]]; then
   fail 'Autocontribute workspace filesystem reported invalid limits'
+fi
+if (( available_blocks > total_blocks || available_inodes > total_inodes )); then
+  fail 'Autocontribute workspace filesystem reported invalid availability'
 fi
 if (( block_size > maximum_bytes || total_blocks > maximum_bytes / block_size )); then
   fail 'Autocontribute workspace filesystem exceeds the byte ceiling'
 fi
 if (( total_inodes > maximum_inodes )); then
   fail 'Autocontribute workspace filesystem exceeds the inode ceiling'
+fi
+if [[ "$check_mode" == --structural ]]; then
+  exit 0
+fi
+minimum_available_blocks=$((
+  minimum_available_bytes / block_size + (minimum_available_bytes % block_size != 0)
+))
+readonly minimum_available_blocks
+if (( available_blocks < minimum_available_blocks )); then
+  fail 'Autocontribute workspace filesystem is below the 4 GiB available-byte floor'
+fi
+if (( available_inodes < minimum_available_inodes )); then
+  fail 'Autocontribute workspace filesystem is below the 65,536 free-inode floor'
 fi

@@ -13,6 +13,7 @@ import typer
 import yaml
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from autocontribute import __version__
 from autocontribute.backup import create_state_bundle, restore_state_bundle
@@ -45,6 +46,7 @@ from autocontribute.orchestrator import Orchestrator
 from autocontribute.publication import Publisher, approve_run, build_approval_review
 from autocontribute.reporting import render_approval_review, render_run_report
 from autocontribute.store import RunStore
+from autocontribute.workspace_gc import WorkspaceGCReport, collect_terminal_workspaces
 
 app = typer.Typer(
     name="autocontribute",
@@ -58,7 +60,7 @@ evaluation_app = typer.Typer(
     no_args_is_help=True,
 )
 state_app = typer.Typer(
-    help="Create verified, portable backups of durable scheduler state.",
+    help="Manage durable state, verified backups, and bounded workspace cleanup.",
     no_args_is_help=True,
 )
 lifecycle_app = typer.Typer(
@@ -593,6 +595,58 @@ def restore_state(
     console.print(f"[green]Verified {kind} restored:[/green] {restored}")
 
 
+@state_app.command(name="gc-workspaces")
+def gc_workspaces(
+    config: ConfigOption = DEFAULT_CONFIG,
+    older_than_days: Annotated[
+        int,
+        typer.Option(
+            "--older-than-days",
+            min=1,
+            max=3_650,
+            help="Only inspect terminal workspaces older than this many days.",
+        ),
+    ] = 7,
+    limit: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=1_000,
+            help="Maximum old terminal workspace entries inspected in this invocation.",
+        ),
+    ] = 25,
+    execute: Annotated[
+        bool,
+        typer.Option(
+            "--execute",
+            help="Delete entries that pass every safety check; the default is a dry run.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the machine-readable cleanup report."),
+    ] = False,
+) -> None:
+    """Report or safely remove old terminal repository workspaces."""
+
+    settings = _config(config)
+    try:
+        report = collect_terminal_workspaces(
+            RunStore(settings.storage.path),
+            older_than=timedelta(days=older_than_days),
+            limit=limit,
+            execute=execute,
+        )
+    except (AutocontributeError, ValueError) as exc:
+        _fail(str(exc))
+    if json_output:
+        console.print(report.model_dump_json(indent=2), markup=False)
+    else:
+        _print_workspace_gc_report(report)
+    if report.errors:
+        raise typer.Exit(2)
+
+
 @lifecycle_app.command(name="sync")
 def lifecycle_sync(config: ConfigOption = DEFAULT_CONFIG) -> None:
     """Poll every durable open pull request and activate any hard safety stop."""
@@ -897,6 +951,36 @@ def _print_lifecycle_result(result: LifecycleSyncResult) -> None:
                 f"{signal.reason} ({signal.source_url})",
                 markup=False,
             )
+
+
+def _print_workspace_gc_report(report: WorkspaceGCReport) -> None:
+    mode = "EXECUTE" if report.execute else "DRY RUN"
+    color = "green" if report.execute else "yellow"
+    console.print(
+        f"[{color}]Workspace cleanup: {mode}[/{color}] "
+        f"(terminal cutoff {report.cutoff.isoformat()}, inspection limit {report.limit})"
+    )
+    if report.items:
+        table = Table("Run", "Status", "Action", "Entries", "Bytes", "Reason")
+        for item in report.items:
+            table.add_row(
+                Text(json.dumps(item.run_id, ensure_ascii=True)[1:-1]),
+                item.status.value,
+                item.action,
+                f"{item.entries:,}",
+                f"{item.bytes:,}",
+                item.reason,
+                style="red" if item.error else None,
+            )
+        console.print(table)
+    console.print(
+        "Summary: "
+        f"{report.deleted} deleted, {report.would_delete} would delete, "
+        f"{report.retained} retained, {report.errors} error(s), "
+        f"{report.protected_nonterminal} nonterminal workspace(s) protected, "
+        f"{report.younger_terminal} terminal workspace(s) inside retention, "
+        f"{report.truncated} old terminal candidate(s) deferred."
+    )
 
 
 def _print_outcome(manifest: RunManifest, store: RunStore) -> None:

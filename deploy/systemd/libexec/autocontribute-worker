@@ -15,6 +15,14 @@ readonly rootless_docker_check="/usr/local/libexec/autocontribute-rootless-docke
 readonly workspace_quota_check="/usr/local/libexec/autocontribute-workspace-quota-check"
 readonly workspace_root="/var/lib/autocontribute/state/workspaces"
 
+case "$operation" in
+  doctor | run) ;;
+  *)
+    printf 'Unsupported Autocontribute systemd operation\n' >&2
+    exit 1
+    ;;
+esac
+
 if [[ ! -x "$executable" ]]; then
   printf 'Autocontribute executable is unavailable\n' >&2
   exit 1
@@ -31,8 +39,16 @@ if [[ ! -x "$workspace_quota_check" ]]; then
   printf 'Autocontribute workspace quota check is unavailable\n' >&2
   exit 1
 fi
-"$workspace_quota_check" "$workspace_root"
+"$workspace_quota_check" --structural "$workspace_root"
 export AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT="$workspace_root"
+if [[ "$operation" == run ]]; then
+  "$executable" state gc-workspaces \
+    --config "$config" \
+    --older-than-days 7 \
+    --limit 25 \
+    --execute
+fi
+"$workspace_quota_check" --headroom "$workspace_root"
 export XDG_RUNTIME_DIR="$runtime_directory"
 export DOCKER_HOST="unix://$docker_socket"
 unset DOCKER_CONTEXT DOCKER_CERT_PATH DOCKER_TLS_VERIFY
@@ -83,9 +99,5 @@ case "$operation" in
     ;;
   run)
     exec "$executable" run --scheduled --config "$config"
-    ;;
-  *)
-    printf 'Unsupported Autocontribute systemd operation\n' >&2
-    exit 1
     ;;
 esac
