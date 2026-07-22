@@ -542,10 +542,13 @@ def test_security_integration_exercises_rootful_and_rootless_resource_boundaries
     assert rootless["if"] == "matrix.docker_mode == 'rootless'"
     assert rootless["env"]["AUTOCONTRIBUTE_RUN_DOCKER_TESTS"] == "1"
     assert "set -Eeuo pipefail" in script
+    assert "trap rootless_error ERR" in script
+    assert "trap - ERR" in script
     assert 'install -d -m 0700 "$gpg_home"' in script
     assert '--homedir "$gpg_home"' in script
     assert "9DC858229FC7DD38854AE2D88D81803C0EBFCD88" in script
     assert '"docker-ce-rootless-extras=${docker_package_version}"' in script
+    assert "Required rootless command is unavailable" in script
     assert "no shared subordinate UID/GID range is available" in script
     assert "sudo systemctl stop docker.service docker.socket" in script
     assert 'runtime="/run/user/${service_uid}"' in script

@@ -59,6 +59,12 @@ jobs:
           user_manager_was_active=1
           docker_apt_key=/etc/apt/keyrings/autocontribute-rootless-docker.asc
           docker_apt_source=/etc/apt/sources.list.d/autocontribute-rootless-docker.list
+          rootless_error() {
+            status=$?
+            printf 'Rootless Docker integration failed at script line %s\n' \
+              "${BASH_LINENO[0]:-unknown}" >&2
+            exit "$status"
+          }
           show_rootless_diagnostics() {
             sed -n '1,200p' "${RUNNER_TEMP}/rootless-dockerd.log" 2>/dev/null || true
             if [[ -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
@@ -66,6 +72,7 @@ jobs:
             fi
           }
           cleanup_rootless_job() {
+            trap - ERR
             set +e
             if [[ -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
               systemctl --user stop --no-block "$daemon_unit" 2>/dev/null || true
@@ -101,6 +108,7 @@ jobs:
             fi
             sudo rm -f -- "$docker_apt_source" "$docker_apt_key"
           }
+          trap rootless_error ERR
           trap cleanup_rootless_job EXIT
 
           sudo apt-get update
@@ -152,11 +160,17 @@ jobs:
           installed_extras_version="$(
             dpkg-query --show --showformat='${Version}' docker-ce-rootless-extras
           )"
-          test "$installed_extras_version" = "$docker_package_version"
+          if [[ "$installed_extras_version" != "$docker_package_version" ]]; then
+            printf 'Rootless extras version does not match Docker Engine\n' >&2
+            exit 1
+          fi
           for command_name in \
             docker dockerd-rootless.sh fuse-overlayfs newgidmap newuidmap \
             rootlesskit setsid slirp4netns; do
-            command -v "$command_name" >/dev/null
+            if ! command -v "$command_name" >/dev/null; then
+              printf 'Required rootless command is unavailable: %s\n' "$command_name" >&2
+              exit 1
+            fi
           done
           unset command_name
 
