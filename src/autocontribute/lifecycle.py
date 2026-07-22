@@ -489,6 +489,7 @@ def _parsed_pull_request(value: object) -> PullRequestDetails:
             "merge_commit_sha",
             "merged",
             "merged_at",
+            "node_id",
             "number",
             "repository",
             "review_comment_count",
@@ -534,6 +535,7 @@ def _parsed_pull_request(value: object) -> PullRequestDetails:
         base_ref=_text(record, "base_ref", field="pull request base ref"),
         head_ref=_text(record, "head_ref", field="pull request head ref"),
         head_label=_text(record, "head_label", field="pull request head label"),
+        node_id=_node_id(record, "node_id", field="pull request GraphQL node identifier"),
     )
     if pull_request.merged and (
         pull_request.state != "closed"
@@ -811,6 +813,13 @@ def _repository(record: dict[str, object], key: str, *, field: str) -> str:
         part in {".", ".."} for part in value.split("/")
     ):
         raise ValueError(f"{field} must use canonical owner/name syntax")
+    return value
+
+
+def _node_id(record: dict[str, object], key: str, *, field: str) -> str:
+    value = _text(record, key, field=field)
+    if len(value) > 256 or any(not character.isprintable() for character in value):
+        raise ValueError(f"{field} must be a bounded printable string")
     return value
 
 

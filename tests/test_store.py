@@ -256,6 +256,7 @@ def _lifecycle_snapshot(*, head_sha: str = "a" * 40) -> PullRequestLifecycleSnap
             base_ref="main",
             head_ref="fix-lifecycle",
             head_label="example:fix-lifecycle",
+            node_id="PR_fixture_node_7",
         ),
         reviews=(),
         issue_comments=(),
@@ -2158,6 +2159,7 @@ def test_lifecycle_snapshot_rejects_noncanonical_and_structurally_invalid_json(
         (("pull_request", "merge_commit_sha"), "short", "full Git SHA"),
         (("pull_request", "title"), "", "nonempty canonical string"),
         (("pull_request", "base_ref"), "", "nonempty canonical string"),
+        (("pull_request", "node_id"), "bad\nnode", "bounded printable string"),
         (("pull_request", "repository"), "example/project/extra", "owner/name"),
         (
             ("pull_request", "html_url"),

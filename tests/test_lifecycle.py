@@ -53,6 +53,7 @@ def _pull_request(**changes: object) -> PullRequestDetails:
         "base_ref": "main",
         "head_ref": "fix-lifecycle",
         "head_label": "example:fix-lifecycle",
+        "node_id": "PR_fixture_node_7",
     }
     values.update(changes)
     return PullRequestDetails(**values)  # type: ignore[arg-type]
