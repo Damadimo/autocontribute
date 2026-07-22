@@ -117,10 +117,15 @@ jobs:
           test "$docker_cli_version" = "$docker_package_version"
 
           docker_key="${RUNNER_TEMP}/docker-release.asc"
+          gpg_home="${RUNNER_TEMP}/autocontribute-gpg"
+          install -d -m 0700 "$gpg_home"
           curl --fail --location --proto '=https' --show-error --silent --tlsv1.2 \
             https://download.docker.com/linux/ubuntu/gpg \
             --output "$docker_key"
-          key_metadata="$(gpg --batch --no-options --show-keys --with-colons "$docker_key")"
+          key_metadata="$(
+            gpg --batch --no-options --homedir "$gpg_home" \
+              --show-keys --with-colons "$docker_key"
+          )"
           key_count="$(
             awk -F: '$1 == "pub" { count += 1 } END { print count + 0 }' \
               <<<"$key_metadata"

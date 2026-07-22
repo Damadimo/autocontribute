@@ -37,8 +37,8 @@ jobs:
         run: '"$(go env GOPATH)/bin/gitleaks" git --redact --verbose .'
 
   systemd-deployment:
-    # Keep the systemd major version fixed so parser behavior and security scoring cannot drift
-    # underneath the checked-in exposure ceilings. Ubuntu 24.04 ships systemd 255.
+    # Require the reviewed systemd major and let parser or scoring changes fail the checked-in
+    # exposure ceilings visibly. Ubuntu 24.04 currently ships systemd 255.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
