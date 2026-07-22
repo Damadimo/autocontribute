@@ -116,6 +116,10 @@ leaves the external committed generation unchanged and retryable.
 
 Immediately before lifecycle/model work—or the snapshot-only handoff—the job rereads the lineage,
 requires it to equal the value resolved before preflight, and changes it to an `in-progress` claim.
+New claims have the form
+`in-progress:v2:<committed|handoff>:<run-id>:<attempt>:<parent-key>:<destination-key>`;
+the claim therefore binds both the exact generation being produced and whether successful
+finalization must commit it or permanently hand it off.
 At the end, `autocontribute state backup` uses SQLite's online-backup API to fold committed WAL pages
 into `.autocontribute/snapshots/state.sqlite3`, checks the snapshot's integrity and schema, and
 publishes it atomically. That snapshot,
@@ -194,6 +198,46 @@ snapshot, run bundles, and separate evaluation files and is the review handoff. 
 reports are credential-redacted, but the manifest and ledger retain the public issue text and
 proposed contribution text; handle the artifact as review data, not as a sanitized public export.
 Missing artifact files are a hard failure and prevent the lineage from being committed.
+
+### Recovering a stranded hosted claim
+
+An `in-progress` lineage is an intentional fail-closed condition, not a value to repair by hand. It
+means a run claimed the parent but did not complete the final pointer update. Never delete, rewrite,
+or point `AUTOCONTRIBUTE_STATE_LINEAGE` at a guessed cache key. Use the protected **Recover production
+hosted state** workflow so recovery shares the scheduler's concurrency lock and compare-and-swaps the
+exact claim only after a fresh generation and immutable evidence have been verified.
+
+1. Set `AUTOCONTRIBUTE_ENABLED=false` and leave it false throughout recovery. Confirm no production
+   scheduler job is still running, then copy the complete current
+   `AUTOCONTRIBUTE_STATE_LINEAGE` value without editing it.
+2. Dispatch **Recover production hosted state** from the default branch with
+   `recovery_action=promote_claimed`, the copied value as `expected_claim`,
+   `legacy_claim_intent=reject`, and `restore_over_unusable_claimant=false`. This first probes the exact
+   destination cache named by the v2 claim. If GitHub has evicted that cache, it instead downloads the
+   unexpired `autocontribute-<run-id>-<attempt>` evidence artifact from the exact claimant run. It
+   validates the configuration, schema, SQLite state, run evidence, evaluations, and complete-bundle
+   invariants before saving a fresh cache generation and 30-day recovery artifact.
+3. If the claim predates v2, inspect the claimant run and explicitly select its intended
+   `legacy_claim_intent` (`committed` or `handoff`) when promoting it. A legacy claim does not encode
+   that decision, so the recovery workflow will not infer it.
+4. Use `restore_parent_stopped` only when claimant cache and artifact evidence are absent, or after a
+   promotion attempt has proved the retained evidence unusable. Supply a canonical `operator_actor`
+   and a concrete single-line `recovery_reason`. If evidence still exists but was proven unusable,
+   also set `restore_over_unusable_claimant=true` as an explicit continuity-loss attestation. This
+   restores only the exact claimed parent (or initializes the claimed bootstrap parent), activates a
+   persistent safety stop, and persists that stopped state as a new generation before finalizing.
+
+The workflow rereads `AUTOCONTRIBUTE_ENABLED` with the dedicated state token both before restoration
+and immediately before the final compare-and-swap. If the enable variable or claim changed, it leaves
+the lineage untouched. The state token is exposed only to those two control steps; artifact recovery
+uses the workflow's read-only Actions permission and never receives model or target-repository
+credentials.
+
+After parent recovery, keep hosted scheduling disabled. Download the recovery artifact, restore its
+complete bundle into an absent path on a trusted persistent worker, run `safety status`, reconcile all
+known upstream pull requests, and use the audited `safety resume` command only after the continuity
+loss has been resolved. Do not re-enable the hosted scheduler merely because the recovery workflow is
+green; parent recovery deliberately preserves a stop that requires operator review.
 
 Do not publish directly from an ordinary artifact while the hosted scheduler remains active; that
 would create a divergent local state lineage which hosted lifecycle polling cannot see. First

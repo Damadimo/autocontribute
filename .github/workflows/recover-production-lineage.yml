@@ -1,0 +1,68 @@
+name: Recover production hosted state
+
+on:
+  workflow_dispatch:
+    inputs:
+      recovery_action:
+        description: "Promote exact claimant state, or restore its parent with a safety stop"
+        required: true
+        type: choice
+        options:
+          - promote_claimed
+          - restore_parent_stopped
+      expected_claim:
+        description: "Exact current AUTOCONTRIBUTE_STATE_LINEAGE in-progress value"
+        required: true
+        type: string
+      restore_over_unusable_claimant:
+        description: "After failed promotion, attest that claimant evidence is unusable"
+        required: true
+        default: false
+        type: boolean
+      legacy_claim_intent:
+        description: "For legacy promotion only; v2 claims must leave this at reject"
+        required: true
+        default: reject
+        type: choice
+        options:
+          - reject
+          - committed
+          - handoff
+      operator_actor:
+        description: "Required canonical operator identity for parent recovery"
+        required: false
+        type: string
+      recovery_reason:
+        description: "Required incident reason for parent recovery"
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: autocontribute-${{ github.repository_owner }}
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    uses: ./.github/workflows/_recover-lineage.yml
+    with:
+      artifact_prefix: autocontribute-lineage-recovery
+      config_path: autocontribute.yml
+      enabled_variable: AUTOCONTRIBUTE_ENABLED
+      expected_claim: ${{ inputs.expected_claim }}
+      key_prefix: autocontribute-state-
+      legacy_claim_intent: ${{ inputs.legacy_claim_intent }}
+      lineage_variable: AUTOCONTRIBUTE_STATE_LINEAGE
+      operator_actor: ${{ inputs.operator_actor }}
+      recovery_action: ${{ inputs.recovery_action }}
+      recovery_reason: ${{ inputs.recovery_reason }}
+      restore_over_unusable_claimant: ${{ inputs.restore_over_unusable_claimant }}
+      scheduler_enabled: ${{ vars.AUTOCONTRIBUTE_ENABLED }}
+      source_artifact_prefix: autocontribute
+      storage_root: .autocontribute
+    secrets:
+      state_token: ${{ secrets.AUTOCONTRIBUTE_STATE_TOKEN }}

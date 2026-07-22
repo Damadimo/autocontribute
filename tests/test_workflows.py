@@ -78,6 +78,7 @@ def test_scheduler_persistence_keeps_evaluations_with_every_state_copy(
         "key_prefix",
         "v4_key_prefix",
         "v3_key_prefix",
+        "claim_expression",
     ),
     [
         (
@@ -87,6 +88,7 @@ def test_scheduler_persistence_keeps_evaluations_with_every_state_copy(
             "autocontribute-state-v5-",
             "autocontribute-state-v4-",
             "autocontribute-state-v3-",
+            "in-progress:v2:$final_prefix:$RUN_ID:$RUN_ATTEMPT:$PARENT_KEY:$NEW_KEY",
         ),
         (
             "staging.yml",
@@ -95,6 +97,7 @@ def test_scheduler_persistence_keeps_evaluations_with_every_state_copy(
             "autocontribute-staging-state-v5-",
             "autocontribute-staging-state-v4-",
             "autocontribute-staging-state-v3-",
+            "in-progress:v2:committed:$RUN_ID:$RUN_ATTEMPT:$PARENT_KEY:$NEW_KEY",
         ),
     ],
 )
@@ -105,6 +108,7 @@ def test_scheduler_cache_uses_externally_committed_exact_lineage(
     key_prefix: str,
     v4_key_prefix: str,
     v3_key_prefix: str,
+    claim_expression: str,
 ) -> None:
     document = yaml.safe_load((ROOT / ".github" / "workflows" / workflow).read_text())
     assert document["permissions"] == {"contents": "read"}
@@ -141,7 +145,8 @@ def test_scheduler_cache_uses_externally_committed_exact_lineage(
     assert claim["env"]["RESOLVED_LINEAGE"] == (
         "${{ steps.state_lineage.outputs.resolved_lineage }}"
     )
-    assert "in-progress:" in claim["run"]
+    assert claim["env"]["NEW_KEY"] == "${{ steps.state_lineage.outputs.new_key }}"
+    assert f'claim="{claim_expression}"' in claim["run"]
     assert 'current" != "$RESOLVED_LINEAGE' in claim["run"]
     assert 'echo "claim=$claim"' in claim["run"]
     lineage_suffix = "${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
@@ -283,6 +288,7 @@ def test_production_handoff_locks_hosted_mutation_steps() -> None:
         assert step["if"] == "${{ inputs.lock_for_handoff != true }}"
 
     commit = next(step for step in job["steps"] if step["name"] == "Commit scheduler state lineage")
+    claim = next(step for step in job["steps"] if step["name"] == "Claim scheduler state lineage")
     upload = next(step for step in job["steps"] if step["name"] == "Upload evidence bundle")
 
     assert job["steps"].index(upload) < job["steps"].index(commit)
@@ -291,7 +297,177 @@ def test_production_handoff_locks_hosted_mutation_steps() -> None:
     assert "steps.state_cache_verify.outputs.cache-hit == 'true'" in upload["if"]
     assert upload["with"]["if-no-files-found"] == "error"
     assert "steps.evidence_upload.outcome == 'success'" in commit["if"]
-    assert "handoff:$NEW_KEY" in commit["run"]
+    assert claim["env"]["LOCK_FOR_HANDOFF"] == "${{ inputs.lock_for_handoff }}"
+    assert 'final_prefix="handoff"' in claim["run"]
+    assert (
+        'claim="in-progress:v2:$final_prefix:$RUN_ID:$RUN_ATTEMPT:$PARENT_KEY:$NEW_KEY"'
+        in claim["run"]
+    )
+    assert 'echo "final_prefix=$final_prefix"' in claim["run"]
+    assert commit["env"]["FINAL_PREFIX"] == "${{ steps.state_claim.outputs.final_prefix }}"
+    assert 'committed="$FINAL_PREFIX:$NEW_KEY"' in commit["run"]
+
+
+@pytest.mark.parametrize(
+    (
+        "wrapper",
+        "scheduler",
+        "enabled_variable",
+        "lineage_variable",
+        "state_secret",
+        "key_prefix",
+        "storage_root",
+        "artifact_prefix",
+    ),
+    [
+        (
+            "recover-production-lineage.yml",
+            "autocontribute.yml",
+            "AUTOCONTRIBUTE_ENABLED",
+            "AUTOCONTRIBUTE_STATE_LINEAGE",
+            "${{ secrets.AUTOCONTRIBUTE_STATE_TOKEN }}",
+            "autocontribute-state-",
+            ".autocontribute",
+            "autocontribute",
+        ),
+        (
+            "recover-staging-lineage.yml",
+            "staging.yml",
+            "AUTOCONTRIBUTE_STAGING_ENABLED",
+            "AUTOCONTRIBUTE_STAGING_STATE_LINEAGE",
+            "${{ secrets.AUTOCONTRIBUTE_STAGING_STATE_TOKEN }}",
+            "autocontribute-staging-state-",
+            ".autocontribute-staging",
+            "autocontribute-staging",
+        ),
+    ],
+)
+def test_hosted_lineage_recovery_wrappers_share_scheduler_lock_and_fixed_boundaries(
+    wrapper: str,
+    scheduler: str,
+    enabled_variable: str,
+    lineage_variable: str,
+    state_secret: str,
+    key_prefix: str,
+    storage_root: str,
+    artifact_prefix: str,
+) -> None:
+    workflow_root = ROOT / ".github" / "workflows"
+    document = yaml.safe_load((workflow_root / wrapper).read_text())
+    scheduler_document = yaml.safe_load((workflow_root / scheduler).read_text())
+    triggers = document.get("on", document[True])
+    inputs = triggers["workflow_dispatch"]["inputs"]
+    job = document["jobs"]["recover"]
+
+    assert inputs["recovery_action"]["options"] == [
+        "promote_claimed",
+        "restore_parent_stopped",
+    ]
+    assert inputs["expected_claim"]["required"] is True
+    assert inputs["restore_over_unusable_claimant"]["default"] is False
+    assert inputs["legacy_claim_intent"]["default"] == "reject"
+    assert document["permissions"] == {"actions": "read", "contents": "read"}
+    assert document["concurrency"] == scheduler_document["concurrency"]
+    assert "github.event.repository.default_branch" in job["if"]
+    assert job["uses"] == "./.github/workflows/_recover-lineage.yml"
+    assert job["with"]["enabled_variable"] == enabled_variable
+    assert job["with"]["lineage_variable"] == lineage_variable
+    assert job["with"]["key_prefix"] == key_prefix
+    assert job["with"]["storage_root"] == storage_root
+    assert job["with"]["source_artifact_prefix"] == artifact_prefix
+    assert job["with"]["scheduler_enabled"] == f"${{{{ vars.{enabled_variable} }}}}"
+    assert job["secrets"] == {"state_token": state_secret}
+
+
+def test_hosted_lineage_recovery_requires_exact_claim_and_exact_retained_evidence() -> None:
+    path = ROOT / ".github" / "workflows" / "_recover-lineage.yml"
+    document = yaml.safe_load(path.read_text())
+    job = document["jobs"]["recover"]
+    steps = job["steps"]
+    resolve = next(step for step in steps if step.get("id") == "recovery_lineage")
+    claimant_probe = next(step for step in steps if step.get("id") == "claimant_probe")
+    artifact_probe = next(step for step in steps if step.get("id") == "claimant_artifact")
+    claimant_restore = next(step for step in steps if step.get("id") == "claimant_cache")
+    artifact_restore = next(
+        step for step in steps if step.get("name") == "Restore exact claimant evidence artifact"
+    )
+
+    assert document["permissions"] == {"actions": "read", "contents": "read"}
+    assert job["timeout-minutes"] == 45
+    assert 'current" != "$EXPECTED_CLAIM' in resolve["run"]
+    assert '"${#claim_parts[@]}" -eq 7' in resolve["run"]
+    assert '"${claim_parts[1]}" == "v2"' in resolve["run"]
+    assert 'candidate_key="${claim_parts[6]}"' in resolve["run"]
+    assert 'candidate_key="${KEY_PREFIX}v5-' in resolve["run"]
+    assert 'candidate_key" != "$expected_candidate' in resolve["run"]
+    assert "requires an explicit committed or handoff intent" in resolve["run"]
+    assert claimant_probe["with"]["key"] == "${{ steps.recovery_lineage.outputs.candidate_key }}"
+    assert claimant_probe["with"]["lookup-only"] is True
+    assert "restore-keys" not in claimant_probe["with"]
+    assert claimant_restore["with"]["key"] == "${{ steps.recovery_lineage.outputs.candidate_key }}"
+    assert claimant_restore["with"]["fail-on-cache-miss"] is True
+    assert "restore-keys" not in claimant_restore["with"]
+    assert "actions/artifacts?per_page=100&name=$ARTIFACT_NAME" in artifact_probe["run"]
+    assert ".workflow_run.id == $CLAIM_RUN_ID" in artifact_probe["run"]
+    assert ".expired == false" in artifact_probe["run"]
+    assert "ARTIFACT_NAME" in artifact_probe["run"]
+    assert artifact_probe["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "steps.claimant_probe.outputs.cache-hit != 'true'" in artifact_restore["if"]
+    assert "steps.claimant_artifact.outputs.artifact-hit == 'true'" in artifact_restore["if"]
+    assert 'gh run download "$CLAIM_RUN_ID"' in artifact_restore["run"]
+    assert ' --name "$ARTIFACT_NAME"' in artifact_restore["run"]
+
+
+def test_hosted_lineage_recovery_persists_safe_generation_before_stale_claim_cas() -> None:
+    path = ROOT / ".github" / "workflows" / "_recover-lineage.yml"
+    document = yaml.safe_load(path.read_text())
+    steps = document["jobs"]["recover"]["steps"]
+    require_disabled = next(step for step in steps if step["name"] == "Require disabled scheduling")
+    resolve = next(step for step in steps if step.get("id") == "recovery_lineage")
+    refuse_rollback = next(
+        step for step in steps if step["name"] == "Refuse recoverable claimant rollback"
+    )
+    stop = next(step for step in steps if step["name"] == "Activate continuity-loss safety stop")
+    complete_backup = next(
+        step
+        for step in steps
+        if step["name"] == "Verify recovered state and create complete evidence"
+    )
+    save = next(step for step in steps if step.get("id") == "recovery_cache_save")
+    verify = next(step for step in steps if step.get("id") == "recovery_cache_verify")
+    upload = next(step for step in steps if step.get("id") == "recovery_evidence")
+    compare_and_swap = next(
+        step for step in steps if step["name"] == "Compare-and-swap recovered lineage"
+    )
+
+    assert '"$SCHEDULER_ENABLED" == "true"' in require_disabled["run"]
+    assert '"$enabled" == "true"' in resolve["run"]
+    assert "RESTORE_OVER_UNUSABLE" in refuse_rollback["run"]
+    assert "use promote_claimed instead of discarding it" in refuse_rollback["run"]
+    assert stop["if"] == "${{ inputs.recovery_action == 'restore_parent_stopped' }}"
+    assert "safety stop" in stop["run"]
+    assert '--actor "$OPERATOR_ACTOR"' in stop["run"]
+    assert "--complete" in complete_backup["run"]
+    assert save["with"]["key"] == "${{ steps.recovery_lineage.outputs.recovery_key }}"
+    assert verify["with"]["key"] == "${{ steps.recovery_lineage.outputs.recovery_key }}"
+    assert verify["with"]["lookup-only"] is True
+    assert verify["with"]["fail-on-cache-miss"] is True
+    assert upload["with"]["if-no-files-found"] == "error"
+    assert steps.index(complete_backup) < steps.index(save) < steps.index(verify)
+    assert steps.index(verify) < steps.index(upload) < steps.index(compare_and_swap)
+    assert '"$enabled" == "true"' in compare_and_swap["run"]
+    assert 'current" != "$CLAIMED_LINEAGE' in compare_and_swap["run"]
+    assert '-f value="$FINAL_PREFIX:$RECOVERY_KEY"' in compare_and_swap["run"]
+
+    state_token = "${{ secrets.state_token }}"
+    token_steps = [step["name"] for step in steps if state_token in step.get("env", {}).values()]
+    assert token_steps == [
+        "Resolve exact stuck lineage claim",
+        "Compare-and-swap recovered lineage",
+    ]
+    workflow_text = path.read_text()
+    assert "OPENAI_API_KEY" not in workflow_text
+    assert "AUTOCONTRIBUTE_GITHUB_TOKEN" not in workflow_text
 
 
 def test_ci_audits_workflows_shell_and_complete_history_for_secrets() -> None:

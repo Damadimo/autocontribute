@@ -1,0 +1,520 @@
+name: Reusable hosted-state recovery
+
+on:
+  workflow_call:
+    inputs:
+      artifact_prefix:
+        required: true
+        type: string
+      config_path:
+        required: true
+        type: string
+      expected_claim:
+        required: true
+        type: string
+      enabled_variable:
+        required: true
+        type: string
+      key_prefix:
+        required: true
+        type: string
+      legacy_claim_intent:
+        required: true
+        type: string
+      lineage_variable:
+        required: true
+        type: string
+      operator_actor:
+        required: false
+        type: string
+      recovery_action:
+        required: true
+        type: string
+      recovery_reason:
+        required: false
+        type: string
+      restore_over_unusable_claimant:
+        required: false
+        type: boolean
+      scheduler_enabled:
+        required: false
+        type: string
+      source_artifact_prefix:
+        required: true
+        type: string
+      storage_root:
+        required: true
+        type: string
+    secrets:
+      state_token:
+        required: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Require disabled scheduling
+        shell: bash
+        env:
+          RECOVERY_ACTION: ${{ inputs.recovery_action }}
+          SCHEDULER_ENABLED: ${{ inputs.scheduler_enabled }}
+        run: |
+          set -euo pipefail
+          if [[ "$SCHEDULER_ENABLED" == "true" ]]; then
+            echo "Disable this scheduler's repository enable variable before recovery" >&2
+            exit 1
+          fi
+          if [[ "$RECOVERY_ACTION" != "promote_claimed" &&
+                "$RECOVERY_ACTION" != "restore_parent_stopped" ]]; then
+            echo "Unsupported hosted-state recovery action" >&2
+            exit 1
+          fi
+      - name: Check out protected recovery source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Resolve exact stuck lineage claim
+        id: recovery_lineage
+        shell: bash
+        env:
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          ENABLED_VARIABLE: ${{ inputs.enabled_variable }}
+          EXPECTED_CLAIM: ${{ inputs.expected_claim }}
+          GH_TOKEN: ${{ secrets.state_token }}
+          KEY_PREFIX: ${{ inputs.key_prefix }}
+          LEGACY_CLAIM_INTENT: ${{ inputs.legacy_claim_intent }}
+          LINEAGE_VARIABLE: ${{ inputs.lineage_variable }}
+          OPERATOR_ACTOR: ${{ inputs.operator_actor }}
+          RECOVERY_ACTION: ${{ inputs.recovery_action }}
+          RECOVERY_REASON: ${{ inputs.recovery_reason }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          RUNNER_OS: ${{ runner.os }}
+          SOURCE_ARTIFACT_PREFIX: ${{ inputs.source_artifact_prefix }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "The dedicated hosted-state token is required" >&2
+            exit 1
+          fi
+          if [[ ! "$KEY_PREFIX" =~ ^[a-z0-9-]+-$ ||
+                ! "$SOURCE_ARTIFACT_PREFIX" =~ ^[a-z0-9-]+$ ||
+                ! "$ENABLED_VARIABLE" =~ ^[A-Z][A-Z0-9_]*$ ||
+                ! "$LINEAGE_VARIABLE" =~ ^[A-Z][A-Z0-9_]*$ ||
+                ! "$RUNNER_OS" =~ ^[A-Za-z][A-Za-z0-9._-]*$ ||
+                ! "$REPOSITORY_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Recovery configuration contains an invalid lineage component" >&2
+            exit 1
+          fi
+          endpoint="repos/$CONTROL_REPOSITORY/actions/variables/$LINEAGE_VARIABLE"
+          enabled="$(gh api --paginate \
+            "repos/$CONTROL_REPOSITORY/actions/variables?per_page=100" \
+            --jq ".variables[] | select(.name == \"$ENABLED_VARIABLE\") | .value")"
+          if [[ "$enabled" == "true" ]]; then
+            echo "Scheduler enable variable changed during recovery preflight" >&2
+            exit 1
+          fi
+          current="$(gh api "$endpoint" --jq .value)"
+          if [[ -z "$EXPECTED_CLAIM" || "$current" != "$EXPECTED_CLAIM" ]]; then
+            echo "Hosted-state lineage no longer equals the operator-confirmed claim" >&2
+            exit 1
+          fi
+
+          IFS=: read -r -a claim_parts <<<"$current"
+          claim_format=""
+          final_prefix=""
+          if [[ "${#claim_parts[@]}" -eq 7 &&
+                "${claim_parts[0]}" == "in-progress" &&
+                "${claim_parts[1]}" == "v2" ]]; then
+            claim_format="v2"
+            final_prefix="${claim_parts[2]}"
+            claim_run_id="${claim_parts[3]}"
+            claim_run_attempt="${claim_parts[4]}"
+            parent_key="${claim_parts[5]}"
+            candidate_key="${claim_parts[6]}"
+            if [[ "$LEGACY_CLAIM_INTENT" != "reject" ]]; then
+              echo "A v2 claim already binds finalization intent; reject legacy override input" >&2
+              exit 1
+            fi
+          elif [[ "${#claim_parts[@]}" -eq 4 &&
+                  "${claim_parts[0]}" == "in-progress" ]]; then
+            claim_format="legacy"
+            claim_run_id="${claim_parts[1]}"
+            claim_run_attempt="${claim_parts[2]}"
+            parent_key="${claim_parts[3]}"
+            candidate_key="${KEY_PREFIX}v5-${RUNNER_OS}-${REPOSITORY_ID}-${claim_run_id}-${claim_run_attempt}"
+            if [[ "$RECOVERY_ACTION" == "promote_claimed" ]]; then
+              if [[ "$LEGACY_CLAIM_INTENT" != "committed" &&
+                    "$LEGACY_CLAIM_INTENT" != "handoff" ]]; then
+                echo "Promoting a legacy claim requires an explicit committed or handoff intent" >&2
+                exit 1
+              fi
+              final_prefix="$LEGACY_CLAIM_INTENT"
+            else
+              final_prefix="committed"
+            fi
+          else
+            echo "Hosted-state lineage is not a supported in-progress claim" >&2
+            exit 1
+          fi
+
+          if [[ "$final_prefix" != "committed" && "$final_prefix" != "handoff" ]]; then
+            echo "Hosted-state claim has an invalid finalization intent" >&2
+            exit 1
+          fi
+          if [[ ! "$claim_run_id" =~ ^[1-9][0-9]*$ ||
+                ! "$claim_run_attempt" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Hosted-state claim has an invalid run identity" >&2
+            exit 1
+          fi
+          expected_candidate="${KEY_PREFIX}v5-${RUNNER_OS}-${REPOSITORY_ID}-${claim_run_id}-${claim_run_attempt}"
+          if [[ "$candidate_key" != "$expected_candidate" ]]; then
+            echo "Hosted-state claim destination is not the exact claimant generation" >&2
+            exit 1
+          fi
+
+          if [[ "$parent_key" == "bootstrap" ]]; then
+            parent_schema="bootstrap"
+          elif [[ "$parent_key" =~ ^${KEY_PREFIX}v(3|4|5)-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$ ]]; then
+            parent_schema="v${BASH_REMATCH[1]}"
+          else
+            echo "Hosted-state claim has an unsupported parent generation" >&2
+            exit 1
+          fi
+
+          if [[ "$RECOVERY_ACTION" == "restore_parent_stopped" ]]; then
+            final_prefix="committed"
+            if [[ ! "$OPERATOR_ACTOR" =~ ^[A-Za-z0-9][A-Za-z0-9_.@-]{0,99}$ ]]; then
+              echo "Continuity-loss recovery requires a canonical operator identity" >&2
+              exit 1
+            fi
+            if [[ ! "$RECOVERY_REASON" =~ ^[[:print:]]{1,500}$ ]]; then
+              echo "Continuity-loss recovery requires a bounded, single-line incident reason" >&2
+              exit 1
+            fi
+          fi
+
+          recovery_key="${KEY_PREFIX}v5-${RUNNER_OS}-${REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          source_artifact="${SOURCE_ARTIFACT_PREFIX}-${claim_run_id}-${claim_run_attempt}"
+          {
+            echo "candidate_key=$candidate_key"
+            echo "claim_format=$claim_format"
+            echo "claim_run_id=$claim_run_id"
+            echo "final_prefix=$final_prefix"
+            echo "parent_key=$parent_key"
+            echo "parent_schema=$parent_schema"
+            echo "recovery_key=$recovery_key"
+            echo "source_artifact=$source_artifact"
+          } >>"$GITHUB_OUTPUT"
+      - name: Probe exact claimant generation
+        id: claimant_probe
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ${{ inputs.storage_root }}/runs/
+            ${{ inputs.storage_root }}/evaluations/
+            ${{ inputs.storage_root }}/snapshots/state.sqlite3
+          key: ${{ steps.recovery_lineage.outputs.candidate_key }}
+          lookup-only: true
+      - name: Probe exact claimant evidence artifact
+        id: claimant_artifact
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.recovery_lineage.outputs.source_artifact }}
+          CLAIM_RUN_ID: ${{ steps.recovery_lineage.outputs.claim_run_id }}
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          matches="$(gh api --paginate \
+            "repos/$CONTROL_REPOSITORY/actions/artifacts?per_page=100&name=$ARTIFACT_NAME" \
+            --jq ".artifacts[] | select(.name == \"$ARTIFACT_NAME\" and \
+              .workflow_run.id == $CLAIM_RUN_ID and .expired == false) | .name")"
+          if [[ -n "$matches" ]]; then
+            echo "artifact-hit=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "artifact-hit=false" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Restore exact claimant cache
+        id: claimant_cache
+        if: >-
+          ${{ inputs.recovery_action == 'promote_claimed' &&
+          steps.claimant_probe.outputs.cache-hit == 'true' }}
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ${{ inputs.storage_root }}/runs/
+            ${{ inputs.storage_root }}/evaluations/
+            ${{ inputs.storage_root }}/snapshots/state.sqlite3
+          key: ${{ steps.recovery_lineage.outputs.candidate_key }}
+          fail-on-cache-miss: true
+      - name: Restore exact claimant evidence artifact
+        if: >-
+          ${{ inputs.recovery_action == 'promote_claimed' &&
+          steps.claimant_probe.outputs.cache-hit != 'true' &&
+          steps.claimant_artifact.outputs.artifact-hit == 'true' }}
+        shell: bash
+        env:
+          ARTIFACT_NAME: ${{ steps.recovery_lineage.outputs.source_artifact }}
+          CLAIM_RUN_ID: ${{ steps.recovery_lineage.outputs.claim_run_id }}
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          STORAGE_ROOT: ${{ inputs.storage_root }}
+        run: >-
+          gh run download "$CLAIM_RUN_ID"
+          --repo "$CONTROL_REPOSITORY"
+          --name "$ARTIFACT_NAME"
+          --dir "$STORAGE_ROOT"
+      - name: Require recoverable claimant evidence
+        if: ${{ inputs.recovery_action == 'promote_claimed' }}
+        shell: bash
+        env:
+          CLAIMANT_ARTIFACT_HIT: ${{ steps.claimant_artifact.outputs.artifact-hit }}
+          CLAIMANT_CACHE_HIT: ${{ steps.claimant_probe.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ "$CLAIMANT_CACHE_HIT" != "true" && "$CLAIMANT_ARTIFACT_HIT" != "true" ]]; then
+            echo "Neither exact claimant cache nor immutable evidence artifact is available" >&2
+            exit 1
+          fi
+      - name: Refuse recoverable claimant rollback
+        if: ${{ inputs.recovery_action == 'restore_parent_stopped' }}
+        shell: bash
+        env:
+          CLAIMANT_ARTIFACT_HIT: ${{ steps.claimant_artifact.outputs.artifact-hit }}
+          CLAIMANT_CACHE_HIT: ${{ steps.claimant_probe.outputs.cache-hit }}
+          RESTORE_OVER_UNUSABLE: ${{ inputs.restore_over_unusable_claimant }}
+        run: |
+          set -euo pipefail
+          if [[ ( "$CLAIMANT_CACHE_HIT" == "true" || "$CLAIMANT_ARTIFACT_HIT" == "true" ) &&
+                "$RESTORE_OVER_UNUSABLE" != "true" ]]; then
+            echo "Exact claimant evidence exists; use promote_claimed instead of discarding it" >&2
+            exit 1
+          fi
+      - name: Restore exact parent generation
+        id: parent_cache
+        if: >-
+          ${{ inputs.recovery_action == 'restore_parent_stopped' &&
+          steps.recovery_lineage.outputs.parent_key != 'bootstrap' }}
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ${{ inputs.storage_root }}/runs/
+            ${{ inputs.storage_root }}/evaluations/
+            ${{ inputs.storage_root }}/snapshots/state.sqlite3
+          key: ${{ steps.recovery_lineage.outputs.parent_key }}
+          fail-on-cache-miss: true
+      - name: Validate exact recovery source
+        shell: bash
+        env:
+          CANDIDATE_KEY: ${{ steps.recovery_lineage.outputs.candidate_key }}
+          CLAIMANT_MATCHED_KEY: ${{ steps.claimant_cache.outputs.cache-matched-key }}
+          CLAIMANT_ARTIFACT_HIT: ${{ steps.claimant_artifact.outputs.artifact-hit }}
+          CLAIMANT_CACHE_HIT: ${{ steps.claimant_probe.outputs.cache-hit }}
+          PARENT_KEY: ${{ steps.recovery_lineage.outputs.parent_key }}
+          PARENT_MATCHED_KEY: ${{ steps.parent_cache.outputs.cache-matched-key }}
+          RECOVERY_ACTION: ${{ inputs.recovery_action }}
+          STORAGE_ROOT: ${{ inputs.storage_root }}
+        run: |
+          set -euo pipefail
+          snapshot="$STORAGE_ROOT/snapshots/state.sqlite3"
+          live_state="$STORAGE_ROOT/state.sqlite3"
+          if [[ -L "$STORAGE_ROOT" ]]; then
+            echo "Recovery storage root cannot be a symbolic link" >&2
+            exit 1
+          fi
+          if [[ "$RECOVERY_ACTION" == "promote_claimed" ]]; then
+            if [[ "$CLAIMANT_CACHE_HIT" == "true" &&
+                  "$CLAIMANT_MATCHED_KEY" != "$CANDIDATE_KEY" ]]; then
+              echo "Recovered cache does not exactly match the claimant generation" >&2
+              exit 1
+            fi
+            if [[ "$CLAIMANT_CACHE_HIT" != "true" && "$CLAIMANT_ARTIFACT_HIT" != "true" ]]; then
+              echo "No exact claimant evidence was restored" >&2
+              exit 1
+            fi
+          elif [[ "$PARENT_KEY" == "bootstrap" ]]; then
+            if [[ -n "$PARENT_MATCHED_KEY" || -e "$snapshot" || -L "$snapshot" ||
+                  -e "$live_state" || -L "$live_state" ]]; then
+              echo "Bootstrap recovery found unexpected prior state" >&2
+              exit 1
+            fi
+            exit 0
+          elif [[ "$PARENT_MATCHED_KEY" != "$PARENT_KEY" ]]; then
+            echo "Recovered cache does not exactly match the claimed parent generation" >&2
+            exit 1
+          fi
+          if [[ -L "$snapshot" || ! -f "$snapshot" || -e "$live_state" || -L "$live_state" ]]; then
+            echo "Recovery source does not contain one safe offline state snapshot" >&2
+            exit 1
+          fi
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.30"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install locked Autocontribute
+        run: uv sync --locked
+      - name: Validate recovery configuration and source schema
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+          PARENT_SCHEMA: ${{ steps.recovery_lineage.outputs.parent_schema }}
+          RECOVERY_ACTION: ${{ inputs.recovery_action }}
+          STORAGE_ROOT: ${{ inputs.storage_root }}
+        run: |
+          uv run python - <<'PY'
+          import os
+          import sqlite3
+          from pathlib import Path
+
+          from autocontribute.config import load_config
+
+          storage = Path(os.environ["STORAGE_ROOT"])
+          expected_storage = (Path.cwd() / storage).resolve()
+          settings = load_config(Path(os.environ["CONFIG_PATH"]))
+          if settings.storage.path != expected_storage:
+              raise SystemExit("Recovery configuration points at a different storage root")
+          if settings.publishing.mode != "review_required":
+              raise SystemExit("Hosted recovery requires publishing.mode: review_required")
+          if (
+              settings.sandbox.backend != "docker"
+              or settings.sandbox.network != "none"
+              or settings.sandbox.allow_unsafe_local
+          ):
+              raise SystemExit("Hosted recovery requires the isolated Docker configuration")
+
+          if os.environ["RECOVERY_ACTION"] == "promote_claimed":
+              expected_schema = 5
+          else:
+              parent_schema = os.environ["PARENT_SCHEMA"]
+              if parent_schema == "bootstrap":
+                  raise SystemExit(0)
+              expected_schema = int(parent_schema.removeprefix("v"))
+          database = storage / "snapshots" / "state.sqlite3"
+          with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+              row = connection.execute(
+                  "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+              ).fetchone()
+          if row != (expected_schema,):
+              raise SystemExit("Recovery cache schema does not match its claimed generation")
+          PY
+      - name: Restore recovery source into live state
+        if: ${{ steps.recovery_lineage.outputs.parent_schema != 'bootstrap' || inputs.recovery_action == 'promote_claimed' }}
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+          STORAGE_ROOT: ${{ inputs.storage_root }}
+        run: >-
+          uv run autocontribute state restore
+          --config "$CONFIG_PATH"
+          --input "$STORAGE_ROOT/snapshots/state.sqlite3"
+      - name: Initialize continuity-loss bootstrap state
+        if: >-
+          ${{ inputs.recovery_action == 'restore_parent_stopped' &&
+          steps.recovery_lineage.outputs.parent_schema == 'bootstrap' }}
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: uv run autocontribute safety status --config "$CONFIG_PATH"
+      - name: Activate continuity-loss safety stop
+        if: ${{ inputs.recovery_action == 'restore_parent_stopped' }}
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+          OPERATOR_ACTOR: ${{ inputs.operator_actor }}
+          RECOVERY_REASON: ${{ inputs.recovery_reason }}
+        run: >-
+          uv run autocontribute safety stop
+          --config "$CONFIG_PATH"
+          --actor "$OPERATOR_ACTOR"
+          --reason "Hosted lineage continuity loss: $RECOVERY_REASON"
+      - name: Verify recovered state and create complete evidence
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+          RECOVERY_BUNDLE: ${{ runner.temp }}/hosted-lineage-recovery.bundle.zip
+        run: >-
+          uv run autocontribute state backup
+          --config "$CONFIG_PATH"
+          --complete
+          --output "$RECOVERY_BUNDLE"
+      - name: Create canonical recovered snapshot
+        env:
+          CONFIG_PATH: ${{ inputs.config_path }}
+          STORAGE_ROOT: ${{ inputs.storage_root }}
+        run: >-
+          uv run autocontribute state backup
+          --config "$CONFIG_PATH"
+          --output "$STORAGE_ROOT/snapshots/state.sqlite3"
+          --overwrite
+      - name: Save fresh recovered generation
+        id: recovery_cache_save
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ${{ inputs.storage_root }}/runs/
+            ${{ inputs.storage_root }}/evaluations/
+            ${{ inputs.storage_root }}/snapshots/state.sqlite3
+          key: ${{ steps.recovery_lineage.outputs.recovery_key }}
+      - name: Verify recovered generation persistence
+        id: recovery_cache_verify
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ${{ inputs.storage_root }}/runs/
+            ${{ inputs.storage_root }}/evaluations/
+            ${{ inputs.storage_root }}/snapshots/state.sqlite3
+          key: ${{ steps.recovery_lineage.outputs.recovery_key }}
+          lookup-only: true
+          fail-on-cache-miss: true
+      - name: Upload immutable recovery evidence
+        id: recovery_evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact_prefix }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ inputs.storage_root }}/runs/
+            ${{ inputs.storage_root }}/evaluations/
+            ${{ inputs.storage_root }}/snapshots/state.sqlite3
+            ${{ runner.temp }}/hosted-lineage-recovery.bundle.zip
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+      - name: Compare-and-swap recovered lineage
+        shell: bash
+        env:
+          CLAIMED_LINEAGE: ${{ inputs.expected_claim }}
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          ENABLED_VARIABLE: ${{ inputs.enabled_variable }}
+          FINAL_PREFIX: ${{ steps.recovery_lineage.outputs.final_prefix }}
+          GH_TOKEN: ${{ secrets.state_token }}
+          LINEAGE_VARIABLE: ${{ inputs.lineage_variable }}
+          RECOVERY_CACHE_HIT: ${{ steps.recovery_cache_verify.outputs.cache-hit }}
+          RECOVERY_KEY: ${{ steps.recovery_lineage.outputs.recovery_key }}
+        run: |
+          set -euo pipefail
+          if [[ "$RECOVERY_CACHE_HIT" != "true" ]]; then
+            echo "Recovered cache generation was not independently verified" >&2
+            exit 1
+          fi
+          if [[ "$FINAL_PREFIX" != "committed" && "$FINAL_PREFIX" != "handoff" ]]; then
+            echo "Recovered lineage has an invalid finalization intent" >&2
+            exit 1
+          fi
+          endpoint="repos/$CONTROL_REPOSITORY/actions/variables/$LINEAGE_VARIABLE"
+          enabled="$(gh api --paginate \
+            "repos/$CONTROL_REPOSITORY/actions/variables?per_page=100" \
+            --jq ".variables[] | select(.name == \"$ENABLED_VARIABLE\") | .value")"
+          if [[ "$enabled" == "true" ]]; then
+            echo "Scheduler was re-enabled during recovery; refusing lineage mutation" >&2
+            exit 1
+          fi
+          current="$(gh api "$endpoint" --jq .value)"
+          if [[ "$current" != "$CLAIMED_LINEAGE" ]]; then
+            echo "Hosted-state lineage changed during recovery; refusing stale finalization" >&2
+            exit 1
+          fi
+          gh api --method PATCH "$endpoint" -f name="$LINEAGE_VARIABLE" \
+            -f value="$FINAL_PREFIX:$RECOVERY_KEY" >/dev/null

@@ -81,6 +81,19 @@ bypass a failed save, migration, or missing lineage. Although the shadow workflo
 preserve the matching snapshot, run bundles, and evaluation records together for any later
 operator-reviewed fixture publication.
 
+If staging is left at an `in-progress` claim, set `AUTOCONTRIBUTE_STAGING_ENABLED=false` and use
+**Recover staging hosted state** from the default branch; never rewrite
+`AUTOCONTRIBUTE_STAGING_STATE_LINEAGE`. Copy the exact claim and try `promote_claimed` first. Recovery
+uses only its exact destination cache or the unexpired
+`autocontribute-staging-<run-id>-<attempt>` artifact, then verifies and persists a fresh generation
+before compare-and-swapping the unchanged claim. Use `restore_parent_stopped` only when claimant
+evidence is absent or has failed validation, with an operator identity and incident reason; if
+unusable evidence still exists, explicitly attest that fact with
+`restore_over_unusable_claimant=true`. Parent recovery activates a persistent safety stop. Keep
+staging disabled and inspect the recovered complete bundle on a trusted worker before any audited
+resume. The detailed procedure and legacy-claim rules are in
+[Scheduled operation](scheduled-operation.md#recovering-a-stranded-hosted-claim).
+
 ## What each fixture must exercise
 
 - a clear issue that should be solved and a superficially attractive issue that should be skipped;

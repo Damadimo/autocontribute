@@ -89,8 +89,12 @@ key, and claim that still-current generation immediately before stateful work. P
 leave the committed pointer retryable; a failed cache verification or evidence upload after the claim
 leaves the lineage locked instead of rolling back. The lineage steps require a separate
 `AUTOCONTRIBUTE_STATE_TOKEN` scoped only to **Variables: Read and write** on the control repository;
-that credential is never exposed to model or target-repository work. Before
-downloading state for local approval/publication, use the workflow's `lock_for_handoff=true`
+that credential is never exposed to model or target-repository work. If a stranded `in-progress`
+value needs recovery, disable scheduling and use the default-branch
+**Recover production hosted state** workflow to promote its exact cache or retained evidence artifact;
+the continuity-loss fallback restores only its exact parent and persists a safety stop. Never rewrite
+the lineage variable directly. Before downloading state for local approval/publication, use the
+workflow's `lock_for_handoff=true`
 dispatch; it uploads the complete handoff artifact before writing the irreversible marker that
 permanently stops the hosted lineage, so lifecycle state cannot fork. See
 [Scheduled operation](docs/scheduled-operation.md).

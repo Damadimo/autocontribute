@@ -251,6 +251,8 @@ jobs:
           CONTROL_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.AUTOCONTRIBUTE_STATE_TOKEN }}
           LINEAGE_VARIABLE: AUTOCONTRIBUTE_STATE_LINEAGE
+          LOCK_FOR_HANDOFF: ${{ inputs.lock_for_handoff }}
+          NEW_KEY: ${{ steps.state_lineage.outputs.new_key }}
           PARENT_KEY: ${{ steps.state_lineage.outputs.parent_key }}
           RESOLVED_LINEAGE: ${{ steps.state_lineage.outputs.resolved_lineage }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
@@ -265,7 +267,11 @@ jobs:
             echo "Scheduler lineage changed during preflight" >&2
             exit 1
           fi
-          claim="in-progress:$RUN_ID:$RUN_ATTEMPT:$PARENT_KEY"
+          final_prefix="committed"
+          if [[ "$LOCK_FOR_HANDOFF" == "true" ]]; then
+            final_prefix="handoff"
+          fi
+          claim="in-progress:v2:$final_prefix:$RUN_ID:$RUN_ATTEMPT:$PARENT_KEY:$NEW_KEY"
           if [[ -z "$RESOLVED_LINEAGE" ]]; then
             gh api --method POST "repos/$CONTROL_REPOSITORY/actions/variables" \
               -f name="$LINEAGE_VARIABLE" -f value="$claim" >/dev/null
@@ -274,6 +280,7 @@ jobs:
               -f value="$claim" >/dev/null
           fi
           echo "claim=$claim" >>"$GITHUB_OUTPUT"
+          echo "final_prefix=$final_prefix" >>"$GITHUB_OUTPUT"
       - name: Sync open pull-request lifecycle
         if: ${{ inputs.lock_for_handoff != true }}
         env:
@@ -351,7 +358,7 @@ jobs:
           CONTROL_REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.AUTOCONTRIBUTE_STATE_TOKEN }}
           LINEAGE_VARIABLE: AUTOCONTRIBUTE_STATE_LINEAGE
-          LOCK_FOR_HANDOFF: ${{ inputs.lock_for_handoff }}
+          FINAL_PREFIX: ${{ steps.state_claim.outputs.final_prefix }}
           NEW_KEY: ${{ steps.state_lineage.outputs.new_key }}
         run: |
           set -euo pipefail
@@ -361,10 +368,10 @@ jobs:
             echo "Scheduler lineage changed after it was claimed" >&2
             exit 1
           fi
-          if [[ "$LOCK_FOR_HANDOFF" == "true" ]]; then
-            committed="handoff:$NEW_KEY"
-          else
-            committed="committed:$NEW_KEY"
+          if [[ "$FINAL_PREFIX" != "committed" && "$FINAL_PREFIX" != "handoff" ]]; then
+            echo "Scheduler claim has an invalid finalization intent" >&2
+            exit 1
           fi
+          committed="$FINAL_PREFIX:$NEW_KEY"
           gh api --method PATCH "$endpoint" -f name="$LINEAGE_VARIABLE" \
             -f value="$committed" >/dev/null

@@ -1,0 +1,67 @@
+name: Recover staging hosted state
+
+on:
+  workflow_dispatch:
+    inputs:
+      recovery_action:
+        description: "Promote exact claimant state, or restore its parent with a safety stop"
+        required: true
+        type: choice
+        options:
+          - promote_claimed
+          - restore_parent_stopped
+      expected_claim:
+        description: "Exact current AUTOCONTRIBUTE_STAGING_STATE_LINEAGE in-progress value"
+        required: true
+        type: string
+      restore_over_unusable_claimant:
+        description: "After failed promotion, attest that claimant evidence is unusable"
+        required: true
+        default: false
+        type: boolean
+      legacy_claim_intent:
+        description: "For legacy promotion only; staging claims were always committed"
+        required: true
+        default: reject
+        type: choice
+        options:
+          - reject
+          - committed
+      operator_actor:
+        description: "Required canonical operator identity for parent recovery"
+        required: false
+        type: string
+      recovery_reason:
+        description: "Required incident reason for parent recovery"
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: autocontribute-staging-${{ github.repository_id }}
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    uses: ./.github/workflows/_recover-lineage.yml
+    with:
+      artifact_prefix: autocontribute-staging-lineage-recovery
+      config_path: autocontribute.staging.yml
+      enabled_variable: AUTOCONTRIBUTE_STAGING_ENABLED
+      expected_claim: ${{ inputs.expected_claim }}
+      key_prefix: autocontribute-staging-state-
+      legacy_claim_intent: ${{ inputs.legacy_claim_intent }}
+      lineage_variable: AUTOCONTRIBUTE_STAGING_STATE_LINEAGE
+      operator_actor: ${{ inputs.operator_actor }}
+      recovery_action: ${{ inputs.recovery_action }}
+      recovery_reason: ${{ inputs.recovery_reason }}
+      restore_over_unusable_claimant: ${{ inputs.restore_over_unusable_claimant }}
+      scheduler_enabled: ${{ vars.AUTOCONTRIBUTE_STAGING_ENABLED }}
+      source_artifact_prefix: autocontribute-staging
+      storage_root: .autocontribute-staging
+    secrets:
+      state_token: ${{ secrets.AUTOCONTRIBUTE_STAGING_STATE_TOKEN }}
