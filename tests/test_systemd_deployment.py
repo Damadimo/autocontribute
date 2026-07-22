@@ -198,6 +198,7 @@ def _run_workspace_quota_check(
     filesystem_type: str = "ext4",
     filesystem_root: str = "/",
     mount_options: str = "rw,nosuid,nodev,relatime",
+    mount_records: str | None = None,
     mount_table: str | None = None,
     workspace_owner: int | None = None,
     workspace_group: int | None = None,
@@ -216,6 +217,18 @@ def _run_workspace_quota_check(
     uid = os.getuid()
     gid = os.getgid()
     resolved_target = mount_target or os.fspath(workspace)
+    resolved_mount_records = (
+        mount_records
+        if mount_records is not None
+        else "{target} {filesystem} {root} {options} {device}\n"
+    ).format(
+        target=resolved_target,
+        workspace=resolved_target,
+        filesystem=filesystem_type,
+        root=filesystem_root,
+        options=mount_options,
+        device=mount_device,
+    )
     resolved_mount_table = (mount_table or "0:1 /\n{device} {workspace}\n0:2 /proc\n").format(
         device=mount_device,
         workspace=workspace,
@@ -233,17 +246,11 @@ printf '%s\n' "$TEST_SERVICE_GID"
         fake_bin / "findmnt",
         """#!/bin/sh
 set -eu
-if [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--target' ]; then
+if [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--mountpoint' ]; then
   [ "$4" = "$TEST_WORKSPACE" ]
   [ "$5" = '--output' ]
-  case "$6" in
-    TARGET) printf '%s\n' "$TEST_MOUNT_TARGET" ;;
-    FSTYPE) printf '%s\n' "$TEST_FILESYSTEM_TYPE" ;;
-    FSROOT) printf '%s\n' "$TEST_FILESYSTEM_ROOT" ;;
-    OPTIONS) printf '%s\n' "$TEST_MOUNT_OPTIONS" ;;
-    MAJ:MIN) printf '%s\n' "$TEST_MOUNT_DEVICE" ;;
-    *) exit 80 ;;
-  esac
+  [ "$6" = 'TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN' ]
+  printf '%s' "$TEST_MOUNT_RECORDS"
 elif [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--output' ]; then
   [ "$4" = 'MAJ:MIN,TARGET' ]
   printf '%s' "$TEST_MOUNT_TABLE"
@@ -284,6 +291,7 @@ esac
         "TEST_FILESYSTEM_TYPE": filesystem_type,
         "TEST_MOUNT_OPTIONS": mount_options,
         "TEST_MOUNT_DEVICE": mount_device,
+        "TEST_MOUNT_RECORDS": resolved_mount_records,
         "TEST_MOUNT_TABLE": resolved_mount_table,
         "TEST_MOUNT_TARGET": resolved_target,
         "TEST_PARENT_DEVICE": parent_device,
@@ -424,7 +432,12 @@ def test_workspace_quota_check_accepts_bounded_dedicated_ext4_mount(tmp_path: Pa
 def test_workspace_quota_check_accepts_same_target_namespace_layers(tmp_path: Path) -> None:
     result = _run_workspace_quota_check(
         tmp_path / "same-target-layers",
-        mount_table="253:7 {workspace}\n253:7 {workspace}\n",
+        mount_records=(
+            "{workspace} ext4 / rw,nosuid,nodev,relatime 253:7\n"
+            "{workspace} ext4 / rw,nosuid,nodev,relatime 253:7\n"
+            "{workspace} ext4 / rw,nosuid,nodev,relatime 253:7\n"
+        ),
+        mount_table=("253:7 {workspace}\n253:7 {workspace}\n253:7 {workspace}\n"),
     )
 
     assert result.returncode == 0, result.stderr
@@ -441,6 +454,21 @@ def test_workspace_quota_check_accepts_same_target_namespace_layers(tmp_path: Pa
         ("missing-nodev", {"mount_options": "rw,nosuid"}, "must use nodev"),
         ("missing-nosuid", {"mount_options": "rw,nodev"}, "must use nosuid"),
         ("bind", {"mount_options": "rw,nodev,nosuid,bind"}, "cannot be a bind"),
+        (
+            "layered-other-device",
+            {
+                "mount_records": (
+                    "{workspace} ext4 / rw,nodev,nosuid 253:7\n"
+                    "{workspace} ext4 / rw,nodev,nosuid 253:8\n"
+                )
+            },
+            "layered over another device",
+        ),
+        (
+            "hidden-device-layer",
+            {"mount_table": ("253:7 {workspace}\n253:8 {workspace}\n")},
+            "layered over another device",
+        ),
         (
             "alias-second-target",
             {"mount_table": ("0:1 /\n253:7 {workspace}\n253:7 /mnt/same-device-via-uuid-alias\n")},

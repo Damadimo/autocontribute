@@ -52,54 +52,58 @@ if [[
   fail 'Autocontribute workspace quota mount has unsafe ownership or permissions'
 fi
 
-mount_target="$(
-  findmnt --noheadings --raw --target "$workspace_root" --output TARGET
+mount_records="$(
+  findmnt --noheadings --raw --mountpoint "$workspace_root" \
+    --output TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN
 )" || fail 'Autocontribute could not resolve the workspace quota mount'
-filesystem_type="$(
-  findmnt --noheadings --raw --target "$workspace_root" --output FSTYPE
-)" || fail 'Autocontribute could not resolve the workspace quota filesystem'
-filesystem_root="$(
-  findmnt --noheadings --raw --target "$workspace_root" --output FSROOT
-)" || fail 'Autocontribute could not resolve the workspace quota filesystem root'
-mount_options="$(
-  findmnt --noheadings --raw --target "$workspace_root" --output OPTIONS
-)" || fail 'Autocontribute could not resolve the workspace quota mount options'
-mount_device="$(
-  findmnt --noheadings --raw --target "$workspace_root" --output MAJ:MIN
-)" || fail 'Autocontribute could not resolve the workspace quota mount device number'
-readonly mount_target filesystem_type filesystem_root mount_options mount_device
-
-if [[ "$mount_target" != "$workspace_root" ]]; then
-  printf 'Autocontribute workspaces are not an exact dedicated mount; findmnt reported %q\n' \
-    "$mount_target" >&2
-  exit 1
+readonly mount_records
+mount_device=""
+mount_record_count=0
+while read -r \
+  candidate_target candidate_filesystem candidate_root candidate_options candidate_device \
+  candidate_trailing; do
+  mount_record_count=$((mount_record_count + 1))
+  if [[ -n "$candidate_trailing" || "$candidate_target" != "$workspace_root" ]]; then
+    fail 'Autocontribute workspaces are not an exact dedicated mount'
+  fi
+  if [[ "$candidate_filesystem" != ext4 ]]; then
+    fail 'Autocontribute workspace quota mount must use ext4 with a fixed inode table'
+  fi
+  if [[ "$candidate_root" != / ]]; then
+    fail 'Autocontribute workspace quota mount must expose one whole filesystem'
+  fi
+  if [[ ! "$candidate_device" =~ ^[0-9]+:[0-9]+$ ]]; then
+    fail 'Autocontribute workspace quota mount reported an invalid device number'
+  fi
+  case ",$candidate_options," in
+    *,rw,*) ;;
+    *) fail 'Autocontribute workspace quota mount is not writable' ;;
+  esac
+  case ",$candidate_options," in
+    *,nodev,*) ;;
+    *) fail 'Autocontribute workspace quota mount must use nodev' ;;
+  esac
+  case ",$candidate_options," in
+    *,nosuid,*) ;;
+    *) fail 'Autocontribute workspace quota mount must use nosuid' ;;
+  esac
+  case ",$candidate_options," in
+    *,bind,* | *,rbind,*)
+      fail 'Autocontribute workspace quota mount cannot be a bind mount'
+      ;;
+  esac
+  if [[ -z "$mount_device" ]]; then
+    mount_device="$candidate_device"
+  elif [[ "$candidate_device" != "$mount_device" ]]; then
+    fail 'Autocontribute workspace quota mount is layered over another device'
+  fi
+done <<< "$mount_records"
+readonly mount_device mount_record_count
+unset candidate_target candidate_filesystem candidate_root candidate_options candidate_device
+unset candidate_trailing
+if [[ "$mount_record_count" -lt 1 || -z "$mount_device" ]]; then
+  fail 'Autocontribute workspace quota mount is unavailable'
 fi
-if [[ "$filesystem_type" != ext4 ]]; then
-  fail 'Autocontribute workspace quota mount must use ext4 with a fixed inode table'
-fi
-if [[ "$filesystem_root" != / ]]; then
-  fail 'Autocontribute workspace quota mount must expose one whole filesystem'
-fi
-if [[ ! "$mount_device" =~ ^[0-9]+:[0-9]+$ ]]; then
-  fail 'Autocontribute workspace quota mount reported an invalid device number'
-fi
-case ",$mount_options," in
-  *,rw,*) ;;
-  *) fail 'Autocontribute workspace quota mount is not writable' ;;
-esac
-case ",$mount_options," in
-  *,nodev,*) ;;
-  *) fail 'Autocontribute workspace quota mount must use nodev' ;;
-esac
-case ",$mount_options," in
-  *,nosuid,*) ;;
-  *) fail 'Autocontribute workspace quota mount must use nosuid' ;;
-esac
-case ",$mount_options," in
-  *,bind,* | *,rbind,*)
-    fail 'Autocontribute workspace quota mount cannot be a bind mount'
-    ;;
-esac
 
 mount_table="$(
   findmnt --noheadings --raw --output MAJ:MIN,TARGET
@@ -107,12 +111,14 @@ mount_table="$(
 readonly mount_table
 matching_mount_count=0
 while read -r candidate_device candidate_target; do
-  if [[ "$candidate_device" != "$mount_device" ]]; then
-    continue
+  if [[ "$candidate_target" == "$workspace_root" && "$candidate_device" != "$mount_device" ]]; then
+    fail 'Autocontribute workspace quota mount is layered over another device'
   fi
-  matching_mount_count=$((matching_mount_count + 1))
-  if [[ "$candidate_target" != "$workspace_root" ]]; then
+  if [[ "$candidate_device" == "$mount_device" && "$candidate_target" != "$workspace_root" ]]; then
     fail 'Autocontribute workspace quota device is mounted at another host path'
+  fi
+  if [[ "$candidate_device" == "$mount_device" && "$candidate_target" == "$workspace_root" ]]; then
+    matching_mount_count=$((matching_mount_count + 1))
   fi
 done <<< "$mount_table"
 readonly matching_mount_count
