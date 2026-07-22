@@ -167,9 +167,27 @@ def _legacy_database(root: Path) -> RunManifest:
     return run
 
 
-def _downgrade_current_database_to_v4(database: Path) -> None:
-    """Remove only the v5 object, leaving the exact canonical v4 schema behind."""
+def _downgrade_current_database_to_v5(database: Path) -> None:
+    """Remove only the v6 fence, leaving the exact canonical v5 schema behind."""
 
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        connection.executescript(
+            """
+            ALTER TABLE publication_gate_holds DROP COLUMN outcome_corpus_cursor;
+            UPDATE schema_metadata SET schema_version = 5 WHERE singleton = 1;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _downgrade_current_database_to_v4(database: Path) -> None:
+    """Remove the v6/v5 objects, leaving the exact canonical v4 schema behind."""
+
+    _downgrade_current_database_to_v5(database)
     connection = sqlite3.connect(database)
     try:
         connection.execute("PRAGMA journal_mode = DELETE")
@@ -321,6 +339,15 @@ def _reserve_gate(
     cursor: str | None = None,
     fingerprint: str = "d" * 64,
 ) -> None:
+    run.publishing_login = "octocat"
+    run.publishing_api_origin = "https://api.github.com"
+    store.save(run, event="test.publication_context", details={})
+    outcome_cursor = store.upstream_outcome_corpus_cursor(
+        fingerprint,
+        "octocat",
+        "https://api.github.com",
+        exclude_run_id=run.run_id,
+    )
     store.reserve_publication(
         run.run_id,
         "example/project",
@@ -328,6 +355,9 @@ def _reserve_gate(
         repository_cooldown=timedelta(0),
         evaluation_corpus_cursor=cursor or store.evaluation_corpus_cursor(),
         evaluation_deployment_fingerprint=fingerprint,
+        outcome_corpus_cursor=outcome_cursor,
+        publishing_login="octocat",
+        publishing_api_origin="https://api.github.com",
     )
 
 
@@ -337,7 +367,7 @@ def _publication_run(
     status: RunStatus = RunStatus.APPROVED,
     repository: str = "example/project",
 ) -> RunManifest:
-    run = store.create_run()
+    run = store.create_run(deployment_fingerprint="d" * 64)
     observed_at = datetime(2026, 7, 21, 12, tzinfo=UTC)
     run.candidate = IssueCandidate(
         repository=repository,
@@ -370,6 +400,16 @@ def _begin_publication(
     now: datetime | None = None,
 ) -> RunManifest:
     cursor = store.evaluation_corpus_cursor() if with_gate else None
+    outcome_cursor = (
+        store.upstream_outcome_corpus_cursor(
+            "d" * 64,
+            "octocat",
+            "https://api.github.com",
+            exclude_run_id=run.run_id,
+        )
+        if with_gate
+        else None
+    )
     return store.begin_publication(
         run,
         "example/project",
@@ -386,6 +426,7 @@ def _begin_publication(
         now=now,
         evaluation_corpus_cursor=cursor,
         evaluation_deployment_fingerprint="d" * 64 if with_gate else None,
+        outcome_corpus_cursor=outcome_cursor,
     )
 
 
@@ -447,7 +488,7 @@ def test_artifact_path_cannot_escape_run_directory(tmp_path: Path) -> None:
         store.write_artifact(run.run_id, "../secret", "no")
 
 
-def test_fresh_database_has_current_version_and_all_v5_tables(tmp_path: Path) -> None:
+def test_fresh_database_has_current_version_and_all_v6_tables(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
 
     with sqlite3.connect(store.database_path) as connection:
@@ -458,7 +499,7 @@ def test_fresh_database_has_current_version_and_all_v5_tables(tmp_path: Path) ->
             )
         }
 
-    assert store.schema_version == CURRENT_SCHEMA_VERSION == 5
+    assert store.schema_version == CURRENT_SCHEMA_VERSION == 6
     assert tables == {
         "schema_metadata",
         "runs",
@@ -480,7 +521,7 @@ def test_legacy_database_migrates_transactionally_without_losing_data(tmp_path: 
 
     store = RunStore(root)
 
-    assert store.schema_version == CURRENT_SCHEMA_VERSION == 5
+    assert store.schema_version == CURRENT_SCHEMA_VERSION == 6
     assert store.get(legacy.run_id) == legacy
     assert len(store.events(legacy.run_id)) == 1
     assert store.circuit_breaker_status().is_tripped is False
@@ -504,7 +545,7 @@ def test_v3_migration_backfills_event_heads_and_active_lease_generation(tmp_path
 
     migrated = RunStore(root)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 5
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 6
     migrated.verify_event_chains()
     with sqlite3.connect(migrated.database_path) as connection:
         anchor = connection.execute(
@@ -624,6 +665,54 @@ def test_v4_migration_attests_a_legacy_gate_hold_and_keeps_it_active(tmp_path: P
     ]
     assert len(legacy) == 1
     assert json.loads(legacy[0]["details"]) == {"corpus_cursor": cursor, "held_at": held_at}
+
+
+def test_v5_migration_fences_a_pre_outcome_hold_from_automatic_recovery(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = RunStore(root)
+    run = _publication_run(store, status=RunStatus.READY_FOR_APPROVAL)
+    _begin_publication(store, run, with_gate=False)
+    cursor = store.evaluation_corpus_cursor()
+    held_at = datetime(2026, 7, 21, 14, 30, tzinfo=UTC).isoformat()
+    with store._connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            INSERT INTO publication_gate_holds(
+                run_id, deployment_fingerprint, corpus_cursor,
+                outcome_corpus_cursor, held_at
+            ) VALUES (?, ?, ?, NULL, ?)
+            """,
+            (run.run_id, "d" * 64, cursor, held_at),
+        )
+        store._append_event(
+            connection,
+            run.run_id,
+            "publication.gate.held",
+            {
+                "deployment_fingerprint": "d" * 64,
+                "corpus_cursor": cursor,
+                "held_at": held_at,
+            },
+        )
+    _downgrade_current_database_to_v5(store.database_path)
+
+    migrated = RunStore(root)
+
+    assert migrated.schema_version == 6
+    with sqlite3.connect(migrated.database_path) as connection:
+        assert connection.execute(
+            """
+            SELECT outcome_corpus_cursor FROM publication_gate_holds
+            WHERE run_id = ?
+            """,
+            (run.run_id,),
+        ).fetchone() == (None,)
+    recovered = migrated.get(run.run_id)
+    with pytest.raises(StateError, match="predates schema-v6"):
+        _begin_publication(migrated, recovered, with_gate=False)
 
 
 def test_v4_migration_derives_released_legacy_hold_evidence_from_exact_release(
@@ -973,7 +1062,7 @@ def test_restore_snapshot_accepts_exact_v2_then_initialization_migrates_it(
     with sqlite3.connect(restored) as connection:
         assert connection.execute("SELECT schema_version FROM schema_metadata").fetchone() == (2,)
     migrated = RunStore(restored_root)
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 5
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 6
     assert migrated.get(run.run_id).run_id == run.run_id
 
 
@@ -1327,7 +1416,7 @@ def test_begin_publication_rejects_another_runs_hold_without_mutating_intent(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    other = store.create_run()
+    other = store.create_run(deployment_fingerprint="d" * 64)
     _reserve_gate(store, other)
     run = _publication_run(store)
 
@@ -1395,15 +1484,7 @@ def test_begin_publication_recovers_an_approved_same_run_hold_without_duplicatio
 ) -> None:
     store = RunStore(tmp_path / "state")
     run = _publication_run(store)
-    cursor = store.evaluation_corpus_cursor()
-    store.reserve_publication(
-        run.run_id,
-        "example/project",
-        max_per_utc_day=100,
-        repository_cooldown=timedelta(0),
-        evaluation_corpus_cursor=cursor,
-        evaluation_deployment_fingerprint="d" * 64,
-    )
+    _reserve_gate(store, run)
 
     _begin_publication(store, run)
 
@@ -1420,7 +1501,7 @@ def test_compensation_without_a_same_run_hold_rejects_any_other_active_hold(
     store = RunStore(tmp_path / "state")
     review_run = _publication_run(store)
     _begin_publication(store, review_run, with_gate=False)
-    other = store.create_run()
+    other = store.create_run(deployment_fingerprint="d" * 64)
     _reserve_gate(store, other)
 
     with pytest.raises(StateError, match="held by another run"):
@@ -1565,10 +1646,24 @@ def test_publication_gate_reservation_is_paired_exact_and_does_not_bypass_existi
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    holder = store.create_run()
-    blocked = store.create_run()
+    holder = store.create_run(deployment_fingerprint="d" * 64)
+    blocked = store.create_run(deployment_fingerprint="d" * 64)
     cursor = store.evaluation_corpus_cursor()
-    fingerprint = "a" * 64
+    fingerprint = "d" * 64
+    holder.publishing_login = "octocat"
+    holder.publishing_api_origin = "https://api.github.com"
+    store.save(holder, event="test.publication_context", details={})
+    outcome_cursor = store.upstream_outcome_corpus_cursor(
+        fingerprint,
+        "octocat",
+        "https://api.github.com",
+        exclude_run_id=holder.run_id,
+    )
+    scope = {
+        "outcome_corpus_cursor": outcome_cursor,
+        "publishing_login": "octocat",
+        "publishing_api_origin": "https://api.github.com",
+    }
 
     with pytest.raises(ValueError, match="provided together"):
         store.reserve_publication(
@@ -1586,6 +1681,7 @@ def test_publication_gate_reservation_is_paired_exact_and_does_not_bypass_existi
             repository_cooldown=timedelta(0),
             evaluation_corpus_cursor="0" * 64,
             evaluation_deployment_fingerprint=fingerprint,
+            **scope,
         )
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM publication_reservations").fetchone() == (
@@ -1599,6 +1695,7 @@ def test_publication_gate_reservation_is_paired_exact_and_does_not_bypass_existi
         repository_cooldown=timedelta(0),
         evaluation_corpus_cursor=cursor,
         evaluation_deployment_fingerprint=fingerprint,
+        **scope,
     )
     assert (
         store.reserve_publication(
@@ -1608,10 +1705,11 @@ def test_publication_gate_reservation_is_paired_exact_and_does_not_bypass_existi
             repository_cooldown=timedelta(days=365),
             evaluation_corpus_cursor=cursor,
             evaluation_deployment_fingerprint=fingerprint,
+            **scope,
         )
         == reservation
     )
-    with pytest.raises(StateError, match="different evaluation gate"):
+    with pytest.raises(StateError, match="different deployment"):
         store.reserve_publication(
             holder.run_id,
             "example/project",
@@ -1619,7 +1717,19 @@ def test_publication_gate_reservation_is_paired_exact_and_does_not_bypass_existi
             repository_cooldown=timedelta(0),
             evaluation_corpus_cursor=cursor,
             evaluation_deployment_fingerprint="b" * 64,
+            outcome_corpus_cursor=outcome_cursor,
+            publishing_login="octocat",
+            publishing_api_origin="https://api.github.com",
         )
+    blocked.publishing_login = "octocat"
+    blocked.publishing_api_origin = "https://api.github.com"
+    store.save(blocked, event="test.publication_context", details={})
+    blocked_outcome_cursor = store.upstream_outcome_corpus_cursor(
+        fingerprint,
+        "octocat",
+        "https://api.github.com",
+        exclude_run_id=blocked.run_id,
+    )
     with pytest.raises(StateError, match="held by another run"):
         store.reserve_publication(
             blocked.run_id,
@@ -1628,6 +1738,9 @@ def test_publication_gate_reservation_is_paired_exact_and_does_not_bypass_existi
             repository_cooldown=timedelta(0),
             evaluation_corpus_cursor=cursor,
             evaluation_deployment_fingerprint=fingerprint,
+            outcome_corpus_cursor=blocked_outcome_cursor,
+            publishing_login="octocat",
+            publishing_api_origin="https://api.github.com",
         )
 
     with sqlite3.connect(store.database_path) as connection:
@@ -1647,7 +1760,7 @@ def test_existing_reservation_can_only_gain_a_gate_hold_after_cursor_validation(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    run = store.create_run()
+    run = store.create_run(deployment_fingerprint="c" * 64)
     reservation = store.reserve_publication(
         run.run_id,
         "example/project",
@@ -1655,6 +1768,15 @@ def test_existing_reservation_can_only_gain_a_gate_hold_after_cursor_validation(
         repository_cooldown=timedelta(0),
     )
     cursor = store.evaluation_corpus_cursor()
+    run.publishing_login = "octocat"
+    run.publishing_api_origin = "https://api.github.com"
+    store.save(run, event="test.publication_context", details={})
+    outcome_cursor = store.upstream_outcome_corpus_cursor(
+        "c" * 64,
+        "octocat",
+        "https://api.github.com",
+        exclude_run_id=run.run_id,
+    )
 
     upgraded = store.reserve_publication(
         run.run_id,
@@ -1663,6 +1785,9 @@ def test_existing_reservation_can_only_gain_a_gate_hold_after_cursor_validation(
         repository_cooldown=timedelta(0),
         evaluation_corpus_cursor=cursor,
         evaluation_deployment_fingerprint="c" * 64,
+        outcome_corpus_cursor=outcome_cursor,
+        publishing_login="octocat",
+        publishing_api_origin="https://api.github.com",
     )
 
     assert upgraded == reservation
@@ -1677,7 +1802,7 @@ def test_gate_hold_and_evaluation_write_are_serialized_without_a_race_window(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    holder = store.create_run()
+    holder = store.create_run(deployment_fingerprint="d" * 64)
     evaluated = store.create_run()
     cursor = store.evaluation_corpus_cursor()
     barrier = threading.Barrier(2)
@@ -1728,7 +1853,7 @@ def test_gate_hold_blocks_all_evaluation_writes_until_pr_open_is_durable(
     evaluated = store.create_run()
     initial_hash = "a" * 64
     store.record_evaluation_anchor(evaluated.run_id, {"evaluation_hash": initial_hash})
-    holder = store.create_run()
+    holder = store.create_run(deployment_fingerprint="d" * 64)
     pending = store.create_run()
     _reserve_gate(store, holder)
 
@@ -1765,7 +1890,7 @@ def test_gate_hold_blocks_all_evaluation_writes_until_pr_open_is_durable(
 
 def test_pr_open_refuses_to_release_a_hold_for_a_different_corpus(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    holder = store.create_run()
+    holder = store.create_run(deployment_fingerprint="d" * 64)
     _reserve_gate(store, holder)
     _set_status(store, holder, RunStatus.SUBMITTING)
     with sqlite3.connect(store.database_path) as connection:
@@ -1792,7 +1917,7 @@ def test_arbitrary_failed_transition_never_releases_a_publication_gate_hold(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    holder = store.create_run()
+    holder = store.create_run(deployment_fingerprint="d" * 64)
     pending = store.create_run()
     _reserve_gate(store, holder)
     _set_status(store, holder, RunStatus.SUBMITTING)
@@ -1817,7 +1942,7 @@ def test_verified_compensation_transition_and_exact_hold_release_are_atomic(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    holder = store.create_run()
+    holder = store.create_run(deployment_fingerprint="d" * 64)
     _reserve_gate(store, holder)
     _set_status(store, holder, RunStatus.SUBMITTING)
     stale = store.get(holder.run_id)
