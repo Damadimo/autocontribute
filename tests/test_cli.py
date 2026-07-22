@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from rich.text import Text
 from typer.testing import CliRunner
 
 import autocontribute.cli as cli
@@ -369,16 +370,18 @@ def test_eval_record_previews_every_field_and_refusal_writes_nothing(tmp_path: P
         input="n\n",
     )
 
+    output = Text.from_ansi(result.output).plain
     assert result.exit_code == 1
-    assert "BEGIN COMPLETE EVALUATION JSON" in result.output
-    assert '"agent_prepared": false' in result.output
-    assert '"policy_failure": true' in result.output
-    assert '"security_failure": false' in result.output
-    assert '"etiquette_failure": false' in result.output
-    assert '"verdict": "correct_abstention"' in result.output
-    assert "\\u001b[2J" in result.output
-    assert "\\u202e" in result.output
-    assert "\x1b" not in result.output
+    assert "BEGIN COMPLETE EVALUATION JSON" in output
+    assert '"agent_prepared": false' in output
+    assert '"policy_failure": true' in output
+    assert '"security_failure": false' in output
+    assert '"etiquette_failure": false' in output
+    assert '"verdict": "correct_abstention"' in output
+    assert "\\u001b[2J" in output
+    assert "\\u202e" in output
+    assert "\x1b[2J" not in result.output
+    assert "\u202e" not in result.output
     assert not store.evaluation_revision_anchors()
     assert not list((state / "evaluations").glob("*.json"))
 
