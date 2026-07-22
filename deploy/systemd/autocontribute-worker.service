@@ -63,7 +63,7 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 KeyringMode=private
-ReadOnlyPaths=/etc/autocontribute /opt/autocontribute
+ReadOnlyPaths=/etc/autocontribute /opt/autocontribute /var/lib/autocontribute/docker
 ReadWritePaths=/var/lib/autocontribute
 
 StandardOutput=journal

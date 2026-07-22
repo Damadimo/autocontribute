@@ -24,6 +24,8 @@ _CONTAINER_WORKSPACE: Final = "/workspace"
 _MAX_CAPTURE_BYTES: Final = 2_000_000
 _TRUNCATED_MARKER: Final = b"\n[output truncated by autocontribute]\n"
 _SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_MIN_DOCKER_DATA_AVAILABLE_BYTES: Final = 1_073_741_824
+_MIN_DOCKER_DATA_AVAILABLE_INODES: Final = 16_384
 _DOCKER_RUNTIME_INFO_FORMAT: Final = (
     '{"security_options":{{json .SecurityOptions}},'
     '"docker_root_dir":{{json .DockerRootDir}},'
@@ -513,6 +515,7 @@ def detect_docker_daemon_mode(
             raise SandboxError("Required Docker data-root path is invalid")
         if docker_root_dir != required_docker_root:
             raise SandboxError("Docker daemon is outside the required bounded data-root")
+        _verify_docker_data_headroom(required_docker_root)
     cgroup_driver = runtime_info["cgroup_driver"]
     if (
         runtime_info["cgroup_version"] != "2"
@@ -528,6 +531,24 @@ def detect_docker_daemon_mode(
     if any(option == "name=userns" for option in options):
         raise SandboxError("Docker daemon user namespace remapping is unsupported")
     return "rootless" if rootless_count == 1 else "rootful"
+
+
+def _verify_docker_data_headroom(path: str) -> None:
+    """Fail before launch when the systemd-bounded daemon store is nearly exhausted."""
+
+    try:
+        filesystem = os.statvfs(path)
+    except OSError as exc:
+        raise SandboxError("Could not verify bounded Docker data-root headroom") from exc
+    fragment_size = filesystem.f_frsize
+    available_blocks = filesystem.f_bavail
+    available_inodes = filesystem.f_favail
+    if fragment_size <= 0 or available_blocks < 0 or available_inodes < 0:
+        raise SandboxError("Docker data-root returned invalid headroom information")
+    if available_blocks * fragment_size < _MIN_DOCKER_DATA_AVAILABLE_BYTES:
+        raise SandboxError("Docker data-root is below the required free byte headroom")
+    if available_inodes < _MIN_DOCKER_DATA_AVAILABLE_INODES:
+        raise SandboxError("Docker data-root is below the required free inode headroom")
 
 
 def docker_client_environment(

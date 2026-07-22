@@ -321,6 +321,11 @@ def test_docker_daemon_mode_enforces_the_required_bounded_data_root(
         "PATH": "/bin",
         "AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT": "/var/lib/autocontribute/docker",
     }
+    monkeypatch.setattr(
+        sandbox.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(f_frsize=4096, f_bavail=262144, f_favail=16384),
+    )
 
     assert sandbox.detect_docker_daemon_mode(environment=environment) == "rootless"
 
@@ -346,6 +351,51 @@ def test_docker_daemon_mode_rejects_a_data_root_outside_the_required_mount(
 
     with pytest.raises(SandboxError, match="outside the required bounded data-root"):
         sandbox.detect_docker_daemon_mode(environment=environment)
+
+
+@pytest.mark.parametrize(
+    ("filesystem_overrides", "message"),
+    [
+        ({"f_bavail": 262143}, "free byte headroom"),
+        ({"f_favail": 16383}, "free inode headroom"),
+        ({"f_frsize": 0}, "invalid headroom information"),
+    ],
+)
+def test_docker_daemon_mode_rejects_exhausted_bounded_data_root(
+    monkeypatch: pytest.MonkeyPatch,
+    filesystem_overrides: dict[str, int],
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        sandbox.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=_docker_runtime_info(
+                ["name=seccomp,profile=builtin", "name=rootless"],
+                docker_root_dir="/var/lib/autocontribute/docker",
+            ),
+        ),
+    )
+    filesystem = {
+        "f_frsize": 4096,
+        "f_bavail": 262144,
+        "f_favail": 16384,
+        **filesystem_overrides,
+    }
+    monkeypatch.setattr(
+        sandbox.os,
+        "statvfs",
+        lambda _path: SimpleNamespace(**filesystem),
+    )
+
+    with pytest.raises(SandboxError, match=message):
+        sandbox.detect_docker_daemon_mode(
+            environment={
+                "PATH": "/bin",
+                "AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT": "/var/lib/autocontribute/docker",
+            }
+        )
 
 
 @pytest.mark.parametrize(

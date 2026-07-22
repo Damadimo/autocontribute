@@ -1,6 +1,7 @@
 [Unit]
-Description=Check Autocontribute worker and backup freshness
+Description=Check Autocontribute freshness and Docker storage headroom
 Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
+RequiresMountsFor=/var/lib/autocontribute/docker
 OnFailure=autocontribute-failure@%n.service
 RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute
 
@@ -12,6 +13,7 @@ WorkingDirectory=/var/lib/autocontribute
 UMask=0077
 Environment=AUTOCONTRIBUTE_WORKER_MAX_AGE_SECONDS=64800
 Environment=AUTOCONTRIBUTE_BACKUP_MAX_AGE_SECONDS=129600
+ExecStartPre=/usr/local/libexec/autocontribute-docker-data-check --read-only-health /var/lib/autocontribute/docker
 ExecStart=/usr/local/libexec/autocontribute-healthcheck
 TimeoutStartSec=30s
 
@@ -39,7 +41,7 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 KeyringMode=private
-ReadOnlyPaths=/var/lib/autocontribute/health /var/lib/autocontribute/state /var/backups/autocontribute
+ReadOnlyPaths=/var/lib/autocontribute/health /var/lib/autocontribute/state /var/lib/autocontribute/docker /var/backups/autocontribute
 
 StandardOutput=journal
 StandardError=journal

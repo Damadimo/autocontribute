@@ -863,6 +863,13 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
     doctor_unit_text = (SYSTEMD / "autocontribute-doctor.service").read_text(encoding="utf-8")
     assert "RequiresMountsFor=/var/lib/autocontribute/state/workspaces" in doctor_unit_text
     assert "RequiresMountsFor=/var/lib/autocontribute/docker" in doctor_unit_text
+    readonly_paths = (
+        "ReadOnlyPaths=/etc/autocontribute /opt/autocontribute /var/lib/autocontribute/docker"
+    )
+    assert readonly_paths in unit_text
+    assert readonly_paths in doctor_unit_text
+    assert "ReadWritePaths=/var/lib/autocontribute" in unit_text
+    assert "ReadWritePaths=/var/lib/autocontribute" in doctor_unit_text
 
     helper = (SYSTEMD / "libexec" / "autocontribute-worker").read_text(encoding="utf-8")
     assert 'run --scheduled --config "$config"' in helper
@@ -1518,7 +1525,7 @@ def test_worker_doctor_and_complete_backup_share_one_exclusive_lock() -> None:
         assert "EnvironmentFile=" not in signal_unit
 
     health_unit = _directives(SYSTEMD / "autocontribute-health.service")
-    assert _one(health_unit, "Unit", "RequiresMountsFor") == "/var/lib/autocontribute/docker"
+    assert "/var/lib/autocontribute/docker" in health_unit[("Unit", "RequiresMountsFor")]
     assert (
         _one(health_unit, "Service", "ExecStartPre")
         == "/usr/local/libexec/autocontribute-docker-data-check "
@@ -1583,6 +1590,9 @@ def test_tmpfiles_keeps_state_private_and_docs_cover_safe_recovery() -> None:
     assert "--user-group" in guide
     assert "21,474,836,480 bytes" in guide
     assert "524,288 inodes" in guide
+    assert "34,359,738,368 bytes" in guide
+    assert "1,048,576 fixed inodes" in guide
+    assert "1,073,741,824 bytes" in guide
     assert "rw,nodev,nosuid" in guide
     assert "state filesystem is capped at 8 GiB and 262,144 inodes" in guide
     assert "backup filesystem is capped" in guide

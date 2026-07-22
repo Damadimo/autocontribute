@@ -568,17 +568,24 @@ def test_ci_exercises_docker_data_preflight_on_a_real_hardened_mount() -> None:
     assert job["runs-on"] == "ubuntu-24.04"
     assert steps.index(install) < steps.index(smoke)
     assert 'test "$(cat /proc/1/comm)" = systemd' in script
-    assert 'fallocate --length 64M "$docker_data_image"' in script
+    assert 'fallocate --length 2G "$docker_data_image"' in script
     assert 'sudo losetup --find --show "$docker_data_image"' in script
-    assert 'sudo mkfs.ext4 -q -N 8192 "$loop_device"' in script
+    assert 'sudo mkfs.ext4 -q -m 0 -N 32768 "$loop_device"' in script
     assert 'sudo mount -t ext4 -o nodev,nosuid -- "$loop_device" "$docker_data_mount"' in script
     assert 'chmod 0710 "$docker_data_mount"' in script
     assert "sudo systemd-run" in script
+    assert script.count("sudo systemd-run") == 2
     assert "--property=PrivateDevices=yes" in script
     assert "--property=ProtectSystem=strict" in script
     assert '--property="ReadWritePaths=$smoke_root"' in script
+    assert script.count('--property="ReadWritePaths=$smoke_root"') == 2
+    assert '--property="ReadOnlyPaths=$docker_data_mount"' in script
     assert "/usr/local/libexec/autocontribute-docker-data-check" in script
     assert '--mount-only "$docker_data_mount"' in script
+    assert '--read-only-health "$docker_data_mount"' in script
+    assert script.index('--mount-only "$docker_data_mount"') < script.index(
+        '--read-only-health "$docker_data_mount"'
+    )
     assert "trap cleanup_docker_data_smoke EXIT" in script
     assert 'sudo umount -- "$docker_data_mount"' in script
     assert 'sudo losetup --detach "$loop_device"' in script

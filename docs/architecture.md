@@ -57,12 +57,15 @@ mount. This host-storage boundary is deployment-specific; ordinary CLI and hoste
 their own host disk controls.
 
 That deployment also gives the rootless daemon a separate dedicated ext4 data filesystem with
-verified aggregate byte and fixed-inode ceilings. A mount-only preflight stops the daemon before it
-can fall back to the service home, while the credential-bearing wrapper compares structured
-`DockerRootDir` output to the exact checked mount before loading credentials. It exports a
-non-secret boundary marker that makes every later structured sandbox probe repeat the exact
-comparison. The marker is absent for ordinary local and rootful review use, so those environments
-retain their own operator-managed disk policy.
+verified aggregate byte and fixed-inode ceilings plus minimum free-byte and free-inode headroom. A
+mount-only preflight stops the daemon before it can fall back to the service home, while the
+credential-bearing wrapper compares structured `DockerRootDir` output to the exact checked mount
+before loading credentials. The worker and doctor see that daemon-owned path through an explicitly
+read-only child mount while the separate rootless Docker service retains its writable host view. The
+wrapper exports a non-secret boundary marker that makes every later structured sandbox probe repeat
+the exact comparison and headroom check. The scheduled health service also checks the filesystem
+through an explicitly read-only namespace view. The marker is absent for ordinary local and rootful
+review use, so those environments retain their own operator-managed disk policy.
 
 Immediately before every Docker launch, the control process parses one bounded structured daemon
 probe. It requires an absolute Docker data-root report, cgroup v2, a real cgroup driver, and reported

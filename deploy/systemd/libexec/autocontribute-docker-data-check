@@ -7,6 +7,8 @@ readonly check_mode="${1:-}"
 readonly docker_data_root="${2:-}"
 readonly maximum_bytes=34359738368
 readonly maximum_inodes=1048576
+readonly minimum_available_bytes=1073741824
+readonly minimum_available_inodes=16384
 
 fail() {
   printf '%s\n' "$1" >&2
@@ -15,7 +17,11 @@ fail() {
 
 if [[
   $# -ne 2 ||
-  ( "$check_mode" != --mount-only && "$check_mode" != --daemon ) ||
+  (
+    "$check_mode" != --mount-only &&
+    "$check_mode" != --read-only-health &&
+    "$check_mode" != --daemon
+  ) ||
   ! "$docker_data_root" =~ ^/[A-Za-z0-9._/-]+$ ||
   "$docker_data_root" == / ||
   "$docker_data_root" == */ ||
@@ -62,6 +68,8 @@ mount_rows="$(
 readonly mount_rows
 mount_device=""
 mount_row_count=0
+writable_mount_row_count=0
+readonly_mount_row_count=0
 while read -r mount_target filesystem_type filesystem_root mount_options candidate_device trailing; do
   if [[ -n "$trailing" || "$mount_target" != "$docker_data_root" ]]; then
     fail 'Autocontribute Docker data-root is not an exact dedicated mount'
@@ -75,10 +83,17 @@ while read -r mount_target filesystem_type filesystem_root mount_options candida
   if [[ ! "$candidate_device" =~ ^[0-9]+:[0-9]+$ ]]; then
     fail 'Autocontribute Docker data-root mount reported an invalid device number'
   fi
-  case ",$mount_options," in
-    *,rw,*) ;;
-    *) fail 'Autocontribute Docker data-root mount is not writable' ;;
-  esac
+  if [[ ",$mount_options," == *,rw,* && ",$mount_options," == *,ro,* ]]; then
+    fail 'Autocontribute Docker data-root mount reported ambiguous access options'
+  elif [[ ",$mount_options," == *,rw,* ]]; then
+    writable_mount_row_count=$((writable_mount_row_count + 1))
+  elif [[ ",$mount_options," == *,ro,* && "$check_mode" != --mount-only ]]; then
+    readonly_mount_row_count=$((readonly_mount_row_count + 1))
+  elif [[ "$check_mode" != --mount-only ]]; then
+    fail 'Autocontribute Docker data-root service view is not explicitly read-only or writable'
+  else
+    fail 'Autocontribute Docker data-root mount is not writable'
+  fi
   case ",$mount_options," in
     *,nodev,*) ;;
     *) fail 'Autocontribute Docker data-root mount must use nodev' ;;
@@ -98,10 +113,63 @@ while read -r mount_target filesystem_type filesystem_root mount_options candida
   mount_device="$candidate_device"
   mount_row_count=$((mount_row_count + 1))
 done <<< "$mount_rows"
-readonly mount_device mount_row_count
+readonly mount_device mount_row_count writable_mount_row_count readonly_mount_row_count
 unset mount_target filesystem_type filesystem_root mount_options candidate_device trailing
 if [[ "$mount_row_count" -lt 1 ]]; then
   fail 'Autocontribute Docker data-root is not an exact dedicated mount'
+fi
+if [[ "$check_mode" != --mount-only ]]; then
+  if [[ "$writable_mount_row_count" -lt 1 || "$readonly_mount_row_count" -lt 1 ]]; then
+    fail 'Autocontribute Docker data-root service view did not prove writable and read-only layers'
+  fi
+elif [[ "$writable_mount_row_count" -ne "$mount_row_count" ]]; then
+  fail 'Autocontribute Docker data-root mount is not writable'
+fi
+
+if [[ "$check_mode" != --mount-only ]]; then
+  effective_mount_row="$(
+    findmnt --noheadings --raw --target "$docker_data_root" \
+      --output TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN
+  )" || fail 'Autocontribute could not resolve the effective Docker data-root service view'
+  readonly effective_mount_row
+  if [[ "$effective_mount_row" == *$'\n'* ]]; then
+    fail 'Autocontribute Docker data-root effective service view is ambiguous'
+  fi
+  read -r \
+    effective_target effective_filesystem_type effective_filesystem_root \
+    effective_mount_options effective_device effective_trailing \
+    <<< "$effective_mount_row"
+  readonly \
+    effective_target effective_filesystem_type effective_filesystem_root \
+    effective_mount_options effective_device effective_trailing
+  if [[
+    -n "$effective_trailing" ||
+    "$effective_target" != "$docker_data_root" ||
+    "$effective_filesystem_type" != ext4 ||
+    "$effective_filesystem_root" != / ||
+    "$effective_device" != "$mount_device"
+  ]]; then
+    fail 'Autocontribute Docker data-root effective service view does not match the safe mount'
+  fi
+  if [[
+    ",$effective_mount_options," == *,rw,* ||
+    ",$effective_mount_options," != *,ro,*
+  ]]; then
+    fail 'Autocontribute Docker data-root effective service view is not read-only'
+  fi
+  case ",$effective_mount_options," in
+    *,nodev,*) ;;
+    *) fail 'Autocontribute Docker data-root effective service view must use nodev' ;;
+  esac
+  case ",$effective_mount_options," in
+    *,nosuid,*) ;;
+    *) fail 'Autocontribute Docker data-root effective service view must use nosuid' ;;
+  esac
+  case ",$effective_mount_options," in
+    *,bind,* | *,rbind,*)
+      fail 'Autocontribute Docker data-root effective service view cannot be a bind mount'
+      ;;
+  esac
 fi
 
 mount_table="$(
@@ -139,20 +207,29 @@ if [[ "$data_stat_device" == "$parent_device" ]]; then
 fi
 
 filesystem_limits="$(
-  stat --file-system --format=%S:%b:%c -- "$docker_data_root"
+  stat --file-system --format=%S:%b:%c:%a:%d -- "$docker_data_root"
 )" || fail 'Autocontribute could not inspect Docker data-root filesystem limits'
 readonly filesystem_limits
-IFS=: read -r block_size total_blocks total_inodes trailing <<< "$filesystem_limits"
-readonly block_size total_blocks total_inodes trailing
+IFS=: read -r \
+  block_size total_blocks total_inodes available_blocks available_inodes trailing \
+  <<< "$filesystem_limits"
+readonly block_size total_blocks total_inodes available_blocks available_inodes trailing
 if [[
   ! "$block_size" =~ ^[1-9][0-9]*$ ||
   ! "$total_blocks" =~ ^[1-9][0-9]*$ ||
   ! "$total_inodes" =~ ^[1-9][0-9]*$ ||
+  ! "$available_blocks" =~ ^(0|[1-9][0-9]*)$ ||
+  ! "$available_inodes" =~ ^(0|[1-9][0-9]*)$ ||
   "${#block_size}" -gt 11 ||
   "${#total_blocks}" -gt 11 ||
   "${#total_inodes}" -gt 7 ||
+  "${#available_blocks}" -gt 11 ||
+  "${#available_inodes}" -gt 7 ||
   -n "$trailing"
 ]]; then
+  fail 'Autocontribute Docker data-root filesystem reported invalid limits'
+fi
+if (( available_blocks > total_blocks || available_inodes > total_inodes )); then
   fail 'Autocontribute Docker data-root filesystem reported invalid limits'
 fi
 if (( block_size > maximum_bytes || total_blocks > maximum_bytes / block_size )); then
@@ -161,8 +238,16 @@ fi
 if (( total_inodes > maximum_inodes )); then
   fail 'Autocontribute Docker data-root filesystem exceeds the inode ceiling'
 fi
+minimum_available_blocks=$(((minimum_available_bytes + block_size - 1) / block_size))
+readonly minimum_available_blocks
+if (( available_blocks < minimum_available_blocks )); then
+  fail 'Autocontribute Docker data-root is below the required free byte headroom'
+fi
+if (( available_inodes < minimum_available_inodes )); then
+  fail 'Autocontribute Docker data-root is below the required free inode headroom'
+fi
 
-if [[ "$check_mode" == --mount-only ]]; then
+if [[ "$check_mode" != --daemon ]]; then
   exit 0
 fi
 

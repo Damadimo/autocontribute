@@ -293,16 +293,19 @@ sudo chown autocontribute:autocontribute /var/lib/autocontribute/docker
 sudo chmod 0710 /var/lib/autocontribute/docker
 findmnt --target /var/lib/autocontribute/docker \
   --output TARGET,SOURCE,FSTYPE,OPTIONS
-stat --file-system --format='block_size=%S blocks=%b inodes=%c' \
+stat --file-system \
+  --format='block_size=%S blocks=%b inodes=%c available_blocks=%a available_inodes=%d' \
   /var/lib/autocontribute/docker
 ```
 
-The hard ceilings are 34,359,738,368 bytes and 1,048,576 inodes. The checker uses filesystem totals,
-not free-space snapshots, and compares mount identity by `MAJ:MIN`, so alternate device names cannot
-hide a second mount. It does not need access to the block node and therefore works with the supplied
-services' `PrivateDevices=yes`. CI runs its mount-only path against a real loop-backed ext4
-filesystem inside that same hardened service boundary; production still requires fully allocated
-storage.
+The hard ceilings are 34,359,738,368 total bytes and 1,048,576 inodes total. The fail-closed
+headroom floors are 1,073,741,824 bytes and 16,384 inodes available to the unprivileged service
+account. The checker uses filesystem totals for the hard ceilings and current available values for
+the headroom floors. It compares mount identity by `MAJ:MIN`, so alternate device names cannot hide
+a second mount. It does not need access to the block node and therefore works with the supplied
+services' `PrivateDevices=yes`. CI runs both its writable mount-only path and its read-only health
+path against a real loop-backed ext4 filesystem inside hardened service boundaries; production
+still requires fully allocated storage.
 
 Install rootless Docker for that account using the distribution's supported procedure, but do not
 enable or start its user service yet. Rootless
@@ -638,15 +641,17 @@ sudo journalctl \
   --since '24 hours ago'
 ```
 
-The health timer fails when the last successful worker is older than 18 hours, the last complete
-backup is older than 36 hours, either durable filesystem violates its fixed ceiling, or state or
-backup headroom falls below a fixed reserve. The worker, doctor, and backup apply the same writable
-storage check before doing work; low backup capacity therefore stops new contributions even while a
-recent backup stamp is still fresh. Every worker, backup, doctor, or health failure invokes
-`autocontribute-failure@.service`, which writes the last failed unit and UTC time to
-`/var/lib/autocontribute/health/last-failure` and emits an error-priority journal event. Forward
-those events to the existing host alerting system, or add another `OnFailure=` target in a drop-in.
-An on-host stamp alone is not a page and is lost with the host.
+The health timer runs every 15 minutes. It fails when the last successful worker is older than 18
+hours, the last complete backup is older than 36 hours, either durable filesystem violates its
+fixed ceiling, state or backup falls below its fixed reserve, or Docker data has less than 1 GiB or
+16,384 inodes available. Its storage checks receive read-only namespace views; the Docker check
+requires an explicit read-only layer over the same safe writable ext4 mount. The worker, doctor, and
+backup apply the corresponding writable checks before doing work, so low capacity stops new
+contributions even while a success stamp is still fresh. Every worker, backup, doctor, or health
+failure invokes `autocontribute-failure@.service`, which writes the last failed unit and UTC time to
+`/var/lib/autocontribute/health/last-failure` and emits an error-priority journal event. Forward those
+events to the existing host alerting system, or add another `OnFailure=` target in a drop-in. An
+on-host stamp alone is not a page and is lost with the host.
 
 Alert on workspace and Docker-data byte or inode consumption before either reaches 75%; this
 precedes the fixed start-of-run floors on the reference filesystems. Docker data
