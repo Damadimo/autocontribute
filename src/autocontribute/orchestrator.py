@@ -75,6 +75,8 @@ _WORD = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}")
 _RUN_LEASE_TTL = timedelta(minutes=5)
 _RUN_HEARTBEAT_INTERVAL = timedelta(minutes=1)
 _STALE_RUN_AGE = timedelta(hours=2)
+_MAX_GUIDANCE_FILES = 30
+_MAX_GUIDANCE_CHARACTERS = 80_000
 
 
 class Orchestrator:
@@ -277,17 +279,21 @@ class Orchestrator:
             workspace_root,
         )
         self._assert_operational()
-        guidance = workspace.guidance(max_characters=80_000)
-        if select_pull_request_template(guidance) is None:
-            guidance = {
-                **discovery.organization_pull_request_templates(repository.full_name),
-                **guidance,
-            }
-        self._assert_operational()
         index = self._render_index(
             workspace.context_index(), issue_text=f"{issue.title} {issue.body}"
         )
         initial_matches = self._search_context(workspace, issue_search_queries(issue))
+        repository_guidance = self._load_repository_guidance(
+            workspace,
+            target_paths=list(dict.fromkeys(match.path for match in initial_matches)),
+        )
+        organization_guidance: dict[str, str] = {}
+        if select_pull_request_template(repository_guidance) is None:
+            organization_guidance = discovery.organization_pull_request_templates(
+                repository.full_name
+            )
+        guidance = self._combine_guidance(organization_guidance, repository_guidance)
+        self._assert_operational()
 
         self._assert_operational()
         self.store.transition(manifest, RunStatus.PLANNING, reason="building a bounded plan")
@@ -324,6 +330,77 @@ class Orchestrator:
             plan=plan,
             initial_matches=initial_matches,
         )
+        scoped_guidance_targets = list(
+            dict.fromkeys([*context_paths, *(match.path for match in context_matches)])
+        )
+        scoped_repository_guidance = self._load_repository_guidance(
+            workspace,
+            target_paths=scoped_guidance_targets,
+        )
+        newly_applicable_guidance = [
+            path for path in scoped_repository_guidance if path not in repository_guidance
+        ]
+        if newly_applicable_guidance:
+            if not self._has_model_capacity(manifest, ("scout", "builder", "critic")):
+                raise PolicyError(
+                    "Scoped repository guidance requires an instruction-aware replan, but the "
+                    "remaining model budget cannot complete replanning, implementation, and review"
+                )
+            guidance = self._combine_guidance(
+                organization_guidance,
+                scoped_repository_guidance,
+            )
+            replanned_result = self._call_model(
+                manifest,
+                role="scout",
+                instructions=PLANNER_INSTRUCTIONS,
+                prompt=planning_prompt(
+                    issue,
+                    repository,
+                    guidance=guidance,
+                    repository_index=index,
+                    repository_references=render_text_matches(context_matches),
+                ),
+                output_type=ContributionPlan,
+            )
+            plan = replanned_result.output
+            manifest.plan = plan
+            self._assert_operational()
+            self.store.save(
+                manifest,
+                event="plan.guidance_replanned",
+                details={
+                    "decision": plan.decision,
+                    "reason": plan.decision_reason,
+                    "new_guidance_count": str(len(newly_applicable_guidance)),
+                    "first_new_guidance": newly_applicable_guidance[0],
+                },
+            )
+            if plan.decision == "skip":
+                manifest.skip_reason = plan.decision_reason
+                self._assert_operational()
+                self.store.transition(manifest, RunStatus.SKIPPED, reason=plan.decision_reason)
+                return manifest
+            replanning_guidance = scoped_repository_guidance
+            context_paths, context_matches = self._expanded_context_paths(
+                workspace,
+                issue=issue,
+                plan=plan,
+                initial_matches=initial_matches,
+            )
+            scoped_guidance_targets = list(
+                dict.fromkeys([*context_paths, *(match.path for match in context_matches)])
+            )
+            scoped_repository_guidance = self._load_repository_guidance(
+                workspace,
+                target_paths=scoped_guidance_targets,
+            )
+            self._assert_guidance_accounted_for_paths(
+                workspace,
+                replanning_guidance,
+                scoped_guidance_targets,
+            )
+        guidance = self._combine_guidance(organization_guidance, scoped_repository_guidance)
         selected_files = self._read_context(
             workspace,
             context_paths,
@@ -370,6 +447,11 @@ class Orchestrator:
         )
         proposal = self._with_disclosure(proposal_result.output)
         manifest.proposal = proposal
+        self._assert_guidance_accounted_for_paths(
+            workspace,
+            scoped_repository_guidance,
+            [*context_paths, *(edit.path for edit in proposal.edits)],
+        )
         validate_publication_text(manifest)
         validate_pull_request_template(proposal.pull_request_body, guidance)
         self._assert_operational()
@@ -404,7 +486,13 @@ class Orchestrator:
 
         self._assert_operational()
         self.store.transition(manifest, RunStatus.CRITIQUING, reason="fresh-context review")
-        review = self._review(manifest, workspace, guidance, commands)
+        review = self._review(
+            manifest,
+            workspace,
+            guidance,
+            scoped_repository_guidance,
+            commands,
+        )
 
         if (
             review.verdict == "reject"
@@ -441,6 +529,11 @@ class Orchestrator:
                 update={"validation_commands": initial_proposal_validation_commands}
             )
             manifest.proposal = proposal
+            self._assert_guidance_accounted_for_paths(
+                workspace,
+                scoped_repository_guidance,
+                [*context_paths, *(edit.path for edit in proposal.edits)],
+            )
             validate_publication_text(manifest)
             validate_pull_request_template(proposal.pull_request_body, guidance)
             self._assert_operational()
@@ -460,7 +553,13 @@ class Orchestrator:
                 RunStatus.CRITIQUING,
                 reason="reviewing repaired patch from fresh evidence",
             )
-            review = self._review(manifest, workspace, guidance, commands)
+            review = self._review(
+                manifest,
+                workspace,
+                guidance,
+                scoped_repository_guidance,
+                commands,
+            )
 
         diff = workspace.diff()
         quality = QualityEvaluator(self.config).evaluate(
@@ -516,6 +615,7 @@ class Orchestrator:
         manifest: RunManifest,
         workspace: RepositoryWorkspace,
         guidance: Mapping[str, str],
+        repository_guidance: Mapping[str, str],
         commands: list[CommandResult],
     ) -> CriticReview:
         assert manifest.candidate is not None and manifest.plan is not None
@@ -526,6 +626,11 @@ class Orchestrator:
             plan=manifest.plan,
             initial_matches=[],
             changed_paths=workspace.changed_paths(),
+        )
+        self._assert_guidance_accounted_for_paths(
+            workspace,
+            repository_guidance,
+            affected_paths,
         )
         affected_context = self._read_context(
             workspace,
@@ -557,6 +662,60 @@ class Orchestrator:
             output_type=CriticReview,
         )
         return result.output
+
+    @staticmethod
+    def _load_repository_guidance(
+        workspace: RepositoryWorkspace,
+        *,
+        target_paths: Sequence[str] = (),
+    ) -> dict[str, str]:
+        return workspace.guidance(
+            max_files=_MAX_GUIDANCE_FILES,
+            max_characters=_MAX_GUIDANCE_CHARACTERS,
+            target_paths=target_paths,
+        )
+
+    @staticmethod
+    def _combine_guidance(*sources: Mapping[str, str]) -> dict[str, str]:
+        combined: dict[str, str] = {}
+        for source in sources:
+            for path, content in source.items():
+                if path in combined:
+                    raise PolicyError(
+                        "Repository and organization guidance use the same path; source "
+                        f"precedence is ambiguous: {path}"
+                    )
+                combined[path] = content
+        if len(combined) > _MAX_GUIDANCE_FILES:
+            raise PolicyError(
+                f"Combined repository and organization guidance has {len(combined)} files, "
+                f"above the configured limit of {_MAX_GUIDANCE_FILES}"
+            )
+        characters = sum(len(content) for content in combined.values())
+        if characters > _MAX_GUIDANCE_CHARACTERS:
+            raise PolicyError(
+                "Combined repository and organization guidance exceeds the configured "
+                f"{_MAX_GUIDANCE_CHARACTERS}-character limit"
+            )
+        return combined
+
+    @staticmethod
+    def _assert_guidance_accounted_for_paths(
+        workspace: RepositoryWorkspace,
+        repository_guidance: Mapping[str, str],
+        target_paths: Sequence[str],
+    ) -> None:
+        required = workspace.guidance_paths(target_paths=target_paths)
+        accounted = set(repository_guidance)
+        missing = [path for path in required if path not in accounted]
+        if missing:
+            rendered = ", ".join(missing[:3])
+            if len(missing) > 3:
+                rendered += f", and {len(missing) - 3} more"
+            raise PolicyError(
+                "Planned, read, or edited paths enter repository-guidance scope(s) that were "
+                f"not supplied to the model: {rendered}"
+            )
 
     @staticmethod
     def _validation_suite(

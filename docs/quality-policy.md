@@ -36,6 +36,21 @@ All gates must pass. A high model score cannot override one.
   networking are infrastructure failures rather than regression evidence.
 - Every operator-owned repository validation command passes in a disposable offline sandbox copy;
   model-suggested commands cannot replace it and command-budget truncation fails closed.
+- Repository guidance is an exhaustive bounded input, never a best-effort sample. Before planning,
+  every tracked contribution, policy, AI, security, conduct/legal, and pull-request-template file is
+  loaded in full together with root `AGENTS.md` and README guidance. Ancestor `AGENTS.md` and README
+  files are resolved for paths quoted in literal-reference evidence and, after planning, every
+  planned or selected context path. File-count, character, read, type, or UTF-8 failures stop the run
+  instead of dropping or truncating a document. Nested READMEs outside those path scopes are not
+  treated as repository-wide instructions. Repository and applicable organization-template inputs
+  share one ceiling of 30 files and 80,000 characters per model stage.
+- If the first plan selects a path governed by guidance that was not visible to that planner, one
+  bounded scout replan runs with the expanded complete guidance set before implementation. A second
+  plan that enters another unseen scope fails closed; scoped instructions are never retroactively
+  treated as if the planner had seen them.
+- Before either initial or repair edits are applied, every edit path must remain inside the exact
+  repository-guidance scopes supplied to that builder call. The critic receives the same complete
+  scoped set, and additional affected context that would enter an unseen scope fails closed.
 - A fresh-context critic reports no blocker or missing issue requirement.
 - Every critic dimension is at least 80 and weighted readiness is at least 90.
 - The exact patch bytes and all evidence that authorized readiness match the immutable preparation

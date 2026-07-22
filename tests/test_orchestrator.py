@@ -1042,6 +1042,317 @@ def test_organization_default_pull_request_template_is_a_hard_gate(
     assert providers["critic"].calls == 0
 
 
+def test_planner_selected_new_scope_triggers_one_instruction_aware_replan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = _source_repository(tmp_path)
+    (source / "AGENTS.md").write_text("ROOT_GUIDANCE_MARKER\n", encoding="utf-8")
+    component = source / "component"
+    component.mkdir()
+    (component / "AGENTS.md").write_text("COMPONENT_AGENT_MARKER\n", encoding="utf-8")
+    (component / "README.md").write_text("COMPONENT_README_MARKER\n", encoding="utf-8")
+    (component / "app.py").write_text("answer = 1\n", encoding="utf-8")
+    unrelated = source / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "AGENTS.md").write_text("UNRELATED_AGENT_MARKER\n", encoding="utf-8")
+    (unrelated / "README.md").write_text("UNRELATED_README_MARKER\n", encoding="utf-8")
+    referenced = source / "referenced"
+    referenced.mkdir()
+    (referenced / "AGENTS.md").write_text("REFERENCE_AGENT_MARKER\n", encoding="utf-8")
+    (referenced / "probe.py").write_text("documented_boundary_value = 1\n", encoding="utf-8")
+    _git(source, "add", ".")
+    _git(source, "commit", "--quiet", "-m", "add scoped guidance")
+    sha = _git(source, "rev-parse", "HEAD")
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    providers = _providers()
+    plan = providers["scout"].output
+    proposal = providers["builder"].output
+    assert isinstance(plan, ContributionPlan)
+    assert isinstance(proposal, PatchProposal)
+    providers["scout"].output = plan.model_copy(update={"files_to_read": ["component/app.py"]})
+    providers["builder"].output = proposal.model_copy(
+        update={
+            "edits": [
+                FileEdit(
+                    operation="replace",
+                    path="component/app.py",
+                    find="answer = 1\n",
+                    replace="answer = 2\n",
+                    content=None,
+                    rationale="Match the documented boundary behavior.",
+                )
+            ]
+        }
+    )
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.READY_FOR_APPROVAL
+    assert providers["scout"].calls == 2
+    planner_prompt = str(providers["scout"].requests[0]["prompt"])
+    replanned_prompt = str(providers["scout"].requests[1]["prompt"])
+    builder_prompt = str(providers["builder"].requests[0]["prompt"])
+    critic_prompt = str(providers["critic"].requests[0]["prompt"])
+    assert "ROOT_GUIDANCE_MARKER" in planner_prompt
+    assert "REFERENCE_AGENT_MARKER" in planner_prompt
+    assert "COMPONENT_AGENT_MARKER" not in planner_prompt
+    assert "COMPONENT_README_MARKER" not in planner_prompt
+    for prompt in (replanned_prompt, builder_prompt, critic_prompt):
+        assert "ROOT_GUIDANCE_MARKER" in prompt
+        assert "COMPONENT_AGENT_MARKER" in prompt
+        assert "COMPONENT_README_MARKER" in prompt
+        assert "UNRELATED_AGENT_MARKER" not in prompt
+        assert "UNRELATED_README_MARKER" not in prompt
+
+
+def test_replan_cannot_expand_into_a_second_unseen_guidance_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = _source_repository(tmp_path)
+    for directory in ("first", "second"):
+        scoped = source / directory
+        scoped.mkdir()
+        (scoped / "AGENTS.md").write_text(f"{directory.upper()}_SCOPE_MARKER\n", encoding="utf-8")
+        (scoped / "opaque.py").write_text(f"answer_{directory} = 1\n", encoding="utf-8")
+    _git(source, "add", ".")
+    _git(source, "commit", "--quiet", "-m", "add two scoped instruction sets")
+    sha = _git(source, "rev-parse", "HEAD")
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    providers = _providers()
+    initial_plan = providers["scout"].output
+    assert isinstance(initial_plan, ContributionPlan)
+    providers["scout"] = SequenceProvider(
+        [
+            initial_plan.model_copy(update={"files_to_read": ["first/opaque.py"]}),
+            initial_plan.model_copy(update={"files_to_read": ["second/opaque.py"]}),
+        ],
+        "gpt-5.6",
+    )
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.FAILED
+    assert "second/AGENTS.md" in (manifest.error or "")
+    assert providers["scout"].calls == 2
+    assert providers["builder"].calls == 0
+    assert providers["critic"].calls == 0
+
+
+def test_builder_edit_entering_unseen_agents_scope_fails_before_workspace_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = _source_repository(tmp_path)
+    other = source / "other"
+    other.mkdir()
+    (other / "AGENTS.md").write_text("OTHER_SCOPE_MARKER\n", encoding="utf-8")
+    (other / "opaque.py").write_text("answer = 1\n", encoding="utf-8")
+    _git(source, "add", ".")
+    _git(source, "commit", "--quiet", "-m", "add other scope")
+    sha = _git(source, "rev-parse", "HEAD")
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    providers = _providers()
+    proposal = providers["builder"].output
+    assert isinstance(proposal, PatchProposal)
+    providers["builder"].output = proposal.model_copy(
+        update={
+            "edits": [
+                FileEdit(
+                    operation="replace",
+                    path="other/opaque.py",
+                    find="answer = 1\n",
+                    replace="answer = 2\n",
+                    content=None,
+                    rationale="Attempt to edit a path outside the supplied guidance scope.",
+                )
+            ]
+        }
+    )
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.FAILED
+    assert "repository-guidance scope" in (manifest.error or "")
+    assert "other/AGENTS.md" in (manifest.error or "")
+    assert providers["builder"].calls == 1
+    assert providers["critic"].calls == 0
+    workspace = store.workspace_dir(manifest.run_id) / "repository"
+    assert (workspace / "other" / "opaque.py").read_text(encoding="utf-8") == "answer = 1\n"
+
+
+def test_excess_global_guidance_fails_before_any_model_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = _source_repository(tmp_path)
+    for index in range(30):
+        (source / f"POLICY-{index:02d}.md").write_text(
+            f"Policy {index}.\n",
+            encoding="utf-8",
+        )
+    _git(source, "add", ".")
+    _git(source, "commit", "--quiet", "-m", "add excessive guidance")
+    sha = _git(source, "rev-parse", "HEAD")
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    providers = _providers()
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.FAILED
+    assert "above the configured limit of 30" in (manifest.error or "")
+    assert all(provider.calls == 0 for provider in providers.values())
+
+
+def test_excess_scoped_guidance_fails_after_planning_but_before_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source, _ = _source_repository(tmp_path)
+    component = source / "component"
+    component.mkdir()
+    (component / "app.py").write_text("answer = 1\n", encoding="utf-8")
+    (component / "AGENTS.md").write_text("x" * 80_001, encoding="utf-8")
+    _git(source, "add", ".")
+    _git(source, "commit", "--quiet", "-m", "add oversized scoped guidance")
+    sha = _git(source, "rev-parse", "HEAD")
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    providers = _providers()
+    plan = providers["scout"].output
+    assert isinstance(plan, ContributionPlan)
+    providers["scout"].output = plan.model_copy(update={"files_to_read": ["component/app.py"]})
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.FAILED
+    assert "Applicable repository guidance exceeds" in (manifest.error or "")
+    assert providers["scout"].calls == 1
+    assert providers["builder"].calls == 0
+    assert providers["critic"].calls == 0
+
+
 def test_operator_required_commands_run_when_models_omit_them(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     source, sha = _source_repository(tmp_path)
     original_clone = RepositoryWorkspace.clone

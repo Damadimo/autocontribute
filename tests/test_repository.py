@@ -430,18 +430,102 @@ def test_context_index_and_guidance_are_bounded_and_include_policies(
     assert sum(map(len, guidance.values())) <= 120_000
 
 
-def test_guidance_reserves_budget_for_complete_pull_request_templates(
+def test_guidance_never_drops_or_truncates_applicable_files_to_fit_limits(
     tmp_path: Path, source_repository: tuple[Path, str, str]
 ) -> None:
     source, first_sha, _ = source_repository
     workspace = _clone(source, first_sha, tmp_path / "workspace")
-    template = "Explain the change.\n"
+    complete = workspace.guidance()
+    exact_characters = sum(len(content) for content in complete.values())
 
-    guidance = workspace.guidance(max_characters=len(template))
+    assert workspace.guidance(max_characters=exact_characters) == complete
+    with pytest.raises(RepositoryError, match=r"refusing to (?:omit|truncate)"):
+        workspace.guidance(max_characters=exact_characters - 1)
+    with pytest.raises(RepositoryError, match="refusing an incomplete guidance set"):
+        workspace.guidance(max_files=len(complete) - 1)
 
-    assert guidance == {".github/PULL_REQUEST_TEMPLATE.md": template}
-    with pytest.raises(RepositoryError, match="truncated template"):
-        workspace.guidance(max_characters=len(template) - 1)
+
+def test_guidance_read_failure_is_not_silently_skipped(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+    security = workspace.path / "SECURITY.md"
+    security.unlink()
+    security.symlink_to("README.md")
+
+    with pytest.raises(
+        RepositoryError,
+        match=r"Could not load applicable repository guidance in full: SECURITY[.]md",
+    ):
+        workspace.guidance()
+
+
+def test_guidance_uses_path_scoped_agents_and_readmes_without_loading_unrelated_readmes(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, _, _ = source_repository
+    (source / "AGENTS.md").write_text("Repository rules.\n", encoding="utf-8")
+    package = source / "src" / "package"
+    package.mkdir(parents=True)
+    (source / "src" / "AGENTS.md").write_text("Source rules.\n", encoding="utf-8")
+    (source / "src" / "README.md").write_text("Source conventions.\n", encoding="utf-8")
+    (package / "AGENTS.md").write_text("Package rules.\n", encoding="utf-8")
+    (package / "README.md").write_text("Package conventions.\n", encoding="utf-8")
+    (package / "module.py").write_text("value = 1\n", encoding="utf-8")
+    unrelated = source / "unrelated"
+    unrelated.mkdir()
+    (unrelated / "AGENTS.md").write_text("Unrelated rules.\n", encoding="utf-8")
+    (unrelated / "README.md").write_text("u" * 120_001, encoding="utf-8")
+    nested_policy = unrelated / "CONTRIBUTION_POLICY.md"
+    nested_policy.write_text("Repository-wide contribution policy.\n", encoding="utf-8")
+    alternate_policy = unrelated / "PROJECT-SECURITY-POLICY.adoc"
+    alternate_policy.write_text("Repository-wide security policy.\n", encoding="utf-8")
+    extensionless_policy = unrelated / "AI_POLICY"
+    extensionless_policy.write_text("Repository-wide AI policy.\n", encoding="utf-8")
+    _git(source, "add", ".")
+    _git(source, "commit", "--quiet", "-m", "add scoped guidance")
+    sha = _git(source, "rev-parse", "HEAD")
+    workspace = _clone(source, sha, tmp_path / "workspace")
+
+    global_guidance = workspace.guidance()
+    assert "AGENTS.md" in global_guidance
+    assert "README.md" in global_guidance
+    assert "unrelated/CONTRIBUTION_POLICY.md" in global_guidance
+    assert "unrelated/PROJECT-SECURITY-POLICY.adoc" in global_guidance
+    assert "unrelated/AI_POLICY" in global_guidance
+    assert "src/AGENTS.md" not in global_guidance
+    assert "src/README.md" not in global_guidance
+    assert "unrelated/AGENTS.md" not in global_guidance
+    assert "unrelated/README.md" not in global_guidance
+
+    scoped = workspace.guidance(target_paths=["src/package/module.py"])
+    assert "src/AGENTS.md" in scoped
+    assert "src/README.md" in scoped
+    assert "src/package/AGENTS.md" in scoped
+    assert "src/package/README.md" in scoped
+    assert "unrelated/AGENTS.md" not in scoped
+    assert "unrelated/README.md" not in scoped
+    scoped_paths = list(scoped)
+    assert scoped_paths.index("AGENTS.md") < scoped_paths.index("src/AGENTS.md")
+    assert scoped_paths.index("src/AGENTS.md") < scoped_paths.index("src/package/AGENTS.md")
+
+
+def test_non_utf8_policy_fails_guidance_closed(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, _, _ = source_repository
+    (source / "POLICY.md").write_bytes(b"invalid: \xff\n")
+    _git(source, "add", "POLICY.md")
+    _git(source, "commit", "--quiet", "-m", "add invalid policy")
+    sha = _git(source, "rev-parse", "HEAD")
+    workspace = _clone(source, sha, tmp_path / "workspace")
+
+    with pytest.raises(
+        RepositoryError,
+        match=r"Could not load applicable repository guidance in full: POLICY[.]md",
+    ):
+        workspace.guidance()
 
 
 @pytest.mark.parametrize(

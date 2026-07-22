@@ -33,6 +33,16 @@ request, likely credentials and conventionally sensitive file contents are redac
 match strict Pydantic schemas. File edits use exact, unique search/replace operations and paths that
 cannot escape the workspace.
 
+Guidance discovery is complete within explicit input ceilings. Named contribution, policy, AI,
+security, legal/conduct, and pull-request-template files are repository-wide inputs; root
+`AGENTS.md` and README files are also always included. Nested `AGENTS.md` and README files are
+resolved root-to-leaf only for model-visible literal-reference, planned, selected-context,
+affected-review, and proposed-edit paths they govern. Any applicable file-count/character overflow
+or safe-read/UTF-8 failure aborts preparation. A model cannot move an edit into a previously unseen
+`AGENTS.md` scope: the orchestrator checks the complete tracked guidance inventory before mutating
+the workspace. When the initial scout selects a newly governed path, one bounded scout replan sees
+that expanded guidance before builder work; any further scope expansion fails closed.
+
 Model calls use a durable per-run budget ledger. Before crossing the provider boundary, the worker
 records conservative input/output, cost, and timeout reservations in the manifest. It clamps the
 provider's output and timeout to the remaining aggregate budget, then reconciles input/output usage,

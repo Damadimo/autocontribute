@@ -373,54 +373,70 @@ class RepositoryWorkspace:
         *,
         max_files: int = 30,
         max_characters: int = 120_000,
+        target_paths: Sequence[str] = (),
     ) -> dict[str, str]:
-        """Read contribution, PR, security, AI, and repository guidance files."""
+        """Read every applicable guidance file in full or fail closed.
+
+        Named contribution, policy, AI, security, legal, conduct, and pull-request-template files
+        are repository-wide evidence regardless of their directory. Root ``AGENTS.md`` and README
+        files are also always applicable. Nested ``AGENTS.md`` and README files are scoped to
+        target paths beneath their directory, so callers can account for the exact plan/read/edit
+        scope without treating every component README as global instructions.
+        """
 
         if max_files < 1 or max_characters < 1:
             raise ValueError("guidance limits must be positive")
-        candidates = [path for path in self._tracked_paths() if _is_guidance_path(path)]
-        templates = sorted(path for path in candidates if _is_pull_request_template_path(path))
-        if len(templates) > max_files:
+        candidates = self.guidance_paths(target_paths=target_paths)
+        if len(candidates) > max_files:
             raise RepositoryError(
-                "Repository has more pull-request templates than the configured guidance file "
-                "limit; refusing to evaluate an incomplete template set"
+                f"Repository has {len(candidates)} applicable guidance files, above the "
+                f"configured limit of {max_files}; refusing an incomplete guidance set"
             )
-        other_guidance = sorted(
-            (path for path in candidates if not _is_pull_request_template_path(path)),
-            key=_guidance_sort_key,
-        )
-        # Templates are publication requirements, so load every one in full before spending the
-        # bounded remainder on generic guidance. This also makes ambiguity detection exhaustive.
-        candidates = [*templates, *other_guidance]
         result: dict[str, str] = {}
         remaining = max_characters
-        for relative_path in candidates[:max_files]:
+        for relative_path in candidates:
             if remaining <= 0:
-                if _is_pull_request_template_path(relative_path):
-                    raise RepositoryError(
-                        "Pull-request templates exceed the configured guidance character limit; "
-                        "refusing to validate a truncated template"
-                    )
-                break
+                raise RepositoryError(
+                    "Applicable repository guidance exceeds the configured character limit; "
+                    f"refusing to omit {relative_path}"
+                )
             try:
-                content = self.read_file(relative_path, max_bytes=min(remaining * 4, 2_000_000))
+                content = self.read_file(relative_path, max_bytes=remaining * 4)
             except RepositoryError as exc:
-                if _is_pull_request_template_path(relative_path):
-                    raise RepositoryError(
-                        f"Could not load pull-request template in full: {relative_path}"
-                    ) from exc
-                continue
+                raise RepositoryError(
+                    f"Could not load applicable repository guidance in full: {relative_path}"
+                ) from exc
             if len(content) > remaining:
-                if _is_pull_request_template_path(relative_path):
-                    raise RepositoryError(
-                        "Pull-request templates exceed the configured guidance character limit; "
-                        "refusing to validate a truncated template"
-                    )
-                suffix = "\n\n[truncated by autocontribute]"
-                content = content[: max(0, remaining - len(suffix))] + suffix
+                raise RepositoryError(
+                    "Applicable repository guidance exceeds the configured character limit; "
+                    f"refusing to truncate {relative_path}"
+                )
             result[relative_path] = content
             remaining -= len(content)
         return result
+
+    def guidance_paths(self, *, target_paths: Sequence[str] = ()) -> list[str]:
+        """Return the complete applicable guidance inventory for target paths.
+
+        This is intentionally separate from :meth:`guidance` so the orchestrator can prove that a
+        model-proposed edit did not enter a guidance scope that was absent from its prompt, without
+        rereading a guidance document that the proposed patch itself may modify.
+        """
+
+        normalized_targets = [self._normalize_path(path) for path in target_paths]
+        candidates = [
+            path
+            for path in self._tracked_paths()
+            if _is_applicable_guidance_path(path, target_paths=normalized_targets)
+        ]
+        folded: dict[str, str] = {}
+        for path in candidates:
+            previous = folded.setdefault(path.casefold(), path)
+            if previous != path:
+                raise RepositoryError(
+                    f"Applicable repository guidance paths differ only by case: {previous}, {path}"
+                )
+        return sorted(candidates, key=_guidance_sort_key)
 
     def apply_edit(self, edit: FileEdit) -> None:
         """Apply one exact create/replace/delete operation."""
@@ -668,7 +684,13 @@ class RepositoryWorkspace:
             flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             descriptor = os.open(path, flags)
             with os.fdopen(descriptor, "rb") as handle:
-                return handle.read()
+                data = handle.read() if max_bytes is None else handle.read(max_bytes + 1)
+            if max_bytes is not None and len(data) > max_bytes:
+                raise RepositoryError(
+                    f"File exceeds the {max_bytes}-byte context limit: "
+                    f"{path.relative_to(self.path)}"
+                )
+            return data
         except OSError as exc:
             relative = path.relative_to(self.path)
             raise RepositoryError(f"Could not safely read {relative}: {exc}") from exc
@@ -952,25 +974,61 @@ def _decode_git_path(value: bytes) -> str:
         raise RepositoryError("Repository contains a non-UTF-8 path") from exc
 
 
-def _is_guidance_path(relative_path: str) -> bool:
-    lowered = relative_path.casefold()
+def _is_applicable_guidance_path(
+    relative_path: str,
+    *,
+    target_paths: Sequence[str],
+) -> bool:
+    if _is_repository_policy_path(relative_path):
+        return True
+    if not _is_scoped_guidance_path(relative_path):
+        return False
+    scope = PurePosixPath(relative_path).parent
+    if scope == PurePosixPath("."):
+        return True
+    scope_parts = scope.parts
+    return any(
+        PurePosixPath(target).parts[: len(scope_parts)] == scope_parts for target in target_paths
+    )
+
+
+def _is_scoped_guidance_path(relative_path: str) -> bool:
+    name = PurePosixPath(relative_path.casefold()).name
+    return name == "agents.md" or name in {
+        "readme",
+        "readme.adoc",
+        "readme.asciidoc",
+        "readme.md",
+        "readme.markdown",
+        "readme.rst",
+        "readme.txt",
+    }
+
+
+def _is_repository_policy_path(relative_path: str) -> bool:
+    lowered = relative_path.casefold().strip("/")
     name = PurePosixPath(lowered).name
-    if name in {"agents.md", "readme.md", "readme.rst", "readme.txt"}:
+    supported_suffixes = (".adoc", ".asciidoc", ".md", ".markdown", ".rst", ".txt")
+    suffix = next((item for item in supported_suffixes if name.endswith(item)), "")
+    if not suffix and "." in name:
+        return False
+    if _is_pull_request_template_path(relative_path):
         return True
-    if name.startswith(("contributing", "security", "code_of_conduct", "code-of-conduct")):
-        return True
-    if name.startswith(
-        (
-            "ai_policy",
-            "ai-policy",
-            "ai_contribution",
-            "ai-contribution",
-            "responsible-ai",
-            "generative-ai",
-        )
-    ):
-        return True
-    return _is_pull_request_template_path(relative_path)
+    stem = name[: -len(suffix)] if suffix else name
+    normalized = re.sub(r"[^a-z0-9]+", "-", stem).strip("-")
+    tokens = set(normalized.split("-"))
+    fragments = (
+        "automation",
+        "code-of-conduct",
+        "contribut",
+        "developer-certificate",
+        "license-agreement",
+        "policy",
+        "security",
+    )
+    return bool(tokens.intersection({"ai", "bot", "cla", "dco", "llm", "support"})) or any(
+        marker in normalized for marker in fragments
+    )
 
 
 def _is_pull_request_template_path(relative_path: str) -> bool:
@@ -984,9 +1042,10 @@ def _is_pull_request_template_path(relative_path: str) -> bool:
     )
 
 
-def _guidance_sort_key(relative_path: str) -> tuple[int, str]:
+def _guidance_sort_key(relative_path: str) -> tuple[int, int, str]:
     lowered = relative_path.casefold()
-    name = PurePosixPath(lowered).name
+    pure_path = PurePosixPath(lowered)
+    name = pure_path.name
     priorities = (
         ("agents", 0),
         ("contributing", 1),
@@ -1000,8 +1059,8 @@ def _guidance_sort_key(relative_path: str) -> tuple[int, str]:
     )
     for prefix, priority in priorities:
         if name.startswith(prefix):
-            return priority, lowered
-    return 7, lowered
+            return priority, len(pure_path.parts), lowered
+    return 7, len(pure_path.parts), lowered
 
 
 __all__ = ["ContextEntry", "PatchMetrics", "RepositoryWorkspace", "TextMatch"]
