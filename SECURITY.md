@@ -16,6 +16,10 @@ suggested mitigation. Please do not include live credentials or data belonging t
 ## Deployment expectations
 
 - Keep model and GitHub credentials in a secret manager or environment variables.
+- Before storing credentials in GitHub Actions, protect the default branch that controls the
+  workflows: require pull requests and passing CI, apply the rules to administrators where supported,
+  and block force pushes and deletion. If the repository plan cannot enforce those controls, keep the
+  credentials out of hosted Actions and use a trusted persistent worker instead.
 - Prefer an expiring GitHub App user token with minimum permissions for hosted deployments.
 - Never mount a home directory, Docker socket, SSH agent, cloud credentials, or provider keys into
   the repository sandbox.

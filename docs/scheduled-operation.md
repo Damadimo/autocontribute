@@ -14,7 +14,12 @@ The included workflow runs at 09:17 and 21:17 UTC. It is inert until the reposit
    and no unsafe-local opt-in. Its configured aggregate model ceiling plus worst-case sandbox command
    budget must not exceed 180 minutes; the four-hour job timeout reserves the remaining hour for
    preflight and fail-closed state finalization.
-3. Add `OPENAI_API_KEY` and `AUTOCONTRIBUTE_GITHUB_TOKEN` as GitHub Actions secrets. Prefer an expiring
+3. Protect the control repository's default branch before storing any hosted credential. Require pull
+   requests and passing CI, apply the rule to administrators where supported, and block force pushes
+   and deletion. If the account plan cannot enforce these controls for the repository, keep hosted
+   secrets and the schedule disabled; use a trusted persistent worker or move a sanitized control
+   repository to a visibility/plan that supports protection.
+4. Add `OPENAI_API_KEY` and `AUTOCONTRIBUTE_GITHUB_TOKEN` as GitHub Actions secrets. Prefer an expiring
    GitHub App user token in hosted systems. This prepare-only workflow needs only the read permissions
    required for discovery and lifecycle polling. Provision a separate, short-lived write-capable
    credential only on the trusted persistent worker that performs an approved publication. Also add
@@ -22,10 +27,10 @@ The included workflow runs at 09:17 and 21:17 UTC. It is inert until the reposit
    with only **Variables: Read and write** (plus GitHub's implicit metadata read). Grant it no contents,
    issues, pull-request, or Actions access, and rotate it independently from the target-repository
    credential.
-4. Leave `publishing.mode: review_required`. The hosted workflow validates this setting and rejects
+5. Leave `publishing.mode: review_required`. The hosted workflow validates this setting and rejects
    `auto`; it is a permanent prepare-and-review boundary, not an autonomous publisher.
-5. Set the repository variable `AUTOCONTRIBUTE_ENABLED=true`.
-6. Before waiting for a schedule, manually dispatch **Prepare contribution** from the default branch
+6. Set the repository variable `AUTOCONTRIBUTE_ENABLED=true`.
+7. Before waiting for a schedule, manually dispatch **Prepare contribution** from the default branch
    with `bootstrap_state=true`. This explicit dispatch creates the first state lineage. After that
    first successful run, leave `bootstrap_state=false`; normal dispatches and schedules must restore
    the existing lineage.

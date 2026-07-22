@@ -22,7 +22,12 @@ credentials, private code, personal data, or other non-public material in the fi
    leaves the remaining hour for preflight and state finalization.
    Keep the fixture's 11-command budget: it covers one baseline reproduction and the five-command
    deduplicated validation suite both before and after the single bounded critic-repair pass.
-3. Add `OPENAI_API_KEY` and a read-only `AUTOCONTRIBUTE_STAGING_GITHUB_TOKEN` as repository secrets.
+3. Protect the control repository's default branch before storing any hosted credential. Require pull
+   requests and passing CI, apply the rule to administrators where supported, and block force pushes
+   and deletion. If the account plan cannot enforce these controls for the repository, keep hosted
+   secrets and staging disabled; run the shadow check from a trusted worker or move a sanitized control
+   repository to a visibility/plan that supports protection.
+4. Add `OPENAI_API_KEY` and a read-only `AUTOCONTRIBUTE_STAGING_GITHUB_TOKEN` as repository secrets.
    Use a dedicated provider project. The target token must be either an expiring fine-grained PAT or a
    GitHub App **user access token** because preflight identifies its account with `GET /user`; a plain
    installation token is not sufficient. Restrict it to the fixture repository with read-only metadata,
@@ -30,8 +35,8 @@ credentials, private code, personal data, or other non-public material in the fi
    expiring fine-grained PAT restricted to this control repository with only **Variables: Read and
    write** (plus implicit metadata read). Grant it no contents, issues, pull-request, or Actions access,
    and rotate it independently.
-4. Set `AUTOCONTRIBUTE_STAGING_REPOSITORY` to the fixture's `owner/repository` name.
-5. Set `AUTOCONTRIBUTE_STAGING_ENABLED=true`, then manually dispatch **Staging shadow run** from the
+5. Set `AUTOCONTRIBUTE_STAGING_REPOSITORY` to the fixture's `owner/repository` name.
+6. Set `AUTOCONTRIBUTE_STAGING_ENABLED=true`, then manually dispatch **Staging shadow run** from the
    default branch with a fixture issue reference and `bootstrap_state=true`. This flag is required
    only for the first-ever state lineage; leave it `false` on later dispatches so a missing cache
    fails closed instead of silently discarding history.
