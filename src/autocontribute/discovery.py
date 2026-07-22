@@ -21,8 +21,15 @@ _REPRODUCTION_TERMS = re.compile(
     r"\b(repro(?:duce|duction)?|traceback|error|fails?|incorrect|bug|typo|broken)\b", re.I
 )
 _DANGEROUS_TERMS = re.compile(
-    r"\b(CVE-\d{4}-\d+|vulnerabilit(?:y|ies)|remote code execution|credential leak|"
-    r"SQL injection|cross[ -]site scripting|XSS)\b",
+    r"\b(?:CVE-\d{4}-\d+|vulnerabilit(?:y|ies)|"
+    r"remote code execution|arbitrary code execution|"
+    r"authentication bypass|authorization bypass|privilege escalation|"
+    r"server[ -]side request forgery|SSRF|"
+    r"(?:path|directory) traversal|use[ -]after[ -]free|"
+    r"arbitrary file (?:read|write)|credential (?:exposure|leak)|secret exposure|"
+    r"SQL injection|command injection|code injection|"
+    r"cross[ -]site scripting|XSS|cross[ -]site request forgery|CSRF|"
+    r"XML external entity|XXE|buffer overflow|memory corruption)\b",
     re.I,
 )
 _AI_PROHIBITION = re.compile(

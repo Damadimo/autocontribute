@@ -127,11 +127,39 @@ def test_possible_security_issue_is_never_publicly_selected(tmp_path) -> None:
     assert "private handling" in " ".join(result.blockers)
 
 
-@pytest.mark.parametrize("title", ["Fix SQL injection in search", "Prevent XSS in rendered names"])
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Fix SQL injection in search",
+        "Prevent XSS in rendered names",
+        "Authentication bypass in SSO middleware",
+        "Authorization bypass permits cross-tenant reads",
+        "Local privilege escalation through helper binary",
+        "Prevent SSRF in webhook previews",
+        "Server-side request forgery through redirects",
+        "Path traversal when unpacking an archive",
+        "Directory traversal in static file handler",
+        "Use-after-free in the stream parser",
+        "Arbitrary file write via crafted output path",
+        "Arbitrary file read in template loader",
+    ],
+)
 def test_security_issue_synonyms_fail_closed(tmp_path, title: str) -> None:  # type: ignore[no-untyped-def]
     service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
 
     result = service.evaluate(_issue(title=title), _repository())
+
+    assert not result.eligible
+    assert "private handling" in " ".join(result.blockers)
+
+
+def test_security_issue_term_in_body_fails_closed(tmp_path) -> None:
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+
+    result = service.evaluate(
+        _issue(body="A crafted request triggers memory corruption in the native parser."),
+        _repository(),
+    )
 
     assert not result.eligible
     assert "private handling" in " ".join(result.blockers)
