@@ -31,6 +31,7 @@ _MAX_ACTIVE_CIRCUIT_BREAKER_TRIGGERS: Final = 10_000
 _MAX_LIFECYCLE_SNAPSHOT_BYTES: Final = 2_000_000
 _MAX_RUN_CORPUS: Final = 10_000
 _MAX_EVALUATION_EVENT_CORPUS: Final = 10_000
+_REQUIRED_WORKSPACE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT"
 _INITIAL_EVENT_HASH: Final = "0" * 64
 _METADATA_COLUMNS: Final = {"singleton", "schema_version", "migrated_at"}
 _V3_RUN_COLUMNS: Final = {
@@ -342,11 +343,32 @@ class RunStore:
         self.runs_dir = self.root / "runs"
         self.workspaces_dir = self.root / "workspaces"
         self.database_path = self.root / "state.sqlite3"
+        self._validate_required_workspace_root()
         self.root.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.workspaces_dir.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self.synchronize_manifest_artifacts()
+
+    def _validate_required_workspace_root(self) -> None:
+        """Bind a hardened deployment to its preflight-verified workspace mount."""
+
+        required_value = os.environ.get(_REQUIRED_WORKSPACE_ROOT_ENV)
+        if required_value is None:
+            return
+        if not required_value or "\0" in required_value:
+            raise StateError("Required workspace root is invalid")
+        required = Path(required_value)
+        if not required.is_absolute():
+            raise StateError("Required workspace root must be absolute")
+        try:
+            resolved = required.resolve(strict=True)
+        except OSError as exc:
+            raise StateError("Required workspace root is unavailable") from exc
+        if required != resolved:
+            raise StateError("Required workspace root must be an exact real path")
+        if self.workspaces_dir != required:
+            raise StateError("Configured storage path bypasses the required workspace root")
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:

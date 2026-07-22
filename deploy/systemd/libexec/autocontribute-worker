@@ -12,6 +12,8 @@ readonly runtime_directory="/run/user/$UID"
 readonly docker_socket="$runtime_directory/docker.sock"
 readonly rootful_docker_socket="/var/run/docker.sock"
 readonly rootless_docker_check="/usr/local/libexec/autocontribute-rootless-docker-check"
+readonly workspace_quota_check="/usr/local/libexec/autocontribute-workspace-quota-check"
+readonly workspace_root="/var/lib/autocontribute/state/workspaces"
 
 if [[ ! -x "$executable" ]]; then
   printf 'Autocontribute executable is unavailable\n' >&2
@@ -25,6 +27,12 @@ if [[ ! -x "$rootless_docker_check" ]]; then
   printf 'Autocontribute rootless Docker boundary check is unavailable\n' >&2
   exit 1
 fi
+if [[ ! -x "$workspace_quota_check" ]]; then
+  printf 'Autocontribute workspace quota check is unavailable\n' >&2
+  exit 1
+fi
+"$workspace_quota_check" "$workspace_root"
+export AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT="$workspace_root"
 export XDG_RUNTIME_DIR="$runtime_directory"
 export DOCKER_HOST="unix://$docker_socket"
 unset DOCKER_CONTEXT DOCKER_CERT_PATH DOCKER_TLS_VERIFY
@@ -42,7 +50,7 @@ for credential_name in $credential_names; do
     exit 1
   fi
   case "$credential_name" in
-    AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH | BASH* | CDPATH | DOCKER_* | ENV | GIT_* | HOME | IFS | LD_* | PATH | PYTHON* | SHELL | XDG_*)
+    AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH | AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT | BASH* | CDPATH | DOCKER_* | ENV | GIT_* | HOME | IFS | LD_* | PATH | PYTHON* | SHELL | XDG_*)
       printf 'An Autocontribute credential uses a reserved environment name\n' >&2
       exit 1
       ;;

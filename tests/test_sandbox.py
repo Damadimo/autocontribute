@@ -68,6 +68,7 @@ def test_docker_command_enforces_isolation_and_clears_environment(
     assert "--cpus=1.5" in arguments
     assert "--pids-limit=64" in arguments
     assert "--pull=never" in arguments
+    assert "--log-driver=none" in arguments
     assert "--entrypoint=/usr/bin/env" in arguments
     assert "-i" in arguments
     assert "VERY_SECRET_TOKEN" not in rendered

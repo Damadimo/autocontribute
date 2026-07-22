@@ -9,12 +9,14 @@ import tempfile
 from collections import defaultdict
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).parents[1]
 SYSTEMD = ROOT / "deploy" / "systemd"
 LOCK_PATH = "/var/lib/autocontribute/operation.lock"
 ROOTLESS_CHECK = SYSTEMD / "libexec" / "autocontribute-rootless-docker-check"
+WORKSPACE_QUOTA_CHECK = SYSTEMD / "libexec" / "autocontribute-workspace-quota-check"
 
 
 def _directives(path: Path) -> dict[tuple[str, str], list[str]]:
@@ -188,6 +190,128 @@ exit "$TEST_DOCKER_EXIT"
     return result, observed_environment
 
 
+def _run_workspace_quota_check(
+    case_directory: Path,
+    *,
+    mount_target: str | None = None,
+    mount_device: str = "253:7",
+    filesystem_type: str = "ext4",
+    filesystem_root: str = "/",
+    mount_options: str = "rw,nosuid,nodev,relatime",
+    mount_table: str | None = None,
+    workspace_owner: int | None = None,
+    workspace_group: int | None = None,
+    workspace_mode: str = "700",
+    workspace_stat_device: str = "2049",
+    parent_device: str = "2048",
+    block_size: str = "4096",
+    total_blocks: str = "4194304",
+    total_inodes: str = "262144",
+) -> subprocess.CompletedProcess[str]:
+    case_directory.mkdir()
+    workspace = case_directory / "workspace"
+    workspace.mkdir(mode=0o700)
+    fake_bin = case_directory / "bin"
+    fake_bin.mkdir()
+    uid = os.getuid()
+    gid = os.getgid()
+    resolved_target = mount_target or os.fspath(workspace)
+    resolved_mount_table = (mount_table or "0:1 /\n{device} {workspace}\n0:2 /proc\n").format(
+        device=mount_device,
+        workspace=workspace,
+    )
+
+    _write_executable(
+        fake_bin / "id",
+        """#!/bin/sh
+set -eu
+[ "$*" = '--group' ]
+printf '%s\n' "$TEST_SERVICE_GID"
+""",
+    )
+    _write_executable(
+        fake_bin / "findmnt",
+        """#!/bin/sh
+set -eu
+if [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--target' ]; then
+  [ "$4" = "$TEST_WORKSPACE" ]
+  [ "$5" = '--output' ]
+  case "$6" in
+    TARGET) printf '%s\n' "$TEST_MOUNT_TARGET" ;;
+    FSTYPE) printf '%s\n' "$TEST_FILESYSTEM_TYPE" ;;
+    FSROOT) printf '%s\n' "$TEST_FILESYSTEM_ROOT" ;;
+    OPTIONS) printf '%s\n' "$TEST_MOUNT_OPTIONS" ;;
+    MAJ:MIN) printf '%s\n' "$TEST_MOUNT_DEVICE" ;;
+    *) exit 80 ;;
+  esac
+elif [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--output' ]; then
+  [ "$4" = 'MAJ:MIN,TARGET' ]
+  printf '%s' "$TEST_MOUNT_TABLE"
+else
+  exit 81
+fi
+""",
+    )
+    _write_executable(
+        fake_bin / "stat",
+        """#!/bin/sh
+set -eu
+if [ "$1" = '--file-system' ]; then
+  [ "$2" = '--format=%S:%b:%c' ]
+  [ "$3" = '--' ]
+  [ "$4" = "$TEST_WORKSPACE" ]
+  printf '%s:%s:%s\n' "$TEST_BLOCK_SIZE" "$TEST_TOTAL_BLOCKS" "$TEST_TOTAL_INODES"
+  exit 0
+fi
+[ "$2" = '--' ]
+path=$3
+case "$1:$path" in
+  --format=%u:"$TEST_WORKSPACE") printf '%s\n' "$TEST_WORKSPACE_OWNER" ;;
+  --format=%g:"$TEST_WORKSPACE") printf '%s\n' "$TEST_WORKSPACE_GROUP" ;;
+  --format=%a:"$TEST_WORKSPACE") printf '%s\n' "$TEST_WORKSPACE_MODE" ;;
+  --format=%d:"$TEST_WORKSPACE") printf '%s\n' "$TEST_WORKSPACE_DEVICE" ;;
+  --format=%d:"$TEST_WORKSPACE_PARENT") printf '%s\n' "$TEST_PARENT_DEVICE" ;;
+  *) exit 82 ;;
+esac
+""",
+    )
+
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "TEST_BLOCK_SIZE": block_size,
+        "TEST_FILESYSTEM_ROOT": filesystem_root,
+        "TEST_FILESYSTEM_TYPE": filesystem_type,
+        "TEST_MOUNT_OPTIONS": mount_options,
+        "TEST_MOUNT_DEVICE": mount_device,
+        "TEST_MOUNT_TABLE": resolved_mount_table,
+        "TEST_MOUNT_TARGET": resolved_target,
+        "TEST_PARENT_DEVICE": parent_device,
+        "TEST_SERVICE_GID": str(gid),
+        "TEST_TOTAL_BLOCKS": total_blocks,
+        "TEST_TOTAL_INODES": total_inodes,
+        "TEST_WORKSPACE": os.fspath(workspace),
+        "TEST_WORKSPACE_DEVICE": workspace_stat_device,
+        "TEST_WORKSPACE_GROUP": str(gid if workspace_group is None else workspace_group),
+        "TEST_WORKSPACE_MODE": workspace_mode,
+        "TEST_WORKSPACE_OWNER": str(uid if workspace_owner is None else workspace_owner),
+        "TEST_WORKSPACE_PARENT": os.fspath(workspace.parent),
+    }
+    test_script = case_directory / "workspace-quota-check"
+    _write_executable(test_script, WORKSPACE_QUOTA_CHECK.read_text(encoding="utf-8"))
+    return subprocess.run(
+        [
+            "bash",
+            os.fspath(test_script),
+            os.fspath(workspace),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+
 def test_systemd_bundle_contains_expected_units_and_executable_helpers() -> None:
     expected = {
         "autocontribute-backup.service",
@@ -210,6 +334,7 @@ def test_systemd_bundle_contains_expected_units_and_executable_helpers() -> None
         "autocontribute-record-failure",
         "autocontribute-rootless-docker-check",
         "autocontribute-worker",
+        "autocontribute-workspace-quota-check",
     }
     for helper in helpers:
         assert stat.S_IMODE(helper.stat().st_mode) == 0o755
@@ -260,6 +385,10 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
     assert "LoadCredentialEncrypted=OPENAI_API_KEY:" in unit_text
     assert "LoadCredentialEncrypted=AUTOCONTRIBUTE_GITHUB_TOKEN:" in unit_text
     assert "EnvironmentFile=" not in unit_text
+    assert "RequiresMountsFor=/var/lib/autocontribute/state/workspaces" in unit_text
+
+    doctor_unit_text = (SYSTEMD / "autocontribute-doctor.service").read_text(encoding="utf-8")
+    assert "RequiresMountsFor=/var/lib/autocontribute/state/workspaces" in doctor_unit_text
 
     helper = (SYSTEMD / "libexec" / "autocontribute-worker").read_text(encoding="utf-8")
     assert 'run --scheduled --config "$config"' in helper
@@ -279,6 +408,75 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
     assert "DOCKER_*" in helper
     assert "credential_value" in helper
     assert "set -euo pipefail" in helper
+    quota_call = '"$workspace_quota_check" "$workspace_root"'
+    assert quota_call in helper
+    assert helper.index(quota_call) < helper.index(check_call)
+    assert helper.index(quota_call) < helper.index('credential_value="$(<"$credential_path")"')
+    assert 'export AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT="$workspace_root"' in helper
+
+
+def test_workspace_quota_check_accepts_bounded_dedicated_ext4_mount(tmp_path: Path) -> None:
+    result = _run_workspace_quota_check(tmp_path / "valid")
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_workspace_quota_check_accepts_same_target_namespace_layers(tmp_path: Path) -> None:
+    result = _run_workspace_quota_check(
+        tmp_path / "same-target-layers",
+        mount_table="253:7 {workspace}\n253:7 {workspace}\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "overrides", "message"),
+    (
+        ("wrong-target", {"mount_target": "/var/lib/autocontribute"}, "exact dedicated mount"),
+        ("invalid-device", {"mount_device": "not-a-device"}, "invalid device number"),
+        ("subdirectory", {"filesystem_root": "/subdir"}, "whole filesystem"),
+        ("wrong-filesystem", {"filesystem_type": "xfs"}, "must use ext4"),
+        ("read-only", {"mount_options": "ro,nosuid,nodev"}, "not writable"),
+        ("missing-nodev", {"mount_options": "rw,nosuid"}, "must use nodev"),
+        ("missing-nosuid", {"mount_options": "rw,nodev"}, "must use nosuid"),
+        ("bind", {"mount_options": "rw,nodev,nosuid,bind"}, "cannot be a bind"),
+        (
+            "alias-second-target",
+            {"mount_table": ("0:1 /\n253:7 {workspace}\n253:7 /mnt/same-device-via-uuid-alias\n")},
+            "another host path",
+        ),
+        ("same-device", {"parent_device": "2049"}, "separate filesystem"),
+        ("too-many-blocks", {"total_blocks": "5242881"}, "byte ceiling"),
+        ("too-many-inodes", {"total_inodes": "524289"}, "inode ceiling"),
+        ("invalid-limits", {"block_size": "not-a-number"}, "invalid limits"),
+    ),
+)
+def test_workspace_quota_check_rejects_unenforced_boundaries(
+    tmp_path: Path,
+    name: str,
+    overrides: dict[str, str],
+    message: str,
+) -> None:
+    result = _run_workspace_quota_check(tmp_path / name, **overrides)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_workspace_quota_check_rejects_unsafe_mount_metadata(tmp_path: Path) -> None:
+    cases: tuple[tuple[str, dict[str, int | str]], ...] = (
+        ("owner", {"workspace_owner": os.getuid() + 1}),
+        ("group", {"workspace_group": os.getgid() + 1}),
+        ("mode", {"workspace_mode": "750"}),
+    )
+    for name, overrides in cases:
+        result = _run_workspace_quota_check(
+            tmp_path / name,
+            **overrides,  # type: ignore[arg-type]
+        )
+        assert result.returncode != 0
+        assert "unsafe ownership or permissions" in result.stderr
 
 
 def test_rootless_docker_check_accepts_only_the_exact_option_and_clears_context(
@@ -448,6 +646,10 @@ def test_no_unit_embeds_secret_values_or_enables_automatic_publication() -> None
 def test_tmpfiles_keeps_state_private_and_docs_cover_safe_recovery() -> None:
     tmpfiles = (SYSTEMD / "autocontribute.tmpfiles.conf").read_text(encoding="utf-8")
     assert "d /var/lib/autocontribute/state 0700 autocontribute autocontribute -" in tmpfiles
+    assert (
+        "d /var/lib/autocontribute/state/workspaces 0700 autocontribute autocontribute -"
+        in tmpfiles
+    )
     assert "d /var/backups/autocontribute 0700 autocontribute autocontribute -" in tmpfiles
 
     guide = (ROOT / "docs" / "systemd-deployment.md").read_text(encoding="utf-8")
@@ -458,6 +660,10 @@ def test_tmpfiles_keeps_state_private_and_docs_cover_safe_recovery() -> None:
     assert "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH=1" in guide
     assert "useradd --system --create-home" in guide
     assert "--user-group" in guide
+    assert "21,474,836,480 bytes" in guide
+    assert "524,288 inodes" in guide
+    assert "rw,nodev,nosuid" in guide
+    assert "AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT" not in guide
 
 
 def test_docs_apply_sensitive_dropins_to_both_execution_services() -> None:

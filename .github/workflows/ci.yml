@@ -62,6 +62,104 @@ jobs:
           sudo install -o root -g root -m 0755 \
             deploy/systemd/libexec/* \
             /usr/local/libexec/
+      - name: Exercise bounded workspace preflight in a hardened service
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          loop_device=""
+          smoke_root=""
+          workspace_image=""
+          workspace_mount=""
+
+          cleanup_workspace_quota_smoke() {
+            local exit_status=$?
+            local cleanup_failed=0
+            local still_mounted=0
+            trap - EXIT
+            set +e
+
+            if [[ -n "$workspace_mount" ]] && mountpoint --quiet -- "$workspace_mount"; then
+              if ! sudo umount -- "$workspace_mount"; then
+                echo "Failed to unmount the workspace quota smoke-test filesystem" >&2
+                cleanup_failed=1
+                still_mounted=1
+              fi
+            fi
+            if [[ "$still_mounted" -eq 0 && -n "$loop_device" ]]; then
+              if sudo losetup --detach "$loop_device"; then
+                loop_device=""
+              else
+                echo "Failed to detach the workspace quota smoke-test loop device" >&2
+                cleanup_failed=1
+              fi
+            fi
+            if [[ "$still_mounted" -eq 0 && -z "$loop_device" && -n "$smoke_root" ]]; then
+              if [[ -n "$workspace_image" ]]; then
+                rm -f -- "$workspace_image" || cleanup_failed=1
+              fi
+              for cleanup_directory in \
+                "$workspace_mount" "${workspace_mount%/*}" "$smoke_root"; do
+                if [[ -d "$cleanup_directory" ]] && ! rmdir -- "$cleanup_directory"; then
+                  echo "Failed to remove smoke-test directory: $cleanup_directory" >&2
+                  cleanup_failed=1
+                fi
+              done
+            fi
+            if [[ "$exit_status" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
+              exit_status=1
+            fi
+            exit "$exit_status"
+          }
+          trap cleanup_workspace_quota_smoke EXIT
+
+          for required_command in \
+            fallocate findmnt losetup mkfs.ext4 mount mountpoint realpath systemd-run umount; do
+            command -v "$required_command" >/dev/null
+          done
+          unset required_command
+          test "$(cat /proc/1/comm)" = systemd
+
+          smoke_root="$(mktemp --directory \
+            "${RUNNER_TEMP}/autocontribute-workspace-quota.XXXXXX")"
+          smoke_root="$(realpath "$smoke_root")"
+          workspace_image="${smoke_root}/workspace.ext4"
+          workspace_mount="${smoke_root}/state/workspaces"
+          install -d -m 0700 "$workspace_mount"
+          fallocate --length 64M "$workspace_image"
+          loop_device="$(sudo losetup --find --show "$workspace_image")"
+          if [[ ! "$loop_device" =~ ^/dev/loop[0-9]+$ ]]; then
+            echo "losetup returned an unexpected loop-device path" >&2
+            exit 1
+          fi
+          sudo mkfs.ext4 -q -N 8192 "$loop_device"
+          sudo mount -t ext4 -o nodev,nosuid -- "$loop_device" "$workspace_mount"
+
+          service_uid="$(id --user)"
+          service_gid="$(id --group)"
+          test "$service_uid" -ne 0
+          sudo chown "${service_uid}:${service_gid}" "$workspace_mount"
+          chmod 0700 "$workspace_mount"
+          test "$(stat --format=%u "$workspace_mount")" = "$service_uid"
+          test "$(stat --format=%g "$workspace_mount")" = "$service_gid"
+          test "$(stat --format=%a "$workspace_mount")" = 700
+
+          quota_unit="autocontribute-workspace-quota-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
+          sudo systemd-run \
+            --unit="$quota_unit" \
+            --wait \
+            --collect \
+            --pipe \
+            --property=Type=exec \
+            --property="User=$service_uid" \
+            --property="Group=$service_gid" \
+            --property=NoNewPrivileges=yes \
+            --property=PrivateDevices=yes \
+            --property=PrivateTmp=yes \
+            --property=ProtectSystem=strict \
+            --property=RestrictSUIDSGID=yes \
+            --property="ReadWritePaths=$smoke_root" \
+            /usr/local/libexec/autocontribute-workspace-quota-check "$workspace_mount"
       - name: Verify system and timer units
         shell: bash
         env:

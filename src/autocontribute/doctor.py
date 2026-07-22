@@ -219,7 +219,12 @@ def _run_doctor(
                 ],
             )
         )
-        checks.append(_docker_bind_mount_check(config))
+        checks.append(
+            _docker_bind_mount_check(
+                config,
+                workspace_parent=store.workspaces_dir if store is not None else None,
+            )
+        )
     else:
         checks.append(
             DoctorCheck(
@@ -783,6 +788,7 @@ def _docker_toolchain_probe(
         "run",
         "--rm",
         "--pull=never",
+        "--log-driver=none",
         "--network=none",
         "--read-only",
         "--cap-drop=ALL",
@@ -893,7 +899,11 @@ def _command_check(
     return DoctorCheck(name, result.returncode == 0, _safe_detail(detail))
 
 
-def _docker_bind_mount_check(config: AutocontributeConfig) -> DoctorCheck:
+def _docker_bind_mount_check(
+    config: AutocontributeConfig,
+    *,
+    workspace_parent: Path | None = None,
+) -> DoctorCheck:
     """Prove the configured sandbox can use a private service-owned bind mount."""
 
     getuid = getattr(os, "getuid", None)
@@ -918,6 +928,7 @@ def _docker_bind_mount_check(config: AutocontributeConfig) -> DoctorCheck:
     try:
         with tempfile.TemporaryDirectory(
             prefix="autocontribute-bind-probe-",
+            dir=workspace_parent,
             ignore_cleanup_errors=True,
         ) as temporary:
             workspace = Path(temporary)

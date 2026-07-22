@@ -143,7 +143,9 @@ def test_active_breaker_skips_billed_model_and_github_probes(
     monkeypatch.setattr(
         doctor,
         "_docker_bind_mount_check",
-        lambda _config: doctor.DoctorCheck("sandbox private bind mount", True, "available"),
+        lambda _config, **_kwargs: doctor.DoctorCheck(
+            "sandbox private bind mount", True, "available"
+        ),
     )
     monkeypatch.setattr(
         doctor,
@@ -292,7 +294,9 @@ def test_doctor_redacts_configured_and_recognizable_credentials_from_provider_er
     monkeypatch.setattr(
         doctor,
         "_docker_bind_mount_check",
-        lambda _config: doctor.DoctorCheck("sandbox private bind mount", True, "available"),
+        lambda _config, **_kwargs: doctor.DoctorCheck(
+            "sandbox private bind mount", True, "available"
+        ),
     )
     monkeypatch.setattr(doctor, "_github_checks", lambda *_args, **_kwargs: [])
 
@@ -474,6 +478,7 @@ def test_docker_toolchain_probe_matches_sandbox_isolation(
 
     assert command[:3] == ["docker", "run", "--rm"]
     assert "--pull=never" in command
+    assert "--log-driver=none" in command
     assert "--network=none" in command
     assert "--read-only" in command
     assert "--cap-drop=ALL" in command
@@ -538,6 +543,32 @@ def test_doctor_private_bind_probe_verifies_0700_mount_and_host_side_output(
     assert "daemon-selected identity" in check.detail
     assert "cgroup v2 limits" in check.detail
     assert "host-side ownership" in check.detail
+
+
+def test_doctor_private_bind_probe_uses_store_workspace_filesystem(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    observed: dict[str, Path] = {}
+
+    class FailingProbeRunner:
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def run(self, workspace: Path, _command: str) -> SimpleNamespace:
+            observed["parent"] = workspace.parent
+            return SimpleNamespace(passed=False, stderr="expected test stop")
+
+    monkeypatch.setattr(doctor, "DockerSandbox", FailingProbeRunner)
+
+    check = doctor._docker_bind_mount_check(
+        _config(),
+        workspace_parent=store.workspaces_dir,
+    )
+
+    assert not check.passed
+    assert observed["parent"] == store.workspaces_dir
 
 
 def test_doctor_private_bind_probe_cannot_pass_without_host_side_output(

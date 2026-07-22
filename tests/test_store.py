@@ -15,6 +15,44 @@ from autocontribute.exceptions import StateError
 from autocontribute.store import CURRENT_SCHEMA_VERSION, RunStore
 
 
+def test_required_workspace_root_binds_storage_to_verified_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = tmp_path / "state"
+    required = state / "workspaces"
+    required.mkdir(parents=True)
+    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT", os.fspath(required))
+
+    store = RunStore(state)
+
+    assert store.workspaces_dir == required
+
+
+def test_required_workspace_root_rejects_storage_bypass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required = tmp_path / "bounded" / "workspaces"
+    required.mkdir(parents=True)
+    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT", os.fspath(required))
+
+    with pytest.raises(StateError, match="bypasses the required workspace root"):
+        RunStore(tmp_path / "unbounded")
+
+
+@pytest.mark.parametrize("required", ("", "relative/workspaces"))
+def test_required_workspace_root_rejects_invalid_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    required: str,
+) -> None:
+    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT", required)
+
+    with pytest.raises(StateError, match="Required workspace root"):
+        RunStore(tmp_path / "state")
+
+
 def _legacy_database(root: Path) -> RunManifest:
     root.mkdir(parents=True, exist_ok=True)
     now = datetime(2025, 1, 1, tzinfo=UTC)

@@ -45,8 +45,16 @@ Model and GitHub credentials exist only in the control process. Each validation 
 fresh disposable copy of the target working tree; mutations never become part of the authoritative
 patch or leak into later checks. Docker receives a read/write bind of that copy, a read-only `.git`
 directory, a fresh temporary home, no inherited environment, no network, no capabilities, no Docker
-socket, and explicit CPU/memory/PID/time limits. Local command execution is rejected unless the user
-opts into `allow_unsafe_local: true`.
+socket, no persistent Docker log driver, and explicit CPU/memory/PID/time/output limits. Attached
+stdout and stderr remain available to the controller's bounded capture. Local command execution is
+rejected unless the user opts into `allow_unsafe_local: true`.
+
+The persistent systemd deployment additionally places every authoritative repository and disposable
+validation copy on one dedicated ext4 filesystem with verified aggregate byte and fixed-inode
+ceilings. Its wrapper rejects a missing, oversized, shared, bind, or incorrectly mounted filesystem
+before loading credentials, and the store rejects any configured workspace path outside that checked
+mount. This host-storage boundary is deployment-specific; ordinary CLI and hosted runs must provide
+their own host disk controls.
 
 Immediately before every Docker launch, the control process parses one bounded structured daemon
 probe. It requires cgroup v2, a real cgroup driver, and reported memory, swap, CPU-quota, and PID-limit

@@ -204,6 +204,7 @@ class SandboxRunner:
             "run",
             "--rm",
             "--pull=never",
+            "--log-driver=none",
             f"--cidfile={cidfile}",
             "--network=none",
             "--read-only",

@@ -19,7 +19,8 @@ Use this layout on one durable host:
 | `/opt/autocontribute/current` | `root:root` symlink | Atomically selected release |
 | `/etc/autocontribute/autocontribute.yml` | `root:autocontribute`, `0640` | Reviewed, non-secret policy and repository configuration |
 | `/etc/autocontribute/credentials/*.cred` | `root:root`, `0600` | Encrypted systemd credentials |
-| `/var/lib/autocontribute/state` | `autocontribute:autocontribute`, `0700` | Live SQLite, evidence, evaluations, and workspaces |
+| `/var/lib/autocontribute/state` | `autocontribute:autocontribute`, `0700` | Live SQLite, evidence, and evaluations |
+| `/var/lib/autocontribute/state/workspaces` | `autocontribute:autocontribute`, `0700` | Dedicated capacity-limited ext4 filesystem for target repositories and validation copies |
 | `/var/lib/autocontribute/tmp` | `autocontribute:autocontribute`, `0700` | Private temporary files visible to the rootless Docker daemon |
 | `/var/backups/autocontribute` | `autocontribute:autocontribute`, `0700` | Local immutable-name complete bundles awaiting off-host replication |
 
@@ -28,6 +29,21 @@ serializes the packaged worker, doctor, and backup services on this host. It is 
 lock: never run a second host, an ad-hoc CLI writer, or the hosted scheduler against the same
 lineage. Keep the state on a local filesystem with working SQLite locks; do not place it on NFS or an
 eventually consistent mount.
+
+Every host-backed path writable by repository code is below the dedicated `state/workspaces` mount;
+the container's other writable path is its size-limited `/tmp` tmpfs. The supplied worker accepts
+only an exact, non-bind ext4 mount backed by one whole block device, mounted nowhere else, with
+`rw,nodev,nosuid`, at most 20 GiB of addressable blocks, and at most 524,288 fixed inodes. This is an
+aggregate hard ceiling across durable repositories and disposable validation copies. It prevents
+workspace writes from exhausting the filesystem that holds SQLite, evidence, or the service home.
+It is not a per-run fairness limit: a full workspace filesystem makes the worker fail safely and
+requires operator cleanup. The wrapper checks the mount before reading any credential and binds the
+Python store to that exact path; a configuration that redirects storage around it is rejected.
+`doctor` creates its writable Docker probe below the same bounded mount. Capacity for the rootless
+Docker daemon's own image and metadata store remains a separate operator-managed host concern; use
+only pre-pulled digest-pinned images and monitor that store as part of host capacity. Sandbox and
+doctor containers use Docker's `none` log driver so untrusted output cannot also accumulate in that
+store; attached stdout and stderr remain available directly to the controlling process.
 
 The sandbox daemon must be rootless and owned by the dedicated `autocontribute` account. Membership
 in the host `docker` group or use of `/var/run/docker.sock` would give the worker root-equivalent
@@ -52,10 +68,11 @@ service-owned `0700` bind, and verifies the resulting file's host ownership and 
 
 The reference units target systemd 252 or newer and a Linux distribution with:
 
-- Python 3.11 or 3.12, `uv`, Git, `flock`, and GNU coreutils;
+- Python 3.11 or 3.12, `uv`, Git, `flock`, GNU coreutils, util-linux `findmnt`, and e2fsprogs;
 - rootless Docker on cgroup v2 with systemd resource-controller delegation, including `newuidmap`,
   `newgidmap`, and a unique subordinate UID/GID range;
-- enough durable disk for the live workspaces and several backup generations; and
+- a dedicated, fully allocated (not thin-provisioned) block device of at most 20 GiB for
+  workspaces, plus durable disk for state and several backup generations; and
 - persistent time synchronization and outbound HTTPS for GitHub and the configured model API.
 
 Create a locked service account with a durable home. Allocate subordinate IDs that do not overlap
@@ -76,6 +93,63 @@ sudo loginctl enable-linger autocontribute
 The explicit private user group is required by every supplied unit and tmpfiles rule. Do not add
 the account to `docker`; the runtime preflight rejects that exact group even if a separately started
 rootless daemon appears healthy.
+
+### Provision the bounded workspace filesystem
+
+Create a dedicated logical volume or partition no larger than 20 GiB. Its physical storage must be
+fully allocated: do not use a thin-provisioned logical volume or a sparse loopback file. Exhausting
+the shared thin pool or the loopback file's backing filesystem could still exhaust storage outside
+the boundary this mount is intended to protect. The example below assumes an operator has allocated
+an otherwise unused, fully allocated 16 GiB block device at
+`/dev/mapper/autocontribute-workspaces`. **`mkfs.ext4` destroys all data on its argument. Resolve and
+verify the exact device through the host's storage tooling before running it.** Never paste a device
+name from this guide without that check.
+
+Format it with a deliberately bounded, fixed inode table. `-N` is a requested count and ext4 can
+round it, so the runtime ceiling leaves headroom and still verifies the actual superblock value.
+
+```bash
+workspace_device=/dev/mapper/autocontribute-workspaces
+test -b "$workspace_device"
+test -z "$(findmnt --noheadings --source "$workspace_device")"
+sudo mkfs.ext4 -L autocontribute-workspaces -m 0 -N 262144 -- "$workspace_device"
+sudo install -d -o autocontribute -g autocontribute -m 0700 \
+  /var/lib/autocontribute/state/workspaces
+sudo blkid --output value --match-tag UUID -- "$workspace_device"
+unset workspace_device
+```
+
+Add the returned UUID to `/etc/fstab` only after checking that it is unique. The mount must be
+durable across reboot and must not be mounted at any second path:
+
+```fstab
+UUID=UUID_FROM_BLKID /var/lib/autocontribute/state/workspaces ext4 rw,nodev,nosuid 0 2
+```
+
+Mount it, set the mounted filesystem root's ownership (not merely the covered directory), and verify
+the actual byte and inode totals. The reference 16 GiB/262,144-inode format is below the worker's hard
+ceilings of 21,474,836,480 bytes and 524,288 inodes.
+
+```bash
+sudo mount /var/lib/autocontribute/state/workspaces
+sudo chown autocontribute:autocontribute /var/lib/autocontribute/state/workspaces
+sudo chmod 0700 /var/lib/autocontribute/state/workspaces
+findmnt --target /var/lib/autocontribute/state/workspaces \
+  --output TARGET,SOURCE,FSTYPE,OPTIONS
+stat --file-system --format='block_size=%S blocks=%b inodes=%c' \
+  /var/lib/autocontribute/state/workspaces
+```
+
+The preflight rejects a missing mount, a bind or shared-device mount, another filesystem type,
+missing `nodev`/`nosuid`, unsafe ownership or mode, and either actual capacity above its hard ceiling.
+Ext4 is required because its inode table is fixed at format time; a current `df -i` total on a
+dynamically allocating filesystem would not prove an inode ceiling. A private systemd tmpfs is also
+not sufficient: the separately running rootless Docker daemon resolves bind sources in the host
+mount namespace and would not see the service's private mount.
+
+CI exercises this preflight on a small loop-backed ext4 filesystem inside a hardened transient
+systemd service. That loop device is only a disposable integration-test fixture; production must
+use the fully allocated dedicated storage described above.
 
 Install rootless Docker for that account using the distribution's supported procedure. Rootless
 Docker can enforce the configured CPU, memory, swap, and PID limits only when cgroup v2 controllers
@@ -273,6 +347,11 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/autocontribute.conf
 sudo systemctl daemon-reload
 ```
 
+Run `systemd-tmpfiles` while the workspace filesystem is mounted so its filesystem root receives the
+required ownership and mode. Both credential-bearing services declare `RequiresMountsFor=` and still
+repeat the exact mount and capacity verification at every invocation; an accidentally unmounted
+directory on the parent filesystem is rejected rather than used as a fallback.
+
 Validate the installed files on the target host. `systemd-analyze security` is advisory; review
 every relaxation instead of chasing a score that breaks rootless Docker or durable state.
 CI also parses every packaged unit with systemd 255 on Ubuntu 24.04 and fails on parser warnings.
@@ -336,6 +415,8 @@ systemctl show autocontribute-worker.service \
 systemctl show autocontribute-backup.service \
   -p ActiveState -p Result -p ExecMainStatus -p ExecMainStartTimestamp -p ExecMainExitTimestamp
 sudo -u autocontribute /usr/local/libexec/autocontribute-healthcheck
+df --block-size=1 /var/lib/autocontribute/state/workspaces
+df --inodes /var/lib/autocontribute/state/workspaces
 sudo journalctl \
   -u autocontribute-worker.service \
   -u autocontribute-backup.service \
@@ -350,6 +431,14 @@ backup is older than 36 hours. Every worker, backup, doctor, or health failure i
 `/var/lib/autocontribute/health/last-failure` and emits an error-priority journal event. Forward
 those events to the existing host alerting system, or add another `OnFailure=` target in a drop-in.
 An on-host stamp alone is not a page and is lost with the host.
+
+Alert on workspace byte or inode consumption before either reaches 80%. Space exhaustion is a safe
+worker failure, but it can prevent publication recovery that still depends on a local commit. Stop
+the worker timer and service before removing workspaces. Inspect each run's durable status first;
+never remove a `submitting` workspace unless remote reconciliation has proven the exact commit exists
+or the contribution is being abandoned through the incident procedure. Complete state bundles
+intentionally exclude target repositories, so deleting a workspace is not repaired by restoring a
+normal backup.
 
 Autocontribute redacts known credential forms, but issue text, proposed changes, command output, and
 public URLs are operational evidence and may appear in the journal. Never log decrypted credentials
