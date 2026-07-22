@@ -28,10 +28,6 @@ on:
           - reject
           - committed
           - handoff
-      operator_actor:
-        description: "Required canonical operator identity for parent recovery"
-        required: false
-        type: string
       recovery_reason:
         description: "Required incident reason for parent recovery"
         required: false
@@ -57,7 +53,6 @@ jobs:
       key_prefix: autocontribute-state-
       legacy_claim_intent: ${{ inputs.legacy_claim_intent }}
       lineage_variable: AUTOCONTRIBUTE_STATE_LINEAGE
-      operator_actor: ${{ inputs.operator_actor }}
       recovery_action: ${{ inputs.recovery_action }}
       recovery_reason: ${{ inputs.recovery_reason }}
       restore_over_unusable_claimant: ${{ inputs.restore_over_unusable_claimant }}

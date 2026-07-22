@@ -366,6 +366,7 @@ def test_hosted_lineage_recovery_wrappers_share_scheduler_lock_and_fixed_boundar
     assert inputs["expected_claim"]["required"] is True
     assert inputs["restore_over_unusable_claimant"]["default"] is False
     assert inputs["legacy_claim_intent"]["default"] == "reject"
+    assert "operator_actor" not in inputs
     assert document["permissions"] == {"actions": "read", "contents": "read"}
     assert document["concurrency"] == scheduler_document["concurrency"]
     assert "github.event.repository.default_branch" in job["if"]
@@ -376,6 +377,7 @@ def test_hosted_lineage_recovery_wrappers_share_scheduler_lock_and_fixed_boundar
     assert job["with"]["storage_root"] == storage_root
     assert job["with"]["source_artifact_prefix"] == artifact_prefix
     assert job["with"]["scheduler_enabled"] == f"${{{{ vars.{enabled_variable} }}}}"
+    assert "operator_actor" not in job["with"]
     assert job["secrets"] == {"state_token": state_secret}
 
 
@@ -442,11 +444,20 @@ def test_hosted_lineage_recovery_persists_safe_generation_before_stale_claim_cas
 
     assert '"$SCHEDULER_ENABLED" == "true"' in require_disabled["run"]
     assert '"$enabled" == "true"' in resolve["run"]
+    assert "operator_actor" not in document[True]["workflow_call"]["inputs"]
+    assert resolve["env"]["TRIGGERING_ACTOR"] == "${{ github.triggering_actor }}"
+    assert resolve["env"]["WORKFLOW_ACTOR"] == "${{ github.actor }}"
+    assert '"$TRIGGERING_ACTOR" =~ $github_login' in resolve["run"]
+    assert '"$WORKFLOW_ACTOR" =~ $github_login' in resolve["run"]
     assert "RESTORE_OVER_UNUSABLE" in refuse_rollback["run"]
     assert "use promote_claimed instead of discarding it" in refuse_rollback["run"]
     assert stop["if"] == "${{ inputs.recovery_action == 'restore_parent_stopped' }}"
     assert "safety stop" in stop["run"]
-    assert '--actor "$OPERATOR_ACTOR"' in stop["run"]
+    assert stop["env"]["TRIGGERING_ACTOR"] == "${{ github.triggering_actor }}"
+    assert stop["env"]["WORKFLOW_ACTOR"] == "${{ github.actor }}"
+    assert '--actor "$TRIGGERING_ACTOR"' in stop["run"]
+    assert '"$TRIGGERING_ACTOR" != "$WORKFLOW_ACTOR"' in stop["run"]
+    assert "[workflow authority: $WORKFLOW_ACTOR]" in stop["run"]
     assert "--complete" in complete_backup["run"]
     assert save["with"]["key"] == "${{ steps.recovery_lineage.outputs.recovery_key }}"
     assert verify["with"]["key"] == "${{ steps.recovery_lineage.outputs.recovery_key }}"

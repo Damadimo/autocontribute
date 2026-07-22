@@ -221,10 +221,13 @@ exact claim only after a fresh generation and immutable evidence have been verif
    `legacy_claim_intent` (`committed` or `handoff`) when promoting it. A legacy claim does not encode
    that decision, so the recovery workflow will not infer it.
 4. Use `restore_parent_stopped` only when claimant cache and artifact evidence are absent, or after a
-   promotion attempt has proved the retained evidence unusable. Supply a canonical `operator_actor`
-   and a concrete single-line `recovery_reason`. If evidence still exists but was proven unusable,
-   also set `restore_over_unusable_claimant=true` as an explicit continuity-loss attestation. This
-   restores only the exact claimed parent (or initializes the claimed bootstrap parent), activates a
+   promotion attempt has proved the retained evidence unusable. Supply a concrete single-line
+   `recovery_reason`; the workflow binds the safety-stop actor to the authenticated
+   `github.triggering_actor` instead of accepting a caller-provided identity. On a rerun it also
+   records `github.actor` as the workflow authority when that identity differs from the person who
+   initiated the current execution. If evidence still exists but was proven unusable, also set
+   `restore_over_unusable_claimant=true` as an explicit continuity-loss attestation. This restores
+   only the exact claimed parent (or initializes the claimed bootstrap parent), activates a
    persistent safety stop, and persists that stopped state as a new generation before finalizing.
 
 The workflow rereads `AUTOCONTRIBUTE_ENABLED` with the dedicated state token both before restoration
