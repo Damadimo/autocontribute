@@ -32,6 +32,11 @@ class _Identified(Protocol):
     def identifier(self) -> int: ...
 
 
+class _NodeIdentified(Protocol):
+    @property
+    def node_id(self) -> str: ...
+
+
 IdentifiedT = TypeVar("IdentifiedT", bound=_Identified)
 
 _AUTHOR_ASSOCIATIONS = frozenset(
@@ -64,6 +69,8 @@ _GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _REPOSITORY_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _ABUSE_WARNING = re.compile(r"(?:abuse detection|secondary rate limit|temporarily blocked)", re.I)
+_PULL_REQUEST_HISTORY_EVENTS = frozenset({"closed", "head_ref_force_pushed", "merged", "reopened"})
+_MAX_PULL_REQUEST_COMMITS = 250
 
 SafetyTriggerHandler = Callable[[CircuitBreakerTrigger], object]
 
@@ -85,6 +92,7 @@ class PullRequestDetails:
     head_repository: str
     issue_comment_count: int
     review_comment_count: int
+    commit_count: int
     title: str = ""
     body: str = ""
     base_ref: str = ""
@@ -144,12 +152,44 @@ class PullRequestReference:
     """One PR-to-PR timeline reference used only as explicit revert evidence."""
 
     identifier: int
+    node_id: str
     source_url: str
     source_title: str
     source_body: str
     source_state: str
     source_merged_at: datetime | None
     created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequestCommit:
+    """One commit in GitHub's complete, ordered pull-request commit graph."""
+
+    position: int
+    sha: str
+    node_id: str
+    parent_shas: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequestTimelineEvent:
+    """One state-changing timeline event needed to establish an upstream outcome."""
+
+    identifier: int
+    node_id: str
+    event: str
+    actor: str
+    commit_sha: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PullRequestTimeline:
+    """Complete bounded timeline collection plus the evidence retained from it."""
+
+    item_count: int
+    events: tuple[PullRequestTimelineEvent, ...]
+    references: tuple[PullRequestReference, ...]
 
 
 def resolve_github_token(config: GitHubConfig) -> str:
@@ -937,6 +977,44 @@ class GitHubClient:
             expected_number=number,
         )
 
+    def list_pull_request_commits(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_count: int,
+        expected_head_sha: str,
+        max_commits: int = _MAX_PULL_REQUEST_COMMITS,
+    ) -> list[PullRequestCommit]:
+        """Read the complete ordered PR commit graph and bind it to the advertised tip."""
+
+        expected = _nonnegative_count(expected_count, field="expected pull request commit count")
+        if not 1 <= max_commits <= _MAX_PULL_REQUEST_COMMITS:
+            raise ValueError(f"max_commits must be between 1 and {_MAX_PULL_REQUEST_COMMITS}")
+        if expected < 1:
+            raise GitHubError("Pull request advertised an empty commit history")
+        if expected > max_commits:
+            raise GitHubError(
+                f"Pull request has {expected} commits, above the safe limit of {max_commits}; "
+                "lifecycle evidence is incomplete"
+            )
+        expected_head = _full_git_sha(expected_head_sha, field="expected pull request head SHA")
+        data = self._bounded_list(
+            f"/repos/{quote(repository, safe='/')}/pulls/{_positive_number(number)}/commits",
+            resource="pull request commits",
+            max_items=max_commits,
+        )
+        commits = [
+            _parse_pull_request_commit(item, position=position)
+            for position, item in enumerate(data, start=1)
+        ]
+        _validate_pull_request_commit_history(
+            commits,
+            expected_count=expected,
+            expected_head_sha=expected_head,
+        )
+        return commits
+
     def list_pull_request_reviews(
         self,
         repository: str,
@@ -1094,25 +1172,36 @@ class GitHubClient:
             resource="commit statuses",
         )
 
-    def list_pull_request_references(
+    def get_pull_request_timeline(
         self,
         repository: str,
         number: int,
         *,
         max_events: int = 1_000,
-    ) -> list[PullRequestReference]:
-        """Read bounded PR cross-references that may provide explicit revert evidence."""
+    ) -> PullRequestTimeline:
+        """Read the complete bounded timeline and retain outcome-relevant evidence."""
 
         data = self._bounded_list(
             f"/repos/{quote(repository, safe='/')}/issues/{_positive_number(number)}/timeline",
             resource="pull request timeline events",
             max_items=max_events,
         )
+        timeline_node_ids = [_graphql_node_id(event.get("node_id")) for event in data]
+        if len(timeline_node_ids) != len(set(timeline_node_ids)):
+            raise GitHubError(
+                "GitHub returned duplicate pull request timeline node identities; "
+                "lifecycle evidence may have changed"
+            )
+        events: list[PullRequestTimelineEvent] = []
         references: list[PullRequestReference] = []
-        for event in data:
-            if str(event.get("event") or "").casefold() != "cross-referenced":
+        for raw_event in data:
+            event = _nonempty(raw_event.get("event"), field="timeline event type").casefold()
+            if event in _PULL_REQUEST_HISTORY_EVENTS:
+                events.append(_parse_pull_request_timeline_event(raw_event, event=event))
                 continue
-            source = event.get("source")
+            if event != "cross-referenced":
+                continue
+            source = raw_event.get("source")
             if not isinstance(source, dict):
                 continue
             source_issue = source.get("issue")
@@ -1120,8 +1209,47 @@ class GitHubClient:
                 source_issue.get("pull_request"), dict
             ):
                 continue
-            references.append(_parse_pull_request_reference(event, source_issue))
-        return _unique_records(references, resource="pull request references")
+            references.append(_parse_pull_request_reference(raw_event, source_issue))
+        _require_unique_identifiers(events, resource="pull request history events")
+        _require_unique_node_ids(events, resource="pull request history events")
+        _require_unique_identifiers(references, resource="pull request references")
+        _require_unique_node_ids(references, resource="pull request references")
+        retained_identifiers = [item.identifier for item in events] + [
+            item.identifier for item in references
+        ]
+        if len(retained_identifiers) != len(set(retained_identifiers)):
+            raise GitHubError(
+                "GitHub returned duplicate retained pull request timeline identifiers; "
+                "lifecycle evidence may have changed"
+            )
+        return PullRequestTimeline(
+            item_count=len(data),
+            events=tuple(
+                sorted(events, key=lambda item: (item.created_at, item.identifier, item.node_id))
+            ),
+            references=tuple(
+                sorted(
+                    references, key=lambda item: (item.created_at, item.identifier, item.node_id)
+                )
+            ),
+        )
+
+    def list_pull_request_references(
+        self,
+        repository: str,
+        number: int,
+        *,
+        max_events: int = 1_000,
+    ) -> list[PullRequestReference]:
+        """Compatibility wrapper for callers that need only explicit revert references."""
+
+        return list(
+            self.get_pull_request_timeline(
+                repository,
+                number,
+                max_events=max_events,
+            ).references
+        )
 
     def ensure_fork(self, repository: str, login: str) -> str:
         name = repository.split("/", 1)[1]
@@ -1520,6 +1648,15 @@ def _unique_records(records: list[IdentifiedT], *, resource: str) -> list[Identi
     return records
 
 
+def _require_unique_node_ids(records: Sequence[_NodeIdentified], *, resource: str) -> None:
+    node_ids = [record.node_id for record in records]
+    if len(node_ids) != len(set(node_ids)):
+        raise GitHubError(
+            f"GitHub returned duplicate {resource} node identities; "
+            "lifecycle evidence may have changed"
+        )
+
+
 def _nonempty(value: object, *, field: str) -> str:
     if not isinstance(value, str) or not value.strip() or "\0" in value:
         raise GitHubError(f"GitHub returned an invalid {field}")
@@ -1707,6 +1844,7 @@ def _parse_pull_request(
         review_comment_count=_nonnegative_count(
             data.get("review_comments"), field="pull request review comment count"
         ),
+        commit_count=_nonnegative_count(data.get("commits"), field="pull request commit count"),
         title=_nonempty(data.get("title"), field="pull request title"),
         body=_optional_string(data.get("body"), field="pull request body"),
         base_ref=_nonempty(base.get("ref"), field="pull request base ref"),
@@ -1755,6 +1893,61 @@ def _parse_pull_request_review(data: dict[str, Any]) -> PullRequestReview:
         html_url=_nonempty(data.get("html_url"), field="pull request review URL"),
         submitted_at=_parse_datetime(data.get("submitted_at")),
     )
+
+
+def _parse_pull_request_commit(
+    data: dict[str, Any],
+    *,
+    position: int,
+) -> PullRequestCommit:
+    parents = _mapping_list(data.get("parents"), resource="pull request commit parents")
+    if len(parents) > 100:
+        raise GitHubError("GitHub returned a pull request commit with too many parents")
+    parent_shas = tuple(
+        _full_git_sha(parent.get("sha"), field="pull request commit parent SHA")
+        for parent in parents
+    )
+    if len(parent_shas) != len(set(parent_shas)):
+        raise GitHubError("GitHub returned duplicate pull request commit parents")
+    sha = _full_git_sha(data.get("sha"), field="pull request commit SHA")
+    if sha in parent_shas:
+        raise GitHubError("GitHub returned a self-parented pull request commit")
+    return PullRequestCommit(
+        position=position,
+        sha=sha,
+        node_id=_graphql_node_id(data.get("node_id")),
+        parent_shas=parent_shas,
+    )
+
+
+def _validate_pull_request_commit_history(
+    commits: Sequence[PullRequestCommit],
+    *,
+    expected_count: int,
+    expected_head_sha: str,
+) -> None:
+    if len(commits) != expected_count:
+        raise GitHubError(
+            "Pull-request commit count changed while it was fetched; retry observation"
+        )
+    shas = [commit.sha for commit in commits]
+    if len(shas) != len(set(shas)):
+        raise GitHubError(
+            "GitHub returned duplicate pull request commits; lifecycle evidence may have changed"
+        )
+    _require_unique_node_ids(commits, resource="pull request commits")
+    if not commits or commits[-1].sha != expected_head_sha:
+        raise GitHubError(
+            "Pull-request commit history does not terminate at its advertised head; "
+            "retry observation"
+        )
+    for position in range(1, len(commits)):
+        previous = commits[position - 1]
+        current = commits[position]
+        if previous.sha not in current.parent_shas:
+            raise GitHubError(
+                "GitHub returned a non-contiguous pull request commit history; retry observation"
+            )
 
 
 def _parse_github_comment(data: dict[str, Any]) -> GitHubComment:
@@ -1831,12 +2024,40 @@ def _parse_pull_request_reference(
         raise GitHubError("GitHub returned an unsupported timeline source state")
     return PullRequestReference(
         identifier=_identifier(event.get("id"), resource="timeline event"),
+        node_id=_graphql_node_id(event.get("node_id")),
         source_url=_nonempty(source_issue.get("html_url"), field="timeline source URL"),
         source_title=_optional_string(source_issue.get("title"), field="timeline source title"),
         source_body=_optional_string(source_issue.get("body"), field="timeline source body"),
         source_state=source_state,
         source_merged_at=_parse_datetime(source_pull_request.get("merged_at")),
         created_at=_required_datetime(event.get("created_at"), field="timeline event created_at"),
+    )
+
+
+def _parse_pull_request_timeline_event(
+    data: dict[str, Any],
+    *,
+    event: str,
+) -> PullRequestTimelineEvent:
+    if event not in _PULL_REQUEST_HISTORY_EVENTS:
+        raise GitHubError("GitHub returned an unsupported pull request history event")
+    raw_commit = data.get("commit_id")
+    commit_sha = (
+        None
+        if raw_commit is None
+        else _full_git_sha(raw_commit, field="pull request history commit SHA")
+    )
+    if event in {"head_ref_force_pushed", "merged"} and commit_sha is None:
+        raise GitHubError(f"GitHub omitted the commit identity for a {event} timeline event")
+    return PullRequestTimelineEvent(
+        identifier=_identifier(data.get("id"), resource="pull request history event"),
+        node_id=_graphql_node_id(data.get("node_id")),
+        event=event,
+        actor=_user_login(data.get("actor"), resource="pull request history event"),
+        commit_sha=commit_sha,
+        created_at=_required_datetime(
+            data.get("created_at"), field="pull request history event created_at"
+        ),
     )
 
 
@@ -1892,8 +2113,11 @@ __all__ = [
     "CommitStatusDetails",
     "GitHubClient",
     "GitHubComment",
+    "PullRequestCommit",
     "PullRequestDetails",
     "PullRequestReference",
     "PullRequestReview",
+    "PullRequestTimeline",
+    "PullRequestTimelineEvent",
     "resolve_github_token",
 ]

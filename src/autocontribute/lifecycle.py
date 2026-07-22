@@ -18,9 +18,12 @@ from autocontribute.github import (
     CheckRunDetails,
     CommitStatusDetails,
     GitHubComment,
+    PullRequestCommit,
     PullRequestDetails,
     PullRequestReference,
     PullRequestReview,
+    PullRequestTimeline,
+    PullRequestTimelineEvent,
 )
 from autocontribute.github_origin import canonical_api_origin, web_origin_for_api
 
@@ -82,6 +85,7 @@ _PULL_REQUEST_PATH: Final = re.compile(r"/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pu
 _REPOSITORY_NAME: Final = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _COMMIT_SHA: Final = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 MAX_LIFECYCLE_RUNS: Final = 1_000
+MAX_PULL_REQUEST_COMMITS: Final = 250
 
 
 class LifecycleStore(Protocol):
@@ -114,6 +118,16 @@ class LifecycleGitHub(Protocol):
         self, repository: str, number: int, *, max_reviews: int = 500
     ) -> list[PullRequestReview]: ...
 
+    def list_pull_request_commits(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_count: int,
+        expected_head_sha: str,
+        max_commits: int = MAX_PULL_REQUEST_COMMITS,
+    ) -> list[PullRequestCommit]: ...
+
     def list_issue_comments(
         self,
         repository: str,
@@ -140,9 +154,9 @@ class LifecycleGitHub(Protocol):
         self, repository: str, ref: str, *, max_statuses: int = 500
     ) -> list[CommitStatusDetails]: ...
 
-    def list_pull_request_references(
+    def get_pull_request_timeline(
         self, repository: str, number: int, *, max_events: int = 1_000
-    ) -> list[PullRequestReference]: ...
+    ) -> PullRequestTimeline: ...
 
 
 class LifecycleSignalKind(StrEnum):
@@ -159,11 +173,14 @@ class PullRequestLifecycleSnapshot:
     observed_at: datetime
     expected_head_sha: str
     pull_request: PullRequestDetails
+    commits: tuple[PullRequestCommit, ...]
     reviews: tuple[PullRequestReview, ...]
     issue_comments: tuple[GitHubComment, ...]
     review_comments: tuple[GitHubComment, ...]
     check_runs: tuple[CheckRunDetails, ...]
     commit_statuses: tuple[CommitStatusDetails, ...]
+    timeline_item_count: int
+    timeline_events: tuple[PullRequestTimelineEvent, ...]
     references: tuple[PullRequestReference, ...]
 
     def to_json(self) -> str:
@@ -210,18 +227,25 @@ def parse_lifecycle_snapshot_json(
         keys={
             "check_runs",
             "commit_statuses",
+            "commits",
             "expected_head_sha",
             "issue_comments",
             "pull_request",
             "references",
             "review_comments",
             "reviews",
+            "timeline_events",
+            "timeline_item_count",
         },
     )
     snapshot = PullRequestLifecycleSnapshot(
         observed_at=_aware_utc_timestamp(observed_at, field="lifecycle observation metadata"),
         expected_head_sha=_full_sha(payload, "expected_head_sha", field="expected head SHA"),
         pull_request=_parsed_pull_request(payload["pull_request"]),
+        commits=tuple(
+            _parsed_pull_request_commit(item)
+            for item in _object_sequence(payload["commits"], field="pull request commits")
+        ),
         reviews=tuple(
             _parsed_review(item)
             for item in _object_sequence(payload["reviews"], field="pull request reviews")
@@ -241,6 +265,17 @@ def parse_lifecycle_snapshot_json(
         commit_statuses=tuple(
             _parsed_commit_status(item)
             for item in _object_sequence(payload["commit_statuses"], field="commit statuses")
+        ),
+        timeline_item_count=_nonnegative_integer(
+            payload,
+            "timeline_item_count",
+            field="pull request timeline item count",
+        ),
+        timeline_events=tuple(
+            _parsed_timeline_event(item)
+            for item in _object_sequence(
+                payload["timeline_events"], field="pull request timeline events"
+            )
         ),
         references=tuple(
             _parsed_reference(item)
@@ -354,6 +389,12 @@ class LifecycleObserver:
 
         pull_request = self.github.get_pull_request(normalized_repository, number)
         _require_identity(pull_request, normalized_repository, number)
+        commits = self.github.list_pull_request_commits(
+            normalized_repository,
+            number,
+            expected_count=pull_request.commit_count,
+            expected_head_sha=pull_request.head_sha,
+        )
         reviews = self.github.list_pull_request_reviews(normalized_repository, number)
         issue_comments = self.github.list_issue_comments(
             normalized_repository,
@@ -369,11 +410,7 @@ class LifecycleObserver:
         commit_statuses = self.github.list_commit_statuses(
             normalized_repository, pull_request.head_sha
         )
-        references = (
-            self.github.list_pull_request_references(normalized_repository, number)
-            if pull_request.merged
-            else []
-        )
+        timeline = self.github.get_pull_request_timeline(normalized_repository, number)
 
         # A second top-level read catches comment/review/state/head races during pagination.
         confirmed = self.github.get_pull_request(normalized_repository, number)
@@ -387,6 +424,7 @@ class LifecycleObserver:
             observed_at=_observation_time(observed_at),
             expected_head_sha=expected_sha,
             pull_request=pull_request,
+            commits=tuple(sorted(commits, key=lambda commit: commit.position)),
             reviews=tuple(sorted(reviews, key=lambda review: review.identifier)),
             issue_comments=tuple(sorted(issue_comments, key=lambda comment: comment.identifier)),
             review_comments=tuple(sorted(review_comments, key=lambda comment: comment.identifier)),
@@ -406,7 +444,23 @@ class LifecycleObserver:
                     ),
                 )
             ),
-            references=tuple(sorted(references, key=lambda reference: reference.identifier)),
+            timeline_item_count=timeline.item_count,
+            timeline_events=tuple(
+                sorted(
+                    timeline.events,
+                    key=lambda event: (event.created_at, event.identifier, event.node_id),
+                )
+            ),
+            references=tuple(
+                sorted(
+                    timeline.references,
+                    key=lambda reference: (
+                        reference.created_at,
+                        reference.identifier,
+                        reference.node_id,
+                    ),
+                )
+            ),
         )
         signals = classify_lifecycle(snapshot)
         fingerprint = snapshot.fingerprint()
@@ -479,6 +533,7 @@ def _parsed_pull_request(value: object) -> PullRequestDetails:
             "base_sha",
             "body",
             "closed_at",
+            "commit_count",
             "draft",
             "head_label",
             "head_ref",
@@ -530,6 +585,11 @@ def _parsed_pull_request(value: object) -> PullRequestDetails:
             "review_comment_count",
             field="pull request review comment count",
         ),
+        commit_count=_nonnegative_integer(
+            record,
+            "commit_count",
+            field="pull request commit count",
+        ),
         title=_text(record, "title", field="pull request title"),
         body=_text(record, "body", field="pull request body", empty=True),
         base_ref=_text(record, "base_ref", field="pull request base ref"),
@@ -578,6 +638,32 @@ def _parsed_review(value: object) -> PullRequestReview:
         body=_text(record, "body", field="review body", empty=True),
         html_url=_text(record, "html_url", field="review URL"),
         submitted_at=_optional_timestamp(record, "submitted_at", field="review submission time"),
+    )
+
+
+def _parsed_pull_request_commit(value: object) -> PullRequestCommit:
+    record = _exact_object(
+        value,
+        field="pull request commit",
+        keys={"node_id", "parent_shas", "position", "sha"},
+    )
+    parent_values = _object_sequence(record["parent_shas"], field="pull request commit parents")
+    if len(parent_values) > 100:
+        raise ValueError("lifecycle snapshot pull request commit has too many parents")
+    parent_shas = tuple(
+        _canonical_full_sha_value(parent, field="pull request commit parent SHA")
+        for parent in parent_values
+    )
+    if len(parent_shas) != len(set(parent_shas)):
+        raise ValueError("lifecycle snapshot contains duplicate pull request commit parents")
+    sha = _full_sha(record, "sha", field="pull request commit SHA")
+    if sha in parent_shas:
+        raise ValueError("lifecycle snapshot contains a self-parented pull request commit")
+    return PullRequestCommit(
+        position=_positive_integer(record, "position", field="pull request commit position"),
+        sha=sha,
+        node_id=_node_id(record, "node_id", field="pull request commit node identifier"),
+        parent_shas=parent_shas,
     )
 
 
@@ -684,6 +770,7 @@ def _parsed_reference(value: object) -> PullRequestReference:
         keys={
             "created_at",
             "identifier",
+            "node_id",
             "source_body",
             "source_merged_at",
             "source_state",
@@ -693,6 +780,7 @@ def _parsed_reference(value: object) -> PullRequestReference:
     )
     return PullRequestReference(
         identifier=_positive_integer(record, "identifier", field="reference identifier"),
+        node_id=_node_id(record, "node_id", field="reference node identifier"),
         source_url=_text(record, "source_url", field="reference source URL"),
         source_title=_text(record, "source_title", field="reference source title", empty=True),
         source_body=_text(record, "source_body", field="reference source body", empty=True),
@@ -711,13 +799,50 @@ def _parsed_reference(value: object) -> PullRequestReference:
     )
 
 
+def _parsed_timeline_event(value: object) -> PullRequestTimelineEvent:
+    record = _exact_object(
+        value,
+        field="pull request timeline event",
+        keys={"actor", "commit_sha", "created_at", "event", "identifier", "node_id"},
+    )
+    event = _choice(
+        record,
+        "event",
+        field="pull request timeline event type",
+        choices={"closed", "head_ref_force_pushed", "merged", "reopened"},
+    )
+    commit_sha = _optional_full_sha(
+        record,
+        "commit_sha",
+        field="pull request timeline event commit SHA",
+    )
+    if event in {"head_ref_force_pushed", "merged"} and commit_sha is None:
+        raise ValueError(
+            "lifecycle snapshot omits a required pull request timeline commit identity"
+        )
+    return PullRequestTimelineEvent(
+        identifier=_positive_integer(
+            record, "identifier", field="pull request timeline event identifier"
+        ),
+        node_id=_node_id(record, "node_id", field="pull request timeline event node identifier"),
+        event=event,
+        actor=_text(record, "actor", field="pull request timeline event actor"),
+        commit_sha=commit_sha,
+        created_at=_timestamp(
+            record, "created_at", field="pull request timeline event creation time"
+        ),
+    )
+
+
 def _validate_snapshot_shape(snapshot: PullRequestLifecycleSnapshot) -> None:
     for field, values, maximum in (
+        ("pull request commits", snapshot.commits, MAX_PULL_REQUEST_COMMITS),
         ("reviews", snapshot.reviews, 500),
         ("issue comments", snapshot.issue_comments, 500),
         ("review comments", snapshot.review_comments, 500),
         ("check runs", snapshot.check_runs, 500),
         ("commit statuses", snapshot.commit_statuses, 500),
+        ("timeline events", snapshot.timeline_events, 1_000),
         ("references", snapshot.references, 1_000),
     ):
         if len(values) > maximum:
@@ -726,10 +851,23 @@ def _validate_snapshot_shape(snapshot: PullRequestLifecycleSnapshot) -> None:
         raise ValueError("lifecycle snapshot issue-comment count does not match its evidence")
     if snapshot.pull_request.review_comment_count != len(snapshot.review_comments):
         raise ValueError("lifecycle snapshot review-comment count does not match its evidence")
-    if snapshot.references and not snapshot.pull_request.merged:
-        raise ValueError(
-            "lifecycle snapshot contains revert references for an unmerged pull request"
-        )
+    if snapshot.pull_request.commit_count != len(snapshot.commits) or not snapshot.commits:
+        raise ValueError("lifecycle snapshot commit count does not match its evidence")
+    if snapshot.timeline_item_count > 1_000:
+        raise ValueError("lifecycle snapshot timeline item count exceeds the collection limit")
+    if snapshot.timeline_item_count < len(snapshot.timeline_events) + len(snapshot.references):
+        raise ValueError("lifecycle snapshot timeline item count omits retained evidence")
+    if snapshot.commits != tuple(sorted(snapshot.commits, key=lambda commit: commit.position)):
+        raise ValueError("lifecycle snapshot pull request commits are not in canonical order")
+    if [commit.position for commit in snapshot.commits] != list(
+        range(1, len(snapshot.commits) + 1)
+    ):
+        raise ValueError("lifecycle snapshot pull request commit positions are not contiguous")
+    if snapshot.commits[-1].sha != snapshot.pull_request.head_sha:
+        raise ValueError("lifecycle snapshot commit history does not terminate at the PR head")
+    for position in range(1, len(snapshot.commits)):
+        if snapshot.commits[position - 1].sha not in snapshot.commits[position].parent_shas:
+            raise ValueError("lifecycle snapshot pull request commit history is not contiguous")
     if snapshot.reviews != tuple(sorted(snapshot.reviews, key=lambda review: review.identifier)):
         raise ValueError("lifecycle snapshot reviews are not in canonical order")
     if snapshot.issue_comments != tuple(
@@ -758,20 +896,91 @@ def _validate_snapshot_shape(snapshot: PullRequestLifecycleSnapshot) -> None:
         )
     ):
         raise ValueError("lifecycle snapshot commit statuses are not in canonical order")
+    if snapshot.timeline_events != tuple(
+        sorted(
+            snapshot.timeline_events,
+            key=lambda event: (event.created_at, event.identifier, event.node_id),
+        )
+    ):
+        raise ValueError("lifecycle snapshot timeline events are not in canonical order")
     if snapshot.references != tuple(
-        sorted(snapshot.references, key=lambda reference: reference.identifier)
+        sorted(
+            snapshot.references,
+            key=lambda reference: (
+                reference.created_at,
+                reference.identifier,
+                reference.node_id,
+            ),
+        )
     ):
         raise ValueError("lifecycle snapshot references are not in canonical order")
     for field, identifiers in (
+        ("pull request commits", [item.sha for item in snapshot.commits]),
         ("reviews", [item.identifier for item in snapshot.reviews]),
         ("issue comments", [item.identifier for item in snapshot.issue_comments]),
         ("review comments", [item.identifier for item in snapshot.review_comments]),
         ("check runs", [item.identifier for item in snapshot.check_runs]),
         ("commit statuses", [item.identifier for item in snapshot.commit_statuses]),
+        ("timeline events", [item.identifier for item in snapshot.timeline_events]),
         ("references", [item.identifier for item in snapshot.references]),
+        (
+            "retained timeline records",
+            [item.identifier for item in snapshot.timeline_events]
+            + [item.identifier for item in snapshot.references],
+        ),
     ):
         if len(identifiers) != len(set(identifiers)):
             raise ValueError(f"lifecycle snapshot contains duplicate {field}")
+    for field, node_ids in (
+        ("pull request commits", [item.node_id for item in snapshot.commits]),
+        ("timeline events", [item.node_id for item in snapshot.timeline_events]),
+        ("references", [item.node_id for item in snapshot.references]),
+        (
+            "retained timeline records",
+            [item.node_id for item in snapshot.timeline_events]
+            + [item.node_id for item in snapshot.references],
+        ),
+    ):
+        if len(node_ids) != len(set(node_ids)):
+            raise ValueError(f"lifecycle snapshot contains duplicate {field} node identities")
+    _validate_timeline_state(snapshot)
+
+
+def _validate_timeline_state(snapshot: PullRequestLifecycleSnapshot) -> None:
+    pull_request = snapshot.pull_request
+    state = "open"
+    latest_closed_at: datetime | None = None
+    merged_events: list[PullRequestTimelineEvent] = []
+    for event in snapshot.timeline_events:
+        if event.event == "closed":
+            if state != "open":
+                raise ValueError("lifecycle snapshot contains consecutive close events")
+            state = "closed"
+            latest_closed_at = event.created_at
+        elif event.event == "reopened":
+            if state != "closed":
+                raise ValueError("lifecycle snapshot contains a reopen without a prior close")
+            state = "open"
+            latest_closed_at = None
+        elif event.event == "merged":
+            merged_events.append(event)
+    if state != pull_request.state:
+        raise ValueError(
+            "lifecycle snapshot timeline does not reach the current pull request state"
+        )
+    if latest_closed_at != pull_request.closed_at:
+        raise ValueError("lifecycle snapshot timeline does not match the pull request close time")
+    if pull_request.merged:
+        if len(merged_events) != 1:
+            raise ValueError("lifecycle snapshot merged pull request lacks one merge event")
+        merged = merged_events[0]
+        if (
+            merged.created_at != pull_request.merged_at
+            or merged.commit_sha != pull_request.merge_commit_sha
+        ):
+            raise ValueError("lifecycle snapshot merge event does not match pull request state")
+    elif merged_events:
+        raise ValueError("lifecycle snapshot contains a merge event for an unmerged pull request")
 
 
 def _exact_object(value: object, *, field: str, keys: set[str]) -> dict[str, object]:
@@ -824,7 +1033,12 @@ def _node_id(record: dict[str, object], key: str, *, field: str) -> str:
 
 
 def _full_sha(record: dict[str, object], key: str, *, field: str) -> str:
-    value = _text(record, key, field=field)
+    return _canonical_full_sha_value(record[key], field=field)
+
+
+def _canonical_full_sha_value(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not value or value != value.strip() or "\0" in value:
+        raise ValueError(f"{field} must be a canonical full Git SHA")
     if not _COMMIT_SHA.fullmatch(value) or value != value.casefold():
         raise ValueError(f"{field} must be a canonical full Git SHA")
     return value

@@ -13,9 +13,12 @@ from autocontribute.github import (
     CheckRunDetails,
     CommitStatusDetails,
     GitHubComment,
+    PullRequestCommit,
     PullRequestDetails,
     PullRequestReference,
     PullRequestReview,
+    PullRequestTimeline,
+    PullRequestTimelineEvent,
 )
 from autocontribute.lifecycle import (
     LifecycleObserver,
@@ -48,6 +51,7 @@ def _pull_request(**changes: object) -> PullRequestDetails:
         "head_repository": "example/project",
         "issue_comment_count": 0,
         "review_comment_count": 0,
+        "commit_count": 1,
         "title": "Fix lifecycle evidence",
         "body": "",
         "base_ref": "main",
@@ -136,22 +140,70 @@ def _snapshot(
     *,
     pull_request: PullRequestDetails | None = None,
     expected_head_sha: str = "a" * 40,
+    commits: tuple[PullRequestCommit, ...] | None = None,
     reviews: tuple[PullRequestReview, ...] = (),
     issue_comments: tuple[GitHubComment, ...] = (),
     review_comments: tuple[GitHubComment, ...] = (),
     checks: tuple[CheckRunDetails, ...] = (),
     statuses: tuple[CommitStatusDetails, ...] = (),
     references: tuple[PullRequestReference, ...] = (),
+    timeline_events: tuple[PullRequestTimelineEvent, ...] | None = None,
+    timeline_item_count: int | None = None,
 ) -> PullRequestLifecycleSnapshot:
+    pull_request = pull_request or _pull_request()
+    commit_evidence = (
+        commits
+        if commits is not None
+        else (
+            PullRequestCommit(
+                position=1,
+                sha=pull_request.head_sha,
+                node_id=f"C_{pull_request.head_sha}",
+                parent_shas=(pull_request.base_sha,),
+            ),
+        )
+    )
+    if timeline_events is None:
+        default_events: list[PullRequestTimelineEvent] = []
+        if pull_request.merged:
+            default_events.append(
+                PullRequestTimelineEvent(
+                    identifier=90,
+                    node_id="ME_fixture_90",
+                    event="merged",
+                    actor="maintainer",
+                    commit_sha=pull_request.merge_commit_sha,
+                    created_at=pull_request.merged_at or NOW,
+                )
+            )
+        if pull_request.state == "closed":
+            default_events.append(
+                PullRequestTimelineEvent(
+                    identifier=91,
+                    node_id="CE_fixture_91",
+                    event="closed",
+                    actor="maintainer",
+                    commit_sha=None,
+                    created_at=pull_request.closed_at or NOW,
+                )
+            )
+        timeline_events = tuple(default_events)
     return PullRequestLifecycleSnapshot(
         observed_at=NOW,
         expected_head_sha=expected_head_sha,
-        pull_request=pull_request or _pull_request(),
+        pull_request=pull_request,
+        commits=commit_evidence,
         reviews=reviews,
         issue_comments=issue_comments,
         review_comments=review_comments,
         check_runs=checks,
         commit_statuses=statuses,
+        timeline_item_count=(
+            len(timeline_events) + len(references)
+            if timeline_item_count is None
+            else timeline_item_count
+        ),
+        timeline_events=timeline_events,
         references=references,
     )
 
@@ -171,6 +223,16 @@ class FakeLifecycleGitHub:
         self.check_runs: list[CheckRunDetails] = []
         self.statuses: list[CommitStatusDetails] = []
         self.references: list[PullRequestReference] = []
+        self.commits: list[PullRequestCommit] = [
+            PullRequestCommit(
+                position=1,
+                sha=self.pull_requests[0].head_sha,
+                node_id=f"C_{self.pull_requests[0].head_sha}",
+                parent_shas=(self.pull_requests[0].base_sha,),
+            )
+        ]
+        self.timeline_events: list[PullRequestTimelineEvent] = []
+        self.timeline_item_count = 0
         self.get_calls = 0
 
     def get_pull_request(self, repository: str, number: int) -> PullRequestDetails:
@@ -182,6 +244,19 @@ class FakeLifecycleGitHub:
         self, repository: str, number: int, *, max_reviews: int = 500
     ) -> list[PullRequestReview]:
         return self.reviews
+
+    def list_pull_request_commits(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_count: int,
+        expected_head_sha: str,
+        max_commits: int = 250,
+    ) -> list[PullRequestCommit]:
+        assert expected_count == len(self.commits)
+        assert self.commits[-1].sha == expected_head_sha
+        return self.commits
 
     def list_issue_comments(
         self,
@@ -215,10 +290,14 @@ class FakeLifecycleGitHub:
     ) -> list[CommitStatusDetails]:
         return self.statuses
 
-    def list_pull_request_references(
+    def get_pull_request_timeline(
         self, repository: str, number: int, *, max_events: int = 1_000
-    ) -> list[PullRequestReference]:
-        return self.references
+    ) -> PullRequestTimeline:
+        return PullRequestTimeline(
+            item_count=self.timeline_item_count,
+            events=tuple(self.timeline_events),
+            references=tuple(self.references),
+        )
 
 
 class FakeLifecycleStore:
@@ -290,6 +369,17 @@ def test_observer_records_immutable_snapshot_and_deduplicates_signals() -> None:
     github.reviews = [_review(10, state="CHANGES_REQUESTED")]
     github.issue_comments = [_comment(20, "Please close this PR and stop automated submissions.")]
     github.check_runs = [_check(30, "failure")]
+    github.timeline_events = [
+        PullRequestTimelineEvent(
+            identifier=40,
+            node_id="HRFPE_fixture_40",
+            event="head_ref_force_pushed",
+            actor="contributor",
+            commit_sha="a" * 40,
+            created_at=NOW,
+        )
+    ]
+    github.timeline_item_count = 1
     store = FakeLifecycleStore()
     observer = LifecycleObserver(github, store)
 
@@ -323,6 +413,8 @@ def test_observer_records_immutable_snapshot_and_deduplicates_signals() -> None:
     stored = json.loads(next(iter(store.snapshots.values())))
     assert "observed_at" not in stored
     assert stored["pull_request"]["number"] == 7
+    assert stored["commits"][0]["sha"] == "a" * 40
+    assert stored["timeline_events"][0]["event"] == "head_ref_force_pushed"
 
 
 def test_lifecycle_snapshot_strict_parser_round_trips_complete_evidence() -> None:
@@ -337,6 +429,7 @@ def test_lifecycle_snapshot_strict_parser_round_trips_complete_evidence() -> Non
     )
     reference = PullRequestReference(
         identifier=60,
+        node_id="CRE_fixture_60",
         source_url="https://github.com/example/project/pull/8",
         source_title="Revert the change",
         source_body="Reverts example/project#7",
@@ -358,6 +451,95 @@ def test_lifecycle_snapshot_strict_parser_round_trips_complete_evidence() -> Non
 
     assert parsed == snapshot
     assert parsed.fingerprint() == snapshot.fingerprint()
+
+
+def test_lifecycle_snapshot_accepts_ordered_close_reopen_history() -> None:
+    events = (
+        PullRequestTimelineEvent(
+            identifier=1,
+            node_id="CE_fixture_1",
+            event="closed",
+            actor="maintainer",
+            commit_sha=None,
+            created_at=NOW,
+        ),
+        PullRequestTimelineEvent(
+            identifier=2,
+            node_id="RE_fixture_2",
+            event="reopened",
+            actor="maintainer",
+            commit_sha=None,
+            created_at=NOW + timedelta(minutes=1),
+        ),
+    )
+    snapshot = _snapshot(timeline_events=events, timeline_item_count=2)
+
+    parsed = parse_lifecycle_snapshot_json(snapshot.to_json(), observed_at=NOW)
+
+    assert [event.event for event in parsed.timeline_events] == ["closed", "reopened"]
+    assert parsed.pull_request.state == "open"
+
+
+def test_lifecycle_snapshot_rejects_tampered_commit_chain() -> None:
+    commits = (
+        PullRequestCommit(
+            position=1,
+            sha="b" * 40,
+            node_id="C_fixture_b",
+            parent_shas=("c" * 40,),
+        ),
+        PullRequestCommit(
+            position=2,
+            sha="a" * 40,
+            node_id="C_fixture_a",
+            parent_shas=("b" * 40,),
+        ),
+    )
+    snapshot = _snapshot(
+        pull_request=_pull_request(commit_count=2),
+        commits=commits,
+    )
+    payload = json.loads(snapshot.to_json())
+    payload["commits"][1]["parent_shas"] = ["d" * 40]
+    tampered = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    with pytest.raises(ValueError, match="commit history is not contiguous"):
+        parse_lifecycle_snapshot_json(tampered, observed_at=NOW)
+
+
+def test_commit_and_timeline_history_mutations_change_snapshot_fingerprint() -> None:
+    snapshot = _snapshot()
+    changed_commit = replace(
+        snapshot,
+        commits=(replace(snapshot.commits[0], node_id="C_replaced_identity"),),
+    )
+    changed_history = replace(
+        snapshot,
+        timeline_item_count=1,
+        timeline_events=(
+            PullRequestTimelineEvent(
+                identifier=1,
+                node_id="HRFPE_fixture_1",
+                event="head_ref_force_pushed",
+                actor="contributor",
+                commit_sha="a" * 40,
+                created_at=NOW,
+            ),
+        ),
+    )
+    changed_unretained_history = replace(snapshot, timeline_item_count=1)
+
+    assert (
+        len(
+            {
+                snapshot.fingerprint(),
+                changed_commit.fingerprint(),
+                changed_history.fingerprint(),
+                changed_unretained_history.fingerprint(),
+            }
+        )
+        == 4
+    )
 
 
 def test_classifier_ignores_untrusted_stop_text_and_superseded_ci_failures() -> None:
@@ -511,6 +693,7 @@ def test_revert_requires_merged_source_and_explicit_target() -> None:
     )
     explicit = PullRequestReference(
         identifier=1,
+        node_id="CRE_fixture_1",
         source_url="https://github.com/example/project/pull/8",
         source_title="Revert parser fix",
         source_body="Reverts example/project#7",

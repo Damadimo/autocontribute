@@ -434,6 +434,7 @@ class FakePublishingGitHub:
             head_sha=self.branch_sha or "d" * 40,
             issue_comment_count=0,
             review_comment_count=0,
+            commit_count=1,
             title=self.pull_request_title,
             body=self.pull_request_body,
             base_ref=self.pull_request_base,

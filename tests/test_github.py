@@ -75,7 +75,24 @@ def _pull_request_payload(*, merged: bool = False, draft: bool = False) -> dict[
         },
         "comments": 1,
         "review_comments": 1,
+        "commits": 1,
     }
+
+
+def _linear_pull_request_commits(count: int) -> list[dict[str, object]]:
+    commits: list[dict[str, object]] = []
+    parent_sha = "f" * 40
+    for index in range(1, count + 1):
+        sha = f"{index:040x}"
+        commits.append(
+            {
+                "sha": sha,
+                "node_id": f"C_fixture_{index}",
+                "parents": [{"sha": parent_sha}],
+            }
+        )
+        parent_sha = sha
+    return commits
 
 
 @pytest.mark.parametrize(
@@ -807,6 +824,17 @@ def test_lifecycle_read_api_parses_complete_bounded_evidence() -> None:
         paths.append(path)
         if path == "/repos/example/project/pulls/7":
             return httpx.Response(200, json=_pull_request_payload(merged=True))
+        if path == "/repos/example/project/pulls/7/commits":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "sha": "a" * 40,
+                        "node_id": "C_fixture_a",
+                        "parents": [{"sha": "c" * 40}],
+                    }
+                ],
+            )
         if path.endswith("/reviews"):
             return httpx.Response(
                 200,
@@ -867,6 +895,7 @@ def test_lifecycle_read_api_parses_complete_bounded_evidence() -> None:
                 json=[
                     {
                         "id": 51,
+                        "node_id": "CRE_fixture_51",
                         "event": "cross-referenced",
                         "created_at": "2026-07-21T14:00:00Z",
                         "source": {
@@ -885,6 +914,12 @@ def test_lifecycle_read_api_parses_complete_bounded_evidence() -> None:
 
     with _client(handler) as github:
         pull_request = github.get_pull_request("example/project", 7)
+        commits = github.list_pull_request_commits(
+            "example/project",
+            7,
+            expected_count=pull_request.commit_count,
+            expected_head_sha=pull_request.head_sha,
+        )
         reviews = github.list_pull_request_reviews("example/project", 7)
         issue_comments = github.list_issue_comments(
             "example/project", 7, expected_count=pull_request.issue_comment_count
@@ -894,17 +929,223 @@ def test_lifecycle_read_api_parses_complete_bounded_evidence() -> None:
         )
         checks = github.list_check_runs("example/project", pull_request.head_sha)
         statuses = github.list_commit_statuses("example/project", pull_request.head_sha)
-        references = github.list_pull_request_references("example/project", 7)
+        timeline = github.get_pull_request_timeline("example/project", 7)
 
     assert pull_request.merged
     assert pull_request.merge_commit_sha == "b" * 40
+    assert commits[0].sha == pull_request.head_sha
     assert reviews[0].state == "APPROVED"
     assert issue_comments[0].identifier == 11
     assert review_comments[0].identifier == 12
     assert checks[0].app_name == "github-actions"
     assert statuses[0].context == "buildkite/test"
-    assert references[0].source_merged_at is not None
-    assert len(paths) == 7
+    assert timeline.references[0].source_merged_at is not None
+    assert timeline.item_count == 1
+    assert len(paths) == 8
+
+
+def test_pull_request_commits_collect_more_than_one_page_in_order() -> None:
+    payloads = _linear_pull_request_commits(101)
+    pages: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        pages.append(page)
+        start = (page - 1) * 100
+        return httpx.Response(200, json=payloads[start : start + 100])
+
+    with _client(handler) as github:
+        commits = github.list_pull_request_commits(
+            "example/project",
+            7,
+            expected_count=101,
+            expected_head_sha=str(payloads[-1]["sha"]),
+        )
+
+    assert pages == [1, 2]
+    assert [commit.position for commit in commits] == list(range(1, 102))
+    assert commits[-1].sha == payloads[-1]["sha"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("count", "count changed"),
+        ("head", "advertised head"),
+        ("sha", "duplicate pull request commits"),
+        ("node", "duplicate pull request commits node identities"),
+    ],
+)
+def test_pull_request_commit_evidence_fails_closed_on_identity_drift(
+    failure: str,
+    message: str,
+) -> None:
+    payloads = _linear_pull_request_commits(2)
+    expected_count = 2
+    expected_head = str(payloads[-1]["sha"])
+    if failure == "count":
+        expected_count = 3
+    elif failure == "head":
+        expected_head = "e" * 40
+    elif failure == "sha":
+        payloads[-1]["sha"] = payloads[0]["sha"]
+        payloads[-1]["parents"] = [{"sha": "e" * 40}]
+        expected_head = str(payloads[0]["sha"])
+    elif failure == "node":
+        payloads[-1]["node_id"] = payloads[0]["node_id"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payloads)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match=message):
+        github.list_pull_request_commits(
+            "example/project",
+            7,
+            expected_count=expected_count,
+            expected_head_sha=expected_head,
+        )
+
+
+def test_pull_request_timeline_captures_force_push_and_orders_close_reopen_history() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 3,
+                    "node_id": "RE_fixture_3",
+                    "event": "reopened",
+                    "actor": {"login": "maintainer"},
+                    "commit_id": None,
+                    "created_at": "2026-07-21T13:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "node_id": "HRFPE_fixture_2",
+                    "event": "head_ref_force_pushed",
+                    "actor": {"login": "contributor"},
+                    "commit_id": "a" * 40,
+                    "created_at": "2026-07-21T12:30:00Z",
+                },
+                {
+                    "id": 1,
+                    "node_id": "CE_fixture_1",
+                    "event": "closed",
+                    "actor": {"login": "maintainer"},
+                    "commit_id": None,
+                    "created_at": "2026-07-21T12:00:00Z",
+                },
+            ],
+        )
+
+    with _client(handler) as github:
+        timeline = github.get_pull_request_timeline("example/project", 7)
+
+    assert timeline.item_count == 3
+    assert [event.event for event in timeline.events] == [
+        "closed",
+        "head_ref_force_pushed",
+        "reopened",
+    ]
+    assert timeline.events[1].actor == "contributor"
+    assert timeline.events[1].commit_sha == "a" * 40
+
+
+def test_pull_request_timeline_overflow_fails_closed() -> None:
+    pages: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        pages.append(page)
+        start = (page - 1) * 100
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": index,
+                    "node_id": f"LE_fixture_{index}",
+                    "event": "labeled",
+                }
+                for index in range(start + 1, start + 101)
+            ],
+        )
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="safe limit of 100"):
+        github.get_pull_request_timeline("example/project", 7, max_events=100)
+
+    assert pages == [1, 2]
+
+
+@pytest.mark.parametrize(
+    ("payloads", "message"),
+    [
+        (
+            [
+                {"id": 1, "node_id": "LE_duplicate", "event": "labeled"},
+                {"id": 2, "node_id": "LE_duplicate", "event": "unlabeled"},
+            ],
+            "duplicate pull request timeline node identities",
+        ),
+        (
+            [
+                {
+                    "id": 1,
+                    "node_id": "CE_fixture_1",
+                    "event": "closed",
+                    "actor": {"login": "maintainer"},
+                    "commit_id": None,
+                    "created_at": "2026-07-21T12:00:00Z",
+                },
+                {
+                    "id": 1,
+                    "node_id": "RE_fixture_1",
+                    "event": "reopened",
+                    "actor": {"login": "maintainer"},
+                    "commit_id": None,
+                    "created_at": "2026-07-21T13:00:00Z",
+                },
+            ],
+            "duplicate pull request history events",
+        ),
+        (
+            [
+                {
+                    "id": 1,
+                    "node_id": "CE_fixture_1",
+                    "event": "closed",
+                    "actor": {"login": "maintainer"},
+                    "commit_id": None,
+                    "created_at": "2026-07-21T12:00:00Z",
+                },
+                {
+                    "id": 1,
+                    "node_id": "CRE_fixture_1",
+                    "event": "cross-referenced",
+                    "created_at": "2026-07-21T13:00:00Z",
+                    "source": {
+                        "issue": {
+                            "title": "Related pull request",
+                            "body": "Tracks example/project#7",
+                            "state": "open",
+                            "html_url": "https://github.com/example/project/pull/8",
+                            "pull_request": {"merged_at": None},
+                        }
+                    },
+                },
+            ],
+            "duplicate retained pull request timeline identifiers",
+        ),
+    ],
+)
+def test_pull_request_timeline_rejects_duplicate_identities(
+    payloads: list[dict[str, object]],
+    message: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payloads)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match=message):
+        github.get_pull_request_timeline("example/project", 7)
 
 
 def test_lifecycle_collection_over_limit_fails_closed_with_overflow_page() -> None:

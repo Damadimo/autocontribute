@@ -13,7 +13,7 @@ import pytest
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.domain import IssueCandidate, RunManifest, RunStatus
 from autocontribute.exceptions import StateError
-from autocontribute.github import PullRequestDetails
+from autocontribute.github import PullRequestCommit, PullRequestDetails
 from autocontribute.lifecycle import PullRequestLifecycleSnapshot
 from autocontribute.store import CURRENT_SCHEMA_VERSION, RunStore
 
@@ -269,6 +269,7 @@ def _lifecycle_snapshot(*, head_sha: str = "a" * 40) -> PullRequestLifecycleSnap
             head_repository="example/project",
             issue_comment_count=0,
             review_comment_count=0,
+            commit_count=1,
             title="Fix lifecycle evidence",
             body="",
             base_ref="main",
@@ -276,11 +277,21 @@ def _lifecycle_snapshot(*, head_sha: str = "a" * 40) -> PullRequestLifecycleSnap
             head_label="example:fix-lifecycle",
             node_id="PR_fixture_node_7",
         ),
+        commits=(
+            PullRequestCommit(
+                position=1,
+                sha=head_sha,
+                node_id=f"C_{head_sha}",
+                parent_shas=("b" * 40,),
+            ),
+        ),
         reviews=(),
         issue_comments=(),
         review_comments=(),
         check_runs=(),
         commit_statuses=(),
+        timeline_item_count=0,
+        timeline_events=(),
         references=(),
     )
 
@@ -2325,7 +2336,7 @@ def test_lifecycle_snapshot_read_recomputes_fingerprint_after_content_tamper(
     store.record_lifecycle_snapshot(run.run_id, snapshot.fingerprint(), snapshot.to_json())
     changed = replace(
         snapshot,
-        pull_request=replace(snapshot.pull_request, head_sha="c" * 40),
+        pull_request=replace(snapshot.pull_request, title="Tampered lifecycle evidence"),
     )
     with sqlite3.connect(store.database_path) as connection:
         connection.execute(
