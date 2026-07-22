@@ -48,6 +48,12 @@ skips or rejects a candidate. Reconciliation deliberately precedes `doctor`: an 
 the persistent breaker, but that breaker must not prevent a later scheduler invocation from safely
 observing or compensating the already-authorized publication.
 
+On an operator-managed worker configured for auto mode, the scheduled path also computes the
+combined production rollout gate before it creates a new run. If either the fixed expert cohort or
+the fixed upstream-outcome cohort is blocked--including a pending or failed prior automatic pull
+request--the invocation exits before run creation, discovery, or any model/API billing. Read-only
+reconciliation of an already-authorized interrupted publication still runs first.
+
 The first run cannot be a scheduled event: schedules have no `bootstrap_state` input, and a cache
 miss fails closed. Use bootstrap only for the first-ever lineage. If an established cache is missing
 or evicted, disable the schedule and recover a known-good backup instead of silently bootstrapping
@@ -152,6 +158,21 @@ change requires a fresh calibration cohort. A usable backup or migration must th
 verified SQLite snapshot, run bundles, and evaluation directory from the same generation. The
 commands without `--complete` cover only SQLite; operator-managed deployments should use the
 complete bundle mode described below.
+
+That first-100 expert gate is only one half of the production decision. The outcome half is scoped to
+the exact deployment fingerprint, canonical publishing login, and canonical GitHub API origin. It
+fixes the first 20 manually approved, published pull requests by global durable
+`SUBMITTING -> PR_OPEN` ledger sequence, not by run creation time. Every fixed member must have both
+expert `accept_as_is` and upstream `merged_as_is`; a failed member is never replaced by a later
+success. Every prior automatic pull request in the scope must likewise remain `merged_as_is` before
+another can be published. Build both cohorts under `review_required`--there is no automatic
+calibration path--and use `autocontribute rollout report` to inspect the combined result.
+
+Outcome classification preserves adverse history permanently. Prepared-head drift or force push,
+maintainer-requested changes, a maintainer stop request, CI failure, close/reopen, closure without
+merge, or a later revert prevents `merged_as_is` even if later state appears healthy. The local
+`observed_at` field is storage metadata; GitHub timestamps and durable ledger ordering are
+authoritative.
 
 Legacy evaluation JSON without a matching ledger anchor does not silently carry into the rollout
 gate. Keep it only as historical material outside the active `evaluations/` directory and build the
@@ -375,9 +396,18 @@ the live SQLite database, `runs/`, and `evaluations/`. Its safety decisions depe
 duplicate history, leases, publication reservations, lifecycle snapshots, circuit-breaker state, and
 ledger-anchored evaluation records; an evictable runner cache is not an acceptable source of truth.
 
-Only after `autocontribute eval report` confirms that the deterministic first-100-run cohort is fully
-reviewed, contains at least 20 prepared cases, has at least 95% accept-as-is precision, and has zero
-policy, security, or etiquette failures should you consider the guarded pilot shape:
+First keep `publishing.mode: review_required` while collecting the fixed first-100 expert cohort and
+the fixed first-20 manually approved, published outcome cohort. `autocontribute eval report` is useful
+for expert calibration, but it does not authorize auto mode. Inspect the combined scoped decision:
+
+```bash
+uv run autocontribute rollout report
+```
+
+Only after that report confirms that the expert cohort is fully reviewed, contains at least 20
+prepared cases, has at least 95% accept-as-is precision, and has zero policy, security, or etiquette
+failures, and that all 20 fixed manual outcomes plus every prior automatic outcome are
+`merged_as_is`, should you consider the guarded pilot shape:
 
 ```yaml
 github:
@@ -432,16 +462,17 @@ canonical URL, repository, branch, and commit are durably verified, at most one 
 created per UTC day, and the repository cooldown is at least seven days. The draft-to-ready mutation
 has its own started/completed intent, so an interrupted worker reconciles the exact PR before any
 retry. This deliberately keeps the first autonomous pilot to one repository and one global
-sandbox/toolchain recipe. The durable expert-evaluation gate and
-environment gate are also required; passing the evaluation gate does not enable publication by
-itself. Automatic mode still performs all quality, account, duplicate, and freshness checks.
+sandbox/toolchain recipe. The durable combined rollout gate and environment gate are also required;
+neither cohort enables publication by itself. Automatic mode still performs all quality, account,
+duplicate, and freshness checks.
 Immediately before any GitHub mutation, it transactionally records the run's reservation; this
 SQLite ledger is the source of truth for the UTC daily limit and repository cooldown even if GitHub
 Search lags. Reservations are idempotent for the same run and survive failed or ambiguous attempts.
 For automatic mode, that same transaction installs a non-expiring hold over the exact validated
-evaluation-corpus cursor. Evaluation records and amendments are rejected until the matching run is
-durably `pr_open` or exact remote compensation is verified and durably finalized; process crashes and
-lease expiry do not clear the hold.
+evaluation and upstream-outcome corpus cursors. Both are recomputed and revalidated during recovery.
+Evaluation records and amendments are rejected until the matching run is durably `pr_open` or exact
+remote compensation is verified and durably finalized; process crashes and lease expiry do not clear
+the hold.
 Removing the variable is the kill switch. It prevents scheduled mutation resumption for durable
 `submitting` intents left by an interrupted worker as well as publication of newly prepared work.
 Read-only reconciliation still runs and can adopt a pull request that already exists remotely; it

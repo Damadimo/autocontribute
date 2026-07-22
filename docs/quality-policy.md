@@ -103,7 +103,7 @@ unsafe for automatic publication.
 healthy outcomes. The project must never optimize for daily PR count, profile activity, company
 prestige, or stars at the expense of maintainer value.
 
-## Shadow rollout gate
+## Production rollout gates
 
 Use `autocontribute eval record` to bind one immutable expert judgment to each exact run artifact and
 `autocontribute eval report` to inspect aggregate evidence for the current deployment fingerprint.
@@ -119,8 +119,27 @@ validation, policy, quality, and publishing-safety configuration. This fixed coh
 least 20 prepared cases, at least 95% accept-as-is precision among prepared cases, and zero policy,
 security, or etiquette failures. Other deployments cannot contribute cases. Any material code, model,
 or configuration change requires a new 100-run calibration; later grades are still validated but
-cannot replace an omitted early matching run or alter the fixed cohort's metrics. Passing this gate
-permits a controlled pilot; it is not permission for owner-wide or quota-driven publication.
+cannot replace an omitted early matching run or alter the fixed cohort's metrics. This expert gate is
+necessary but not sufficient for automatic publication.
+
+A separate upstream-outcome gate is scoped to the exact deployment fingerprint, canonical publishing
+login, and canonical GitHub API origin. Its fixed cohort is the first 20 manually approved, published
+pull requests in that scope, ordered by the global durable ledger sequence of their canonical
+`SUBMITTING -> PR_OPEN` transitions rather than run creation time. Every one of those 20 must have an
+anchored expert `accept_as_is` verdict and a verified upstream `merged_as_is` outcome. A failed or
+ambiguous fixed member is permanent; a later successful pull request never replaces it. In addition,
+every earlier automatically published pull request in the scope must still prove `merged_as_is`
+before another automatic publication is allowed.
+
+Upstream success is monotone and deliberately strict. Any retained evidence of prepared-head drift
+or a force push, maintainer-requested changes, a maintainer stop request, CI failure, close followed
+by reopen, closure without merge, or a later revert permanently prevents `merged_as_is`, even if a
+newer snapshot looks healthy. Local lifecycle `observed_at` is storage metadata, not authoritative
+ordering evidence; the classifier uses GitHub source timestamps and the durable ledger order. Run
+`autocontribute rollout report` for the combined expert and upstream-outcome decision. The report
+must pass both fixed cohorts and the complete prior-automatic history before auto mode is usable.
+Collect calibration evidence only in `review_required` mode; automatic publication is not a
+calibration path and cannot bootstrap either gate.
 
 The first grade is `<run-id>.json` under `<storage.path>/evaluations/`, not part of SQLite. If a
 reviewer made a mistake, `autocontribute eval amend` appends a complete replacement judgment as
@@ -138,10 +157,11 @@ recomputes every event hash and every predecessor link across the complete run l
 the cohort. Preserve all evaluation revisions, referenced run bundles, and the matching verified
 SQLite snapshot together as one generation.
 
-The guarded automatic publisher records the exact validated corpus cursor in a non-expiring SQLite
-hold atomically with its publication reservation. Initial evaluations and amendments are rejected
-while any hold remains. A process crash or expired coordination lease cannot reopen the corpus; only
-a durable open-PR state or fully verified exact remote compensation releases the hold.
+The guarded automatic publisher records both exact validated corpus cursors--expert evaluation and
+upstream outcome--in a non-expiring SQLite hold atomically with its publication reservation. Initial
+evaluations and amendments are rejected while any hold remains. Both cursors are recomputed and
+revalidated during recovery. A process crash or expired coordination lease cannot reopen either
+corpus; only a durable open-PR state or fully verified exact remote compensation releases the hold.
 
 Autonomous mode also requires an operator-managed, non-ephemeral deployment; the included hosted
 Actions workflow remains permanently `review_required` and an evictable cache cannot serve as the

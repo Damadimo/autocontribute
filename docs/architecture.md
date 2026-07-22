@@ -173,6 +173,23 @@ model deployment cannot inherit an older deployment's calibration. Evaluation ha
 verdict and revision metadata are anchored in each run's hash-chained SQLite event ledger, so an
 added, edited, deleted, duplicated, renamed, non-consecutive, predecessor-mismatched, or artifact-
 mismatched grade fails corpus validation.
+This fixed expert cohort must pass before, but cannot by itself authorize, automatic publication.
+The second fixed cohort is scoped by that exact deployment fingerprint together with the canonical
+publishing login and canonical GitHub API origin. It contains the first 20 manually approved,
+published pull requests in global durable `SUBMITTING -> PR_OPEN` ledger-sequence order, not run
+creation order. Each member requires both an anchored expert `accept_as_is` verdict and an upstream
+`merged_as_is` result. A failed member remains in place permanently, and every prior automatic pull
+request in the same scope must also remain `merged_as_is` before the next automatic publication.
+Both cohorts are built through `review_required`; auto mode cannot calibrate itself.
+
+The upstream classifier treats adverse history as monotone. Any observed prepared-head drift or
+force push, maintainer changes request or stop instruction, CI failure, close/reopen sequence,
+unmerged closure, or later revert permanently disqualifies `merged_as_is`; later healthy state cannot
+erase the immutable evidence. Lifecycle `observed_at` records when local storage occurred and is not
+an authoritative source timestamp. GitHub timestamps establish upstream chronology, while hash-chain
+and global publication-ledger order establish local evidence chronology. `autocontribute rollout
+report` combines this outcome decision with the first-100 expert decision and must pass in full
+before auto is usable.
 The build/lock component is a required, schema-validated `_build_identity.json` shipped inside the
 package. CI verifies its `pyproject.toml` and `uv.lock` SHA-256 values before building, so source and
 wheel installs use the same explicit identity without searching or trusting unrelated ancestor files.
@@ -226,13 +243,15 @@ restore can omit reservations, gate holds, outcome cursors, artifact-sync intent
 event heads, or lease generations, so SQLite integrity alone does not make it a safe
 autonomous-publication recovery point.
 
-Automatic publication computes an exact cursor over the globally ordered, hash-chained evaluation
-anchors. Reservation and cursor hold are one SQLite transaction, so an evaluation commit either wins
-first and invalidates the publisher's cursor or loses to the hold and is rejected. The hold has no
-TTL. A successful PR releases it atomically with `pr_open`; a base-race path releases it only after
-the exact PR is confirmed closed, the exact expected branch SHA is conditionally deleted and verified
-absent, and the compensated run is durably failed. Crashes and ambiguous cleanup retain both
-`submitting` and the hold for reconciliation.
+Automatic publication computes exact cursors over the globally ordered, hash-chained evaluation
+anchors and the scoped upstream-outcome evidence. The publication reservation and both cursor holds
+are one SQLite transaction, so a concurrent evidence change either wins first and invalidates the
+publisher's cursor or loses to the hold and is rejected. Recovery recomputes and revalidates both
+cursors before it may continue the held publication. The hold has no TTL. A successful PR releases it
+atomically with `pr_open`; a base-race path releases it only after the exact PR is confirmed closed,
+the exact expected branch SHA is conditionally deleted and verified absent, and the compensated run
+is durably failed. Crashes and ambiguous cleanup retain both `submitting` and the hold for
+reconciliation.
 
 ## Lifecycle feedback and circuit breaker
 
