@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import uuid
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated
 
@@ -12,16 +15,35 @@ from rich.console import Console
 from rich.table import Table
 
 from autocontribute import __version__
-from autocontribute.config import example_config, load_config
+from autocontribute.backup import create_state_bundle, restore_state_bundle
+from autocontribute.config import (
+    AutocontributeConfig,
+    auto_publish_opt_in_enabled,
+    example_config,
+    load_config,
+)
+from autocontribute.coordination import LeaseHeartbeatGuard
+from autocontribute.deployment import compute_deployment_fingerprint
 from autocontribute.discovery import DiscoveryService
 from autocontribute.doctor import run_doctor
-from autocontribute.domain import CommandResult, RunManifest, RunStatus
-from autocontribute.evaluation import EvaluationStore, EvaluationVerdict
-from autocontribute.exceptions import AutocontributeError, ConfigurationError
+from autocontribute.domain import RunManifest, RunStatus
+from autocontribute.evaluation import (
+    EvaluationRevision,
+    EvaluationStore,
+    EvaluationVerdict,
+    evaluation_hash,
+)
+from autocontribute.exceptions import (
+    AutocontributeError,
+    ConfigurationError,
+    PublicationResumeRequired,
+    StateError,
+)
 from autocontribute.github import GitHubClient
+from autocontribute.lifecycle import LifecycleSyncResult, sync_open_pull_requests
 from autocontribute.orchestrator import Orchestrator
-from autocontribute.publication import Publisher, approve_run
-from autocontribute.reporting import render_run_report
+from autocontribute.publication import Publisher, approve_run, build_approval_review
+from autocontribute.reporting import render_approval_review, render_run_report
 from autocontribute.store import RunStore
 
 app = typer.Typer(
@@ -35,9 +57,24 @@ evaluation_app = typer.Typer(
     help="Record expert shadow-run grades and inspect rollout gates.",
     no_args_is_help=True,
 )
+state_app = typer.Typer(
+    help="Create verified, portable backups of durable scheduler state.",
+    no_args_is_help=True,
+)
+lifecycle_app = typer.Typer(
+    help="Observe published pull requests and persist maintainer/CI safety signals.",
+    no_args_is_help=True,
+)
+safety_app = typer.Typer(
+    help="Inspect or explicitly change the persistent operational circuit breaker.",
+    no_args_is_help=True,
+)
 app.add_typer(runs_app, name="runs")
 app.add_typer(config_app, name="config")
 app.add_typer(evaluation_app, name="eval")
+app.add_typer(state_app, name="state")
+app.add_typer(lifecycle_app, name="lifecycle")
+app.add_typer(safety_app, name="safety")
 
 console = Console()
 DEFAULT_CONFIG = Path("autocontribute.yml")
@@ -78,7 +115,7 @@ def doctor(
 
     del non_interactive  # The doctor never prompts; the flag documents CI intent.
     settings = _config(config)
-    checks = run_doctor(settings)
+    checks = run_doctor(settings, store=RunStore(settings.storage.path))
     table = Table("Check", "Result", "Detail")
     for check in checks:
         if check.passed and check.warning:
@@ -100,7 +137,7 @@ def discover(config: ConfigOption = DEFAULT_CONFIG) -> None:
     settings = _config(config)
     store = RunStore(settings.storage.path)
     try:
-        with GitHubClient(settings.github) as github:
+        with _github_client(settings, store) as github:
             selection = DiscoveryService(settings, github, store).discover()
     except AutocontributeError as exc:
         _fail(str(exc))
@@ -132,15 +169,25 @@ def run_once(
 ) -> None:
     """Prepare one candidate, or skip safely when evidence is insufficient."""
 
-    del scheduled  # Kept explicit for audit-friendly workflow invocations.
     settings = _config(config)
     store = RunStore(settings.storage.path)
     github: GitHubClient | None = None
     try:
-        github = GitHubClient(settings.github)
+        github = _github_client(settings, store)
+        if scheduled:
+            _sync_lifecycle(
+                settings,
+                store,
+                github,
+                resume_submitting_publications=(
+                    settings.publishing.mode == "auto"
+                    and auto_publish_opt_in_enabled(settings.publishing)
+                ),
+            )
         with Orchestrator(settings, store=store, github=github) as orchestrator:
             manifest = orchestrator.run(issue_reference=issue)
         if manifest.status == RunStatus.READY_FOR_APPROVAL and settings.publishing.mode == "auto":
+            _sync_lifecycle(settings, store, github)
             manifest = Publisher(settings, store, github).publish(manifest.run_id)
     except (AutocontributeError, ValueError) as exc:
         _fail(str(exc))
@@ -165,21 +212,25 @@ def approve(
 
     settings = _config(config)
     store = RunStore(settings.storage.path)
-    manifest = store.get(run_id)
-    _show_report(store, manifest)
+    try:
+        with _github_client(settings, store) as github:
+            actor = github.authenticated_login()
+        review = build_approval_review(settings, store, run_id, actor=actor)
+        console.print(render_approval_review(review), markup=False)
+    except AutocontributeError as exc:
+        _fail(str(exc))
     if not yes and not typer.confirm(
         "I reviewed the exact diff, validation evidence, and PR text and authorize publication"
     ):
         raise typer.Abort()
     try:
-        with GitHubClient(settings.github) as github:
-            actor = github.authenticated_login()
         manifest = approve_run(
             settings,
             store,
             run_id,
             actor=actor,
             attestation="Reviewed exact diff, validation evidence, and pull-request text.",
+            reviewed_fingerprint=review.fingerprint,
         )
     except AutocontributeError as exc:
         _fail(str(exc))
@@ -208,8 +259,18 @@ def publish(
     if not yes and not typer.confirm("Publish this exact approved artifact to GitHub"):
         raise typer.Abort()
     try:
-        with GitHubClient(settings.github) as github:
-            manifest = Publisher(settings, store, github).publish(run_id)
+        with _github_client(settings, store) as github:
+            _sync_lifecycle(
+                settings,
+                store,
+                github,
+                publication_retry_run_id=(
+                    manifest.run_id if manifest.status == RunStatus.SUBMITTING else None
+                ),
+            )
+            manifest = store.get(run_id)
+            if manifest.status != RunStatus.PR_OPEN:
+                manifest = Publisher(settings, store, github).publish(run_id)
     except AutocontributeError as exc:
         _fail(str(exc))
     _refresh_report(store, manifest)
@@ -245,7 +306,17 @@ def show_run(
 
     settings = _config(config)
     store = RunStore(settings.storage.path)
-    _show_report(store, store.get(run_id))
+    try:
+        manifest = store.get(run_id)
+        if manifest.status == RunStatus.READY_FOR_APPROVAL:
+            with _github_client(settings, store) as github:
+                actor = github.authenticated_login()
+            review = build_approval_review(settings, store, run_id, actor=actor)
+            console.print(render_approval_review(review), markup=False)
+        else:
+            _show_report(store, manifest)
+    except AutocontributeError as exc:
+        _fail(str(exc))
 
 
 @config_app.command(name="validate")
@@ -302,12 +373,20 @@ def record_evaluation(
         bool,
         typer.Option(help="Mark spam, claimed-work, disclosure, or maintainer-time harm."),
     ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Attest to the displayed expert judgment without an interactive prompt.",
+        ),
+    ] = False,
 ) -> None:
-    """Bind one immutable expert grade to a shadow-run artifact."""
+    """Review and bind one immutable expert grade to a shadow-run artifact."""
 
     settings = _config(config)
+    evaluations = EvaluationStore(RunStore(settings.storage.path))
     try:
-        evaluation = EvaluationStore(RunStore(settings.storage.path)).record(
+        preview = evaluations.preview_record(
             run_id,
             reviewer=reviewer,
             verdict=verdict,
@@ -318,9 +397,94 @@ def record_evaluation(
         )
     except (AutocontributeError, ValueError) as exc:
         _fail(str(exc))
+    console.print(_render_evaluation_preview(preview), markup=False)
+    if not yes and not typer.confirm(
+        "I reviewed every field above and attest that this expert judgment is accurate"
+    ):
+        raise typer.Abort()
+    try:
+        evaluation = evaluations.commit_preview(preview)
+    except (AutocontributeError, ValueError) as exc:
+        _fail(str(exc))
     console.print(
         f"[green]Recorded[/green] {evaluation.verdict.value} for `{evaluation.run_id}` "
         f"(subject `{evaluation.subject_hash}`)."
+    )
+
+
+@evaluation_app.command(name="amend")
+def amend_evaluation(
+    run_id: Annotated[
+        str,
+        typer.Argument(help="Run identifier whose latest expert grade needs correction."),
+    ],
+    reviewer: Annotated[str, typer.Option(help="Expert reviewer identity for the audit record.")],
+    verdict: Annotated[
+        EvaluationVerdict,
+        typer.Option(help="Complete replacement judgment for the same reviewed subject."),
+    ],
+    amendment_reason: Annotated[
+        str,
+        typer.Option(
+            "--reason",
+            help="Required explanation of why the previous judgment was incorrect.",
+        ),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG,
+    notes: Annotated[
+        str,
+        typer.Option(help="Complete replacement evidence supporting the corrected judgment."),
+    ] = "",
+    policy_failure: Annotated[
+        bool,
+        typer.Option(help="Corrected repository-policy or legal-process failure value."),
+    ] = False,
+    security_failure: Annotated[
+        bool,
+        typer.Option(help="Corrected credential, isolation, or security failure value."),
+    ] = False,
+    etiquette_failure: Annotated[
+        bool,
+        typer.Option(help="Corrected spam, disclosure, or maintainer-time harm value."),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Attest to the displayed correction without an interactive prompt.",
+        ),
+    ] = False,
+) -> None:
+    """Append a reviewed correction without mutating or deleting prior grades."""
+
+    settings = _config(config)
+    evaluations = EvaluationStore(RunStore(settings.storage.path))
+    try:
+        preview = evaluations.preview_amendment(
+            run_id,
+            reviewer=reviewer,
+            verdict=verdict,
+            amendment_reason=amendment_reason,
+            notes=notes,
+            policy_failure=policy_failure,
+            security_failure=security_failure,
+            etiquette_failure=etiquette_failure,
+        )
+    except (AutocontributeError, ValueError) as exc:
+        _fail(str(exc))
+    console.print(_render_evaluation_preview(preview), markup=False)
+    if not yes and not typer.confirm(
+        "I reviewed every field above and attest that this correction is accurate"
+    ):
+        raise typer.Abort()
+    try:
+        evaluation = evaluations.commit_preview(preview)
+    except (AutocontributeError, ValueError) as exc:
+        _fail(str(exc))
+    console.print(
+        f"[green]Appended revision {evaluation.revision}[/green] "
+        f"{evaluation.verdict.value} for `{evaluation.run_id}` "
+        f"(record `{evaluation_hash(evaluation)}`)."
     )
 
 
@@ -336,7 +500,9 @@ def evaluation_report(
 
     settings = _config(config)
     try:
-        summary = EvaluationStore(RunStore(settings.storage.path)).summary()
+        summary = EvaluationStore(RunStore(settings.storage.path)).summary(
+            deployment_fingerprint=compute_deployment_fingerprint(settings)
+        )
     except AutocontributeError as exc:
         _fail(str(exc))
     if json_output:
@@ -349,6 +515,239 @@ def evaluation_report(
         console.print(f"- {evidence}")
 
 
+@state_app.command(name="backup")
+def backup_state(
+    config: ConfigOption = DEFAULT_CONFIG,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help=(
+                "Destination. Defaults to <storage.path>/snapshots/state.sqlite3, or "
+                "state.bundle.zip with --complete."
+            ),
+        ),
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(help="Atomically replace an existing snapshot or bundle."),
+    ] = False,
+    complete: Annotated[
+        bool,
+        typer.Option(
+            "--complete",
+            help="Include SQLite, run evidence, and expert evaluations in one checksummed bundle.",
+        ),
+    ] = False,
+) -> None:
+    """Create a verified SQLite snapshot or complete portable state bundle."""
+
+    settings = _config(config)
+    store = RunStore(settings.storage.path)
+    default_name = "state.bundle.zip" if complete else "state.sqlite3"
+    destination = output or settings.storage.path / "snapshots" / default_name
+    try:
+        snapshot = (
+            create_state_bundle(store, destination, overwrite=overwrite)
+            if complete
+            else store.create_snapshot(destination, overwrite=overwrite)
+        )
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    kind = "complete state bundle" if complete else "state snapshot"
+    console.print(f"[green]Verified {kind}:[/green] {snapshot}")
+
+
+@state_app.command(name="restore")
+def restore_state(
+    input_path: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            "-i",
+            help="Snapshot or complete bundle to verify and promote into absent live state.",
+        ),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG,
+    complete: Annotated[
+        bool,
+        typer.Option(
+            "--complete",
+            help="Restore SQLite, run evidence, and expert evaluations from a complete bundle.",
+        ),
+    ] = False,
+) -> None:
+    """Verify and atomically promote a snapshot or complete state generation."""
+
+    settings = _config(config)
+    try:
+        restored = (
+            restore_state_bundle(settings.storage.path, input_path)
+            if complete
+            else RunStore.restore_snapshot(settings.storage.path, input_path)
+        )
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    kind = "complete state" if complete else "state"
+    console.print(f"[green]Verified {kind} restored:[/green] {restored}")
+
+
+@lifecycle_app.command(name="sync")
+def lifecycle_sync(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Poll every durable open pull request and activate any hard safety stop."""
+
+    settings = _config(config)
+    store = RunStore(settings.storage.path)
+    try:
+        with _github_client(settings, store) as github:
+            result = _sync_lifecycle(settings, store, github)
+    except (AutocontributeError, ValueError) as exc:
+        _fail(str(exc))
+    _print_lifecycle_result(result)
+    status = store.circuit_breaker_status()
+    if status.is_tripped:
+        console.print(
+            f"Safety stop active: {status.source}: {status.reason}",
+            style="red",
+            markup=False,
+        )
+        raise typer.Exit(2)
+
+
+@safety_app.command(name="status")
+def safety_status(
+    config: ConfigOption = DEFAULT_CONFIG,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the machine-readable breaker status."),
+    ] = False,
+) -> None:
+    """Show whether autonomous preparation and publication are persistently stopped."""
+
+    settings = _config(config)
+    try:
+        status = RunStore(settings.storage.path).circuit_breaker_status()
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    if json_output:
+        console.print(
+            json.dumps(
+                {
+                    "is_tripped": status.is_tripped,
+                    "epoch": status.epoch,
+                    "changed_at": status.changed_at.isoformat(),
+                    "source": status.source,
+                    "reason": status.reason,
+                    "trigger_hash": status.trigger_hash,
+                    "active_revision": status.active_revision,
+                    "active_triggers": [
+                        {
+                            "source": trigger.source,
+                            "reason": trigger.reason,
+                            "trigger_hash": trigger.trigger_hash,
+                        }
+                        for trigger in status.active_triggers
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            markup=False,
+            soft_wrap=True,
+        )
+        return
+    if status.is_tripped:
+        console.print("[red]STOPPED[/red]")
+        console.print(f"Source: {status.source}", markup=False)
+        console.print(f"Reason: {status.reason}", markup=False)
+        console.print(f"Latest trigger hash: {status.trigger_hash}", markup=False)
+        console.print(f"Active trigger-set revision: {status.active_revision}", markup=False)
+        console.print("Active trigger evidence:")
+        for index, trigger in enumerate(status.active_triggers, start=1):
+            console.print(
+                f"  {index}. {trigger.source}: {trigger.reason} [{trigger.trigger_hash}]",
+                markup=False,
+            )
+    else:
+        console.print("[green]OPERATIONAL[/green]")
+    console.print(f"Safety epoch: {status.epoch}")
+    console.print(f"Changed: {status.changed_at.isoformat()}")
+
+
+@safety_app.command(name="stop")
+def safety_stop(
+    actor: Annotated[str, typer.Option(help="Operator identity recorded in the audit trail.")],
+    reason: Annotated[str, typer.Option(help="Concrete reason autonomous work must stop.")],
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Persistently stop preparation and publication without requiring GitHub access."""
+
+    settings = _config(config)
+    store = RunStore(settings.storage.path)
+    actor = actor.strip()
+    reason = reason.strip()
+    if not actor:
+        _fail("operator identity cannot be blank")
+    if not reason:
+        _fail("safety-stop reason cannot be blank")
+    trigger_hash = hashlib.sha256(
+        json.dumps(
+            {"actor": actor, "nonce": uuid.uuid4().hex, "reason": reason},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    try:
+        store.trip_circuit_breaker(
+            source=f"operator:{actor}",
+            reason=reason,
+            trigger_hash=trigger_hash,
+        )
+    except (AutocontributeError, TypeError, ValueError) as exc:
+        _fail(str(exc))
+    status = store.circuit_breaker_status()
+    console.print(
+        f"Safety stop activated: {status.source}: {status.reason}",
+        style="red",
+        markup=False,
+    )
+
+
+@safety_app.command(name="resume")
+def safety_resume(
+    actor: Annotated[str, typer.Option(help="Operator identity recorded in the audit trail.")],
+    reason: Annotated[
+        str,
+        typer.Option(help="Reviewed evidence supporting an explicit operational resume."),
+    ],
+    expected_trigger_hash: Annotated[
+        str,
+        typer.Option(
+            "--expected-trigger-hash",
+            help="Exact active trigger-set revision shown by `safety status` after review.",
+        ),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Resume only after an operator has reviewed and resolved the stop evidence."""
+
+    settings = _config(config)
+    store = RunStore(settings.storage.path)
+    try:
+        resumed = store.resume_circuit_breaker(
+            actor=actor,
+            reason=reason,
+            expected_trigger_hash=expected_trigger_hash,
+        )
+    except (AutocontributeError, TypeError, ValueError) as exc:
+        _fail(str(exc))
+    if not resumed:
+        console.print("[yellow]Safety stop was not active.[/yellow]")
+        return
+    console.print("[green]Safety stop explicitly resumed.[/green]")
+
+
 @app.command()
 def version() -> None:
     """Print the installed version."""
@@ -356,11 +755,148 @@ def version() -> None:
     console.print(__version__)
 
 
+def _render_evaluation_preview(evaluation: EvaluationRevision) -> str:
+    """Render every persisted field without allowing terminal control sequences."""
+
+    payload = json.dumps(
+        evaluation.model_dump(mode="json"),
+        ensure_ascii=True,
+        indent=2,
+        sort_keys=True,
+    )
+    revision = evaluation.schema_version if evaluation.schema_version == 1 else evaluation.revision
+    return "\n".join(
+        [
+            f"# Exact expert-evaluation preview (revision {revision})",
+            "",
+            "Every stored field is shown below. Terminal-control and non-ASCII characters are ",
+            "JSON escaped. Confirmation binds this exact object and fails if its subject or ",
+            "revision predecessor changes before the append.",
+            "",
+            f"Content SHA-256: {evaluation_hash(evaluation)}",
+            "----- BEGIN COMPLETE EVALUATION JSON -----",
+            payload,
+            "----- END COMPLETE EVALUATION JSON -----",
+            "",
+        ]
+    )
+
+
 def _config(path: Path):  # type: ignore[no-untyped-def]
     try:
         return load_config(path)
     except ConfigurationError as exc:
         _fail(str(exc))
+
+
+def _github_client(
+    settings: AutocontributeConfig,
+    store: RunStore,
+) -> GitHubClient:
+    """Create a production client whose GitHub safety signals are durable before failure."""
+
+    return GitHubClient(
+        settings.github,
+        safety_trigger_handler=store.trip_circuit_breaker_trigger,
+    )
+
+
+def _sync_lifecycle(
+    settings: AutocontributeConfig,
+    store: RunStore,
+    github: GitHubClient,
+    *,
+    publication_retry_run_id: str | None = None,
+    resume_submitting_publications: bool = False,
+) -> LifecycleSyncResult:
+    publisher = Publisher(settings, store, github)
+    reconciliation_failures: list[tuple[str, AutocontributeError]] = []
+    with LeaseHeartbeatGuard(
+        store,
+        "autocontribute.lifecycle",
+        ttl=timedelta(minutes=5),
+        heartbeat_interval=timedelta(minutes=1),
+    ) as lease_guard:
+        lease_guard.assert_owned()
+        for manifest in store.list_submitting_runs():
+            lease_guard.assert_owned()
+            try:
+                publisher.reconcile_submitting(manifest.run_id)
+            except PublicationResumeRequired:
+                lease_guard.assert_owned()
+                retry_this_run = manifest.run_id == publication_retry_run_id
+                scheduled_resume_allowed = (
+                    resume_submitting_publications
+                    and settings.publishing.mode == "auto"
+                    and auto_publish_opt_in_enabled(settings.publishing)
+                )
+                if not (scheduled_resume_allowed or retry_this_run):
+                    if settings.publishing.mode != "auto":
+                        reason = "publishing.mode is review_required"
+                    elif not auto_publish_opt_in_enabled(settings.publishing):
+                        reason = (
+                            f"{settings.publishing.auto_publish_env} is not enabled as the "
+                            "dedicated automatic-publication switch"
+                        )
+                    else:
+                        reason = "this lifecycle sync has no publication-resume authorization"
+                    reconciliation_failures.append(
+                        (
+                            manifest.run_id,
+                            PublicationResumeRequired(
+                                f"Run {manifest.run_id} requires publication resumption, but "
+                                f"GitHub writes are disabled because {reason}; use "
+                                f"`autocontribute publish {manifest.run_id}` after review"
+                            ),
+                        )
+                    )
+                    continue
+                lease_guard.assert_owned()
+                try:
+                    publisher.publish(manifest.run_id)
+                except AutocontributeError as resume_exc:
+                    lease_guard.assert_owned()
+                    reconciliation_failures.append((manifest.run_id, resume_exc))
+                else:
+                    lease_guard.assert_owned()
+            except AutocontributeError as exc:
+                lease_guard.assert_owned()
+                reconciliation_failures.append((manifest.run_id, exc))
+            else:
+                lease_guard.assert_owned()
+        lease_guard.assert_owned()
+        result = sync_open_pull_requests(
+            github,
+            store,
+            assert_owned=lease_guard.assert_owned,
+        )
+        lease_guard.assert_owned()
+    if len(reconciliation_failures) == 1:
+        raise reconciliation_failures[0][1]
+    if reconciliation_failures:
+        details = "; ".join(f"{run_id}: {failure}" for run_id, failure in reconciliation_failures)
+        raise StateError(
+            "Multiple submitting runs could not be reconciled after lifecycle observation: "
+            + details
+        ) from reconciliation_failures[0][1]
+    return result
+
+
+def _print_lifecycle_result(result: LifecycleSyncResult) -> None:
+    console.print(
+        "Lifecycle sync: "
+        f"{result.runs_checked} PR(s), "
+        f"{result.snapshots_recorded} new snapshot(s), "
+        f"{result.signals_detected} safety signal(s), "
+        f"{result.newly_tripped} new trigger(s)."
+    )
+    for item in result.observations:
+        for signal in item.observation.signals:
+            console.print(
+                f"- {signal.kind.value}: {signal.repository}#{signal.pull_request_number}: "
+                f"{signal.reason} ({signal.source_url})",
+                markup=False,
+            )
 
 
 def _print_outcome(manifest: RunManifest, store: RunStore) -> None:
@@ -383,27 +919,18 @@ def _print_outcome(manifest: RunManifest, store: RunStore) -> None:
 
 
 def _show_report(store: RunStore, manifest: RunManifest) -> None:
-    path = store.artifact_dir(manifest.run_id) / "report.md"
-    if path.is_file() and not path.is_symlink():
-        console.print(path.read_text(encoding="utf-8"), markup=False)
-    else:
-        console.print(manifest.model_dump_json(indent=2), markup=False)
+    del store
+    console.print(
+        render_run_report(manifest, manifest.patched_validation),
+        markup=False,
+    )
 
 
 def _refresh_report(store: RunStore, manifest: RunManifest) -> None:
-    validation_path = store.artifact_dir(manifest.run_id) / "validation.json"
-    commands: list[CommandResult] = []
-    if validation_path.is_file() and not validation_path.is_symlink():
-        try:
-            payload = json.loads(validation_path.read_text(encoding="utf-8"))
-            values = payload.get("patched", []) if isinstance(payload, dict) else payload
-            commands = [CommandResult.model_validate(value) for value in values]
-        except (ValueError, OSError):
-            commands = []
     store.write_artifact(
         manifest.run_id,
         "report.md",
-        render_run_report(manifest, commands),
+        render_run_report(manifest, manifest.patched_validation),
     )
 
 

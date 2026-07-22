@@ -561,6 +561,12 @@ def _secret_findings(files: Sequence[_DiffFile]) -> list[str]:
     return sorted(findings)
 
 
+def secret_findings(diff: str) -> list[str]:
+    """Return credential-like findings without retaining or returning matched values."""
+
+    return _secret_findings(_parse_git_diff(diff))
+
+
 def _path_evidence(kind: str, paths: Sequence[str]) -> str:
     if not paths:
         return f"no {kind}s detected"
@@ -569,4 +575,4 @@ def _path_evidence(kind: str, paths: Sequence[str]) -> str:
     return f"{kind}(s) detected: {rendered}{suffix}"
 
 
-__all__ = ["QualityEvaluator", "evaluate_quality"]
+__all__ = ["QualityEvaluator", "evaluate_quality", "secret_findings"]

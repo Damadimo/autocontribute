@@ -33,6 +33,14 @@ request, likely credentials and conventionally sensitive file contents are redac
 match strict Pydantic schemas. File edits use exact, unique search/replace operations and paths that
 cannot escape the workspace.
 
+Model calls use a durable per-run budget ledger. Before crossing the provider boundary, the worker
+records conservative input/output, cost, and timeout reservations in the manifest. It clamps the
+provider's output and timeout to the remaining aggregate budget, then reconciles input/output usage,
+configured Decimal token pricing, and monotonic elapsed time before using the response. Missing or
+inconsistent usage is an error. A request that fails ambiguously keeps its reservation, so a recovered
+run cannot treat uncertain billed work as free. Provider-project spend limits remain the final guard
+against a transport failure whose server-side billing cannot be observed locally.
+
 Model and GitHub credentials exist only in the control process. Each validation command receives a
 fresh disposable copy of the target working tree; mutations never become part of the authoritative
 patch or leak into later checks. Docker receives a read/write bind of that copy, a read-only `.git`
@@ -46,8 +54,29 @@ required command must be observed passing; the orchestrator never truncates chec
 successful result.
 
 The publication broker is the only component with GitHub mutation methods. The model cannot invoke
-it. In review mode, the broker requires an unexpired user approval over a canonical hash of the
-repository, issue, base SHA, patch bytes, commit message, PR title/body, and disclosure.
+it. Readiness creates a preparation fingerprint over the exact patch bytes and the candidate,
+eligibility, repository/base, plan, proposal, baseline-validation, complete scrubbed patched-command
+results, and quality evidence. The human-readable `validation.json` sidecar is derived from the
+manifest copy and must match it exactly at approval and publication. Both review and automatic
+publication recompute this immutable seal before continuing. In review mode, the broker additionally
+requires an unexpired user approval over a canonical hash of the repository, issue, base SHA, patch
+bytes, commit message, PR title/body, and disclosure. Publication also rechecks that the PR body
+contains the exact disclosure in the current configuration.
+
+The approval UI does not consume `report.md`. It resolves the authenticated publication identity,
+loads a fresh validated manifest from SQLite, safely opens regular non-symlink patch and validation
+artifacts, and renders the exact issue title/body/discussion, complete patch and command streams, PR
+text, commit identity/text, and resulting approval fingerprint. Once the operator confirms, the
+broker repeats that entire load and validation and constant-time compares the reviewed fingerprint
+before recording approval. A concurrent evidence change therefore requires a new human review.
+
+Publication does not rely on the discovery-time view of upstream state. Before reserving capacity or
+mutating GitHub, it refetches the canonical repository and complete issue, requires the sealed issue
+scope, labels, discussion, and update timestamp to be unchanged, and reruns deterministic eligibility
+and duplicate checks. Eligibility evidence includes a SHA-256 digest over every bounded repository
+and organization policy path read by the selector, including missing files; the publication read must
+produce the same digest. It also requires the repository identity/default branch and tested base SHA
+to remain unchanged.
 
 ## Run state
 
@@ -60,9 +89,113 @@ Normal side exits: skipped, rejected, cancelled, failed
 ```
 
 The critic may trigger one bounded `critiquing -> implementing` repair loop. Every transition is
-persisted before subsequent work. Events form a per-run SHA-256 hash chain. GitHub publication uses a
-stable branch, records mutation intent before the first write, never force-pushes, and reconciles an
-existing branch/PR after uncertain failures.
+persisted before subsequent work. Events form a per-run SHA-256 hash chain. The run row stores the
+authoritative event count and terminal hash; appending an event and advancing that anchor are one
+transaction. Full validation recomputes the chain and compares both values, which makes tail
+truncation detectable. Manifest updates use an `updated_at` compare-and-swap so a stale in-memory copy
+cannot replace newer state or pull-request evidence. GitHub publication uses a stable branch, records
+mutation intent before the first write, never force-pushes, and reconciles an existing branch/PR after
+uncertain failures.
+
+Leases carry fencing generations from a durable per-name counter. A clean release removes only the
+active lease, not its counter; takeover or reacquisition advances the counter, so an earlier token
+cannot become valid again even when the owner string is reused.
+
+Immediately before entering `submitting` or making the first remote mutation, publication acquires a
+transactional reservation in SQLite. The reservation table is authoritative for the worker's UTC-day
+and repository-cooldown accounting, so concurrent workers cannot both pass a stale read and GitHub
+Search lag cannot reopen local capacity. Reservations are idempotent by run ID and are never released
+after a failed or ambiguous attempt. GitHub searches remain an additional conservative account-state
+check rather than the durable limit ledger.
+
+Durable state has three coordinated parts: `state.sqlite3` stores run, lease, persistent fencing
+generation, lifecycle, breaker, publication-reservation, and evaluation-gate-hold state;
+`runs/<run-id>/` stores portable
+evidence bundles; and `evaluations/` stores immutable expert-grade revision files separately from
+SQLite. The initial `<run-id>.json` and each append-only `revision-NNNNNN` correction form a content-
+hash chain; only the latest valid judgment is effective, while every predecessor remains required.
+Each orchestrated run records its deployment fingerprint in both the manifest and its first
+hash-chained creation event. The evaluation gate selects the earliest 100 runs whose immutable
+creation evidence matches the current package source, interpreter, installed dependency closure,
+packaged build/lock manifest, attested exact response-model, and material-configuration fingerprint,
+so a changed runtime or
+model deployment cannot inherit an older deployment's calibration. Evaluation hashes, subject hashes, and
+verdict and revision metadata are anchored in each run's hash-chained SQLite event ledger, so an
+added, edited, deleted, duplicated, renamed, non-consecutive, predecessor-mismatched, or artifact-
+mismatched grade fails corpus validation.
+The build/lock component is a required, schema-validated `_build_identity.json` shipped inside the
+package. CI verifies its `pyproject.toml` and `uv.lock` SHA-256 values before building, so source and
+wheel installs use the same explicit identity without searching or trusting unrelated ancestor files.
+An online SQLite snapshot captures committed WAL pages and verifies integrity, the exact v5 schema,
+and every event chain against its durable count/head anchor, but it does not include either
+directory. `state backup --complete` additionally copies both directories, validates their run
+manifests and evaluation anchors against that snapshot, inventories every file by size and SHA-256,
+and emits one bounded archive. Because repository workspaces are excluded, bundle creation refuses a
+`submitting` run with a stored commit: the exact commit cannot be reproduced byte-for-byte after
+restore. Publication must be reconciled or finished on the persistent worker first. Its matching
+restore verifies paths, types, limits, checksums, schema,
+event chains, manifests, and evaluations before atomically promoting an absent storage root.
+Production backup and migration procedures should quiesce writers and use this complete generation;
+the SQLite-only mode remains for hosted-workflow persistence that already carries the two directories
+in the same immutable cache and artifact.
+
+The current SQLite schema is v5. `state restore` accepts only exact canonical v2, v3, v4, or v5 schemas,
+rejecting unexpected tables, indexes, views, and triggers as well as missing objects, and refuses to
+replace live SQLite state. A v4/v5 snapshot's complete event ledger and run anchors are validated before
+atomic promotion. A v2 or v3 snapshot is structurally validated and promoted unchanged; the next
+command that constructs `RunStore` migrates it transactionally through v3, v4, and v5. The v2-to-v3 step
+conservatively backfills reservations for durable `submitting` and `pr_open` runs at migration time.
+The v3-to-v4 step first verifies every legacy hash chain, then backfills event count/head anchors,
+seeds persistent generation counters from active leases, and conservatively holds the evaluation
+corpus for ambiguous submitting publications. The v4-to-v5 step adds an explicit manifest-artifact
+sync outbox and reconciles materialized reservation/hold rows with their hash-chained evidence.
+Because older schemas did not retain every v5 invariant after
+a clean release, the cutover must be offline and one-way: quiesce every older worker before the first
+v5 open and never let one resume against the migrated lineage. A stale restore can omit reservations,
+gate holds, artifact-sync intent, evaluation anchors, event heads, or lease generations, so SQLite integrity alone does not make it a
+safe autonomous-publication recovery point.
+
+Automatic publication computes an exact cursor over the globally ordered, hash-chained evaluation
+anchors. Reservation and cursor hold are one SQLite transaction, so an evaluation commit either wins
+first and invalidates the publisher's cursor or loses to the hold and is rejected. The hold has no
+TTL. A successful PR releases it atomically with `pr_open`; a base-race path releases it only after
+the exact PR is confirmed closed, the exact expected branch SHA is conditionally deleted and verified
+absent, and the compensated run is durably failed. Crashes and ambiguous cleanup retain both
+`submitting` and the hold for reconciliation.
+
+## Lifecycle feedback and circuit breaker
+
+Publication does not end the safety boundary. The lifecycle observer reads every durable `pr_open`
+run, validates its canonical PR URL and prepared commit, then takes one bounded, internally
+consistent snapshot of the PR, reviews, issue and review comments, checks, commit statuses, and
+cross-references. Snapshots are immutable and content-deduplicated. The observer uses deterministic
+rules, not a model, to detect:
+
+- a PR head that no longer matches the prepared contribution commit;
+- the latest effective maintainer review requesting changes;
+- a non-bot owner, member, or collaborator explicitly asking the contribution or automation to stop;
+- a latest CI check or commit status that has failed;
+- a PR closed without merge; or
+- a merged contribution explicitly reverted by a later merged PR.
+
+Any signal appends deduplicated audit evidence and trips one global circuit breaker in SQLite.
+Preparation checks the breaker at orchestration stage boundaries; publication checks it at entry and
+again before GitHub mutations. A scheduled invocation first runs lifecycle synchronization, before
+candidate discovery, so new adverse evidence prevents model work. Inconsistent, incomplete, or
+unbounded lifecycle evidence fails closed.
+
+Lifecycle synchronization attempts every bounded ambiguous `submitting` reconciliation while
+retaining any failures, then observes every tracked pull request, including newly reconciled ones,
+before reporting the retained failure. Thus one stranded publication cannot suppress fresh safety
+evidence from other open contributions.
+
+The breaker never clears itself. `safety stop` lets an operator activate it without GitHub access;
+every distinct trip changes the hash of the complete active trigger set. `safety resume` requires an
+operator identity, a reason, and that exact set revision and appends a new audit epoch. Resume is an
+operational assertion, so the operator must first inspect every stored source, reason, and hash, review
+the linked upstream evidence, and resolve the condition. A concurrent newer trip makes the reviewed
+set revision stale and prevents resume. This state is durable only when the configured
+SQLite database—or a verified online-backup snapshot of it—is durable.
 
 ## Model boundary
 

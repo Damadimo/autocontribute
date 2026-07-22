@@ -73,6 +73,16 @@ def redact_text(text: str, *, secret_env_names: Iterable[str] = ()) -> str:
     return redacted
 
 
+def contains_credential_material(
+    text: str,
+    *,
+    secret_env_names: Iterable[str] = (),
+) -> bool:
+    """Return whether text matches a credential pattern or a configured secret value."""
+
+    return redact_text(text, secret_env_names=secret_env_names) != text
+
+
 def redact_model_input(
     text: str,
     *,
@@ -86,7 +96,7 @@ def redact_model_input(
     example environment files remain available after ordinary value-level scrubbing.
     """
 
-    if source_path is not None and _is_sensitive_file(source_path):
+    if source_path is not None and is_sensitive_path(source_path):
         return SENSITIVE_FILE_REDACTION
 
     redacted = text
@@ -107,7 +117,9 @@ def _redact_named_value(match: re.Match[str]) -> str:
     return f"{match.group('prefix')}{MODEL_INPUT_REDACTION}{suffix}"
 
 
-def _is_sensitive_file(path: str) -> bool:
+def is_sensitive_path(path: str) -> bool:
+    """Return whether a repository path conventionally contains live credentials."""
+
     normalized = path.replace("\\", "/").casefold()
     name = PurePosixPath(normalized).name
     if name in _SENSITIVE_FILE_NAMES:
@@ -132,6 +144,8 @@ def truncate_artifact(text: str, *, limit: int = 100_000) -> str:
 __all__ = [
     "MODEL_INPUT_REDACTION",
     "SENSITIVE_FILE_REDACTION",
+    "contains_credential_material",
+    "is_sensitive_path",
     "redact_model_input",
     "redact_text",
     "truncate_artifact",

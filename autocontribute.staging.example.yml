@@ -10,7 +10,7 @@ github:
     - YOUR_ACCOUNT/autocontribute-staging-fixture
   owners: []
   include_labels: ["autocontribute-e2e"]
-  exclude_labels: ["security", "blocked", "needs design"]
+  exclude_labels: ["security", "blocked", "needs design", "discussion"]
   min_stars: 0
   repository_limit_per_owner: 1
   issue_limit_per_repository: 10
@@ -22,11 +22,21 @@ models:
   scout: &staging_model
     provider: openai
     model: gpt-5.6
+    # Required for `publishing.mode: auto`: copy the exact immutable model ID returned by the API.
+    # expected_response_model: gpt-5.6-YYYY-MM-DD
+    # immutable_response_model_attested: true  # only after verifying the provider contract
     api_key_env: OPENAI_API_KEY
     reasoning_effort: high
     reasoning_mode: standard
+    max_input_tokens: 500000
     max_output_tokens: 40000
     timeout_seconds: 900
+    # Conservative price ceilings, not a built-in price table. Verify for the selected model.
+    pricing:
+      input_usd_per_million_tokens: 10
+      cached_input_usd_per_million_tokens: 10
+      cache_write_usd_per_million_tokens: 10
+      output_usd_per_million_tokens: 100
   builder: *staging_model
   critic:
     <<: *staging_model
@@ -76,6 +86,7 @@ publishing:
   mode: review_required
   approval_expires_hours: 12
   draft: true
+  # These limits use durable schema-v5 reservations if a reviewed fixture is manually published.
   max_new_pull_requests_per_day: 1
   max_open_pull_requests: 1
   repository_cooldown_days: 30
@@ -84,6 +95,10 @@ publishing:
 budget:
   max_model_calls_per_run: 6
   max_candidates_per_run: 10
+  max_input_tokens_per_run: 3000000
+  max_output_tokens_per_run: 240000
+  max_model_seconds_per_run: 3600
+  max_model_cost_usd_per_run: 50
 
 storage:
   path: .autocontribute-staging

@@ -6,7 +6,9 @@ import hashlib
 import hmac
 import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -17,7 +19,7 @@ from autocontribute.exceptions import PolicyError
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_FINGERPRINT_DOMAIN = b"autocontribute.approval.v2\x00"
+_FINGERPRINT_DOMAIN = b"autocontribute.approval.v3\x00"
 
 
 class ApprovalManifest(BaseModel):
@@ -29,11 +31,17 @@ class ApprovalManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: int = Field(default=2, frozen=True)
+    schema_version: int = Field(default=3, frozen=True)
     repository: str
     issue_number: int = Field(gt=0)
     base_sha: str
+    preparation_fingerprint: str
     publishing_login: str
+    publishing_api_origin: str
+    commit_author_name: str
+    commit_author_email: str
+    commit_committer_name: str
+    commit_committer_email: str
     base_branch: str
     draft: bool
     diff_sha256: str
@@ -57,6 +65,14 @@ class ApprovalManifest(BaseModel):
             raise ValueError("base_sha must be a full 40- or 64-character git SHA")
         return lowered
 
+    @field_validator("preparation_fingerprint")
+    @classmethod
+    def valid_preparation_fingerprint(cls, value: str) -> str:
+        lowered = value.casefold()
+        if not _SHA256.fullmatch(lowered):
+            raise ValueError("preparation_fingerprint must be a SHA-256 hex digest")
+        return lowered
+
     @field_validator("publishing_login")
     @classmethod
     def canonical_publishing_login(cls, value: str) -> str:
@@ -64,6 +80,64 @@ class ApprovalManifest(BaseModel):
         if not canonical:
             raise ValueError("publishing_login cannot be blank")
         return canonical
+
+    @field_validator("publishing_api_origin")
+    @classmethod
+    def canonical_publishing_api_origin(cls, value: str) -> str:
+        try:
+            parsed = urlparse(value)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("publishing_api_origin must be a canonical HTTPS origin") from exc
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("publishing_api_origin must be a canonical HTTPS origin")
+        host = parsed.hostname.casefold()
+        if ":" in host:
+            host = f"[{host}]"
+        expected = f"https://{host}" + (f":{port}" if port is not None else "")
+        if value != expected:
+            raise ValueError("publishing_api_origin must be a canonical HTTPS origin")
+        return value
+
+    @field_validator(
+        "commit_author_name",
+        "commit_committer_name",
+    )
+    @classmethod
+    def valid_git_name(cls, value: str) -> str:
+        if (
+            not value
+            or value != value.strip()
+            or len(value) > 200
+            or any(character in value for character in ("\0", "\r", "\n"))
+        ):
+            raise ValueError("git identity names must be canonical single-line values")
+        return value
+
+    @field_validator(
+        "commit_author_email",
+        "commit_committer_email",
+    )
+    @classmethod
+    def valid_git_email(cls, value: str) -> str:
+        if (
+            not value
+            or value != value.strip()
+            or len(value) > 320
+            or "@" not in value
+            or any(character in value for character in ("\0", "\r", "\n", "<", ">"))
+        ):
+            raise ValueError("git identity emails must be canonical single-line addresses")
+        return value
 
     @field_validator("base_branch")
     @classmethod
@@ -93,6 +167,17 @@ class ApprovalManifest(BaseModel):
         return value
 
 
+@dataclass(frozen=True, slots=True)
+class ApprovalReview:
+    """One fully validated snapshot shown before a human approval."""
+
+    run: RunManifest
+    patch: bytes
+    validation_artifact: bytes
+    manifest: ApprovalManifest
+    fingerprint: str
+
+
 def hash_diff(diff: str | bytes) -> str:
     """Hash the exact diff bytes; newline or whitespace changes invalidate approval."""
 
@@ -105,7 +190,6 @@ def build_approval_manifest(
     *,
     diff: str | bytes,
     disclosure: str,
-    publishing_login: str,
     draft: bool,
 ) -> ApprovalManifest:
     """Extract the exact publishable fields from a ready run."""
@@ -118,11 +202,38 @@ def build_approval_manifest(
         raise PolicyError("Cannot approve a run without repository metadata")
     if run.proposal is None:
         raise PolicyError("Cannot approve a run without a patch proposal")
+    required_context = {
+        "preparation fingerprint": run.preparation_fingerprint,
+        "publishing login": run.publishing_login,
+        "publishing API origin": run.publishing_api_origin,
+        "commit author name": run.commit_author_name,
+        "commit author email": run.commit_author_email,
+        "commit committer name": run.commit_committer_name,
+        "commit committer email": run.commit_committer_email,
+    }
+    missing = [name for name, value in required_context.items() if not value]
+    if missing:
+        raise PolicyError(
+            "Cannot approve a run without durable publication context: " + ", ".join(missing)
+        )
+    assert run.preparation_fingerprint is not None
+    assert run.publishing_login is not None
+    assert run.publishing_api_origin is not None
+    assert run.commit_author_name is not None
+    assert run.commit_author_email is not None
+    assert run.commit_committer_name is not None
+    assert run.commit_committer_email is not None
     return ApprovalManifest(
         repository=run.candidate.repository,
         issue_number=run.candidate.number,
         base_sha=run.base_sha,
-        publishing_login=publishing_login,
+        preparation_fingerprint=run.preparation_fingerprint,
+        publishing_login=run.publishing_login,
+        publishing_api_origin=run.publishing_api_origin,
+        commit_author_name=run.commit_author_name,
+        commit_author_email=run.commit_author_email,
+        commit_committer_name=run.commit_committer_name,
+        commit_committer_email=run.commit_committer_email,
         base_branch=run.repository.default_branch,
         draft=draft,
         diff_sha256=hash_diff(diff),
@@ -218,6 +329,7 @@ def _aware_utc(value: datetime, *, field: str) -> datetime:
 
 __all__ = [
     "ApprovalManifest",
+    "ApprovalReview",
     "approval_is_valid",
     "build_approval_manifest",
     "create_approval",

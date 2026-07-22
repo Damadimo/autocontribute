@@ -9,6 +9,33 @@ permissions:
   contents: read
 
 jobs:
+  repository-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out complete source history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned Go toolchain
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.23.8"
+          cache: false
+      - name: Install pinned repository scanners
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+          go install github.com/zricethezav/gitleaks/v8@v8.28.0
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+      - name: Check workflows and embedded shell
+        run: |
+          shellcheck --version
+          "$(go env GOPATH)/bin/actionlint" -shellcheck "$(command -v shellcheck)"
+      - name: Scan complete history for secrets
+        run: '"$(go env GOPATH)/bin/gitleaks" git --redact --verbose .'
+
   test:
     strategy:
       fail-fast: false
@@ -56,10 +83,16 @@ jobs:
           version: "0.9.30"
           python-version: "3.12"
           enable-cache: true
+      - name: Install locked build backend
+        run: uv sync --locked --extra dev --no-install-project
       - name: Build source distribution
-        run: uv build --sdist --no-sources --clear
+        run: >-
+          uv build --sdist --no-sources --no-build-isolation --offline
+          --python .venv/bin/python --clear
       - name: Build wheel from source distribution
-        run: uv build dist/autocontribute-*.tar.gz --wheel --out-dir dist/wheel
+        run: >-
+          uv build dist/autocontribute-*.tar.gz --wheel --out-dir dist/wheel
+          --no-build-isolation --offline --python .venv/bin/python
       - name: Verify installed package
         run: |
           uv venv --python 3.12 "${RUNNER_TEMP}/autocontribute-package"
@@ -70,3 +103,23 @@ jobs:
           autocontribute_version="$(autocontribute-package/bin/autocontribute version)"
           test "$autocontribute_version" = "0.1.0"
           autocontribute-package/bin/autocontribute --help
+          autocontribute-package/bin/python - <<'PY'
+          import os
+          from pathlib import Path
+
+          import autocontribute.deployment as deployment
+
+          installed_manifest = Path(deployment.__file__).with_name("_build_identity.json")
+          source_manifest = (
+              Path(os.environ["GITHUB_WORKSPACE"])
+              / "src"
+              / "autocontribute"
+              / "_build_identity.json"
+          )
+          if installed_manifest.read_bytes() != source_manifest.read_bytes():
+              raise SystemExit("wheel build identity differs from source")
+          if len(deployment.packaged_build_identity_digest()) != 64:
+              raise SystemExit("wheel build identity digest is invalid")
+          if len(deployment.runtime_environment_digest()) != 64:
+              raise SystemExit("wheel runtime identity digest is invalid")
+          PY

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
+import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
@@ -10,11 +13,18 @@ from openai import OpenAI
 from openai.types.shared_params import Reasoning
 from pydantic import BaseModel, ValidationError
 
-from autocontribute.config import ModelProfile
+from autocontribute.config import ModelProfile, validate_model_identifier
 from autocontribute.exceptions import ModelError
 from autocontribute.redaction import redact_model_input
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
+
+# Retries must remain visible to the orchestrator so every potentially billable
+# request receives its own durable budget reservation.  The SDK otherwise
+# retries selected failures internally, outside Autocontribute's hard limits.
+_SDK_MAX_RETRIES = 0
+_SAFE_INCOMPLETE_REASONS: frozenset[str] = frozenset({"content_filter", "max_output_tokens"})
+_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 
 @dataclass(frozen=True)
@@ -42,16 +52,22 @@ class ModelProvider(Protocol):
         instructions: str,
         prompt: str,
         output_type: type[OutputT],
+        max_output_tokens: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> ModelResult[OutputT]: ...
 
 
-def _token_count(container: object | None, field: str) -> int:
+def _token_count(container: object | None, field: str, *, required: bool = False) -> int:
     """Read a non-negative SDK token count without silently accepting bad data."""
 
     if container is None:
+        if required:
+            raise ModelError(f"Model provider omitted required usage field: {field}")
         return 0
     value = getattr(container, field, None)
     if value is None:
+        if required:
+            raise ModelError(f"Model provider omitted required usage field: {field}")
         return 0
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ModelError(f"Model provider returned invalid usage field: {field}")
@@ -61,35 +77,122 @@ def _token_count(container: object | None, field: str) -> int:
 def _responses_usage(raw_usage: object | None) -> ModelUsage:
     input_details = getattr(raw_usage, "input_tokens_details", None)
     output_details = getattr(raw_usage, "output_tokens_details", None)
-    return ModelUsage(
-        input_tokens=_token_count(raw_usage, "input_tokens"),
+    usage = ModelUsage(
+        input_tokens=_token_count(raw_usage, "input_tokens", required=True),
         cached_input_tokens=_token_count(input_details, "cached_tokens"),
         cache_write_tokens=_token_count(input_details, "cache_write_tokens"),
-        output_tokens=_token_count(raw_usage, "output_tokens"),
+        output_tokens=_token_count(raw_usage, "output_tokens", required=True),
         reasoning_tokens=_token_count(output_details, "reasoning_tokens"),
-        total_tokens=_token_count(raw_usage, "total_tokens"),
+        total_tokens=_token_count(raw_usage, "total_tokens", required=True),
     )
+    return _validate_usage(usage)
 
 
 def _chat_usage(raw_usage: object | None) -> ModelUsage:
     prompt_details = getattr(raw_usage, "prompt_tokens_details", None)
     completion_details = getattr(raw_usage, "completion_tokens_details", None)
-    return ModelUsage(
-        input_tokens=_token_count(raw_usage, "prompt_tokens"),
+    usage = ModelUsage(
+        input_tokens=_token_count(raw_usage, "prompt_tokens", required=True),
         cached_input_tokens=_token_count(prompt_details, "cached_tokens"),
         cache_write_tokens=_token_count(prompt_details, "cache_write_tokens"),
-        output_tokens=_token_count(raw_usage, "completion_tokens"),
+        output_tokens=_token_count(raw_usage, "completion_tokens", required=True),
         reasoning_tokens=_token_count(completion_details, "reasoning_tokens"),
-        total_tokens=_token_count(raw_usage, "total_tokens"),
+        total_tokens=_token_count(raw_usage, "total_tokens", required=True),
     )
+    return _validate_usage(usage)
 
 
-def _request_error(provider: str, exc: Exception) -> ModelError:
+def _validate_usage(usage: ModelUsage) -> ModelUsage:
+    if usage.cached_input_tokens + usage.cache_write_tokens > usage.input_tokens:
+        raise ModelError("Model provider returned input-token details above input_tokens")
+    if usage.reasoning_tokens > usage.output_tokens:
+        raise ModelError("Model provider returned reasoning_tokens above output_tokens")
+    if usage.total_tokens != usage.input_tokens + usage.output_tokens:
+        raise ModelError("Model provider returned inconsistent total_tokens")
+    return usage
+
+
+def _effective_output_tokens(configured: int, requested: int | None) -> int:
+    if requested is None:
+        return configured
+    if isinstance(requested, bool) or not isinstance(requested, int) or requested < 1:
+        raise ModelError("Model request output-token limit must be a positive integer")
+    return min(configured, requested)
+
+
+def _effective_timeout(configured: float, requested: float | None) -> float:
+    if requested is None:
+        return configured
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, (int, float))
+        or not math.isfinite(requested)
+        or requested <= 0
+    ):
+        raise ModelError("Model request timeout must be positive")
+    return min(configured, float(requested))
+
+
+def _request_error(
+    provider: str,
+    exc: Exception,
+    *,
+    profile: ModelProfile,
+    configured_api_key: str,
+) -> ModelError:
     """Create a useful error without echoing provider bodies, prompts, or credentials."""
 
     request_id = getattr(exc, "request_id", None)
-    request_suffix = f" (request ID: {request_id})" if isinstance(request_id, str) else ""
+    safe_request_id: str | None = None
+    if isinstance(request_id, str) and _SAFE_REQUEST_ID.fullmatch(request_id):
+        try:
+            _assert_secret_free_model_output(profile, configured_api_key, request_id)
+        except ModelError:
+            pass
+        else:
+            safe_request_id = request_id
+    request_suffix = f" (request ID: {safe_request_id})" if safe_request_id is not None else ""
     return ModelError(f"{provider} request failed{request_suffix}")
+
+
+def _model_output_strings(value: object) -> Iterator[str]:
+    """Yield every model-authored string from JSON-like structured output."""
+
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, BaseModel):
+        yield from _model_output_strings(value.model_dump(mode="json"))
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _model_output_strings(key)
+            yield from _model_output_strings(item)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            yield from _model_output_strings(item)
+
+
+def _assert_secret_free_model_output(
+    profile: ModelProfile,
+    configured_api_key: str,
+    *values: object,
+) -> None:
+    """Reject credential reflection without returning or logging the reflected value."""
+
+    secret_names = (profile.api_key_env,)
+    for value in values:
+        for text in _model_output_strings(value):
+            if (
+                configured_api_key in text
+                or redact_model_input(
+                    text,
+                    secret_env_names=secret_names,
+                )
+                != text
+            ):
+                raise ModelError("Model provider response contained credential material")
 
 
 def _response_identity(response: object) -> tuple[str, str]:
@@ -97,9 +200,20 @@ def _response_identity(response: object) -> tuple[str, str]:
     model = getattr(response, "model", None)
     if not isinstance(response_id, str) or not response_id:
         raise ModelError("Model provider returned no response identifier")
-    if not isinstance(model, str) or not model:
-        raise ModelError("Model provider returned no model identifier")
-    return response_id, model
+    try:
+        resolved_model = validate_model_identifier(model)
+    except ValueError as exc:
+        raise ModelError("Model provider returned an invalid model identifier") from exc
+    return response_id, resolved_model
+
+
+def _require_deployment_model(profile: ModelProfile, model: str) -> None:
+    expected = profile.deployment_model
+    if expected is not None and model != expected:
+        raise ModelError(
+            "Model provider resolved a different model ID than the calibrated deployment; "
+            "set expected_response_model to the exact provider-returned snapshot and recalibrate"
+        )
 
 
 class OpenAIResponsesProvider:
@@ -107,11 +221,12 @@ class OpenAIResponsesProvider:
 
     def __init__(self, profile: ModelProfile) -> None:
         self.profile = profile
+        self._api_key = profile.require_api_key()
         self.client = OpenAI(
-            api_key=profile.require_api_key(),
+            api_key=self._api_key,
             base_url=str(profile.base_url) if profile.base_url else None,
             timeout=profile.timeout_seconds,
-            max_retries=2,
+            max_retries=_SDK_MAX_RETRIES,
         )
 
     def generate(
@@ -120,8 +235,12 @@ class OpenAIResponsesProvider:
         instructions: str,
         prompt: str,
         output_type: type[OutputT],
+        max_output_tokens: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> ModelResult[OutputT]:
         instructions, prompt = _scrub_request_text(self.profile, instructions, prompt)
+        output_limit = _effective_output_tokens(self.profile.max_output_tokens, max_output_tokens)
+        request_timeout = _effective_timeout(self.profile.timeout_seconds, timeout_seconds)
         reasoning: Reasoning = {"effort": self.profile.reasoning_effort}
         if self.profile.reasoning_mode:
             reasoning["mode"] = self.profile.reasoning_mode
@@ -132,20 +251,43 @@ class OpenAIResponsesProvider:
                 input=prompt,
                 reasoning=reasoning,
                 text_format=output_type,
-                max_output_tokens=self.profile.max_output_tokens,
+                max_output_tokens=output_limit,
                 store=False,
+                timeout=request_timeout,
             )
         except Exception as exc:
-            raise _request_error("OpenAI Responses", exc) from exc
+            raise _request_error(
+                "OpenAI Responses",
+                exc,
+                profile=self.profile,
+                configured_api_key=self._api_key,
+            ) from None
+
+        incomplete_details = getattr(response, "incomplete_details", None)
+        incomplete_reason = getattr(incomplete_details, "reason", None)
+        boundary_values: list[object] = [
+            getattr(response, "id", None),
+            getattr(response, "model", None),
+            getattr(response, "status", None),
+            incomplete_reason,
+            getattr(response, "output_text", None),
+        ]
+        for output in getattr(response, "output", []):
+            for item in getattr(output, "content", []):
+                boundary_values.extend(
+                    (
+                        getattr(item, "text", None),
+                        getattr(item, "parsed", None),
+                        getattr(item, "refusal", None),
+                    )
+                )
+        _assert_secret_free_model_output(self.profile, self._api_key, *boundary_values)
 
         status = getattr(response, "status", None)
         if status != "completed":
-            details = getattr(response, "incomplete_details", None)
-            reason = getattr(details, "reason", None)
-            if status == "incomplete" and isinstance(reason, str):
-                raise ModelError(f"Model response was incomplete: {reason}")
-            status_text = status if isinstance(status, str) else "missing"
-            raise ModelError(f"Model response did not complete (status: {status_text})")
+            if status == "incomplete" and incomplete_reason in _SAFE_INCOMPLETE_REASONS:
+                raise ModelError(f"Model response was incomplete: {incomplete_reason}")
+            raise ModelError("Model response did not complete")
 
         parsed_candidates: list[OutputT] = []
         for output in response.output:
@@ -171,6 +313,7 @@ class OpenAIResponsesProvider:
             raise ModelError("Model returned multiple schema-conforming outputs")
 
         response_id, model = _response_identity(response)
+        _require_deployment_model(self.profile, model)
         return ModelResult(
             output=parsed_candidates[0],
             response_id=response_id,
@@ -184,11 +327,12 @@ class OpenAICompatibleProvider:
 
     def __init__(self, profile: ModelProfile) -> None:
         self.profile = profile
+        self._api_key = profile.require_api_key()
         self.client = OpenAI(
-            api_key=profile.require_api_key(),
+            api_key=self._api_key,
             base_url=str(profile.base_url),
             timeout=profile.timeout_seconds,
-            max_retries=2,
+            max_retries=_SDK_MAX_RETRIES,
         )
 
     def generate(
@@ -197,8 +341,12 @@ class OpenAICompatibleProvider:
         instructions: str,
         prompt: str,
         output_type: type[OutputT],
+        max_output_tokens: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> ModelResult[OutputT]:
         instructions, prompt = _scrub_request_text(self.profile, instructions, prompt)
+        output_limit = _effective_output_tokens(self.profile.max_output_tokens, max_output_tokens)
+        request_timeout = _effective_timeout(self.profile.timeout_seconds, timeout_seconds)
         schema = output_type.model_json_schema()
         try:
             response = self.client.chat.completions.create(
@@ -215,26 +363,41 @@ class OpenAICompatibleProvider:
                         "schema": schema,
                     },
                 },
-                max_completion_tokens=self.profile.max_output_tokens,
+                max_completion_tokens=output_limit,
                 reasoning_effort=self.profile.reasoning_effort,
+                timeout=request_timeout,
             )
         except Exception as exc:
-            raise _request_error("OpenAI-compatible", exc) from exc
+            raise _request_error(
+                "OpenAI-compatible",
+                exc,
+                profile=self.profile,
+                configured_api_key=self._api_key,
+            ) from None
 
         choices = list(response.choices)
+        boundary_values = [getattr(response, "id", None), getattr(response, "model", None)]
+        for candidate_choice in choices:
+            candidate_message = getattr(candidate_choice, "message", None)
+            boundary_values.extend(
+                (
+                    getattr(candidate_choice, "finish_reason", None),
+                    getattr(candidate_message, "content", None),
+                    getattr(candidate_message, "refusal", None),
+                )
+            )
+        _assert_secret_free_model_output(self.profile, self._api_key, *boundary_values)
         if len(choices) != 1:
             raise ModelError("Compatible provider returned an unexpected number of choices")
         choice = choices[0]
         message = choice.message
         refusal = getattr(message, "refusal", None)
         if refusal:
-            raise ModelError(f"Model refused the request: {refusal}")
+            refusal_text = refusal if isinstance(refusal, str) else "unspecified"
+            raise ModelError(f"Model refused the request: {refusal_text}")
         finish_reason = getattr(choice, "finish_reason", None)
         if finish_reason != "stop":
-            reason_text = finish_reason if isinstance(finish_reason, str) else "missing"
-            raise ModelError(
-                f"Compatible provider response did not complete (finish reason: {reason_text})"
-            )
+            raise ModelError("Compatible provider response did not complete")
         if not isinstance(message.content, str):
             raise ModelError("Compatible provider returned no JSON text")
         try:
@@ -243,6 +406,7 @@ class OpenAICompatibleProvider:
             raise ModelError("Compatible provider returned invalid structured output") from exc
 
         response_id, model = _response_identity(response)
+        _require_deployment_model(self.profile, model)
         return ModelResult(
             output=parsed,
             response_id=response_id,

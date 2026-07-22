@@ -8,7 +8,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from autocontribute.domain import FileEdit
 from autocontribute.exceptions import RepositoryError
+from autocontribute.redaction import is_sensitive_path
 
 _FULL_SHA: Final = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _GIT_TIMEOUT_SECONDS: Final = 120
@@ -26,6 +27,8 @@ _DEFAULT_MAX_FILE_BYTES: Final = 1_000_000
 _GIT_SAFETY_OPTIONS: Final[tuple[str, ...]] = (
     "-c",
     "core.hooksPath=/dev/null",
+    "-c",
+    "http.followRedirects=false",
     "-c",
     "submodule.recurse=false",
     "-c",
@@ -45,6 +48,17 @@ class ContextEntry:
     size: int
     lines: int | None
     binary: bool
+    content_inspected: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class TextMatch:
+    """One bounded literal reference found without executing repository tooling."""
+
+    query: str
+    path: str
+    line_number: int
+    line: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +196,13 @@ class RepositoryWorkspace:
         except UnicodeDecodeError as exc:
             raise RepositoryError(f"File is not UTF-8 text: {relative_path}") from exc
 
+    def discard(self) -> None:
+        """Remove this run-owned checkout after sensitive generated content is detected."""
+
+        if not self.path.is_dir() or not (self.path / ".git").is_dir():
+            raise RepositoryError("Repository workspace cannot be discarded safely")
+        shutil.rmtree(self.path)
+
     # A shorter alias is convenient for agent context assembly.
     read_text = read_file
 
@@ -190,15 +211,15 @@ class RepositoryWorkspace:
         *,
         max_files: int = 5_000,
         max_file_bytes: int = _DEFAULT_MAX_FILE_BYTES,
+        max_total_bytes: int = 64_000_000,
     ) -> list[ContextEntry]:
         """Return a stable, bounded index without reading symlinks/submodules."""
 
-        if max_files < 1 or max_file_bytes < 1:
+        if max_files < 1 or max_file_bytes < 1 or max_total_bytes < 1:
             raise ValueError("context index limits must be positive")
         entries: list[ContextEntry] = []
+        inspected_bytes = 0
         for relative_path in self._tracked_paths():
-            if len(entries) >= max_files:
-                break
             try:
                 path = self._resolve_path(relative_path, must_exist=True)
                 metadata = path.lstat()
@@ -206,11 +227,25 @@ class RepositoryWorkspace:
                 continue
             if not stat.S_ISREG(metadata.st_mode):
                 continue
+            if len(entries) >= max_files:
+                raise RepositoryError(
+                    "Repository context index exceeds the configured file limit; "
+                    "completeness cannot be guaranteed"
+                )
             size = metadata.st_size
-            if size > max_file_bytes:
-                entries.append(ContextEntry(relative_path, size, None, True))
+            if size > max_file_bytes or inspected_bytes + size > max_total_bytes:
+                entries.append(
+                    ContextEntry(
+                        relative_path,
+                        size,
+                        None,
+                        False,
+                        content_inspected=False,
+                    )
+                )
                 continue
             data = self._read_regular_file(path, max_bytes=max_file_bytes)
+            inspected_bytes += len(data)
             binary = b"\0" in data[:8_192]
             lines: int | None = None
             if not binary:
@@ -223,6 +258,86 @@ class RepositoryWorkspace:
             entries.append(ContextEntry(relative_path, size, lines, binary))
         return entries
 
+    def search_text(
+        self,
+        queries: Sequence[str],
+        *,
+        max_files: int = 5_000,
+        max_matches: int = 200,
+        max_file_bytes: int = _DEFAULT_MAX_FILE_BYTES,
+        max_total_bytes: int = 32_000_000,
+        max_line_characters: int = 500,
+    ) -> list[TextMatch]:
+        """Search tracked UTF-8 files for bounded literal references.
+
+        Queries are treated only as case-insensitive text, never as regular expressions or shell
+        input. This gives a planner safe symbol/caller exploration without executing repository
+        tooling or allowing a model-controlled query to consume unbounded resources.
+        """
+
+        if (
+            max_files < 1
+            or max_matches < 1
+            or max_file_bytes < 1
+            or max_total_bytes < 1
+            or max_line_characters < 1
+        ):
+            raise ValueError("repository search limits must be positive")
+        materialized: list[str] = []
+        seen: set[str] = set()
+        for query in queries:
+            normalized = query.strip()
+            folded_query = normalized.casefold()
+            if normalized and folded_query not in seen:
+                materialized.append(normalized)
+                seen.add(folded_query)
+        if not materialized:
+            raise RepositoryError("Repository search requires at least one non-empty query")
+        if len(materialized) > 20:
+            raise RepositoryError("Repository search accepts at most 20 literal queries")
+        if any("\0" in query or len(query) > 200 for query in materialized):
+            raise RepositoryError("Repository search query is unsafe or exceeds 200 characters")
+
+        folded = [(query, query.casefold()) for query in materialized]
+        matches: list[TextMatch] = []
+        entries = self.context_index(
+            max_files=max_files,
+            max_file_bytes=max_file_bytes,
+            max_total_bytes=max_total_bytes,
+        )
+        incomplete = [entry.path for entry in entries if not entry.content_inspected]
+        if incomplete:
+            raise RepositoryError(
+                "Repository search exceeded its byte limits before inspecting every tracked "
+                f"file; first incomplete path: {incomplete[0]}"
+            )
+        for entry in entries:
+            if entry.binary:
+                continue
+            content = self.read_file(entry.path, max_bytes=max_file_bytes)
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                folded_line = line.casefold()
+                for query, folded_query in folded:
+                    if folded_query not in folded_line:
+                        continue
+                    rendered = line
+                    if len(rendered) > max_line_characters:
+                        rendered = rendered[:max_line_characters] + " [truncated]"
+                    if len(matches) >= max_matches:
+                        raise RepositoryError(
+                            "Repository search exceeds the configured match limit; "
+                            "results would be incomplete"
+                        )
+                    matches.append(
+                        TextMatch(
+                            query=query,
+                            path=entry.path,
+                            line_number=line_number,
+                            line=rendered,
+                        )
+                    )
+        return matches
+
     def guidance(
         self,
         *,
@@ -234,17 +349,43 @@ class RepositoryWorkspace:
         if max_files < 1 or max_characters < 1:
             raise ValueError("guidance limits must be positive")
         candidates = [path for path in self._tracked_paths() if _is_guidance_path(path)]
-        candidates.sort(key=_guidance_sort_key)
+        templates = sorted(path for path in candidates if _is_pull_request_template_path(path))
+        if len(templates) > max_files:
+            raise RepositoryError(
+                "Repository has more pull-request templates than the configured guidance file "
+                "limit; refusing to evaluate an incomplete template set"
+            )
+        other_guidance = sorted(
+            (path for path in candidates if not _is_pull_request_template_path(path)),
+            key=_guidance_sort_key,
+        )
+        # Templates are publication requirements, so load every one in full before spending the
+        # bounded remainder on generic guidance. This also makes ambiguity detection exhaustive.
+        candidates = [*templates, *other_guidance]
         result: dict[str, str] = {}
         remaining = max_characters
         for relative_path in candidates[:max_files]:
             if remaining <= 0:
+                if _is_pull_request_template_path(relative_path):
+                    raise RepositoryError(
+                        "Pull-request templates exceed the configured guidance character limit; "
+                        "refusing to validate a truncated template"
+                    )
                 break
             try:
                 content = self.read_file(relative_path, max_bytes=min(remaining * 4, 2_000_000))
-            except RepositoryError:
+            except RepositoryError as exc:
+                if _is_pull_request_template_path(relative_path):
+                    raise RepositoryError(
+                        f"Could not load pull-request template in full: {relative_path}"
+                    ) from exc
                 continue
             if len(content) > remaining:
+                if _is_pull_request_template_path(relative_path):
+                    raise RepositoryError(
+                        "Pull-request templates exceed the configured guidance character limit; "
+                        "refusing to validate a truncated template"
+                    )
                 suffix = "\n\n[truncated by autocontribute]"
                 content = content[: max(0, remaining - len(suffix))] + suffix
             result[relative_path] = content
@@ -256,6 +397,8 @@ class RepositoryWorkspace:
 
         if not isinstance(edit, FileEdit):
             raise TypeError("edit must be a FileEdit")
+        if is_sensitive_path(edit.path):
+            raise RepositoryError(f"Refusing to edit sensitive repository path: {edit.path}")
         path = self._resolve_path(edit.path, must_exist=False)
         if self._is_ignored(edit.path):
             raise RepositoryError(f"Edit target is ignored by Git: {edit.path}")
@@ -302,6 +445,11 @@ class RepositoryWorkspace:
         materialized = list(edits)
         if not materialized:
             raise RepositoryError("A patch must contain at least one edit")
+        sensitive = [edit.path for edit in materialized if is_sensitive_path(edit.path)]
+        if sensitive:
+            raise RepositoryError(
+                f"Refusing to edit sensitive repository path: {sorted(sensitive)[0]}"
+            )
 
         snapshots: dict[str, tuple[bytes | None, int | None]] = {}
         order: list[str] = []
@@ -439,12 +587,14 @@ class RepositoryWorkspace:
 
     def _tracked_paths(self) -> list[str]:
         output = self._git_bytes(["ls-files", "-z", "--cached"])
-        return sorted(_decode_git_path(item) for item in output.split(b"\0") if item)
+        return sorted(
+            self._normalize_path(_decode_git_path(item)) for item in output.split(b"\0") if item
+        )
 
     def _normalize_path(self, relative_path: str) -> str:
         if not isinstance(relative_path, str) or not relative_path:
             raise RepositoryError("Repository path must be a non-empty string")
-        if "\0" in relative_path or "\\" in relative_path:
+        if "\\" in relative_path or any(not character.isprintable() for character in relative_path):
             raise RepositoryError(f"Unsafe repository path: {relative_path!r}")
         raw_parts = relative_path.split("/")
         if any(part in {"", ".", ".."} for part in raw_parts):
@@ -792,7 +942,14 @@ def _is_guidance_path(relative_path: str) -> bool:
         )
     ):
         return True
-    return (
+    return _is_pull_request_template_path(relative_path)
+
+
+def _is_pull_request_template_path(relative_path: str) -> bool:
+    lowered = relative_path.casefold().strip("/")
+    name = PurePosixPath(lowered).name
+    markdown = name.endswith((".md", ".markdown"))
+    return markdown and (
         lowered == ".github/pull_request_template.md"
         or lowered.startswith(".github/pull_request_template/")
         or name.startswith("pull_request_template")
@@ -819,4 +976,4 @@ def _guidance_sort_key(relative_path: str) -> tuple[int, str]:
     return 7, lowered
 
 
-__all__ = ["ContextEntry", "PatchMetrics", "RepositoryWorkspace"]
+__all__ = ["ContextEntry", "PatchMetrics", "RepositoryWorkspace", "TextMatch"]

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.27"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -23,6 +23,7 @@ classifiers = [
 dependencies = [
   "httpx>=0.28.1,<1",
   "openai>=2.45.0,<3",
+  "packaging>=24.2,<27",
   "pydantic>=2.11.0,<3",
   "PyYAML>=6.0.2,<7",
   "rich>=14.0.0,<15",
@@ -31,6 +32,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "hatchling==1.27.0",
   "mypy>=1.15.0,<2",
   "pytest>=8.3.0,<10",
   "pytest-cov>=6.1.0,<8",
@@ -45,6 +47,10 @@ autocontribute = "autocontribute.cli:app"
 [project.urls]
 Homepage = "https://github.com/Damadimo/autocontribute"
 Issues = "https://github.com/Damadimo/autocontribute/issues"
+
+[tool.uv]
+# Dependency-update PRs may advance this snapshot only to a timestamp at least seven days old.
+exclude-newer = "2026-07-15T00:00:00Z"
 
 [[tool.uv.index]]
 name = "pypi"

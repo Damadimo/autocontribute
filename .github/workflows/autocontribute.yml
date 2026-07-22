@@ -11,6 +11,16 @@ on:
         description: "Optional owner/repository#number override"
         required: false
         type: string
+      bootstrap_state:
+        description: "Explicitly create the first scheduler state when no cache exists"
+        required: false
+        default: false
+        type: boolean
+      lock_for_handoff:
+        description: "Seal hosted state for download and permanently stop hosted scheduling"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -21,67 +31,340 @@ concurrency:
 
 jobs:
   prepare:
-    if: vars.AUTOCONTRIBUTE_ENABLED == 'true'
+    if: >-
+      vars.AUTOCONTRIBUTE_ENABLED == 'true' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # Reserve one hour beyond the enforced 180-minute model-and-sandbox ceiling for finalization.
+    timeout-minutes: 240
     steps:
       - name: Check out control repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Resolve scheduler state lineage
+        id: state_lineage
+        shell: bash
+        env:
+          BOOTSTRAP_STATE: ${{ inputs.bootstrap_state }}
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.AUTOCONTRIBUTE_STATE_TOKEN }}
+          LINEAGE_VARIABLE: AUTOCONTRIBUTE_STATE_LINEAGE
+          LOCK_FOR_HANDOFF: ${{ inputs.lock_for_handoff }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          RUNNER_OS: ${{ runner.os }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "AUTOCONTRIBUTE_STATE_TOKEN is required" >&2
+            exit 1
+          fi
+          current="$(gh api --paginate \
+            "repos/$CONTROL_REPOSITORY/actions/variables?per_page=100" \
+            --jq ".variables[] | select(.name == \"$LINEAGE_VARIABLE\") | .value")"
+          if [[ ! "$RUNNER_OS" =~ ^[A-Za-z][A-Za-z0-9._-]*$ ||
+                ! "$REPOSITORY_ID" =~ ^[1-9][0-9]*$ ||
+                ! "$RUN_ID" =~ ^[1-9][0-9]*$ ||
+                ! "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "GitHub supplied an invalid scheduler lineage component" >&2
+            exit 1
+          fi
+          v5_lineage_pattern="^committed:autocontribute-state-v5-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
+          v4_lineage_pattern="^committed:autocontribute-state-v4-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
+          v3_lineage_pattern="^committed:autocontribute-state-v3-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
+          bootstrap=false
+          parent_schema=""
+          if [[ -z "$current" ]]; then
+            if [[ "$EVENT_NAME" != "workflow_dispatch" || "$BOOTSTRAP_STATE" != "true" ]]; then
+              echo "Scheduler lineage is missing; use one explicit bootstrap dispatch" >&2
+              exit 1
+            fi
+            if [[ "$LOCK_FOR_HANDOFF" == "true" ]]; then
+              echo "Cannot hand off a scheduler lineage that has not been bootstrapped" >&2
+              exit 1
+            fi
+            parent_key="bootstrap"
+            parent_schema="bootstrap"
+            bootstrap=true
+          elif [[ "$current" =~ $v5_lineage_pattern ]]; then
+            parent_key="${current#committed:}"
+            parent_schema="v5"
+          elif [[ "$current" =~ $v4_lineage_pattern ]]; then
+            parent_key="${current#committed:}"
+            parent_schema="v4"
+          elif [[ "$current" =~ $v3_lineage_pattern ]]; then
+            parent_key="${current#committed:}"
+            parent_schema="v3"
+          elif [[ "$current" == handoff:* ]]; then
+            echo "Hosted scheduler state was handed off and cannot be resumed here" >&2
+            exit 1
+          elif [[ "$current" == in-progress:* ]]; then
+            echo "A prior scheduler generation did not commit; refusing stale rollback" >&2
+            exit 1
+          else
+            echo "Scheduler lineage variable has an unsupported value" >&2
+            exit 1
+          fi
+          if [[ "$LOCK_FOR_HANDOFF" == "true" && "$EVENT_NAME" != "workflow_dispatch" ]]; then
+            echo "State handoff is allowed only through workflow_dispatch" >&2
+            exit 1
+          fi
+          new_key="autocontribute-state-v5-$RUNNER_OS-$REPOSITORY_ID-$RUN_ID-$RUN_ATTEMPT"
+          {
+            echo "bootstrap=$bootstrap"
+            echo "new_key=$new_key"
+            echo "parent_key=$parent_key"
+            echo "parent_schema=$parent_schema"
+            echo "resolved_lineage=$current"
+          } >>"$GITHUB_OUTPUT"
       - name: Restore scheduler state
+        id: scheduler_cache
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             .autocontribute/runs/
-            .autocontribute/state.sqlite3
-          key: autocontribute-state-v1-${{ runner.os }}-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            autocontribute-state-v1-${{ runner.os }}-${{ github.repository_id }}-
+            .autocontribute/evaluations/
+            .autocontribute/snapshots/state.sqlite3
+          key: ${{ steps.state_lineage.outputs.parent_key }}
+          fail-on-cache-miss: ${{ steps.state_lineage.outputs.bootstrap != 'true' }}
+      - name: Validate scheduler state source
+        shell: bash
+        env:
+          BOOTSTRAP_STATE: ${{ steps.state_lineage.outputs.bootstrap }}
+          CACHE_MATCHED_KEY: ${{ steps.scheduler_cache.outputs.cache-matched-key }}
+          EXPECTED_KEY: ${{ steps.state_lineage.outputs.parent_key }}
+        run: |
+          snapshot=".autocontribute/snapshots/state.sqlite3"
+          live_state=".autocontribute/state.sqlite3"
+          if [[ "$BOOTSTRAP_STATE" == "true" ]]; then
+            if [[ -n "$CACHE_MATCHED_KEY" ]]; then
+              echo "Bootstrap unexpectedly restored scheduler state" >&2
+              exit 1
+            fi
+          elif [[ "$CACHE_MATCHED_KEY" != "$EXPECTED_KEY" ]]; then
+            echo "Scheduler cache does not match the externally committed generation" >&2
+            exit 1
+          else
+            if [[ -L "$snapshot" || ! -f "$snapshot" ]]; then
+              echo "The matched scheduler cache did not contain a regular state snapshot" >&2
+              exit 1
+            fi
+          fi
+          if [[ "$BOOTSTRAP_STATE" == "true" && ( -e "$snapshot" || -L "$snapshot" || -e "$live_state" || -L "$live_state" ) ]]; then
+            echo "Refusing to bootstrap over unexpected scheduler state" >&2
+            exit 1
+          fi
       - name: Install uv and Python
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
+          version: "0.9.30"
           python-version: "3.12"
           enable-cache: true
       - name: Install Autocontribute
         run: uv sync --locked
+      - name: Enforce production Actions configuration
+        run: |
+          uv run python - <<'PY'
+          from pathlib import Path
+
+          from autocontribute.config import load_config
+
+          storage_root = Path(".autocontribute")
+          if storage_root.is_symlink():
+              raise SystemExit("Production storage root cannot be a symbolic link")
+          expected_storage = (Path.cwd() / storage_root).resolve()
+          settings = load_config(Path("autocontribute.yml"))
+          if settings.storage.path != expected_storage:
+              raise SystemExit("Production Actions requires storage.path: .autocontribute")
+          if settings.publishing.mode != "review_required":
+              raise SystemExit("Production Actions requires publishing.mode: review_required")
+          if settings.sandbox.backend != "docker":
+              raise SystemExit("Production Actions requires sandbox.backend: docker")
+          if settings.sandbox.network != "none":
+              raise SystemExit("Production Actions requires sandbox.network: none")
+          if settings.sandbox.allow_unsafe_local:
+              raise SystemExit("Production Actions forbids sandbox.allow_unsafe_local")
+          work_budget_seconds = (
+              settings.budget.max_model_seconds_per_run
+              + settings.sandbox.command_timeout_seconds * settings.sandbox.max_commands
+          )
+          if work_budget_seconds > 3 * 60 * 60:
+              raise SystemExit(
+                  "Production Actions requires aggregate model and sandbox ceilings <= 180 minutes"
+              )
+          PY
+      - name: Restore verified scheduler state
+        if: ${{ steps.state_lineage.outputs.bootstrap != 'true' }}
+        run: >-
+          uv run autocontribute state restore
+          --input .autocontribute/snapshots/state.sqlite3
+      - name: Initialize explicitly bootstrapped state
+        if: ${{ steps.state_lineage.outputs.bootstrap == 'true' }}
+        run: uv run autocontribute safety status
+      - name: Confirm live scheduler state
+        id: state_ready
+        shell: bash
+        env:
+          PARENT_SCHEMA: ${{ steps.state_lineage.outputs.parent_schema }}
+        run: |
+          if [[ -L ".autocontribute/state.sqlite3" || ! -f ".autocontribute/state.sqlite3" ]]; then
+            echo "Verified live scheduler state was not created" >&2
+            exit 1
+          fi
+          uv run python - <<'PY'
+          import os
+          import sqlite3
+          from pathlib import Path
+
+          from autocontribute.store import CURRENT_SCHEMA_VERSION, RunStore
+
+          storage = Path(".autocontribute")
+          expected = {"bootstrap": 5, "v3": 3, "v4": 4, "v5": 5}.get(
+              os.environ["PARENT_SCHEMA"]
+          )
+          if expected is None:
+              raise SystemExit("Scheduler lineage did not declare a supported source schema")
+          database = storage / "state.sqlite3"
+          with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+              row = connection.execute(
+                  "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+              ).fetchone()
+          if row != (expected,):
+              raise SystemExit("Scheduler cache schema does not match its committed lineage")
+          store = RunStore(storage)
+          if store.schema_version != CURRENT_SCHEMA_VERSION:
+              raise SystemExit("Scheduler state did not migrate to the current schema")
+          PY
       - name: Preload the configured sandbox image
+        if: ${{ inputs.lock_for_handoff != true }}
         run: |
           image="$(uv run python -c 'from pathlib import Path; from autocontribute.config import load_config; print(load_config(Path("autocontribute.yml")).sandbox.image)')"
           docker pull "$image"
+      - name: Claim scheduler state lineage
+        id: state_claim
+        shell: bash
+        env:
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.AUTOCONTRIBUTE_STATE_TOKEN }}
+          LINEAGE_VARIABLE: AUTOCONTRIBUTE_STATE_LINEAGE
+          PARENT_KEY: ${{ steps.state_lineage.outputs.parent_key }}
+          RESOLVED_LINEAGE: ${{ steps.state_lineage.outputs.resolved_lineage }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          endpoint="repos/$CONTROL_REPOSITORY/actions/variables/$LINEAGE_VARIABLE"
+          current="$(gh api --paginate \
+            "repos/$CONTROL_REPOSITORY/actions/variables?per_page=100" \
+            --jq ".variables[] | select(.name == \"$LINEAGE_VARIABLE\") | .value")"
+          if [[ "$current" != "$RESOLVED_LINEAGE" ]]; then
+            echo "Scheduler lineage changed during preflight" >&2
+            exit 1
+          fi
+          claim="in-progress:$RUN_ID:$RUN_ATTEMPT:$PARENT_KEY"
+          if [[ -z "$RESOLVED_LINEAGE" ]]; then
+            gh api --method POST "repos/$CONTROL_REPOSITORY/actions/variables" \
+              -f name="$LINEAGE_VARIABLE" -f value="$claim" >/dev/null
+          else
+            gh api --method PATCH "$endpoint" -f name="$LINEAGE_VARIABLE" \
+              -f value="$claim" >/dev/null
+          fi
+          echo "claim=$claim" >>"$GITHUB_OUTPUT"
+      - name: Sync open pull-request lifecycle
+        if: ${{ inputs.lock_for_handoff != true }}
+        env:
+          AUTOCONTRIBUTE_GITHUB_TOKEN: ${{ secrets.AUTOCONTRIBUTE_GITHUB_TOKEN }}
+        run: uv run autocontribute lifecycle sync
       - name: Validate configuration and isolation
+        if: ${{ inputs.lock_for_handoff != true }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AUTOCONTRIBUTE_GITHUB_TOKEN: ${{ secrets.AUTOCONTRIBUTE_GITHUB_TOKEN }}
         run: uv run autocontribute doctor --non-interactive
       - name: Prepare one contribution attempt
+        if: ${{ inputs.lock_for_handoff != true }}
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           AUTOCONTRIBUTE_GITHUB_TOKEN: ${{ secrets.AUTOCONTRIBUTE_GITHUB_TOKEN }}
-          AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH: ${{ vars.AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH }}
           REQUESTED_ISSUE: ${{ inputs.issue }}
         run: |
-          args=(--scheduled)
+          args=()
           if [ -n "$REQUESTED_ISSUE" ]; then
             args+=(--issue "$REQUESTED_ISSUE")
           fi
           uv run autocontribute run "${args[@]}"
-      - name: Save scheduler state
-        if: always()
+      - name: Create verified scheduler-state snapshot
+        id: state_snapshot
+        if: >-
+          ${{ always() && steps.state_ready.outcome == 'success' &&
+          steps.state_claim.outcome == 'success' }}
+        run: uv run autocontribute state backup --overwrite
+      - name: Save scheduler state snapshot
+        id: state_cache_save
+        if: ${{ always() && steps.state_snapshot.outcome == 'success' }}
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: |
             .autocontribute/runs/
-            .autocontribute/state.sqlite3
-          key: autocontribute-state-v1-${{ runner.os }}-${{ github.repository_id }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Upload evidence bundle
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+            .autocontribute/evaluations/
+            .autocontribute/snapshots/state.sqlite3
+          key: ${{ steps.state_lineage.outputs.new_key }}
+      - name: Verify scheduler state snapshot persistence
+        id: state_cache_verify
+        if: ${{ always() && steps.state_snapshot.outcome == 'success' }}
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
-          name: autocontribute-${{ github.run_id }}
           path: |
             .autocontribute/runs/
-            .autocontribute/state.sqlite3
+            .autocontribute/evaluations/
+            .autocontribute/snapshots/state.sqlite3
+          key: ${{ steps.state_lineage.outputs.new_key }}
+          lookup-only: true
+          fail-on-cache-miss: true
+      - name: Upload evidence bundle
+        id: evidence_upload
+        if: >-
+          ${{ always() && steps.state_cache_verify.outcome == 'success' &&
+          steps.state_cache_verify.outputs.cache-hit == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: autocontribute-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .autocontribute/runs/
+            .autocontribute/evaluations/
+            .autocontribute/snapshots/state.sqlite3
           include-hidden-files: true
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
+      - name: Commit scheduler state lineage
+        if: >-
+          ${{ always() && steps.state_cache_verify.outcome == 'success' &&
+          steps.state_cache_verify.outputs.cache-hit == 'true' &&
+          steps.evidence_upload.outcome == 'success' }}
+        shell: bash
+        env:
+          CLAIMED_LINEAGE: ${{ steps.state_claim.outputs.claim }}
+          CONTROL_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.AUTOCONTRIBUTE_STATE_TOKEN }}
+          LINEAGE_VARIABLE: AUTOCONTRIBUTE_STATE_LINEAGE
+          LOCK_FOR_HANDOFF: ${{ inputs.lock_for_handoff }}
+          NEW_KEY: ${{ steps.state_lineage.outputs.new_key }}
+        run: |
+          set -euo pipefail
+          endpoint="repos/$CONTROL_REPOSITORY/actions/variables/$LINEAGE_VARIABLE"
+          current="$(gh api "$endpoint" --jq .value)"
+          if [[ "$current" != "$CLAIMED_LINEAGE" ]]; then
+            echo "Scheduler lineage changed after it was claimed" >&2
+            exit 1
+          fi
+          if [[ "$LOCK_FOR_HANDOFF" == "true" ]]; then
+            committed="handoff:$NEW_KEY"
+          else
+            committed="committed:$NEW_KEY"
+          fi
+          gh api --method PATCH "$endpoint" -f name="$LINEAGE_VARIABLE" \
+            -f value="$committed" >/dev/null

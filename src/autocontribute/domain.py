@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
@@ -289,12 +290,28 @@ class Approval(DomainModel):
     attestation: str
 
 
+class ModelBudgetReservation(DomainModel):
+    """A durable, conservative charge recorded before one external model request."""
+
+    call: int = Field(ge=1)
+    role: Literal["scout", "builder", "critic"]
+    input_tokens: int = Field(ge=1)
+    output_tokens: int = Field(ge=1)
+    cost_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    timeout_seconds: float = Field(gt=0)
+    started_at: datetime
+
+
 class RunManifest(DomainModel):
     schema_version: int = 1
     run_id: str
     status: RunStatus
     created_at: datetime
     updated_at: datetime
+    deployment_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     candidate: IssueCandidate | None = None
     eligibility: EligibilityResult | None = None
     repository: RepositoryInfo | None = None
@@ -302,14 +319,43 @@ class RunManifest(DomainModel):
     plan: ContributionPlan | None = None
     proposal: PatchProposal | None = None
     baseline_validation: CommandResult | None = None
+    patched_validation: list[CommandResult] = Field(default_factory=list)
     quality: QualityReport | None = None
+    preparation_config_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    preparation_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
     approval: Approval | None = None
+    publishing_login: str | None = None
+    publishing_api_origin: str | None = None
+    commit_author_name: str | None = None
+    commit_author_email: str | None = None
+    commit_committer_name: str | None = None
+    commit_committer_email: str | None = None
+    publication_draft: bool | None = None
     branch_name: str | None = None
     commit_sha: str | None = None
+    pull_request_creation_started: bool = False
+    publication_compensation_reason: (
+        Literal[
+            "pre_pr_base_moved",
+            "created_pr_base_moved",
+        ]
+        | None
+    ) = None
     pull_request_url: str | None = None
     skip_reason: str | None = None
     error: str | None = None
     model_calls: int = 0
+    model_input_tokens: int = Field(default=0, ge=0)
+    model_output_tokens: int = Field(default=0, ge=0)
+    model_cost_usd: Decimal = Field(default=Decimal("0"), ge=0)
+    model_seconds: float = Field(default=0, ge=0)
+    model_reservation: ModelBudgetReservation | None = None
 
 
 __all__ = [
@@ -324,6 +370,7 @@ __all__ = [
     "GateResult",
     "IssueCandidate",
     "IssueComment",
+    "ModelBudgetReservation",
     "PatchProposal",
     "QualityReport",
     "RepositoryInfo",

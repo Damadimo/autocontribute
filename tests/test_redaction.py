@@ -12,7 +12,7 @@ from autocontribute.redaction import (
 def test_model_input_redacts_credentials_but_preserves_obvious_examples(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    environment_secret = "environment-secret-472839"
+    environment_secret = "-".join(("environment", "secret", "472839"))
     monkeypatch.setenv("AUTOCONTRIBUTE_TEST_SECRET", environment_secret)
     text = "\n".join(
         [

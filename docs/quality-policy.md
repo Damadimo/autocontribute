@@ -38,10 +38,24 @@ All gates must pass. A high model score cannot override one.
   model-suggested commands cannot replace it and command-budget truncation fails closed.
 - A fresh-context critic reports no blocker or missing issue requirement.
 - Every critic dimension is at least 80 and weighted readiness is at least 90.
+- The exact patch bytes and all evidence that authorized readiness match the immutable preparation
+  fingerprint created when the run passed its gates.
+- Complete scrubbed patched-command results are stored in the run manifest, bound by that
+  fingerprint, and exactly match the `validation.json` review artifact.
+- Human approval is based only on a fresh SQLite manifest plus validated regular, non-symlink
+  `contribution.patch` and `validation.json` artifacts. The displayed review contains the entire
+  issue discussion, patch, validation stdout/stderr, PR and commit text, publication identity, and
+  approval fingerprint; `report.md` is never authoritative. Approval reloads everything after the
+  confirmation prompt and rejects a changed fingerprint.
 - Commit and PR text are bounded, credential-free, non-broadcast, and contain the configured
-  disclosure.
-- Immediately before publication, the issue remains open/unassigned, no competing PR exists, and the
-  default branch still equals the tested base SHA.
+  disclosure; publication rechecks the exact current disclosure rather than trusting preparation.
+- Immediately before publication, the canonical repository and issue are fetched again. The issue's
+  title, body, labels, complete discussion, and update timestamp must still match the sealed
+  candidate. The same deterministic eligibility rules are rerun against current repository metadata,
+  no competing PR may exist, and the default branch must still equal the tested base SHA.
+- Every bounded repository and organization contribution-policy input (including a file's absence)
+  is hashed into eligibility evidence. Publication rereads those sources and requires the digest to
+  match, so even a policy edit that does not trigger a known prohibition requires fresh preparation.
 
 Critic dimensions are weighted as follows: correctness 25%, issue alignment 25%, tests 15%, repository
 conventions 15%, diff/security hygiene 10%, and maintainer clarity 10%.
@@ -53,6 +67,13 @@ existing PR is open or for seven days after a recent close/update. A `403`, `429
 base drift, duplicate, assignment race, or unexpected existing branch stops publication. The broker
 never force-pushes.
 
+The daily and repository-cooldown limits use durable SQLite publication reservations as their local
+source of truth. Capacity is consumed transactionally immediately before the first remote mutation,
+is idempotent for a retry of the same run, and is not returned after a failed or ambiguous attempt.
+GitHub account searches independently catch open or externally created PRs, but eventual search
+consistency cannot grant local capacity. Losing or rolling back the reservation ledger is therefore
+unsafe for automatic publication.
+
 “No suitable contribution,” “could not reproduce,” and “validation environment unavailable” are
 healthy outcomes. The project must never optimize for daily PR count, profile activity, company
 prestige, or stars at the expense of maintainer value.
@@ -60,7 +81,43 @@ prestige, or stars at the expense of maintainer value.
 ## Shadow rollout gate
 
 Use `autocontribute eval record` to bind one immutable expert judgment to each exact run artifact and
-`autocontribute eval report` to inspect aggregate evidence. Autonomous rollout remains blocked until
-there are at least 100 reviewed shadow cases, at least 20 prepared cases, at least 95% accept-as-is
-precision among prepared cases, and zero policy, security, or etiquette failures. Passing this gate
+`autocontribute eval report` to inspect aggregate evidence for the current deployment fingerprint.
+Before `eval record` writes anything, it prints every stored field, the exact subject hash, and the
+record content hash with terminal-control characters visibly JSON-escaped. The reviewer must confirm
+that complete preview. `--yes` is the non-interactive form of the same attestation: it still prints
+the preview and does not weaken the post-preview subject-drift check.
+Autonomous rollout remains blocked until the first 100 persisted runs with that fingerprint, ordered
+by creation timestamp and then run ID, all have an evaluable completed outcome and an anchored expert
+grade. The fingerprint covers exact package source, the Python interpreter, the installed runtime
+dependency closure and packaged build/lock manifest, and material model, budget, discovery, sandbox,
+validation, policy, quality, and publishing-safety configuration. This fixed cohort must include at
+least 20 prepared cases, at least 95% accept-as-is precision among prepared cases, and zero policy,
+security, or etiquette failures. Other deployments cannot contribute cases. Any material code, model,
+or configuration change requires a new 100-run calibration; later grades are still validated but
+cannot replace an omitted early matching run or alter the fixed cohort's metrics. Passing this gate
 permits a controlled pilot; it is not permission for owner-wide or quota-driven publication.
+
+The first grade is `<run-id>.json` under `<storage.path>/evaluations/`, not part of SQLite. If a
+reviewer made a mistake, `autocontribute eval amend` appends a complete replacement judgment as
+`<run-id>.revision-000002.json` (and so on); it requires a non-empty reason and the same full-preview
+attestation. Never edit or delete the earlier file. Each amendment records the previous content hash,
+and an atomic SQLite predecessor check prevents two corrections from forking the history. Aggregate
+metrics use only the latest valid revision, but corpus loading validates every historical revision.
+
+Recording the initial judgment or an amendment also appends an immutable anchor containing its
+content hash, reviewed-subject hash, verdict, schema metadata, and, for amendments, revision and
+predecessor hash to the run's hash-chained SQLite event ledger. Corpus validation rejects added,
+edited, deleted, duplicated, renamed, missing, non-consecutive, or predecessor-mismatched records,
+as well as prepared records whose exact patch or preparation fingerprint no longer matches. It also
+recomputes every event hash and every predecessor link across the complete run ledger before trusting
+the cohort. Preserve all evaluation revisions, referenced run bundles, and the matching verified
+SQLite snapshot together as one generation.
+
+The guarded automatic publisher records the exact validated corpus cursor in a non-expiring SQLite
+hold atomically with its publication reservation. Initial evaluations and amendments are rejected
+while any hold remains. A process crash or expired coordination lease cannot reopen the corpus; only
+a durable open-PR state or fully verified exact remote compensation releases the hold.
+
+Autonomous mode also requires an operator-managed, non-ephemeral deployment; the included hosted
+Actions workflow remains permanently `review_required` and an evictable cache cannot serve as the
+pilot's source of truth.

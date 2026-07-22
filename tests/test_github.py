@@ -1,18 +1,31 @@
 from __future__ import annotations
 
+import base64
+import subprocess
+
 import httpx
 import pytest
 
 from autocontribute.config import GitHubConfig
-from autocontribute.exceptions import GitHubError
-from autocontribute.github import GitHubClient
+from autocontribute.exceptions import GitHubError, GitHubSafetyError
+from autocontribute.github import GitHubClient, resolve_github_token
+from autocontribute.store import RunStore
 
 
-def _client(handler) -> GitHubClient:  # type: ignore[no-untyped-def]
-    github = GitHubClient(GitHubConfig(), token="fixture-token")
+def _client(
+    handler,  # type: ignore[no-untyped-def]
+    *,
+    api_url: str = "https://api.github.com",
+    safety_trigger_handler=None,  # type: ignore[no-untyped-def]
+) -> GitHubClient:
+    github = GitHubClient(
+        GitHubConfig(api_url=api_url),
+        token="fixture-token",
+        safety_trigger_handler=safety_trigger_handler,
+    )
     github._client.close()
     github._client = httpx.Client(
-        base_url="https://api.github.com",
+        base_url=api_url,
         transport=httpx.MockTransport(handler),
         headers={"Authorization": "Bearer fixture-token"},
         follow_redirects=False,
@@ -35,6 +48,234 @@ def _repository_payload(full_name: str) -> dict[str, object]:
     }
 
 
+def _pull_request_payload(*, merged: bool = False) -> dict[str, object]:
+    return {
+        "number": 7,
+        "title": "Fix parser boundary",
+        "body": "Fixes #42.",
+        "html_url": "https://github.com/example/project/pull/7",
+        "state": "closed" if merged else "open",
+        "draft": False,
+        "merged": merged,
+        "updated_at": "2026-07-21T13:00:00Z",
+        "merged_at": "2026-07-21T12:30:00Z" if merged else None,
+        "closed_at": "2026-07-21T12:30:00Z" if merged else None,
+        "merge_commit_sha": "b" * 40 if merged else None,
+        "head": {
+            "sha": "a" * 40,
+            "ref": "fix",
+            "label": "octocat:fix",
+            "repo": {"full_name": "octocat/project"},
+        },
+        "base": {
+            "sha": "c" * 40,
+            "ref": "main",
+            "repo": {"full_name": "example/project"},
+        },
+        "comments": 1,
+        "review_comments": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("api_url", "expected_hostname"),
+    [
+        ("https://api.github.com", "github.com"),
+        ("https://git.example.com/api/v3", "git.example.com"),
+        ("https://git.example.com:8443/api/v3", "git.example.com:8443"),
+    ],
+)
+def test_cli_token_lookup_is_bound_to_configured_github_host(
+    monkeypatch: pytest.MonkeyPatch,
+    api_url: str,
+    expected_hostname: str,
+) -> None:
+    config = GitHubConfig(api_url=api_url)
+    monkeypatch.delenv(config.token_env, raising=False)
+    monkeypatch.setenv("GH_HOST", "wrong-host.example")
+    observed: dict[str, object] = {}
+
+    def run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="host-bound-token\n")
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+    assert resolve_github_token(config) == "host-bound-token"
+    assert observed["args"] == (["gh", "auth", "token", "--hostname", expected_hostname],)
+    environment = observed["kwargs"]
+    assert isinstance(environment, dict)
+    assert "GH_HOST" not in environment["env"]
+
+
+def test_get_file_distinguishes_absence_from_readable_content() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/missing.md"):
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(
+            200,
+            json={
+                "type": "file",
+                "encoding": "base64",
+                "size": len(b"Policy text.\n"),
+                "content": base64.b64encode(b"Policy text.\n").decode("ascii"),
+            },
+        )
+
+    with _client(handler) as github:
+        assert github.get_file("example/project", "POLICY.md", ref="a" * 40) == "Policy text.\n"
+        assert github.get_file("example/project", "missing.md", ref="a" * 40) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "dir", "encoding": "base64", "size": 0, "content": ""},
+        {"type": "file", "encoding": "none", "size": 6, "content": "Policy"},
+        {
+            "type": "file",
+            "encoding": "base64",
+            "size": 6,
+            "content": "not valid base64!",
+        },
+    ],
+)
+def test_get_file_fails_closed_when_present_content_is_unreadable(
+    payload: dict[str, object],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="policy"):
+        github.get_file("example/project", "POLICY.md", ref="a" * 40)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "file",
+            "encoding": "base64",
+            "size": 5,
+            "content": base64.b64encode(b"too large").decode("ascii"),
+        },
+        {
+            "type": "file",
+            "encoding": "base64",
+            "size": 9,
+            "content": base64.b64encode(b"too large").decode("ascii"),
+        },
+    ],
+)
+def test_get_file_enforces_declared_and_decoded_byte_limits(
+    payload: dict[str, object],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match=r"size|exceeds"):
+        github.get_file("example/project", "POLICY.md", ref="a" * 40, max_bytes=8)
+
+
+def test_policy_tree_and_content_requests_are_bound_to_an_immutable_ref() -> None:
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, request.url.params.get("ref")))
+        if "/git/trees/" in request.url.path:
+            return httpx.Response(
+                200,
+                json={
+                    "truncated": False,
+                    "tree": [{"type": "blob", "path": "CONTRIBUTING.md"}],
+                },
+            )
+        content = b"Policy text.\n"
+        return httpx.Response(
+            200,
+            json={
+                "type": "file",
+                "encoding": "base64",
+                "size": len(content),
+                "content": base64.b64encode(content).decode("ascii"),
+            },
+        )
+
+    ref = "b" * 40
+    with _client(handler) as github:
+        assert github.list_repository_files("example/project", ref=ref) == ["CONTRIBUTING.md"]
+        assert github.get_file("example/project", "CONTRIBUTING.md", ref=ref) == "Policy text.\n"
+
+    assert seen == [
+        (f"/repos/example/project/git/trees/{ref}", None),
+        ("/repos/example/project/contents/CONTRIBUTING.md", ref),
+    ]
+
+
+def test_optional_policy_repository_resolves_one_full_default_branch_sha() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/repos/example/.github":
+            return httpx.Response(200, json=_repository_payload("example/.github"))
+        return httpx.Response(200, json={"object": {"sha": "c" * 40}})
+
+    with _client(handler) as github:
+        assert github.default_branch_sha_if_exists("example/.github") == "c" * 40
+
+    assert paths == [
+        "/repos/example/.github",
+        "/repos/example/.github/git/ref/heads/main",
+    ]
+
+
+def _comment_payload(identifier: int = 11) -> dict[str, object]:
+    return {
+        "id": identifier,
+        "user": {"login": "maintainer"},
+        "author_association": "MEMBER",
+        "body": "Please update the regression test.",
+        "html_url": f"https://github.com/example/project/pull/7#comment-{identifier}",
+        "created_at": "2026-07-21T12:00:00Z",
+        "updated_at": "2026-07-21T12:00:00Z",
+    }
+
+
+def _pull_request_search_item(
+    number: int,
+    *,
+    title: str,
+    body: str | None = None,
+) -> dict[str, object]:
+    return {
+        "title": title,
+        "body": body,
+        "state": "open",
+        "html_url": f"https://github.com/example/project/pull/{number}",
+        "pull_request": {"url": f"https://api.github.com/pulls/{number}"},
+    }
+
+
+def _authored_pull_request_search_item(
+    number: int = 7,
+    *,
+    repository: str = "example/project",
+    state: str = "open",
+) -> dict[str, object]:
+    return {
+        "number": number,
+        "state": state,
+        "html_url": f"https://github.com/{repository}/pull/{number}",
+        "url": f"https://api.github.com/repos/{repository}/issues/{number}",
+        "repository_url": f"https://api.github.com/repos/{repository}",
+        "pull_request": {
+            "url": f"https://api.github.com/repos/{repository}/pulls/{number}",
+        },
+    }
+
+
 def test_same_origin_repository_rename_redirect_is_followed_once() -> None:
     paths: list[str] = []
 
@@ -54,6 +295,63 @@ def test_same_origin_repository_rename_redirect_is_followed_once() -> None:
     assert paths == ["/repos/old/project", "/repositories/123"]
 
 
+def test_get_repository_accepts_exact_configured_ghes_web_urls() -> None:
+    api_url = "https://git.example.com:8443/api/v3"
+    payload = _repository_payload("example/project")
+    payload["html_url"] = "https://git.example.com:8443/example/project"
+    payload["clone_url"] = "https://git.example.com:8443/example/project.git"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with _client(handler, api_url=api_url) as github:
+        repository = github.get_repository("example/project")
+
+    assert repository.html_url == "https://git.example.com:8443/example/project"
+    assert repository.clone_url == "https://git.example.com:8443/example/project.git"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("full_name", "example/../project", "repository full name"),
+        (
+            "html_url",
+            "https://attacker.invalid/example/project",
+            "repository HTML URL",
+        ),
+        (
+            "html_url",
+            "https://github.com/example/project/",
+            "repository HTML URL",
+        ),
+        (
+            "clone_url",
+            "https://attacker.invalid/example/project.git",
+            "repository clone URL",
+        ),
+        (
+            "clone_url",
+            "https://github.com/example/project.git?redirect=attacker.invalid",
+            "repository clone URL",
+        ),
+    ],
+)
+def test_get_repository_rejects_noncanonical_or_cross_host_identity_metadata(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    payload = _repository_payload("example/project")
+    payload[field] = value
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match=message):
+        github.get_repository("example/project")
+
+
 def test_cross_origin_redirect_never_receives_authorization() -> None:
     calls = 0
 
@@ -67,16 +365,44 @@ def test_cross_origin_redirect_never_receives_authorization() -> None:
     assert calls == 1
 
 
-def test_rate_limit_is_a_circuit_breaker() -> None:
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    [
+        (403, "forbidden"),
+        (429, "slow down"),
+        (422, "You have triggered an abuse detection mechanism"),
+    ],
+)
+def test_rate_or_abuse_signal_is_persisted_before_failure(
+    tmp_path, status_code: int, message: str
+) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            429,
-            headers={"Retry-After": "60", "X-RateLimit-Remaining": "0"},
-            json={"message": "slow down"},
+            status_code,
+            headers={
+                "Retry-After": "60",
+                "X-GitHub-Request-Id": "fixture-request",
+                "X-RateLimit-Remaining": "0",
+            },
+            json={"message": message},
         )
 
-    with _client(handler) as github, pytest.raises(GitHubError, match="run was stopped"):
-        github.authenticated_login()
+    with _client(
+        handler,
+        safety_trigger_handler=store.trip_circuit_breaker_trigger,
+    ) as github:
+        with pytest.raises(GitHubSafetyError, match="global safety stop") as raised:
+            github.authenticated_login()
+        first_hash = raised.value.trigger.trigger_hash
+        with pytest.raises(GitHubSafetyError):
+            github.authenticated_login()
+
+    status = store.circuit_breaker_status()
+    assert status.is_tripped
+    assert status.source == "github_api:rate_or_abuse_limit"
+    assert status.trigger_hash == first_hash
 
 
 def test_existing_unrelated_repository_cannot_be_reused_as_fork() -> None:
@@ -91,10 +417,42 @@ def test_competing_pull_request_search_paginates_issue_timeline() -> None:
     pages: list[int] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search/issues":
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 1,
+                    "incomplete_results": False,
+                    "items": [
+                        {
+                            "title": "Fixes #42",
+                            "body": None,
+                            "state": "open",
+                            "html_url": "https://github.com/example/project/pull/99",
+                            "pull_request": {"url": "https://api.github.com/pulls/99"},
+                        }
+                    ],
+                },
+            )
         page = int(request.url.params["page"])
         pages.append(page)
         if page == 1:
-            return httpx.Response(200, json=[{"event": "commented"}] * 100)
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "event": "cross-referenced",
+                        "source": {
+                            "issue": {
+                                "state": "open",
+                                "html_url": "https://github.com/example/project/pull/98",
+                                "pull_request": {"url": "https://api.github.com/pulls/98"},
+                            }
+                        },
+                    },
+                    *[{"event": "commented"}] * 99,
+                ],
+            )
         return httpx.Response(
             200,
             json=[
@@ -114,7 +472,10 @@ def test_competing_pull_request_search_paginates_issue_timeline() -> None:
     with _client(handler) as github:
         matches = github.search_competing_pull_requests("example/project", 42)
 
-    assert matches == ["https://github.com/example/project/pull/99"]
+    assert matches == [
+        "https://github.com/example/project/pull/98",
+        "https://github.com/example/project/pull/99",
+    ]
     assert pages == [1, 2]
 
 
@@ -130,6 +491,215 @@ def test_oversized_issue_timeline_fails_closed() -> None:
         github.search_competing_pull_requests("example/project", 42)
 
     assert calls == 10
+
+
+def test_competing_pull_request_search_accepts_only_exact_issue_references() -> None:
+    search_query = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal search_query
+        if request.url.path.endswith("/timeline"):
+            return httpx.Response(200, json=[])
+        search_query = request.url.params["q"]
+        items = [
+            _pull_request_search_item(1, title="Fix parser regression (#42)"),
+            _pull_request_search_item(
+                2,
+                title="Fix parser regression",
+                body="Resolves example/project#42.",
+            ),
+            _pull_request_search_item(
+                3,
+                title="Fix parser regression",
+                body="See https://github.com/example/project/issues/42?source=pr.",
+            ),
+            _pull_request_search_item(4, title="Unrelated follow-up for #420"),
+            _pull_request_search_item(
+                5,
+                title="Different project",
+                body="Resolves other/example/project#42.",
+            ),
+            _pull_request_search_item(
+                6,
+                title="Different URL",
+                body="See https://github.com/example/project/issues/420.",
+            ),
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "total_count": len(items),
+                "incomplete_results": False,
+                "items": items,
+            },
+        )
+
+    with _client(handler) as github:
+        matches = github.search_competing_pull_requests("example/project", 42)
+
+    assert matches == [
+        "https://github.com/example/project/pull/1",
+        "https://github.com/example/project/pull/2",
+        "https://github.com/example/project/pull/3",
+    ]
+    assert "42" in search_query
+    assert "in:title,body" in search_query
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {"total_count": 0, "incomplete_results": True, "items": []},
+            "incomplete competing",
+        ),
+        (
+            {"total_count": 101, "incomplete_results": False, "items": []},
+            "above the safe limit",
+        ),
+        (
+            {
+                "total_count": 2,
+                "incomplete_results": False,
+                "items": [_pull_request_search_item(1, title="Fixes #42")],
+            },
+            "truncated competing",
+        ),
+    ],
+)
+def test_competing_pull_request_search_fails_closed_on_incomplete_evidence(
+    payload: dict[str, object], message: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/timeline"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match=message):
+        github.search_competing_pull_requests("example/project", 42)
+
+
+def test_authored_pull_request_search_requires_complete_canonical_results() -> None:
+    query: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        query.update(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "total_count": 1,
+                "incomplete_results": False,
+                "items": [_authored_pull_request_search_item()],
+            },
+        )
+
+    with _client(handler) as github:
+        urls = github.authored_pull_requests(
+            "octocat",
+            state="open",
+            repository="example/project",
+            updated_after="2026-07-01",
+            created_after="2026-07-20",
+        )
+
+    assert urls == ["https://github.com/example/project/pull/7"]
+    assert query == {
+        "q": (
+            "is:pr is:open author:octocat repo:example/project "
+            "updated:>=2026-07-01 created:>=2026-07-20"
+        ),
+        "sort": "updated",
+        "per_page": "100",
+        "page": "1",
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {"total_count": 0, "incomplete_results": True, "items": []},
+            "incomplete authored",
+        ),
+        (
+            {"total_count": 0, "items": []},
+            "malformed authored",
+        ),
+        (
+            {"total_count": 101, "incomplete_results": False, "items": []},
+            "one-page safe limit",
+        ),
+        (
+            {
+                "total_count": 2,
+                "incomplete_results": False,
+                "items": [_authored_pull_request_search_item()],
+            },
+            "truncated authored",
+        ),
+        (
+            {"total_count": 0, "incomplete_results": False},
+            "malformed authored pull request search results",
+        ),
+    ],
+)
+def test_authored_pull_request_search_fails_closed_on_ambiguous_metadata(
+    payload: dict[str, object], message: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match=message):
+        github.authored_pull_requests("octocat")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"state": "closed"}, "different state"),
+        ({"number": 8}, "different number"),
+        ({"html_url": "https://attacker.invalid/example/project/pull/7"}, "noncanonical"),
+        ({"html_url": " https://github.com/example/project/pull/7"}, "noncanonical"),
+        ({"html_url": "https://github.com/other/project/pull/7"}, "different repository"),
+        ({"url": ""}, "invalid searched pull request issue API URL"),
+        ({"repository_url": "https://api.github.com/repos/other/project"}, "noncanonical"),
+        ({"pull_request": {}}, "searched pull request API URL"),
+    ],
+)
+def test_authored_pull_request_search_rejects_malformed_item_identity(
+    overrides: dict[str, object], message: str
+) -> None:
+    item = _authored_pull_request_search_item()
+    item.update(overrides)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"total_count": 1, "incomplete_results": False, "items": [item]},
+        )
+
+    with _client(handler) as github, pytest.raises(GitHubError, match=message):
+        github.authored_pull_requests("octocat", repository="example/project")
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"login": "octocat repo:other/project"},
+        {"login": "octocat", "state": "all"},
+        {"login": "octocat", "repository": "not-a-repository"},
+        {"login": "octocat", "updated_after": "2026-02-30"},
+        {"login": "octocat", "created_after": "2026-7-1"},
+    ],
+)
+def test_authored_pull_request_search_rejects_unsafe_inputs(
+    arguments: dict[str, object],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("invalid search inputs must not reach GitHub")
+
+    with _client(handler) as github, pytest.raises(ValueError):
+        github.authored_pull_requests(**arguments)  # type: ignore[arg-type]
 
 
 def test_get_issue_fetches_complete_discussion() -> None:
@@ -200,3 +770,413 @@ def test_issue_discussion_above_bound_fails_closed() -> None:
 
     with _client(handler) as github, pytest.raises(GitHubError, match="discussion limit"):
         github.get_issue("example/project", 42)
+
+
+def test_exact_hundred_issue_comment_count_detects_new_overflow_comment() -> None:
+    pages: list[int] = []
+
+    def comment(identifier: int) -> dict[str, object]:
+        return {
+            "user": {"login": "maintainer"},
+            "author_association": "MEMBER",
+            "body": f"Comment {identifier}",
+            "html_url": (f"https://github.com/example/project/issues/42#issuecomment-{identifier}"),
+            "created_at": "2026-07-20T12:00:00Z",
+            "updated_at": "2026-07-20T12:00:00Z",
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        pages.append(page)
+        if page == 1:
+            return httpx.Response(200, json=[comment(index) for index in range(1, 101)])
+        return httpx.Response(200, json=[comment(101)])
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="count changed"):
+        github.get_issue_comments("example/project", 42, expected_count=100)
+
+    assert pages == [1, 2]
+
+
+def test_lifecycle_read_api_parses_complete_bounded_evidence() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        paths.append(path)
+        if path == "/repos/example/project/pulls/7":
+            return httpx.Response(200, json=_pull_request_payload(merged=True))
+        if path.endswith("/reviews"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 21,
+                        "user": {"login": "reviewer"},
+                        "author_association": "COLLABORATOR",
+                        "state": "APPROVED",
+                        "body": "Looks good.",
+                        "html_url": "https://github.com/example/project/pull/7#review-21",
+                        "submitted_at": "2026-07-21T12:10:00Z",
+                    }
+                ],
+            )
+        if path == "/repos/example/project/issues/7/comments":
+            return httpx.Response(200, json=[_comment_payload(11)])
+        if path == "/repos/example/project/pulls/7/comments":
+            return httpx.Response(200, json=[_comment_payload(12)])
+        if path.endswith("/check-runs"):
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 1,
+                    "check_runs": [
+                        {
+                            "id": 31,
+                            "name": "unit",
+                            "status": "completed",
+                            "conclusion": "success",
+                            "details_url": "https://github.com/example/project/actions/runs/31",
+                            "app": {"slug": "github-actions"},
+                            "started_at": "2026-07-21T12:15:00Z",
+                            "completed_at": "2026-07-21T12:20:00Z",
+                        }
+                    ],
+                },
+            )
+        if path.endswith("/statuses"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 41,
+                        "context": "buildkite/test",
+                        "state": "success",
+                        "description": "passed",
+                        "target_url": "https://ci.example.invalid/41",
+                        "creator": {"login": "ci-bot"},
+                        "created_at": "2026-07-21T12:15:00Z",
+                        "updated_at": "2026-07-21T12:20:00Z",
+                    }
+                ],
+            )
+        if path.endswith("/timeline"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 51,
+                        "event": "cross-referenced",
+                        "created_at": "2026-07-21T14:00:00Z",
+                        "source": {
+                            "issue": {
+                                "title": "Revert parser fix",
+                                "body": "Reverts example/project#7",
+                                "state": "closed",
+                                "html_url": "https://github.com/example/project/pull/8",
+                                "pull_request": {"merged_at": "2026-07-21T14:30:00Z"},
+                            }
+                        },
+                    }
+                ],
+            )
+        raise AssertionError(f"unexpected path: {path}")
+
+    with _client(handler) as github:
+        pull_request = github.get_pull_request("example/project", 7)
+        reviews = github.list_pull_request_reviews("example/project", 7)
+        issue_comments = github.list_issue_comments(
+            "example/project", 7, expected_count=pull_request.issue_comment_count
+        )
+        review_comments = github.list_review_comments(
+            "example/project", 7, expected_count=pull_request.review_comment_count
+        )
+        checks = github.list_check_runs("example/project", pull_request.head_sha)
+        statuses = github.list_commit_statuses("example/project", pull_request.head_sha)
+        references = github.list_pull_request_references("example/project", 7)
+
+    assert pull_request.merged
+    assert pull_request.merge_commit_sha == "b" * 40
+    assert reviews[0].state == "APPROVED"
+    assert issue_comments[0].identifier == 11
+    assert review_comments[0].identifier == 12
+    assert checks[0].app_name == "github-actions"
+    assert statuses[0].context == "buildkite/test"
+    assert references[0].source_merged_at is not None
+    assert len(paths) == 7
+
+
+def test_lifecycle_collection_over_limit_fails_closed_with_overflow_page() -> None:
+    pages: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pages.append(int(request.url.params["page"]))
+        review = {
+            "id": 1,
+            "user": {"login": "reviewer"},
+            "author_association": "MEMBER",
+            "state": "COMMENTED",
+            "body": "note",
+            "html_url": "https://github.com/example/project/pull/7#review-1",
+            "submitted_at": "2026-07-21T12:00:00Z",
+        }
+        return httpx.Response(200, json=[review] * 100)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="safe limit of 100"):
+        github.list_pull_request_reviews("example/project", 7, max_reviews=100)
+
+    assert pages == [1, 2]
+
+
+def test_lifecycle_comment_count_race_fails_closed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[_comment_payload()])
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="count changed"):
+        github.list_issue_comments("example/project", 7, expected_count=2)
+
+
+def test_check_run_total_mismatch_fails_closed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"total_count": 2, "check_runs": []})
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="fewer check runs"):
+        github.list_check_runs("example/project", "a" * 40)
+
+
+def test_lifecycle_timestamp_without_timezone_fails_closed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _pull_request_payload()
+        payload["updated_at"] = "2026-07-21T13:00:00"
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="without a timezone"):
+        github.get_pull_request("example/project", 7)
+
+
+def test_publication_branch_lookup_rejects_multiple_pull_requests() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"html_url": "https://github.com/example/project/pull/7"},
+                {"html_url": "https://github.com/example/project/pull/8"},
+            ],
+        )
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="multiple pull requests"):
+        github.find_pull_request("example/project", head="octocat:autocontribute/issue-42")
+
+
+def _create_pull_request(github: GitHubClient):  # type: ignore[no-untyped-def]
+    return github.create_pull_request(
+        "example/project",
+        title="Fix parser boundary",
+        body="Fixes #42.",
+        head="octocat:fix",
+        expected_head_sha="a" * 40,
+        expected_head_repository="octocat/project",
+        base="main",
+        expected_base_sha="c" * 40,
+        draft=False,
+    )
+
+
+def test_create_pull_request_returns_canonical_success_details() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/example/project/pulls"
+        return httpx.Response(200, json=_pull_request_payload())
+
+    with _client(handler) as github:
+        details = _create_pull_request(github)
+
+    assert details.html_url == "https://github.com/example/project/pull/7"
+    assert details.repository == "example/project"
+    assert details.number == 7
+    assert details.head_sha == "a" * 40
+    assert details.base_sha == "c" * 40
+
+
+def test_create_pull_request_accepts_exact_ghes_url_with_custom_port() -> None:
+    api_url = "https://git.example.com:8443/api/v3"
+    expected_url = "https://git.example.com:8443/example/project/pull/7"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _pull_request_payload()
+        payload["html_url"] = expected_url
+        return httpx.Response(200, json=payload)
+
+    with _client(handler, api_url=api_url) as github:
+        details = _create_pull_request(github)
+
+    assert details.html_url == expected_url
+
+
+def test_create_pull_request_rejects_ghes_url_without_configured_port() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _pull_request_payload()
+        payload["html_url"] = "https://git.example.com/example/project/pull/7"
+        return httpx.Response(200, json=payload)
+
+    with (
+        _client(
+            handler,
+            api_url="https://git.example.com:8443/api/v3",
+        ) as github,
+        pytest.raises(GitHubError, match="noncanonical"),
+    ):
+        _create_pull_request(github)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("draft", True),
+        ("title", "Different title"),
+        ("body", "Different body"),
+    ],
+)
+def test_create_pull_request_returns_semantically_mismatched_response_for_durable_validation(
+    field: str, value: object
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _pull_request_payload()
+        payload[field] = value
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github:
+        details = _create_pull_request(github)
+
+    assert details.html_url == "https://github.com/example/project/pull/7"
+    assert getattr(details, field) == value
+
+
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        ("https://github.com/example/project/pull/8", "different number"),
+        ("https://attacker.invalid/example/project/pull/7", "noncanonical"),
+    ],
+)
+def test_create_pull_request_rejects_noncanonical_identity_url(url: str, message: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _pull_request_payload()
+        payload["html_url"] = url
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match=message):
+        _create_pull_request(github)
+
+
+@pytest.mark.parametrize(
+    ("nested", "field", "value", "attribute"),
+    [
+        ("base", "ref", "develop", "base_ref"),
+        ("head", "ref", "other", "head_ref"),
+        ("head", "label", "octocat:other", "head_label"),
+        ("head", "sha", "b" * 40, "head_sha"),
+        ("head.repo", "full_name", "other/project", "head_repository"),
+        ("base", "sha", "d" * 40, "base_sha"),
+    ],
+)
+def test_create_pull_request_returns_nested_drift_for_durable_validation(
+    nested: str, field: str, value: object, attribute: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _pull_request_payload()
+        if nested in {"base.repo", "head.repo"}:
+            parent = payload[nested.split(".", 1)[0]]
+            assert isinstance(parent, dict)
+            target = parent["repo"]
+        else:
+            target = payload[nested]
+        assert isinstance(target, dict)
+        target[field] = value
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github:
+        details = _create_pull_request(github)
+
+    assert details.html_url == "https://github.com/example/project/pull/7"
+    assert getattr(details, attribute) == value
+
+
+def test_create_pull_request_rejects_different_base_repository() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = _pull_request_payload()
+        base = payload["base"]
+        assert isinstance(base, dict)
+        repository = base["repo"]
+        assert isinstance(repository, dict)
+        repository["full_name"] = "other/project"
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="different repository"):
+        _create_pull_request(github)
+
+
+def test_create_pull_request_rejects_malformed_success_mapping() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="malformed created"):
+        _create_pull_request(github)
+
+
+def test_create_pull_request_returns_closed_success_response_for_reconciliation() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_pull_request_payload(merged=True))
+
+    with _client(handler) as github:
+        details = _create_pull_request(github)
+
+    assert details.state == "closed"
+    assert details.merged
+
+
+def test_close_pull_request_validates_identity_before_and_after_patch() -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        payload = _pull_request_payload()
+        if request.method == "PATCH":
+            payload["state"] = "closed"
+            payload["closed_at"] = "2026-07-21T13:01:00Z"
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github:
+        closed = github.close_pull_request(
+            "example/project",
+            7,
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+        )
+
+    assert methods == ["GET", "PATCH"]
+    assert closed.state == "closed"
+    assert not closed.merged
+
+
+def test_close_pull_request_refuses_head_drift_without_patch() -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        payload = _pull_request_payload()
+        head = payload["head"]
+        assert isinstance(head, dict)
+        head["sha"] = "d" * 40
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="different head commit"):
+        github.close_pull_request(
+            "example/project",
+            7,
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+        )
+
+    assert methods == ["GET"]

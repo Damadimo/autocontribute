@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from autocontribute.config import AutocontributeConfig
+from autocontribute.deployment import compute_deployment_fingerprint
 from autocontribute.domain import (
     CommandResult,
     ContributionPlan,
@@ -17,11 +21,13 @@ from autocontribute.domain import (
     ReviewScores,
     RunStatus,
 )
+from autocontribute.exceptions import PolicyError, StateError
 from autocontribute.orchestrator import Orchestrator
+from autocontribute.preparation import validate_preparation_fingerprint
 from autocontribute.providers import ModelResult, ModelUsage
 from autocontribute.repository import RepositoryWorkspace
 from autocontribute.sandbox import SandboxRunner
-from autocontribute.store import RunStore
+from autocontribute.store import Lease, RunStore
 
 REPRODUCTION_COMMAND = "python -c 'from app import value; assert value() == 2'"
 TRUSTED_COMMAND = "python -m pytest"
@@ -100,7 +106,15 @@ class FakeGitHub:
     def get_issue(self, repository: str, number: int) -> IssueCandidate:
         return self.issue
 
-    def get_file(self, repository: str, path: str, *, ref: str | None = None) -> str | None:
+    def get_file(
+        self,
+        repository: str,
+        path: str,
+        *,
+        ref: str,
+        max_bytes: int = 1_000_000,
+    ) -> str | None:
+        del repository, ref, max_bytes
         return "Run the project tests." if path == "CONTRIBUTING.md" else None
 
     def search_competing_pull_requests(self, repository: str, issue_number: int) -> list[str]:
@@ -109,20 +123,27 @@ class FakeGitHub:
     def default_branch_sha(self, repository: str, branch: str) -> str:
         return self.sha
 
+    def default_branch_sha_if_exists(self, repository: str) -> str | None:
+        del repository
+        return "b" * 40
+
 
 class FixedProvider:
-    def __init__(self, output: Any, model: str) -> None:
+    def __init__(self, output: Any, model: str, *, usage: ModelUsage | None = None) -> None:
         self.output = output
         self.model = model
         self.calls = 0
+        self.requests: list[dict[str, object]] = []
+        self.usage = usage or ModelUsage(input_tokens=10, output_tokens=5, total_tokens=15)
 
-    def generate(self, **_: object) -> ModelResult[Any]:
+    def generate(self, **request: object) -> ModelResult[Any]:
         self.calls += 1
+        self.requests.append(request)
         return ModelResult(
             output=self.output,
             response_id=f"response-{self.model}-{self.calls}",
             model=self.model,
-            usage=ModelUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+            usage=self.usage,
         )
 
 
@@ -162,6 +183,21 @@ class PassingSandbox:
             )
             for command in commands
         ]
+
+
+def _take_over_run_lease(orchestrator: Orchestrator, store: RunStore) -> Lease:
+    guard = orchestrator._lease_guard
+    assert guard is not None
+    current = guard.lease
+    takeover = store.acquire_lease(
+        "autocontribute.run",
+        "takeover-worker",
+        ttl=timedelta(minutes=5),
+        now=current.expires_at,
+    )
+    assert takeover is not None
+    assert takeover.generation > current.generation
+    return takeover
 
 
 def _providers(
@@ -220,9 +256,9 @@ def _providers(
         maintainer_perspective="Ready for review.",
     )
     return {
-        "scout": FixedProvider(plan, "scout-model"),
-        "builder": FixedProvider(proposal, "builder-model"),
-        "critic": FixedProvider(review, "critic-model"),
+        "scout": FixedProvider(plan, "gpt-5.6"),
+        "builder": FixedProvider(proposal, "gpt-5.6"),
+        "critic": FixedProvider(review, "gpt-5.6"),
     }
 
 
@@ -261,15 +297,590 @@ def test_full_prepare_pipeline_reaches_exact_approval_boundary(tmp_path: Path, m
         manifest = orchestrator.run(issue_reference="example/project#42")
 
     assert manifest.status == RunStatus.READY_FOR_APPROVAL
+    assert manifest.deployment_fingerprint == compute_deployment_fingerprint(config)
     assert manifest.quality and manifest.quality.ready
     assert manifest.model_calls == 3
+    assert manifest.model_input_tokens == 30
+    assert manifest.model_output_tokens == 15
+    assert manifest.model_cost_usd == 0
+    assert manifest.model_reservation is None
     assert sandbox.baseline_commands == [REPRODUCTION_COMMAND]
     assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
     patch = (store.artifact_dir(manifest.run_id) / "contribution.patch").read_text()
     assert "+    return 2" in patch
     assert "baseline-generated" not in patch
+    persisted = store.get(manifest.run_id)
+    assert persisted.preparation_fingerprint == manifest.preparation_fingerprint
+    assert persisted.preparation_fingerprint is not None
+    validate_preparation_fingerprint(persisted, diff=patch.encode("utf-8"))
     assert config.policy.ai_disclosure in manifest.proposal.pull_request_body  # type: ignore[union-attr]
-    assert (store.artifact_dir(manifest.run_id) / "report.md").is_file()
+    report = (store.artifact_dir(manifest.run_id) / "report.md").read_text(encoding="utf-8")
+    assert "Recorded model cost: unknown" in report
+    model_calls = json.loads(
+        (store.artifact_dir(manifest.run_id) / "model-calls.json").read_text(encoding="utf-8")
+    )
+    assert all(call["cost_usd"] == "unknown" for call in model_calls)
+
+
+def test_clone_uses_the_exact_sha_used_for_repository_policy_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sha = "a" * 40
+    policy_reads: list[tuple[str, str]] = []
+    clone_refs: list[str] = []
+
+    class TrackingGitHub(FakeGitHub):
+        def get_file(
+            self,
+            repository: str,
+            path: str,
+            *,
+            ref: str,
+            max_bytes: int = 1_000_000,
+        ) -> str | None:
+            policy_reads.append((repository, ref))
+            return super().get_file(
+                repository,
+                path,
+                ref=ref,
+                max_bytes=max_bytes,
+            )
+
+    def stop_after_clone_ref_is_captured(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        del cls, clone_url, destination
+        clone_refs.append(base_sha)
+        raise RuntimeError("stop after immutable clone ref was captured")
+
+    monkeypatch.setattr(
+        RepositoryWorkspace,
+        "clone",
+        classmethod(stop_after_clone_ref_is_captured),
+    )
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=TrackingGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=_providers(),  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    repository_policy_refs = {
+        ref for repository, ref in policy_reads if repository == "example/project"
+    }
+    assert manifest.status == RunStatus.FAILED
+    assert clone_refs == [sha]
+    assert repository_policy_refs == {sha}
+
+
+def test_secret_finding_trips_global_breaker_without_retaining_value(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    providers = _providers()
+    secret = "ghp_" + "A" * 36
+    proposal = providers["builder"].output
+    assert isinstance(proposal, PatchProposal)
+    providers["builder"].output = proposal.model_copy(
+        update={
+            "edits": [
+                FileEdit(
+                    operation="replace",
+                    path="app.py",
+                    find="    return 1\n",
+                    replace=f"    return 2  # {secret}\n",
+                    content=None,
+                    rationale="Match the documented boundary behavior.",
+                )
+            ]
+        }
+    )
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.FAILED
+    assert manifest.proposal is None
+    assert not store.workspace_dir(manifest.run_id).joinpath("repository").exists()
+    breaker = store.circuit_breaker_status()
+    assert breaker.is_tripped
+    assert breaker.source == f"secret_scanner:{manifest.run_id}"
+    assert secret not in (breaker.reason or "")
+    for path in config.storage.path.rglob("*"):
+        if path.is_file():
+            assert secret.encode() not in path.read_bytes()
+
+    with pytest.raises(StateError, match="Circuit breaker is tripped"):
+        Orchestrator(
+            config,
+            store=store,
+            github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+            providers=_providers(),  # type: ignore[arg-type]
+            sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        ).run(issue_reference="example/project#42")
+
+
+def test_breaker_blocks_before_github_or_model_work(tmp_path: Path) -> None:
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    store.trip_circuit_breaker(
+        source="test-signal",
+        reason="maintainer requested a stop",
+        trigger_hash="test-trigger",
+    )
+    providers = _providers()
+
+    class NoGitHubWork:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"unexpected GitHub access: {name}")
+
+    with (
+        Orchestrator(
+            config,
+            store=store,
+            github=NoGitHubWork(),  # type: ignore[arg-type]
+            providers=providers,  # type: ignore[arg-type]
+            sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        ) as orchestrator,
+        pytest.raises(StateError, match="Circuit breaker is tripped"),
+    ):
+        orchestrator.run(issue_reference="example/project#42")
+
+    assert store.list() == []
+    assert all(provider.calls == 0 for provider in providers.values())
+
+
+def test_run_recovers_stale_work_and_releases_singleton_lease(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    now = datetime.now(UTC)
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    monkeypatch.setattr("autocontribute.store.utc_now", lambda: now - timedelta(hours=3))
+    abandoned = store.create_run()
+    store.transition(abandoned, RunStatus.DISCOVERING, reason="worker started")
+    monkeypatch.setattr("autocontribute.store.utc_now", lambda: now)
+    providers = _providers()
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(assigned=True), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        current = orchestrator.run(issue_reference="example/project#42")
+
+    recovered = store.get(abandoned.run_id)
+    assert recovered.status == RunStatus.FAILED
+    assert "previous worker stopped" in (recovered.error or "")
+    assert current.status == RunStatus.SKIPPED
+    assert all(provider.calls == 0 for provider in providers.values())
+    lease = store.acquire_lease("autocontribute.run", "next-worker", ttl=timedelta(minutes=1))
+    assert lease is not None
+    assert store.release_lease("autocontribute.run", "next-worker", lease.generation)
+
+
+@pytest.mark.parametrize("provider_fails", [False, True])
+def test_run_lease_takeover_during_model_outcome_preserves_ambiguous_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_fails: bool,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    class TakingProvider(FixedProvider):
+        orchestrator: Orchestrator | None = None
+        takeover: Lease | None = None
+
+        def generate(self, **request: object) -> ModelResult[Any]:
+            result = super().generate(**request)
+            assert self.orchestrator is not None
+            self.takeover = _take_over_run_lease(self.orchestrator, store)
+            if provider_fails:
+                raise RuntimeError("provider failed after lease takeover")
+            return result
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    provider = TakingProvider(_providers()["scout"].output, "taking-scout")
+    providers = _providers()
+    providers["scout"] = provider
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        provider.orchestrator = orchestrator
+        with pytest.raises(StateError, match="ownership was lost"):
+            orchestrator.run(issue_reference="example/project#42")
+
+    assert provider.takeover is not None
+    assert store.release_lease(
+        provider.takeover.name,
+        provider.takeover.owner,
+        provider.takeover.generation,
+    )
+    [persisted] = store.list()
+    assert persisted.status == RunStatus.PLANNING
+    assert persisted.error is None
+    assert persisted.model_calls == 1
+    assert persisted.model_seconds == 0
+    assert persisted.model_reservation is not None
+    event_types = [event["event_type"] for event in store.events(persisted.run_id)]
+    assert "model.call.started" in event_types
+    assert "model.call.completed" not in event_types
+    assert "model.call.failed" not in event_types
+    run_artifacts = store.runs_dir / persisted.run_id
+    assert not (run_artifacts / "validation.json").exists()
+    assert not (run_artifacts / "model-calls.json").exists()
+    assert not (run_artifacts / "report.md").exists()
+
+
+def test_run_lease_takeover_during_github_read_stops_before_workspace_or_failure_write(
+    tmp_path: Path,
+) -> None:
+    sha = "a" * 40
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+
+    class TakingGitHub(FakeGitHub):
+        orchestrator: Orchestrator | None = None
+        takeover: Lease | None = None
+
+        def default_branch_sha(self, repository: str, branch: str) -> str:
+            result = super().default_branch_sha(repository, branch)
+            assert self.orchestrator is not None
+            self.takeover = _take_over_run_lease(self.orchestrator, store)
+            return result
+
+    github = TakingGitHub(_issue(), _repository(sha), sha)
+    providers = _providers()
+    with Orchestrator(
+        config,
+        store=store,
+        github=github,  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        github.orchestrator = orchestrator
+        with pytest.raises(StateError, match="ownership was lost"):
+            orchestrator.run(issue_reference="example/project#42")
+
+    assert github.takeover is not None
+    assert store.release_lease(
+        github.takeover.name,
+        github.takeover.owner,
+        github.takeover.generation,
+    )
+    [persisted] = store.list()
+    assert persisted.status == RunStatus.DISCOVERING
+    assert persisted.error is None
+    assert persisted.base_sha is None
+    assert all(provider.calls == 0 for provider in providers.values())
+    assert not (store.workspaces_dir / persisted.run_id).exists()
+    run_artifacts = store.runs_dir / persisted.run_id
+    assert not (run_artifacts / "validation.json").exists()
+    assert not (run_artifacts / "model-calls.json").exists()
+    assert not (run_artifacts / "report.md").exists()
+
+
+def test_breaker_trip_during_model_failure_still_records_safe_failure_bookkeeping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+
+    class BreakerProvider:
+        def generate(self, **_: object) -> ModelResult[Any]:
+            store.trip_circuit_breaker(
+                source="test:model-call",
+                reason="stop while the provider call is in flight",
+                trigger_hash="model-call-stop",
+            )
+            raise RuntimeError("provider failed after safety stop")
+
+    providers = _providers()
+    providers["scout"] = BreakerProvider()  # type: ignore[assignment]
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.FAILED
+    assert manifest.model_reservation is not None
+    event_types = [event["event_type"] for event in store.events(manifest.run_id)]
+    assert "model.call.started" in event_types
+    assert "model.call.failed" in event_types
+    assert "run.transitioned" in event_types
+    run_artifacts = store.runs_dir / manifest.run_id
+    assert (run_artifacts / "validation.json").is_file()
+    assert (run_artifacts / "model-calls.json").is_file()
+    assert (run_artifacts / "report.md").is_file()
+
+
+def test_planner_and_critic_receive_callers_tests_and_exact_publication_text(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    source, _ = _source_repository(tmp_path)
+    (source / "caller.py").write_text(
+        "from app import value\n\nRESULT = value()\n",
+        encoding="utf-8",
+    )
+    (source / "tests").mkdir()
+    (source / "tests" / "test_app.py").write_text(
+        "from app import value\n\ndef test_value():\n    assert value() == 1\n",
+        encoding="utf-8",
+    )
+    _git(source, "add", ".")
+    _git(source, "commit", "--quiet", "-m", "add references")
+    sha = _git(source, "rev-parse", "HEAD")
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    issue = _issue()
+    issue.title = "Fix the documented `value()` boundary"
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(issue, _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.READY_FOR_APPROVAL
+    planner_prompt = str(providers["scout"].requests[0]["prompt"])
+    assert "literal_repository_references" in planner_prompt
+    assert "caller.py" in planner_prompt
+    assert "tests/test_app.py" in planner_prompt
+    critic_prompt = str(providers["critic"].requests[0]["prompt"])
+    assert "affected_source_context" in critic_prompt
+    assert "caller.py" in critic_prompt
+    assert "tests/test_app.py" in critic_prompt
+    assert "proposed_publication_text" in critic_prompt
+    assert "Fix documented boundary value" in critic_prompt
+    assert "Fixes #42. Corrects the boundary return value." in critic_prompt
+    assert config.policy.ai_disclosure in critic_prompt
+
+
+def test_repository_pull_request_template_is_a_hard_pre_review_gate(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    source, _ = _source_repository(tmp_path)
+    template_dir = source / ".github"
+    template_dir.mkdir()
+    (template_dir / "pull_request_template.md").write_text(
+        "## Summary\n\n<!-- Describe the change. -->\n\n## Testing\n\n- [ ] Tests pass\n",
+        encoding="utf-8",
+    )
+    _git(source, "add", ".")
+    _git(source, "commit", "--quiet", "-m", "add pull request template")
+    sha = _git(source, "rev-parse", "HEAD")
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.FAILED
+    assert "missing template heading" in (manifest.error or "")
+    assert providers["builder"].calls == 1
+    assert providers["critic"].calls == 0
+
+
+def test_organization_default_pull_request_template_is_a_hard_gate(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    class OrganizationTemplateGitHub(FakeGitHub):
+        def get_file(
+            self,
+            repository: str,
+            path: str,
+            *,
+            ref: str,
+            max_bytes: int = 1_000_000,
+        ) -> str | None:
+            if repository == "example/.github" and path == "PULL_REQUEST_TEMPLATE.md":
+                return "## Organization verification\n"
+            return super().get_file(repository, path, ref=ref, max_bytes=max_bytes)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=OrganizationTemplateGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.FAILED
+    assert "organization verification" in (manifest.error or "")
+    assert providers["critic"].calls == 0
 
 
 def test_operator_required_commands_run_when_models_omit_them(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -472,3 +1083,315 @@ def test_explicit_issue_cannot_bypass_repository_allowlist(tmp_path: Path) -> No
     assert manifest.status == RunStatus.FAILED
     assert "not in github.repositories" in (manifest.error or "")
     assert all(provider.calls == 0 for provider in providers.values())
+
+
+def test_model_call_forwards_remaining_output_and_wall_clock_budgets(tmp_path: Path) -> None:
+    config = AutocontributeConfig.model_validate(
+        {
+            "models": {
+                role: {
+                    "pricing": {
+                        "input_usd_per_million_tokens": "2",
+                        "output_usd_per_million_tokens": "4",
+                    }
+                }
+                for role in ("scout", "builder", "critic")
+            },
+            "budget": {
+                "max_output_tokens_per_run": 1_000,
+                "max_model_seconds_per_run": 10,
+            },
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    provider = _providers()["scout"]
+    ticks = iter((5.0, 7.0))
+    orchestrator = Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
+        providers={"scout": provider},  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        clock=lambda: next(ticks),
+    )
+    manifest = store.create_run()
+
+    orchestrator._call_model(
+        manifest,
+        role="scout",
+        instructions="Plan safely.",
+        prompt="Inspect one issue.",
+        output_type=ContributionPlan,
+    )
+
+    assert provider.requests[0]["max_output_tokens"] == 1_000
+    assert provider.requests[0]["timeout_seconds"] == 10
+    assert manifest.model_input_tokens == 10
+    assert manifest.model_output_tokens == 5
+    assert str(manifest.model_cost_usd) == "0.00004"
+    assert manifest.model_seconds == 2
+    persisted = store.get(manifest.run_id)
+    assert persisted.model_seconds == 2
+    assert persisted.model_reservation is None
+
+
+def test_cost_budget_rejects_request_before_provider_invocation(tmp_path: Path) -> None:
+    priced_profile = {
+        "pricing": {
+            "input_usd_per_million_tokens": "100",
+            "output_usd_per_million_tokens": "100",
+        }
+    }
+    config = AutocontributeConfig.model_validate(
+        {
+            "models": {
+                "scout": priced_profile,
+                "builder": priced_profile,
+                "critic": priced_profile,
+            },
+            "budget": {"max_model_cost_usd_per_run": "0.0001"},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    provider = _providers()["scout"]
+    orchestrator = Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
+        providers={"scout": provider},  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    )
+    manifest = store.create_run()
+
+    with pytest.raises(PolicyError, match="cost budget exhausted"):
+        orchestrator._call_model(
+            manifest,
+            role="scout",
+            instructions="Plan safely.",
+            prompt="Inspect one issue.",
+            output_type=ContributionPlan,
+        )
+
+    assert provider.calls == 0
+    assert manifest.model_calls == 0
+    assert manifest.model_reservation is None
+
+
+def test_failed_model_call_retains_durable_reservation(tmp_path: Path) -> None:
+    class FailingProvider:
+        def generate(self, **_: object) -> ModelResult[Any]:
+            raise RuntimeError("provider unavailable")
+
+    config = AutocontributeConfig.model_validate(
+        {
+            "budget": {"max_model_seconds_per_run": 10},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    ticks = iter((1.0, 2.5))
+    orchestrator = Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
+        providers={"scout": FailingProvider()},  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        clock=lambda: next(ticks),
+    )
+    manifest = store.create_run()
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        orchestrator._call_model(
+            manifest,
+            role="scout",
+            instructions="Plan safely.",
+            prompt="Inspect one issue.",
+            output_type=ContributionPlan,
+        )
+
+    assert manifest.model_reservation is not None
+    assert manifest.model_seconds == 1.5
+    persisted = store.get(manifest.run_id)
+    assert persisted.model_reservation == manifest.model_reservation
+
+
+def test_provider_usage_above_forwarded_limit_is_charged_then_rejected(tmp_path: Path) -> None:
+    config = AutocontributeConfig.model_validate(
+        {
+            "budget": {"max_output_tokens_per_run": 1_000},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    plan = _providers()["scout"].output
+    provider = FixedProvider(
+        plan,
+        "over-limit-model",
+        usage=ModelUsage(input_tokens=10, output_tokens=1_001, total_tokens=1_011),
+    )
+    orchestrator = Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
+        providers={"scout": provider},  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    )
+    manifest = store.create_run()
+
+    with pytest.raises(PolicyError, match="output usage exceeded"):
+        orchestrator._call_model(
+            manifest,
+            role="scout",
+            instructions="Plan safely.",
+            prompt="Inspect one issue.",
+            output_type=ContributionPlan,
+        )
+
+    assert provider.requests[0]["max_output_tokens"] == 1_000
+    assert manifest.model_output_tokens == 1_001
+    assert manifest.model_reservation is None
+    assert store.get(manifest.run_id).model_output_tokens == 1_001
+
+
+def test_review_mode_accepts_observed_provider_model_without_an_attestation(
+    tmp_path: Path,
+) -> None:
+    config = AutocontributeConfig.model_validate({"storage": {"path": tmp_path / "state"}})
+    store = RunStore(config.storage.path)
+    provider = FixedProvider(_providers()["scout"].output, "provider-snapshot-2026-07-21")
+    orchestrator = Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
+        providers={"scout": provider},  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    )
+    manifest = store.create_run()
+
+    result = orchestrator._call_model(
+        manifest,
+        role="scout",
+        instructions="Plan safely.",
+        prompt="Inspect one issue.",
+        output_type=ContributionPlan,
+    )
+
+    assert result.model == "provider-snapshot-2026-07-21"
+
+
+def test_orchestrator_rejects_a_provider_model_outside_the_attested_deployment(
+    tmp_path: Path,
+) -> None:
+    config = AutocontributeConfig.model_validate(
+        {
+            "models": {"scout": {"expected_response_model": "provider-snapshot-2026-07-21"}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    provider = FixedProvider(_providers()["scout"].output, "provider-snapshot-2026-07-22")
+    orchestrator = Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
+        providers={"scout": provider},  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    )
+    manifest = store.create_run()
+
+    with pytest.raises(PolicyError, match="outside the calibrated deployment"):
+        orchestrator._call_model(
+            manifest,
+            role="scout",
+            instructions="Plan safely.",
+            prompt="Inspect one issue.",
+            output_type=ContributionPlan,
+        )
+
+
+def test_reused_orchestrator_resets_per_run_model_call_artifact(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    providers = _providers()
+    orchestrator = Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    )
+
+    first = orchestrator.run(issue_reference="example/project#42")
+    second = orchestrator.run(issue_reference="example/project#42")
+
+    assert first.status == RunStatus.READY_FOR_APPROVAL
+    assert second.status == RunStatus.READY_FOR_APPROVAL
+    first_events = json.loads(
+        (store.artifact_dir(first.run_id) / "model-calls.json").read_text(encoding="utf-8")
+    )
+    second_events = json.loads(
+        (store.artifact_dir(second.run_id) / "model-calls.json").read_text(encoding="utf-8")
+    )
+    assert len(first_events) == 3
+    assert len(second_events) == 3
+    assert second_events[0]["response_id"] == "response-gpt-5.6-2"
+
+
+def test_orchestrator_closes_only_factory_owned_provider_once(tmp_path: Path) -> None:
+    class CloseableProvider(FixedProvider):
+        def __init__(self, output: Any, model: str) -> None:
+            super().__init__(output, model)
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    config = AutocontributeConfig.model_validate({"storage": {"path": tmp_path / "state"}})
+    store = RunStore(config.storage.path)
+    created = CloseableProvider(_providers()["scout"].output, "gpt-5.6")
+    injected = CloseableProvider(_providers()["builder"].output, "gpt-5.6")
+    orchestrator = Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
+        providers={"builder": injected},  # type: ignore[arg-type]
+        provider_factory=lambda _: created,
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    )
+    manifest = store.create_run()
+    orchestrator._call_model(
+        manifest,
+        role="scout",
+        instructions="Plan safely.",
+        prompt="Inspect one issue.",
+        output_type=ContributionPlan,
+    )
+
+    orchestrator.close()
+    orchestrator.close()
+
+    assert created.close_calls == 1
+    assert injected.close_calls == 0

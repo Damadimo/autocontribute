@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
@@ -14,10 +15,31 @@ from autocontribute.exceptions import ConfigurationError
 
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _IMAGE_DIGEST = re.compile(r"@sha256:[0-9a-fA-F]{64}$")
 _DEFAULT_SANDBOX_IMAGE = (
     "python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a"
 )
+_GUARDED_AUTO_FORBIDDEN_PATHS = frozenset(
+    {
+        ".github/workflows/**",
+        ".github/actions/**",
+        "**/*.pem",
+        "**/*.key",
+        "**/generated/**",
+        "vendor/**",
+    }
+)
+_AUTO_PUBLISH_ENABLED_VALUES = frozenset({"1", "true", "yes"})
+_DEDICATED_AUTO_PUBLISH_ENV = "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH"
+
+
+def validate_model_identifier(value: object) -> str:
+    """Return one bounded canonical provider model ID or reject it."""
+
+    if not isinstance(value, str) or not _MODEL_ID.fullmatch(value):
+        raise ValueError("model identifiers must be canonical provider IDs")
+    return value
 
 
 class StrictModel(BaseModel):
@@ -81,15 +103,76 @@ class GitHubConfig(StrictModel):
         return list(dict.fromkeys(values))
 
 
+class ModelPricing(StrictModel):
+    """Operator-supplied token prices used for a conservative per-run spend ceiling."""
+
+    input_usd_per_million_tokens: Decimal = Field(gt=0, max_digits=12, decimal_places=6)
+    cached_input_usd_per_million_tokens: Decimal | None = Field(
+        default=None, gt=0, max_digits=12, decimal_places=6
+    )
+    cache_write_usd_per_million_tokens: Decimal | None = Field(
+        default=None, gt=0, max_digits=12, decimal_places=6
+    )
+    output_usd_per_million_tokens: Decimal = Field(gt=0, max_digits=12, decimal_places=6)
+
+    @property
+    def cached_input_rate(self) -> Decimal:
+        return self.cached_input_usd_per_million_tokens or self.input_usd_per_million_tokens
+
+    @property
+    def cache_write_rate(self) -> Decimal:
+        return self.cache_write_usd_per_million_tokens or self.input_usd_per_million_tokens
+
+    def upper_bound_cost(self, *, input_tokens: int, output_tokens: int) -> Decimal:
+        """Price a reservation without assuming a discounted cache hit."""
+
+        input_rate = max(
+            self.input_usd_per_million_tokens,
+            self.cached_input_rate,
+            self.cache_write_rate,
+        )
+        return (
+            Decimal(input_tokens) * input_rate
+            + Decimal(output_tokens) * self.output_usd_per_million_tokens
+        ) / Decimal(1_000_000)
+
+    def cost(
+        self,
+        *,
+        input_tokens: int,
+        cached_input_tokens: int,
+        cache_write_tokens: int,
+        output_tokens: int,
+    ) -> Decimal:
+        regular_input_tokens = input_tokens - cached_input_tokens - cache_write_tokens
+        if regular_input_tokens < 0:
+            raise ValueError("cached and cache-write tokens cannot exceed input tokens")
+        return (
+            Decimal(regular_input_tokens) * self.input_usd_per_million_tokens
+            + Decimal(cached_input_tokens) * self.cached_input_rate
+            + Decimal(cache_write_tokens) * self.cache_write_rate
+            + Decimal(output_tokens) * self.output_usd_per_million_tokens
+        ) / Decimal(1_000_000)
+
+
 class ModelProfile(StrictModel):
     provider: Literal["openai", "openai_compatible"] = "openai"
     model: str = "gpt-5.6"
+    expected_response_model: str | None = None
+    immutable_response_model_attested: bool = False
     api_key_env: str = "OPENAI_API_KEY"
     base_url: HttpUrl | None = None
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = "high"
     reasoning_mode: Literal["standard", "pro"] | None = "standard"
+    max_input_tokens: int = Field(default=500_000, ge=1_000, le=2_000_000)
     max_output_tokens: int = Field(default=40_000, ge=1_000, le=128_000)
     timeout_seconds: float = Field(default=900, ge=10, le=3_600)
+    pricing: ModelPricing | None = None
+
+    @field_validator("model", "expected_response_model")
+    @classmethod
+    def model_ids_are_canonical(cls, value: str | None) -> str | None:
+        return None if value is None else validate_model_identifier(value)
 
     @field_validator("api_key_env")
     @classmethod
@@ -120,6 +203,8 @@ class ModelProfile(StrictModel):
                 "openai_compatible profiles cannot portably enforce pro reasoning mode; "
                 "use standard or null"
             )
+        if self.immutable_response_model_attested and self.expected_response_model is None:
+            raise ValueError("immutable_response_model_attested requires expected_response_model")
         return self
 
     def require_api_key(self) -> str:
@@ -129,6 +214,12 @@ class ModelProfile(StrictModel):
                 f"Model credential is missing; set environment variable {self.api_key_env}"
             )
         return value
+
+    @property
+    def deployment_model(self) -> str | None:
+        """Exact provider-returned model ID authorized for autonomous publication."""
+
+        return self.expected_response_model
 
 
 class ModelsConfig(StrictModel):
@@ -271,7 +362,7 @@ class PublishingConfig(StrictModel):
     max_new_pull_requests_per_day: int = Field(default=1, ge=1, le=5)
     max_open_pull_requests: int = Field(default=2, ge=1, le=20)
     repository_cooldown_days: int = Field(default=7, ge=0, le=365)
-    auto_publish_env: str = "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH"
+    auto_publish_env: str = _DEDICATED_AUTO_PUBLISH_ENV
 
     @field_validator("auto_publish_env")
     @classmethod
@@ -281,9 +372,24 @@ class PublishingConfig(StrictModel):
         return value
 
 
+def auto_publish_opt_in_enabled(config: PublishingConfig) -> bool:
+    """Return whether the operator's live automatic-publication switch is enabled."""
+
+    return (
+        config.auto_publish_env == _DEDICATED_AUTO_PUBLISH_ENV
+        and os.environ.get(config.auto_publish_env, "").casefold() in _AUTO_PUBLISH_ENABLED_VALUES
+    )
+
+
 class BudgetConfig(StrictModel):
     max_model_calls_per_run: int = Field(default=6, ge=3, le=30)
     max_candidates_per_run: int = Field(default=25, ge=1, le=200)
+    max_input_tokens_per_run: int = Field(default=3_000_000, ge=1_000, le=20_000_000)
+    max_output_tokens_per_run: int = Field(default=240_000, ge=1_000, le=4_000_000)
+    max_model_seconds_per_run: float = Field(default=3_600, ge=10, le=86_400)
+    max_model_cost_usd_per_run: Decimal | None = Field(
+        default=None, gt=0, max_digits=10, decimal_places=4
+    )
 
 
 class StorageConfig(StrictModel):
@@ -324,6 +430,131 @@ class AutocontributeConfig(StrictModel):
                 "trusted validation commands exceed sandbox.max_commands for: "
                 + ", ".join(oversized)
             )
+        profiles = (
+            ("scout", self.models.scout),
+            ("builder", self.models.builder),
+            ("critic", self.models.critic),
+        )
+        missing_pricing = [role for role, profile in profiles if profile.pricing is None]
+        configured_pricing = [role for role, profile in profiles if profile.pricing is not None]
+        if configured_pricing and missing_pricing:
+            raise ValueError(
+                "model token pricing must be configured for every role; missing: "
+                + ", ".join(missing_pricing)
+            )
+        if self.budget.max_model_cost_usd_per_run is not None and missing_pricing:
+            raise ValueError(
+                "budget.max_model_cost_usd_per_run requires token pricing for model roles: "
+                + ", ".join(missing_pricing)
+            )
+        if self.publishing.mode == "auto":
+            auto_violations: list[str] = []
+            missing_model_attestations = [
+                role for role, profile in profiles if profile.deployment_model is None
+            ]
+            unverified_model_identities = [
+                role for role, profile in profiles if not profile.immutable_response_model_attested
+            ]
+            if len(self.github.repositories) != 1:
+                auto_violations.append("exactly one explicit github.repositories entry")
+            if self.github.owners:
+                auto_violations.append("github.owners must be empty")
+            if not self.publishing.draft:
+                auto_violations.append("publishing.draft must be true")
+            if self.publishing.max_new_pull_requests_per_day != 1:
+                auto_violations.append("publishing.max_new_pull_requests_per_day must equal 1")
+            if self.publishing.max_open_pull_requests != 1:
+                auto_violations.append("publishing.max_open_pull_requests must equal 1")
+            if self.publishing.repository_cooldown_days < 7:
+                auto_violations.append("publishing.repository_cooldown_days must be at least 7")
+            if self.publishing.auto_publish_env != _DEDICATED_AUTO_PUBLISH_ENV:
+                auto_violations.append(
+                    "publishing.auto_publish_env must equal " + _DEDICATED_AUTO_PUBLISH_ENV
+                )
+            if self.sandbox.backend != "docker":
+                auto_violations.append("sandbox.backend must be docker")
+            if not self.github.require_unassigned:
+                auto_violations.append("github.require_unassigned must be true")
+            required_policy_values = (
+                (
+                    self.policy.require_maintainer_signal,
+                    "policy.require_maintainer_signal must be true",
+                ),
+                (
+                    self.policy.require_contribution_guidelines,
+                    "policy.require_contribution_guidelines must be true",
+                ),
+                (
+                    not self.policy.allow_assigned_issues,
+                    "policy.allow_assigned_issues must be false",
+                ),
+                (
+                    not self.policy.allow_security_issues,
+                    "policy.allow_security_issues must be false",
+                ),
+                (
+                    not self.policy.allow_dependency_changes,
+                    "policy.allow_dependency_changes must be false",
+                ),
+                (
+                    not self.policy.allow_workflow_changes,
+                    "policy.allow_workflow_changes must be false",
+                ),
+                (
+                    bool(self.policy.ai_disclosure.strip()),
+                    "policy.ai_disclosure must be non-empty",
+                ),
+            )
+            for satisfied, requirement in required_policy_values:
+                if not satisfied:
+                    auto_violations.append(requirement)
+            if self.quality.min_candidate_score < 85:
+                auto_violations.append("quality.min_candidate_score must be at least 85")
+            if self.quality.min_readiness_score < 90:
+                auto_violations.append("quality.min_readiness_score must be at least 90")
+            if self.quality.min_dimension_score < 80:
+                auto_violations.append("quality.min_dimension_score must be at least 80")
+            if self.quality.max_files_changed > 8:
+                auto_violations.append("quality.max_files_changed must be at most 8")
+            if self.quality.max_changed_lines > 400:
+                auto_violations.append("quality.max_changed_lines must be at most 400")
+            if not self.quality.require_regression_evidence_for_bugfix:
+                auto_violations.append(
+                    "quality.require_regression_evidence_for_bugfix must be true"
+                )
+            forbidden_paths = {path.casefold() for path in self.quality.forbidden_paths}
+            missing_forbidden_paths = sorted(
+                path
+                for path in _GUARDED_AUTO_FORBIDDEN_PATHS
+                if path.casefold() not in forbidden_paths
+            )
+            if missing_forbidden_paths:
+                auto_violations.append(
+                    "quality.forbidden_paths must retain guarded paths: "
+                    + ", ".join(missing_forbidden_paths)
+                )
+            if missing_pricing:
+                auto_violations.append(
+                    "model token pricing is required for every role; missing: "
+                    + ", ".join(missing_pricing)
+                )
+            if missing_model_attestations:
+                auto_violations.append(
+                    "models.<role>.expected_response_model is required for every role; missing: "
+                    + ", ".join(missing_model_attestations)
+                )
+            if unverified_model_identities:
+                auto_violations.append(
+                    "models.<role>.immutable_response_model_attested must be true for every role; "
+                    "unattested: " + ", ".join(unverified_model_identities)
+                )
+            if self.budget.max_model_cost_usd_per_run is None:
+                auto_violations.append("budget.max_model_cost_usd_per_run must be configured")
+            if auto_violations:
+                raise ValueError(
+                    "publishing.mode=auto requires guarded pilot configuration: "
+                    + "; ".join(auto_violations)
+                )
         return self
 
     def model_for(self, role: Literal["scout", "builder", "critic"]) -> ModelProfile:
@@ -374,7 +605,7 @@ github:
     - NVIDIA-NeMo/Guardrails
   owners: []                       # optional discovery across selected owners
   include_labels: ["help wanted", "good first issue"]
-  exclude_labels: ["security", "breaking change", "needs design", "blocked"]
+  exclude_labels: ["security", "breaking change", "needs design", "blocked", "discussion"]
   min_stars: 1000
   require_unassigned: true
   max_repository_inactivity_days: 180
@@ -383,11 +614,20 @@ models:
   scout: &builder_model
     provider: openai
     model: gpt-5.6
+    # Required for auto mode; use the exact immutable model ID returned by the provider.
+    # expected_response_model: gpt-5.6-YYYY-MM-DD
+    # immutable_response_model_attested: true  # only after verifying the provider contract
     api_key_env: OPENAI_API_KEY
     reasoning_effort: high
     reasoning_mode: standard
+    max_input_tokens: 500000
     max_output_tokens: 40000
     timeout_seconds: 900
+    pricing:                         # conservative ceilings; verify for the selected model
+      input_usd_per_million_tokens: 10
+      cached_input_usd_per_million_tokens: 10
+      cache_write_usd_per_million_tokens: 10
+      output_usd_per_million_tokens: 100
   builder: *builder_model
   critic:
     <<: *builder_model
@@ -432,7 +672,7 @@ quality:
   require_regression_evidence_for_bugfix: true
 
 publishing:
-  mode: review_required             # `auto` also requires an environment kill-switch
+  mode: review_required             # guarded `auto` is limited to one explicit repository
   approval_expires_hours: 24
   draft: true
   max_new_pull_requests_per_day: 1
@@ -443,6 +683,10 @@ publishing:
 budget:
   max_model_calls_per_run: 6
   max_candidates_per_run: 25
+  max_input_tokens_per_run: 3000000
+  max_output_tokens_per_run: 240000
+  max_model_seconds_per_run: 3600
+  max_model_cost_usd_per_run: 50
 
 storage:
   path: .autocontribute
@@ -452,8 +696,11 @@ storage:
 __all__ = [
     "AutocontributeConfig",
     "GitHubConfig",
+    "ModelPricing",
     "ModelProfile",
     "ValidationConfig",
+    "auto_publish_opt_in_enabled",
     "example_config",
     "load_config",
+    "validate_model_identifier",
 ]

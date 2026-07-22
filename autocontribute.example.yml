@@ -12,7 +12,7 @@ github:
     - NVIDIA-NeMo/Guardrails
   owners: []
   include_labels: ["help wanted", "good first issue"]
-  exclude_labels: ["security", "breaking change", "needs design", "blocked"]
+  exclude_labels: ["security", "breaking change", "needs design", "blocked", "discussion"]
   min_stars: 1000
   require_unassigned: true
   max_repository_inactivity_days: 180
@@ -21,11 +21,21 @@ models:
   scout: &builder_model
     provider: openai
     model: gpt-5.6
+    # Required for `publishing.mode: auto`: copy the exact immutable model ID returned by the API.
+    # expected_response_model: gpt-5.6-YYYY-MM-DD
+    # immutable_response_model_attested: true  # only after verifying the provider contract
     api_key_env: OPENAI_API_KEY
     reasoning_effort: high
     reasoning_mode: standard
+    max_input_tokens: 500000
     max_output_tokens: 40000
     timeout_seconds: 900
+    # Conservative price ceilings, not a built-in price table. Verify for the selected model.
+    pricing:
+      input_usd_per_million_tokens: 10
+      cached_input_usd_per_million_tokens: 10
+      cache_write_usd_per_million_tokens: 10
+      output_usd_per_million_tokens: 100
   builder: *builder_model
   critic:
     <<: *builder_model
@@ -72,9 +82,11 @@ quality:
   require_regression_evidence_for_bugfix: true
 
 publishing:
-  mode: review_required
+  mode: review_required # guarded `auto` is limited to the one configured repository
   approval_expires_hours: 24
   draft: true
+  # Daily/cooldown capacity is durably reserved in schema-v5 SQLite before GitHub mutation.
+  # Never delete or roll back state to reclaim a failed or ambiguous attempt's reservation.
   max_new_pull_requests_per_day: 1
   max_open_pull_requests: 2
   repository_cooldown_days: 7
@@ -83,6 +95,10 @@ publishing:
 budget:
   max_model_calls_per_run: 6
   max_candidates_per_run: 25
+  max_input_tokens_per_run: 3000000
+  max_output_tokens_per_run: 240000
+  max_model_seconds_per_run: 3600
+  max_model_cost_usd_per_run: 50
 
 storage:
   path: .autocontribute

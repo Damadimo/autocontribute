@@ -45,6 +45,15 @@ def source_repository(tmp_path: Path) -> tuple[Path, str, str]:
     (github / "PULL_REQUEST_TEMPLATE.md").write_text("Explain the change.\n", encoding="utf-8")
     (source / "SECURITY.md").write_text("Report privately.\n", encoding="utf-8")
     (source / "AI_POLICY.md").write_text("Disclose assistance.\n", encoding="utf-8")
+    source_code = source / "src"
+    source_code.mkdir()
+    (source_code / "parser.py").write_text(
+        "def parse_document(value: str) -> str:\n"
+        "    return normalize_document(value)\n\n"
+        "def normalize_document(value: str) -> str:\n"
+        "    return value.strip()\n",
+        encoding="utf-8",
+    )
     (source / "binary.bin").write_bytes(b"\x00fixture")
     _git(source, "add", ".")
     _git(source, "commit", "--quiet", "-m", "first")
@@ -92,6 +101,31 @@ def test_clone_is_pinned_and_does_not_fetch_later_head(
     assert _git(workspace.path, "rev-parse", "HEAD") == first_sha
     assert first_sha != second_sha
     assert not (workspace.path / ".git" / "modules").exists()
+
+
+def test_clone_fetch_disables_http_redirects_before_contacting_remote(
+    tmp_path: Path,
+    source_repository: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, first_sha, _ = source_repository
+    commands: list[list[str]] = []
+    real_run = subprocess.run
+
+    def recording_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = args[0] if args else kwargs["args"]
+        if isinstance(command, list) and all(isinstance(item, str) for item in command):
+            commands.append(command)
+        return real_run(*args, **kwargs)  # type: ignore[call-overload,return-value]
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+
+    _clone(source, first_sha, tmp_path / "workspace")
+
+    fetch = next(command for command in commands if "fetch" in command)
+    redirect_option = fetch.index("http.followRedirects=false")
+    assert fetch[redirect_option - 1] == "-c"
+    assert redirect_option < fetch.index("fetch")
 
 
 def test_clone_rejects_untrusted_sources_and_existing_destination(tmp_path: Path) -> None:
@@ -184,6 +218,43 @@ def test_paths_cannot_escape_or_cross_symlinks(
     assert outside.read_text(encoding="utf-8") == "secret"
 
 
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "line\nbreak.py",
+        "tab\tname.py",
+        "delete\x7fname.py",
+        "next\x85line.py",
+        "bidi\u202ename.py",
+    ],
+)
+def test_repository_paths_reject_control_and_format_characters(
+    tmp_path: Path,
+    source_repository: tuple[Path, str, str],
+    unsafe_path: str,
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+
+    with pytest.raises(RepositoryError, match="Unsafe repository path"):
+        workspace.read_file(unsafe_path)
+    with pytest.raises(RepositoryError, match="Unsafe repository path"):
+        workspace.apply_edit(_edit("create", unsafe_path, content="unsafe\n"))
+
+
+def test_tracked_control_character_path_fails_context_enumeration_closed(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+    unsafe = workspace.path / "quoted\npath.py"
+    unsafe.write_text("unsafe = True\n", encoding="utf-8")
+    _git(workspace.path, "add", "--", unsafe.name)
+
+    with pytest.raises(RepositoryError, match="Unsafe repository path"):
+        workspace.context_index()
+
+
 def test_exact_replace_rejects_ambiguous_matches(
     tmp_path: Path, source_repository: tuple[Path, str, str]
 ) -> None:
@@ -212,3 +283,122 @@ def test_context_index_and_guidance_are_bounded_and_include_policies(
     assert "SECURITY.md" in guidance
     assert "AI_POLICY.md" in guidance
     assert sum(map(len, guidance.values())) <= 120_000
+
+
+def test_guidance_reserves_budget_for_complete_pull_request_templates(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+    template = "Explain the change.\n"
+
+    guidance = workspace.guidance(max_characters=len(template))
+
+    assert guidance == {".github/PULL_REQUEST_TEMPLATE.md": template}
+    with pytest.raises(RepositoryError, match="truncated template"):
+        workspace.guidance(max_characters=len(template) - 1)
+
+
+@pytest.mark.parametrize(
+    ("edit", "path"),
+    [
+        (_edit("create", ".env.production", content="PASSWORD=value\n"), ".env.production"),
+        (_edit("create", "config/private.pem", content="private\n"), "config/private.pem"),
+    ],
+)
+def test_edits_to_sensitive_paths_are_rejected(
+    tmp_path: Path,
+    source_repository: tuple[Path, str, str],
+    edit: FileEdit,
+    path: str,
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+
+    with pytest.raises(RepositoryError, match="sensitive repository path"):
+        workspace.apply_edit(edit)
+
+    assert not (workspace.path / path).exists()
+
+
+def test_sensitive_file_deletion_is_rejected_before_batch_application(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+    sensitive = workspace.path / ".env.production"
+    sensitive.write_text("PASSWORD=live-value-123456\n", encoding="utf-8")
+
+    with pytest.raises(RepositoryError, match="sensitive repository path"):
+        workspace.apply_edits([_edit("delete", ".env.production")])
+
+    assert sensitive.read_text(encoding="utf-8") == "PASSWORD=live-value-123456\n"
+
+
+def test_literal_context_search_finds_symbols_without_executing_repository_code(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+
+    matches = workspace.search_text(["parse_document", "normalize_document"])
+
+    assert [(match.query, match.path, match.line_number) for match in matches] == [
+        ("parse_document", "src/parser.py", 1),
+        ("normalize_document", "src/parser.py", 2),
+        ("normalize_document", "src/parser.py", 4),
+    ]
+
+
+def test_literal_context_search_is_bounded_and_rejects_unsafe_queries(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+
+    matches = workspace.search_text(["document"], max_matches=10, max_line_characters=12)
+
+    assert len(matches) >= 2
+    assert all(len(match.line) <= 25 for match in matches)
+    with pytest.raises(RepositoryError, match="results would be incomplete"):
+        workspace.search_text(["document"], max_matches=2)
+    with pytest.raises(RepositoryError, match="unsafe"):
+        workspace.search_text(["bad\0query"])
+    with pytest.raises(RepositoryError, match="at most 20"):
+        workspace.search_text([f"query-{index}" for index in range(21)])
+
+
+def test_literal_context_search_deduplicates_case_and_enforces_total_byte_budget(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+
+    matches = workspace.search_text(["parse_document", "PARSE_DOCUMENT"])
+
+    assert [(match.query, match.line_number) for match in matches] == [("parse_document", 1)]
+    with pytest.raises(ValueError, match="limits must be positive"):
+        workspace.search_text(["parse_document"], max_total_bytes=0)
+
+
+def test_context_index_signals_byte_exhaustion_and_search_fails_closed(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+
+    entries = workspace.context_index(max_total_bytes=1)
+
+    assert any(not entry.content_inspected for entry in entries)
+    with pytest.raises(RepositoryError, match="before inspecting every tracked file"):
+        workspace.search_text(["parse_document"], max_total_bytes=1)
+
+
+def test_context_index_fails_instead_of_omitting_files_at_file_limit(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+
+    with pytest.raises(RepositoryError, match="file limit"):
+        workspace.context_index(max_files=1)

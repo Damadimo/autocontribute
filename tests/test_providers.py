@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -21,11 +22,18 @@ class Verdict(BaseModel):
     summary: str
 
 
-def _profile(monkeypatch: pytest.MonkeyPatch, *, compatible: bool = False) -> ModelProfile:
-    monkeypatch.setenv(_API_KEY_ENV, _API_KEY)
+def _profile(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    compatible: bool = False,
+    api_key: str = _API_KEY,
+) -> ModelProfile:
+    monkeypatch.setenv(_API_KEY_ENV, api_key)
     return ModelProfile(
         provider="openai_compatible" if compatible else "openai",
         model="test-model",
+        expected_response_model=("compatible-model-v1" if compatible else "test-model-2026-07-21"),
+        immutable_response_model_attested=True,
         api_key_env=_API_KEY_ENV,
         base_url="https://models.example.test/v1" if compatible else None,
         reasoning_effort="high",
@@ -66,13 +74,16 @@ def _responses_response(
 
 
 def _responses_provider(
-    monkeypatch: pytest.MonkeyPatch, response: object
+    monkeypatch: pytest.MonkeyPatch,
+    response: object,
+    *,
+    api_key: str = _API_KEY,
 ) -> tuple[OpenAIResponsesProvider, Mock, Mock]:
     client = Mock()
     client.responses.parse.return_value = response
     constructor = Mock(return_value=client)
     monkeypatch.setattr(providers, "OpenAI", constructor)
-    return OpenAIResponsesProvider(_profile(monkeypatch)), client, constructor
+    return OpenAIResponsesProvider(_profile(monkeypatch, api_key=api_key)), client, constructor
 
 
 def _chat_usage() -> SimpleNamespace:
@@ -105,13 +116,20 @@ def _chat_response(
 
 
 def _compatible_provider(
-    monkeypatch: pytest.MonkeyPatch, response: object
+    monkeypatch: pytest.MonkeyPatch,
+    response: object,
+    *,
+    api_key: str = _API_KEY,
 ) -> tuple[OpenAICompatibleProvider, Mock, Mock]:
     client = Mock()
     client.chat.completions.create.return_value = response
     constructor = Mock(return_value=client)
     monkeypatch.setattr(providers, "OpenAI", constructor)
-    return OpenAICompatibleProvider(_profile(monkeypatch, compatible=True)), client, constructor
+    return (
+        OpenAICompatibleProvider(_profile(monkeypatch, compatible=True, api_key=api_key)),
+        client,
+        constructor,
+    )
 
 
 def test_responses_provider_parses_one_output_and_maps_detailed_usage(
@@ -142,7 +160,7 @@ def test_responses_provider_parses_one_output_and_maps_detailed_usage(
         api_key=_API_KEY,
         base_url=None,
         timeout=900.0,
-        max_retries=2,
+        max_retries=0,
     )
     client.responses.parse.assert_called_once_with(
         model="test-model",
@@ -152,7 +170,100 @@ def test_responses_provider_parses_one_output_and_maps_detailed_usage(
         text_format=Verdict,
         max_output_tokens=40_000,
         store=False,
+        timeout=900.0,
     )
+
+
+def test_provider_rejects_model_snapshot_outside_calibrated_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = Verdict(accepted=True, summary="well scoped")
+    response = _responses_response(SimpleNamespace(type="output_text", parsed=expected))
+    response.model = "test-model-2026-08-01"
+    provider, _, _ = _responses_provider(monkeypatch, response)
+
+    with pytest.raises(ModelError, match="different model ID"):
+        provider.generate(
+            instructions="Return a strict verdict.",
+            prompt="Review the patch.",
+            output_type=Verdict,
+        )
+
+
+def test_compatible_provider_rejects_model_outside_calibrated_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = _chat_response()
+    response.model = "compatible-model-v2"
+    provider, _, _ = _compatible_provider(monkeypatch, response)
+
+    with pytest.raises(ModelError, match="different model ID"):
+        provider.generate(
+            instructions="Return a strict verdict.",
+            prompt="Review the patch.",
+            output_type=Verdict,
+        )
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+def test_provider_rejects_unbounded_resolved_model_identifier(
+    monkeypatch: pytest.MonkeyPatch,
+    compatible: bool,
+) -> None:
+    if compatible:
+        response = _chat_response()
+        response.model = "m" * 201
+        provider, _, _ = _compatible_provider(monkeypatch, response)
+    else:
+        output = Verdict(accepted=True, summary="well scoped")
+        response = _responses_response(SimpleNamespace(type="output_text", parsed=output))
+        response.model = "m" * 201
+        provider, _, _ = _responses_provider(monkeypatch, response)
+
+    with pytest.raises(ModelError, match="invalid model identifier"):
+        provider.generate(
+            instructions="Return a strict verdict.",
+            prompt="Review the patch.",
+            output_type=Verdict,
+        )
+
+
+def test_review_only_profile_records_unpinned_provider_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = Verdict(accepted=True, summary="shadow evidence")
+    response = _responses_response(SimpleNamespace(type="output_text", parsed=expected))
+    provider, _, _ = _responses_provider(monkeypatch, response)
+    provider.profile.immutable_response_model_attested = False
+    provider.profile.expected_response_model = None
+
+    result = provider.generate(
+        instructions="Return a strict verdict.",
+        prompt="Review the patch.",
+        output_type=Verdict,
+    )
+
+    assert result.model == "test-model-2026-07-21"
+
+
+def test_provider_forwards_tighter_per_request_output_and_timeout_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = Verdict(accepted=True, summary="bounded")
+    response = _responses_response(SimpleNamespace(type="output_text", parsed=expected))
+    provider, client, _ = _responses_provider(monkeypatch, response)
+
+    provider.generate(
+        instructions="Return a strict verdict.",
+        prompt="Review the patch.",
+        output_type=Verdict,
+        max_output_tokens=1_234,
+        timeout_seconds=12.5,
+    )
+
+    request = client.responses.parse.call_args.kwargs
+    assert request["max_output_tokens"] == 1_234
+    assert request["timeout"] == 12.5
 
 
 def test_responses_provider_rejects_refusal_even_after_parsed_content(
@@ -250,6 +361,211 @@ def test_provider_request_error_does_not_echo_sensitive_provider_body(
     assert str(raised.value) == "OpenAI Responses request failed (request ID: req_safe_to_log)"
     assert _API_KEY not in str(raised.value)
     assert "private prompt" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        "endpointCredentialWithoutRecognizablePrefix729384",
+        "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ",
+        "req_safe\ncredential-like-diagnostic",
+        "r" * 129,
+    ],
+    ids=["exact-api-key", "recognizable-credential", "control-character", "unbounded"],
+)
+def test_provider_omits_unsafe_request_id_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    compatible: bool,
+    request_id: str,
+) -> None:
+    api_key = (
+        request_id
+        if request_id == "endpointCredentialWithoutRecognizablePrefix729384"
+        else _API_KEY
+    )
+    failure = RuntimeError("provider request failed")
+    failure.request_id = request_id  # type: ignore[attr-defined]
+    if compatible:
+        provider, client, _ = _compatible_provider(
+            monkeypatch,
+            _chat_response(),
+            api_key=api_key,
+        )
+        client.chat.completions.create.side_effect = failure
+        expected = "OpenAI-compatible request failed"
+    else:
+        response = _responses_response(
+            SimpleNamespace(
+                type="output_text",
+                parsed=Verdict(accepted=True, summary="not reached"),
+            )
+        )
+        provider, client, _ = _responses_provider(monkeypatch, response, api_key=api_key)
+        client.responses.parse.side_effect = failure
+        expected = "OpenAI Responses request failed"
+
+    with pytest.raises(ModelError) as raised:
+        provider.generate(instructions="Private.", prompt="Secret.", output_type=Verdict)
+
+    assert str(raised.value) == expected
+    assert request_id not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+@pytest.mark.parametrize("channel", ["schema", "refusal"])
+def test_provider_rejects_opaque_configured_key_in_schema_fields_and_refusals(
+    monkeypatch: pytest.MonkeyPatch,
+    compatible: bool,
+    channel: str,
+) -> None:
+    opaque_key = "endpointCredentialWithoutRecognizablePrefix729384"
+    if compatible:
+        response = (
+            _chat_response(content=json.dumps({"accepted": True, "summary": opaque_key}))
+            if channel == "schema"
+            else _chat_response(content=None, refusal=f"cannot comply: {opaque_key}")
+        )
+        provider, _, _ = _compatible_provider(monkeypatch, response, api_key=opaque_key)
+    else:
+        item = (
+            SimpleNamespace(
+                type="output_text",
+                parsed=Verdict(accepted=True, summary=opaque_key),
+            )
+            if channel == "schema"
+            else SimpleNamespace(type="refusal", refusal=f"cannot comply: {opaque_key}")
+        )
+        provider, _, _ = _responses_provider(
+            monkeypatch,
+            _responses_response(item),
+            api_key=opaque_key,
+        )
+
+    with pytest.raises(ModelError) as raised:
+        provider.generate(instructions="Review.", prompt="Patch.", output_type=Verdict)
+
+    assert str(raised.value) == "Model provider response contained credential material"
+    assert opaque_key not in str(raised.value)
+    assert raised.value.__cause__ is None
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+def test_provider_rejects_recognizable_credential_in_structured_output(
+    monkeypatch: pytest.MonkeyPatch,
+    compatible: bool,
+) -> None:
+    reflected_credential = "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ"
+    if compatible:
+        response = _chat_response(
+            content=json.dumps({"accepted": True, "summary": reflected_credential})
+        )
+        provider, _, _ = _compatible_provider(monkeypatch, response)
+    else:
+        response = _responses_response(
+            SimpleNamespace(
+                type="output_text",
+                parsed=Verdict(accepted=True, summary=reflected_credential),
+            )
+        )
+        provider, _, _ = _responses_provider(monkeypatch, response)
+
+    with pytest.raises(ModelError, match="contained credential material") as raised:
+        provider.generate(instructions="Review.", prompt="Patch.", output_type=Verdict)
+
+    assert reflected_credential not in str(raised.value)
+
+
+def test_responses_provider_scans_raw_output_text_before_returning_parsed_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opaque_key = "endpointCredentialWithoutRecognizablePrefix729384"
+    response = _responses_response(
+        SimpleNamespace(
+            type="output_text",
+            text=json.dumps({"accepted": True, "summary": opaque_key}),
+            parsed=Verdict(accepted=True, summary="apparently safe parsed value"),
+        )
+    )
+    provider, _, _ = _responses_provider(monkeypatch, response, api_key=opaque_key)
+
+    with pytest.raises(ModelError, match="contained credential material"):
+        provider.generate(instructions="Review.", prompt="Patch.", output_type=Verdict)
+
+
+@pytest.mark.parametrize(
+    "channel",
+    [
+        "responses_id",
+        "responses_model",
+        "responses_incomplete_reason",
+        "compatible_id",
+        "compatible_model",
+        "compatible_finish_reason",
+    ],
+)
+def test_provider_rejects_configured_key_in_metadata_reflection_channels(
+    monkeypatch: pytest.MonkeyPatch,
+    channel: str,
+) -> None:
+    opaque_key = "endpointCredentialWithoutRecognizablePrefix729384"
+    if channel.startswith("responses_"):
+        response = _responses_response(
+            SimpleNamespace(
+                type="output_text",
+                parsed=Verdict(accepted=True, summary="safe"),
+            ),
+            status="incomplete" if channel == "responses_incomplete_reason" else "completed",
+            incomplete_reason=(opaque_key if channel == "responses_incomplete_reason" else None),
+        )
+        if channel == "responses_id":
+            response.id = opaque_key
+        elif channel == "responses_model":
+            response.model = opaque_key
+        provider, _, _ = _responses_provider(monkeypatch, response, api_key=opaque_key)
+    else:
+        response = _chat_response(
+            finish_reason=opaque_key if channel == "compatible_finish_reason" else "stop"
+        )
+        if channel == "compatible_id":
+            response.id = opaque_key
+        elif channel == "compatible_model":
+            response.model = opaque_key
+        provider, _, _ = _compatible_provider(monkeypatch, response, api_key=opaque_key)
+
+    with pytest.raises(ModelError) as raised:
+        provider.generate(instructions="Review.", prompt="Patch.", output_type=Verdict)
+
+    assert str(raised.value) == "Model provider response contained credential material"
+    assert opaque_key not in str(raised.value)
+
+
+def test_unallowlisted_provider_reasons_are_not_reflected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    diagnostic = "upstream private diagnostic"
+    responses, _, _ = _responses_provider(
+        monkeypatch,
+        _responses_response(status="incomplete", incomplete_reason=diagnostic),
+    )
+    compatible, _, _ = _compatible_provider(
+        monkeypatch,
+        _chat_response(finish_reason=diagnostic),
+    )
+
+    with pytest.raises(ModelError) as responses_error:
+        responses.generate(instructions="Review.", prompt="Patch.", output_type=Verdict)
+    with pytest.raises(ModelError) as compatible_error:
+        compatible.generate(instructions="Review.", prompt="Patch.", output_type=Verdict)
+
+    assert str(responses_error.value) == "Model response did not complete"
+    assert str(compatible_error.value) == "Compatible provider response did not complete"
+    assert diagnostic not in str(responses_error.value)
+    assert diagnostic not in str(compatible_error.value)
 
 
 @pytest.mark.parametrize("compatible", [False, True])
@@ -319,7 +635,7 @@ def test_compatible_provider_validates_json_and_maps_usage(
         api_key=_API_KEY,
         base_url="https://models.example.test/v1",
         timeout=900.0,
-        max_retries=2,
+        max_retries=0,
     )
     request = client.chat.completions.create.call_args.kwargs
     assert request["messages"] == [
@@ -386,4 +702,26 @@ def test_invalid_usage_is_not_silently_underreported(monkeypatch: pytest.MonkeyP
     provider, _, _ = _responses_provider(monkeypatch, response)
 
     with pytest.raises(ModelError, match="invalid usage field: output_tokens"):
+        provider.generate(instructions="Review.", prompt="Patch.", output_type=Verdict)
+
+
+def test_missing_usage_is_not_silently_treated_as_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = _responses_response(
+        SimpleNamespace(type="output_text", parsed=Verdict(accepted=True, summary="valid output"))
+    )
+    response.usage = None
+    provider, _, _ = _responses_provider(monkeypatch, response)
+
+    with pytest.raises(ModelError, match="omitted required usage field: input_tokens"):
+        provider.generate(instructions="Review.", prompt="Patch.", output_type=Verdict)
+
+
+def test_inconsistent_usage_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    response = _responses_response(
+        SimpleNamespace(type="output_text", parsed=Verdict(accepted=True, summary="valid output"))
+    )
+    response.usage.total_tokens = 999
+    provider, _, _ = _responses_provider(monkeypatch, response)
+
+    with pytest.raises(ModelError, match="inconsistent total_tokens"):
         provider.generate(instructions="Review.", prompt="Patch.", output_type=Verdict)

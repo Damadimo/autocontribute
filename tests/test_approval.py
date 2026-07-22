@@ -32,7 +32,13 @@ def _manifest() -> ApprovalManifest:
         repository="owner/project",
         issue_number=42,
         base_sha="a" * 40,
+        preparation_fingerprint="e" * 64,
         publishing_login="octocat",
+        publishing_api_origin="https://api.github.com",
+        commit_author_name="Octocat",
+        commit_author_email="octocat@users.noreply.github.com",
+        commit_committer_name="Octocat",
+        commit_committer_email="octocat@users.noreply.github.com",
         base_branch="main",
         draft=False,
         diff_sha256=hash_diff("diff --git a/a b/a\n+fixed\n"),
@@ -68,7 +74,13 @@ def test_approval_is_valid_only_during_configured_window() -> None:
         ("repository", "different/project"),
         ("issue_number", 43),
         ("base_sha", "b" * 40),
+        ("preparation_fingerprint", "e" * 63 + "f"),
         ("publishing_login", "different-user"),
+        ("publishing_api_origin", "https://github.example.com"),
+        ("commit_author_name", "Different Author"),
+        ("commit_author_email", "different@example.com"),
+        ("commit_committer_name", "Different Committer"),
+        ("commit_committer_email", "committer@example.com"),
         ("base_branch", "next"),
         ("draft", True),
         ("diff_sha256", "c" * 64),
@@ -165,6 +177,13 @@ def test_build_manifest_extracts_current_run_publication_fields() -> None:
             license_spdx="MIT",
         ),
         base_sha="a" * 40,
+        preparation_fingerprint="e" * 64,
+        publishing_login="octocat",
+        publishing_api_origin="https://api.github.com",
+        commit_author_name="Octocat",
+        commit_author_email="octocat@users.noreply.github.com",
+        commit_committer_name="Octocat",
+        commit_committer_email="octocat@users.noreply.github.com",
         proposal=proposal,
     )
 
@@ -172,14 +191,19 @@ def test_build_manifest_extracts_current_run_publication_fields() -> None:
         run,
         diff="diff bytes",
         disclosure="Reviewed AI-assisted contribution.",
-        publishing_login="OctoCat",
         draft=True,
     )
 
     assert manifest.repository == issue.repository
     assert manifest.issue_number == issue.number
     assert manifest.base_sha == run.base_sha
+    assert manifest.preparation_fingerprint == run.preparation_fingerprint
     assert manifest.publishing_login == "octocat"
+    assert manifest.publishing_api_origin == "https://api.github.com"
+    assert manifest.commit_author_name == "Octocat"
+    assert manifest.commit_author_email == "octocat@users.noreply.github.com"
+    assert manifest.commit_committer_name == "Octocat"
+    assert manifest.commit_committer_email == "octocat@users.noreply.github.com"
     assert manifest.base_branch == "main"
     assert manifest.draft is True
     assert manifest.diff_sha256 == hash_diff("diff bytes")
@@ -201,7 +225,6 @@ def test_build_manifest_fails_closed_when_run_is_incomplete() -> None:
             run,
             diff="diff",
             disclosure="Reviewed.",
-            publishing_login="octocat",
             draft=False,
         )
 
