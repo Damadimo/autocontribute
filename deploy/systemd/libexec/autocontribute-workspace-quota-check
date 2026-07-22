@@ -70,7 +70,9 @@ mount_device="$(
 readonly mount_target filesystem_type filesystem_root mount_options mount_device
 
 if [[ "$mount_target" != "$workspace_root" ]]; then
-  fail 'Autocontribute workspaces are not an exact dedicated mount'
+  printf 'Autocontribute workspaces are not an exact dedicated mount; findmnt reported %q\n' \
+    "$mount_target" >&2
+  exit 1
 fi
 if [[ "$filesystem_type" != ext4 ]]; then
   fail 'Autocontribute workspace quota mount must use ext4 with a fixed inode table'
