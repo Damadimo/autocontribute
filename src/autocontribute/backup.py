@@ -16,9 +16,13 @@ from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from autocontribute.domain import RunManifest
+from autocontribute.domain import RunManifest, RunStatus
 from autocontribute.evaluation import EvaluationStore
-from autocontribute.exceptions import StateError
+from autocontribute.exceptions import PolicyError, StateError
+from autocontribute.preparation import (
+    validate_preparation_fingerprint,
+    validate_validation_artifact,
+)
 from autocontribute.store import RunStore
 
 _BUNDLE_SCHEMA_VERSION: Final = 1
@@ -26,6 +30,14 @@ _MAX_BUNDLE_FILES: Final = 100_000
 _MAX_BUNDLE_FILE_BYTES: Final = 250_000_000
 _MAX_BUNDLE_BYTES: Final = 5_000_000_000
 _COPY_CHUNK_BYTES: Final = 1024 * 1024
+_PREPARED_RUN_STATUSES: Final = frozenset(
+    {
+        RunStatus.READY_FOR_APPROVAL,
+        RunStatus.APPROVED,
+        RunStatus.SUBMITTING,
+        RunStatus.PR_OPEN,
+    }
+)
 
 
 class _StrictModel(BaseModel):
@@ -89,6 +101,7 @@ def create_state_bundle(
         staged_store.verify_event_chains()
         _validate_run_manifests(staged_store)
         _validate_workspace_independent_recovery(staged_store)
+        _validate_prepared_run_artifacts(staged_store)
         EvaluationStore(staged_store).list()
 
         files = _inventory(staging)
@@ -179,6 +192,8 @@ def restore_state_bundle(root: Path, source: Path) -> Path:
         restored_store = RunStore(staging)
         restored_store.verify_event_chains()
         _validate_run_manifests(restored_store)
+        _validate_workspace_independent_recovery(restored_store)
+        _validate_prepared_run_artifacts(restored_store)
         EvaluationStore(restored_store).list()
         os.rename(staging, target)
         _fsync_directory(target.parent)
@@ -357,6 +372,44 @@ def _validate_run_manifests(store: RunStore) -> None:
             raise StateError(f"Run {manifest.run_id} has an invalid manifest artifact") from exc
         if artifact != manifest:
             raise StateError(f"Run {manifest.run_id} manifest artifact is stale")
+
+
+def _validate_prepared_run_artifacts(store: RunStore) -> None:
+    """Require every prepared outcome to remain independently reviewable after restore."""
+
+    for manifest in store.oldest_runs(limit=10_000):
+        if (
+            manifest.status not in _PREPARED_RUN_STATUSES
+            and manifest.preparation_fingerprint is None
+        ):
+            continue
+        patch = _read_required_run_artifact(store, manifest, "contribution.patch")
+        validation = _read_required_run_artifact(store, manifest, "validation.json")
+        try:
+            validate_preparation_fingerprint(manifest, diff=patch)
+            validate_validation_artifact(manifest, artifact=validation)
+        except PolicyError as exc:
+            raise StateError(
+                f"Run {manifest.run_id} has invalid prepared-run recovery artifacts: {exc}"
+            ) from exc
+
+
+def _read_required_run_artifact(
+    store: RunStore,
+    manifest: RunManifest,
+    filename: str,
+) -> bytes:
+    path = store.runs_dir / manifest.run_id / filename
+    if path.is_symlink() or not path.is_file():
+        raise StateError(
+            f"Run {manifest.run_id} is missing required prepared-run artifact {filename}"
+        )
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        raise StateError(
+            f"Run {manifest.run_id} prepared-run artifact {filename} could not be read"
+        ) from exc
 
 
 def _validate_workspace_independent_recovery(store: RunStore) -> None:

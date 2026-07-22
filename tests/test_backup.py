@@ -7,9 +7,123 @@ from pathlib import Path
 import pytest
 
 from autocontribute.backup import create_state_bundle, restore_state_bundle
-from autocontribute.domain import RunManifest, RunStatus
+from autocontribute.domain import (
+    CommandResult,
+    CriticReview,
+    FileEdit,
+    GateResult,
+    IssueCandidate,
+    PatchProposal,
+    QualityReport,
+    RepositoryInfo,
+    ReviewScores,
+    RunManifest,
+    RunStatus,
+)
 from autocontribute.exceptions import StateError
+from autocontribute.preparation import (
+    compute_preparation_fingerprint,
+    render_validation_artifact,
+)
 from autocontribute.store import RunStore
+
+_PATCH = b"diff --git a/app.py b/app.py\n-old\n+new\n"
+
+
+def _prepared_run(
+    store: RunStore,
+    *,
+    status: RunStatus = RunStatus.READY_FOR_APPROVAL,
+) -> RunManifest:
+    run = store.create_run()
+    now = run.created_at
+    run.candidate = IssueCandidate(
+        repository="example/project",
+        number=42,
+        title="Correct the boundary",
+        body="The current boundary result is incorrect.",
+        html_url="https://github.com/example/project/issues/42",
+        state="open",
+        author="maintainer",
+        labels=["bug"],
+        assignees=[],
+        comments=1,
+        created_at=now,
+        updated_at=now,
+    )
+    run.repository = RepositoryInfo(
+        full_name="example/project",
+        html_url="https://github.com/example/project",
+        clone_url="https://github.com/example/project.git",
+        default_branch="main",
+        stars=10_000,
+        archived=False,
+        disabled=False,
+        private=False,
+        pushed_at=now,
+        license_spdx="MIT",
+    )
+    run.base_sha = "b" * 40
+    run.proposal = PatchProposal(
+        summary="Correct the boundary result.",
+        edits=[
+            FileEdit(
+                operation="replace",
+                path="app.py",
+                find="old",
+                replace="new",
+                content=None,
+                rationale="Match the documented behavior.",
+            )
+        ],
+        validation_commands=["python -m pytest"],
+        commit_message="Correct the boundary result",
+        pull_request_title="Correct the boundary result",
+        pull_request_body="Fixes #42.",
+        limitations=[],
+    )
+    review = CriticReview(
+        verdict="approve",
+        summary="The focused change is ready.",
+        scores=ReviewScores(
+            correctness=96,
+            issue_alignment=97,
+            tests=95,
+            repository_conventions=95,
+            diff_hygiene=98,
+            maintainer_clarity=96,
+        ),
+        blocking_findings=[],
+        non_blocking_findings=[],
+        issue_requirements_met=["The boundary is corrected"],
+        issue_requirements_missing=[],
+        test_evidence_assessment="The regression command passed.",
+        maintainer_perspective="Small and reviewable.",
+    )
+    run.patched_validation = [
+        CommandResult(
+            command="python -m pytest",
+            exit_code=0,
+            duration_seconds=1.0,
+            stdout="1 passed",
+            stderr="",
+        )
+    ]
+    run.quality = QualityReport(
+        ready=True,
+        readiness_score=96,
+        gates=[GateResult(gate="validation", passed=True, evidence="1/1 passed")],
+        review=review,
+        changed_files=1,
+        changed_lines=2,
+    )
+    run.preparation_config_fingerprint = "f" * 64
+    store.write_artifact(run.run_id, "contribution.patch", _PATCH.decode())
+    store.write_artifact(run.run_id, "validation.json", render_validation_artifact(run))
+    run.preparation_fingerprint = compute_preparation_fingerprint(run, diff=_PATCH)
+    run.status = status
+    store.save(run, event="fixture.prepared", details={"status": status.value})
+    return run
 
 
 def test_complete_state_bundle_round_trip_is_checksummed_and_atomic(tmp_path: Path) -> None:
@@ -64,21 +178,47 @@ def test_complete_bundle_rejects_submitting_run_with_stored_commit(tmp_path: Pat
 
 def test_complete_bundle_preserves_precommit_submitting_evidence(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    run.status = RunStatus.SUBMITTING
-    run.base_sha = "b" * 40
-    store.write_artifact(run.run_id, "contribution.patch", "durable patch\n")
-    store.save(run, event="fixture.submitting", details={})
+    run = _prepared_run(store, status=RunStatus.SUBMITTING)
 
     bundle = create_state_bundle(store, tmp_path / "state.zip")
     restored_database = restore_state_bundle(tmp_path / "restored", bundle)
     restored = RunStore(restored_database.parent)
 
     assert restored.get(run.run_id).commit_sha is None
-    assert (
-        restored.artifact_dir(run.run_id).joinpath("contribution.patch").read_text()
-        == "durable patch\n"
-    )
+    assert restored.artifact_dir(run.run_id).joinpath("contribution.patch").read_bytes() == _PATCH
+
+
+@pytest.mark.parametrize("filename", ["contribution.patch", "validation.json"])
+def test_complete_bundle_rejects_missing_prepared_run_artifact(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    run = _prepared_run(store)
+    store.artifact_dir(run.run_id).joinpath(filename).unlink()
+
+    with pytest.raises(StateError, match=f"missing required prepared-run artifact {filename}"):
+        create_state_bundle(store, tmp_path / "state.zip")
+
+
+@pytest.mark.parametrize(
+    ("filename", "tampered"),
+    [
+        ("contribution.patch", b"diff --git a/app.py b/app.py\n-old\n+tampered\n"),
+        ("validation.json", b'{"baseline":null,"patched":[]}\n'),
+    ],
+)
+def test_complete_bundle_rejects_tampered_prepared_run_artifact(
+    tmp_path: Path,
+    filename: str,
+    tampered: bytes,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    run = _prepared_run(store)
+    store.artifact_dir(run.run_id).joinpath(filename).write_bytes(tampered)
+
+    with pytest.raises(StateError, match="invalid prepared-run recovery artifacts"):
+        create_state_bundle(store, tmp_path / "state.zip")
 
 
 def test_complete_bundle_keeps_existing_generation_when_stored_commit_is_in_flight(
@@ -111,6 +251,42 @@ def test_complete_bundle_restore_rejects_checksum_tampering(tmp_path: Path) -> N
             target.writestr(info.filename, data)
 
     with pytest.raises(StateError, match="checksum mismatch"):
+        restore_state_bundle(tmp_path / "restored", tampered)
+    assert not (tmp_path / "restored").exists()
+
+
+@pytest.mark.parametrize(
+    ("filename", "tampered_content"),
+    [
+        ("contribution.patch", b"diff --git a/app.py b/app.py\n-old\n+tampered\n"),
+        ("validation.json", b'{"baseline":null,"patched":[]}\n'),
+    ],
+)
+def test_complete_bundle_restore_rejects_checksummed_prepared_artifact_tampering(
+    tmp_path: Path,
+    filename: str,
+    tampered_content: bytes,
+) -> None:
+    store = RunStore(tmp_path / "source")
+    run = _prepared_run(store)
+    original = create_state_bundle(store, tmp_path / "original.zip")
+    tampered = tmp_path / "tampered.zip"
+    member_name = f"runs/{run.run_id}/{filename}"
+    with zipfile.ZipFile(original) as source:
+        infos = source.infolist()
+        contents = {info.filename: source.read(info) for info in infos}
+    manifest = json.loads(contents["bundle-manifest.json"])
+    contents[member_name] = tampered_content
+    manifest["files"][member_name] = {
+        "sha256": hashlib.sha256(tampered_content).hexdigest(),
+        "size": len(tampered_content),
+    }
+    contents["bundle-manifest.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
+    with zipfile.ZipFile(tampered, "w") as target:
+        for info in infos:
+            target.writestr(info, contents[info.filename])
+
+    with pytest.raises(StateError, match="invalid prepared-run recovery artifacts"):
         restore_state_bundle(tmp_path / "restored", tampered)
     assert not (tmp_path / "restored").exists()
 
