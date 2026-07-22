@@ -24,6 +24,36 @@ _GIT_TIMEOUT_SECONDS: Final = 120
 _MAX_ERROR_CHARACTERS: Final = 4_000
 _DEFAULT_MAX_FILE_BYTES: Final = 1_000_000
 
+# Git runs with no repository credentials and executes no repository hooks or
+# filters. Inherit only the operator-controlled process settings needed to find
+# Git, reach a public HTTPS remote through a proxy/custom CA, and create
+# temporary files. In particular, do not copy the model, GitHub, cloud, Python,
+# or dynamic-loader variables that commonly coexist in the worker process.
+_GIT_HOST_ENVIRONMENT_ALLOWLIST: Final[frozenset[str]] = frozenset(
+    {
+        "ALL_PROXY",
+        "COMSPEC",
+        "GIT_SSL_CAINFO",
+        "GIT_SSL_CAPATH",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+        "PATH",
+        "PATHEXT",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "WINDIR",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+)
+
 _GIT_SAFETY_OPTIONS: Final[tuple[str, ...]] = (
     "-c",
     "core.hooksPath=/dev/null",
@@ -850,14 +880,12 @@ def _new_destination(destination: Path) -> Path:
 
 
 def _git_environment() -> dict[str, str]:
-    # Git has many environment variables capable of redirecting its config,
-    # object database, work tree, executable paths, or network helpers. None
-    # are needed here, so retain ordinary process settings while rebuilding a
-    # small explicit Git environment.
+    """Build a credential-free environment for public HTTPS and local Git operations."""
+
     environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("GIT_") and key not in {"SSH_ASKPASS", "SSH_AUTH_SOCK"}
+        name: value
+        for name in _GIT_HOST_ENVIRONMENT_ALLOWLIST
+        if (value := os.environ.get(name)) is not None
     }
     environment.update(
         {

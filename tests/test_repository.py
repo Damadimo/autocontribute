@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import autocontribute.repository as repository_module
 from autocontribute.domain import FileEdit
 from autocontribute.exceptions import RepositoryError
 from autocontribute.repository import RepositoryWorkspace
@@ -126,6 +127,150 @@ def test_clone_fetch_disables_http_redirects_before_contacting_remote(
     redirect_option = fetch.index("http.followRedirects=false")
     assert fetch[redirect_option - 1] == "-c"
     assert redirect_option < fetch.index("fetch")
+
+
+def test_git_environment_inherits_only_transport_and_runtime_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inherited = {
+        "ALL_PROXY": "socks5://proxy.example.test:1080",
+        "COMSPEC": "C:/Windows/System32/cmd.exe",
+        "GIT_SSL_CAINFO": "/operator/ca.pem",
+        "GIT_SSL_CAPATH": "/operator/certs",
+        "HTTPS_PROXY": "https://proxy.example.test:8443",
+        "HTTP_PROXY": "http://proxy.example.test:8080",
+        "NO_PROXY": "localhost,127.0.0.1",
+        "PATH": "/operator/bin:/usr/bin:/bin",
+        "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+        "SSL_CERT_DIR": "/system/certs",
+        "SSL_CERT_FILE": "/system/ca.pem",
+        "SYSTEMROOT": "C:/Windows",
+        "TEMP": "C:/Temp",
+        "TMP": "/operator/tmp-fallback",
+        "TMPDIR": "/operator/tmp",
+        "WINDIR": "C:/Windows",
+        "all_proxy": "socks5://lower-proxy.example.test:1080",
+        "http_proxy": "http://lower-proxy.example.test:8080",
+        "https_proxy": "https://lower-proxy.example.test:8443",
+        "no_proxy": "metadata.example.test",
+    }
+    denied = {
+        # Provider, GitHub, cloud, and application credentials.
+        "ANTHROPIC_API_KEY": "provider-secret",
+        "AUTOCONTRIBUTE_GITHUB_TOKEN": "github-secret",
+        "AWS_SECRET_ACCESS_KEY": "cloud-secret",
+        "DATABASE_URL": "postgres://credential@example.test/database",
+        "GH_TOKEN": "gh-secret",
+        "GITHUB_TOKEN": "actions-secret",
+        "OPENAI_API_KEY": "model-secret",
+        # Git execution and repository redirection controls.
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/attacker/objects",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.hooksPath",
+        "GIT_CONFIG_VALUE_0": "/attacker/hooks",
+        "GIT_DIR": "/attacker/git-dir",
+        "GIT_EXEC_PATH": "/attacker/git-exec",
+        "GIT_PROXY_COMMAND": "/attacker/proxy",
+        "GIT_SSH_COMMAND": "/attacker/ssh",
+        "GIT_WORK_TREE": "/attacker/work-tree",
+        "SSH_ASKPASS": "/attacker/askpass",
+        "SSH_AUTH_SOCK": "/attacker/agent.sock",
+        # Native dynamic-loader injection.
+        "DYLD_FRAMEWORK_PATH": "/attacker/frameworks",
+        "DYLD_INSERT_LIBRARIES": "/attacker/inject.dylib",
+        "DYLD_LIBRARY_PATH": "/attacker/libraries",
+        "LD_LIBRARY_PATH": "/attacker/libraries",
+        "LD_PRELOAD": "/attacker/inject.so",
+        "LIBPATH": "/attacker/libraries",
+        "SHLIB_PATH": "/attacker/libraries",
+        # Python process and import injection.
+        "PYTHONHOME": "/attacker/python",
+        "PYTHONINSPECT": "1",
+        "PYTHONPATH": "/attacker/modules",
+        "PYTHONSTARTUP": "/attacker/startup.py",
+        "PYTHONWARNINGS": "error",
+        "REQUESTS_CA_BUNDLE": "/attacker/requests-ca.pem",
+        "VIRTUAL_ENV": "/attacker/venv",
+    }
+    monkeypatch.setattr(repository_module.os, "environ", {**inherited, **denied})
+
+    environment = repository_module._git_environment()
+
+    fixed = {
+        "GIT_ASKPASS": "",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_EXTERNAL_DIFF": "",
+        "GIT_LFS_SKIP_SMUDGE": "1",
+        "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    assert environment == {**inherited, **fixed}
+    assert set(environment).isdisjoint(denied)
+
+
+def test_local_clone_and_temporary_index_scrub_parent_process_environment(
+    tmp_path: Path,
+    source_repository: tuple[Path, str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, first_sha, _ = source_repository
+    temporary_root = tmp_path / "git-temporary"
+    temporary_root.mkdir()
+    denied_names = (
+        "AUTOCONTRIBUTE_GITHUB_TOKEN",
+        "OPENAI_API_KEY",
+        "LD_PRELOAD",
+        "DYLD_INSERT_LIBRARIES",
+        "PYTHONHOME",
+        "PYTHONPATH",
+    )
+    for name in denied_names:
+        monkeypatch.setenv(name, f"sensitive-{name.casefold()}")
+    monkeypatch.setenv("TMPDIR", str(temporary_root))
+    monkeypatch.setattr(repository_module.tempfile, "tempdir", str(temporary_root))
+
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    real_run = subprocess.run
+
+    def recording_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        command = args[0] if args else kwargs["args"]
+        environment = kwargs.get("env")
+        if (
+            isinstance(command, list)
+            and command
+            and command[0] == "git"
+            and isinstance(environment, dict)
+            and all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in environment.items()
+            )
+        ):
+            calls.append((command, environment.copy()))
+        return real_run(*args, **kwargs)  # type: ignore[call-overload,return-value]
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+    (workspace.path / "README.md").write_text("changed\n", encoding="utf-8")
+    workspace.diff_bytes()
+
+    assert any("fetch" in command for command, _environment in calls)
+    temporary_index_environments = [
+        environment for _command, environment in calls if "GIT_INDEX_FILE" in environment
+    ]
+    assert temporary_index_environments
+    assert all(
+        Path(environment["GIT_INDEX_FILE"]).is_relative_to(temporary_root)
+        for environment in temporary_index_environments
+    )
+    for _command, environment in calls:
+        assert environment["TMPDIR"] == str(temporary_root)
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+        assert environment["GIT_ASKPASS"] == ""
+        assert set(environment).isdisjoint(denied_names)
 
 
 def test_clone_rejects_untrusted_sources_and_existing_destination(tmp_path: Path) -> None:
