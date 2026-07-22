@@ -38,12 +38,23 @@ and that the account cannot use the host socket. It then makes a 30-second bound
 requires one exact `name=rootless` element in Docker's reported `SecurityOptions`. A failed or
 ambiguous check stops the service before the wrapper reads or exports any credential.
 
+The Python sandbox repeats a structured daemon check immediately before every container launch and
+also requires cgroup v2, a non-`none` driver, and Docker-reported memory, swap, CPU-quota, and PID
+control support. For this verified rootless daemon it selects container UID/GID `0:0`; rootless
+Docker maps that namespace identity back to the unprivileged `autocontribute` host account, allowing
+access to its private `0700` workspaces. The sandbox still drops all capabilities, sets
+no-new-privileges, disables networking, and keeps the container root filesystem read-only. On a
+rootful or desktop daemon it retains the caller's nonzero UID/GID. `doctor` additionally proves the
+exact cgroup limits from inside a real container, performs a read/write probe through a fresh
+service-owned `0700` bind, and verifies the resulting file's host ownership and content.
+
 ## Host prerequisites
 
 The reference units target systemd 252 or newer and a Linux distribution with:
 
 - Python 3.11 or 3.12, `uv`, Git, `flock`, and GNU coreutils;
-- rootless Docker, including `newuidmap`, `newgidmap`, and a unique subordinate UID/GID range;
+- rootless Docker on cgroup v2 with systemd resource-controller delegation, including `newuidmap`,
+  `newgidmap`, and a unique subordinate UID/GID range;
 - enough durable disk for the live workspaces and several backup generations; and
 - persistent time synchronization and outbound HTTPS for GitHub and the configured model API.
 
@@ -66,12 +77,36 @@ The explicit private user group is required by every supplied unit and tmpfiles 
 the account to `docker`; the runtime preflight rejects that exact group even if a separately started
 rootless daemon appears healthy.
 
-Install rootless Docker for that account using the distribution's supported procedure. Start its
-user manager and user service without changing the account's login shell:
+Install rootless Docker for that account using the distribution's supported procedure. Rootless
+Docker can enforce the configured CPU, memory, swap, and PID limits only when cgroup v2 controllers
+are delegated through systemd; a daemon reporting cgroup driver `none` ignores those limits. On the
+dedicated host, install Docker's required user-manager delegation and restart the manager so the
+setting is effective. This template drop-in applies to every systemd user manager on the host, so do
+not install it on a shared machine without reviewing that wider delegation boundary.
+
+```bash
+sudo install -d -m 0755 /etc/systemd/system/user@.service.d
+printf '%s\n' \
+  '[Service]' \
+  'Delegate=cpu cpuset io memory pids' \
+  | sudo tee /etc/systemd/system/user@.service.d/delegate.conf >/dev/null
+sudo chmod 0644 /etc/systemd/system/user@.service.d/delegate.conf
+sudo systemctl daemon-reload
+```
+
+Start the account's user manager explicitly and verify its private bus before enabling the Docker
+user service. This does not require changing the account's login shell:
 
 ```bash
 autocontribute_uid="$(id -u autocontribute)"
-sudo systemctl start "user@${autocontribute_uid}.service"
+sudo systemctl restart "user@${autocontribute_uid}.service"
+test -S "/run/user/${autocontribute_uid}/bus"
+test "$(stat -c %u "/run/user/${autocontribute_uid}/bus")" = "$autocontribute_uid"
+sudo -u autocontribute env \
+  HOME=/var/lib/autocontribute \
+  XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${autocontribute_uid}/bus" \
+  systemctl --user show-environment >/dev/null
 sudo -u autocontribute env \
   HOME=/var/lib/autocontribute \
   XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
@@ -80,12 +115,14 @@ sudo -u autocontribute env \
 sudo -u autocontribute env \
   HOME=/var/lib/autocontribute \
   XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${autocontribute_uid}/bus" \
   DOCKER_HOST="unix:///run/user/${autocontribute_uid}/docker.sock" \
   docker info
 unset autocontribute_uid
 ```
 
-The final `docker info` is only an installation smoke test. The packaged services repeat the
+Confirm that the smoke test reports cgroup v2 with a driver other than `none`; `doctor` later proves
+the configured limits inside a real container. The packaged services repeat the
 ownership, permission, group, host-socket, and exact rootless-security-option checks on every
 invocation before the wrapper reads any file in the encrypted credential directory. Rootless Docker
 commonly creates a `0660` socket; this remains private because its owning runtime directory must be

@@ -6,11 +6,13 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
+import tempfile
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 from urllib.parse import quote
 
@@ -24,15 +26,27 @@ from autocontribute.config import (
     auto_publish_opt_in_enabled,
     validate_model_identifier,
 )
+from autocontribute.exceptions import SandboxError
 from autocontribute.github import GitHubClient
 from autocontribute.providers import create_provider
 from autocontribute.redaction import redact_text
+from autocontribute.sandbox import (
+    DockerDaemonMode,
+    DockerSandbox,
+    detect_docker_daemon_mode,
+    docker_client_environment,
+    docker_container_identity,
+)
 from autocontribute.store import RunStore
 
 _DETAIL_LIMIT = 500
 _MODEL_PROBE_MAX_OUTPUT_TOKENS = 1_024
 _MODEL_PROBE_TIMEOUT_SECONDS = 60.0
 _SAFE_CONTAINER_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_BIND_PROBE_INPUT = ".autocontribute-bind-input"
+_BIND_PROBE_OUTPUT = ".autocontribute-bind-output"
+_BIND_PROBE_INPUT_CONTENT = "autocontribute-host-bind-probe\n"
+_BIND_PROBE_OUTPUT_CONTENT = "autocontribute-container-bind-probe\n"
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _SHELL_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _SHELL_SEPARATORS = frozenset({";", ";;", "&", "&&", "|", "||", "(", ")"})
@@ -205,6 +219,7 @@ def _run_doctor(
                 ],
             )
         )
+        checks.append(_docker_bind_mount_check(config))
     else:
         checks.append(
             DoctorCheck(
@@ -611,11 +626,20 @@ def _offline_toolchain_check(config: AutocontributeConfig) -> DoctorCheck:
             warning=True,
         )
 
-    command = _docker_toolchain_probe(config, requirements)
+    docker_environment = docker_client_environment()
+    try:
+        daemon_mode = detect_docker_daemon_mode(
+            "docker",
+            environment=docker_environment,
+        )
+        command = _docker_toolchain_probe(config, requirements, daemon_mode=daemon_mode)
+    except SandboxError as exc:
+        return DoctorCheck("offline validation toolchain", False, _safe_detail(str(exc)))
     result = _command_check(
         "offline validation toolchain",
         command,
         timeout_seconds=30,
+        environment=docker_environment,
     )
     if not result.passed:
         return result
@@ -732,6 +756,8 @@ def _segment_requirement(segment: list[str]) -> tuple[str, list[str]] | None:
 def _docker_toolchain_probe(
     config: AutocontributeConfig,
     requirements: _ToolchainRequirements,
+    *,
+    daemon_mode: DockerDaemonMode,
 ) -> list[str]:
     script = (
         'tool_count="$1"; shift; '
@@ -751,7 +777,7 @@ def _docker_toolchain_probe(
         for interpreter, module in requirements.python_modules
         for value in (interpreter, module)
     ]
-    uid, gid = _non_root_identity()
+    uid, gid = docker_container_identity(daemon_mode)
     return [
         "docker",
         "run",
@@ -787,14 +813,6 @@ def _docker_toolchain_probe(
         *requirements.executables,
         *module_arguments,
     ]
-
-
-def _non_root_identity() -> tuple[int, int]:
-    getuid = getattr(os, "getuid", None)
-    getgid = getattr(os, "getgid", None)
-    uid = getuid() if getuid is not None else 65_532
-    gid = getgid() if getgid is not None else 65_532
-    return (65_532 if uid == 0 else uid, 65_532 if gid == 0 else gid)
 
 
 def _local_python_module_check(interpreter: str, module: str) -> str | None:
@@ -855,6 +873,7 @@ def _command_check(
     command: list[str],
     *,
     timeout_seconds: float = 15,
+    environment: dict[str, str] | None = None,
 ) -> DoctorCheck:
     if shutil.which(command[0]) is None:
         return DoctorCheck(name, False, f"{command[0]} was not found on PATH")
@@ -865,13 +884,129 @@ def _command_check(
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
-            env={"PATH": os.environ.get("PATH", "")},
+            env=environment or _command_environment(command[0]),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return DoctorCheck(name, False, _safe_detail(str(exc)))
     output = (result.stdout or result.stderr).strip().splitlines()
     detail = output[0] if output else "no output"
     return DoctorCheck(name, result.returncode == 0, _safe_detail(detail))
+
+
+def _docker_bind_mount_check(config: AutocontributeConfig) -> DoctorCheck:
+    """Prove the configured sandbox can use a private service-owned bind mount."""
+
+    getuid = getattr(os, "getuid", None)
+    getgid = getattr(os, "getgid", None)
+    if getuid is None or getgid is None:
+        return DoctorCheck(
+            "sandbox private bind mount",
+            False,
+            "host UID/GID inspection is unavailable",
+        )
+    expected_uid = getuid()
+    expected_gid = getgid()
+    probe_config = config.sandbox.model_copy(
+        update={
+            "command_timeout_seconds": 30,
+            "cpus": 1.0,
+            "max_commands": 1,
+            "memory": "128m",
+            "pids_limit": 32,
+        }
+    )
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix="autocontribute-bind-probe-",
+            ignore_cleanup_errors=True,
+        ) as temporary:
+            workspace = Path(temporary)
+            workspace.chmod(0o700)
+            workspace_stat = workspace.stat()
+            if (
+                stat.S_IMODE(workspace_stat.st_mode) != 0o700
+                or workspace_stat.st_uid != expected_uid
+                or workspace_stat.st_gid != expected_gid
+            ):
+                return DoctorCheck(
+                    "sandbox private bind mount",
+                    False,
+                    "could not create an exact 0700 probe owned by the service account",
+                )
+            input_path = workspace / _BIND_PROBE_INPUT
+            input_path.write_text(_BIND_PROBE_INPUT_CONTENT, encoding="utf-8")
+            input_path.chmod(0o600)
+            runner = DockerSandbox(probe_config)
+            result = runner.run(
+                workspace,
+                (
+                    "set -eu; "
+                    f'test "$(cat {_BIND_PROBE_INPUT})" = '
+                    f'"{_BIND_PROBE_INPUT_CONTENT.rstrip()}"; '
+                    'test "$(cat /sys/fs/cgroup/memory.max)" = 134217728; '
+                    'test "$(cat /sys/fs/cgroup/memory.swap.max)" = 0; '
+                    'test "$(cat /sys/fs/cgroup/pids.max)" = 32; '
+                    "read -r cpu_quota cpu_period < /sys/fs/cgroup/cpu.max; "
+                    'test "$cpu_quota" != max; '
+                    'test "$cpu_quota" -eq "$cpu_period"; '
+                    f"umask 077; printf '%s\\n' "
+                    f"'{_BIND_PROBE_OUTPUT_CONTENT.rstrip()}' > {_BIND_PROBE_OUTPUT}"
+                ),
+            )
+            if not result.passed:
+                detail = result.stderr.strip() or "container could not read and write the bind"
+                return DoctorCheck("sandbox private bind mount", False, _safe_detail(detail))
+            output_path = workspace / _BIND_PROBE_OUTPUT
+            try:
+                output_stat = output_path.lstat()
+            except OSError:
+                return DoctorCheck(
+                    "sandbox private bind mount",
+                    False,
+                    "container reported success without a readable host-side output",
+                )
+            if (
+                not stat.S_ISREG(output_stat.st_mode)
+                or stat.S_IMODE(output_stat.st_mode) != 0o600
+                or output_stat.st_uid != expected_uid
+                or output_stat.st_gid != expected_gid
+                or output_stat.st_size != len(_BIND_PROBE_OUTPUT_CONTENT.encode("utf-8"))
+            ):
+                return DoctorCheck(
+                    "sandbox private bind mount",
+                    False,
+                    "container output failed host-side type, size, mode, or ownership checks",
+                )
+            try:
+                output_content = output_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                return DoctorCheck(
+                    "sandbox private bind mount",
+                    False,
+                    "container output was not readable as bounded probe text",
+                )
+            if output_content != _BIND_PROBE_OUTPUT_CONTENT:
+                return DoctorCheck(
+                    "sandbox private bind mount",
+                    False,
+                    "container output failed its host-side content check",
+                )
+    except (OSError, SandboxError) as exc:
+        return DoctorCheck("sandbox private bind mount", False, _safe_detail(str(exc)))
+    return DoctorCheck(
+        "sandbox private bind mount",
+        True,
+        (
+            "verified daemon-selected identity, enforced cgroup v2 limits, and service-owned "
+            "0700 bind read/write with host-side ownership"
+        ),
+    )
+
+
+def _command_environment(executable: str) -> dict[str, str]:
+    if PurePosixPath(executable).name == "docker":
+        return docker_client_environment()
+    return {"PATH": os.environ.get("PATH", "")}
 
 
 def _safe_detail(value: object) -> str:

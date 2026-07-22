@@ -510,3 +510,42 @@ def test_security_integration_pins_uv_version() -> None:
     )
 
     assert setup_uv["with"]["version"] == "0.9.30"
+
+
+def test_security_integration_exercises_rootful_and_rootless_resource_boundaries() -> None:
+    document = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "security-integration.yml").read_text()
+    )
+    job = document["jobs"]["live-docker-isolation"]
+    rootless = next(
+        step for step in job["steps"] if step["name"] == "Exercise live rootless Docker isolation"
+    )
+    rootful = next(
+        step for step in job["steps"] if step["name"] == "Exercise live rootful Docker isolation"
+    )
+    script = rootless["run"]
+
+    assert job["runs-on"] == "ubuntu-24.04"
+    assert job["strategy"]["matrix"]["docker_mode"] == ["rootful", "rootless"]
+    assert rootful["if"] == "matrix.docker_mode == 'rootful'"
+    assert rootless["if"] == "matrix.docker_mode == 'rootless'"
+    assert rootless["env"]["AUTOCONTRIBUTE_RUN_DOCKER_TESTS"] == "1"
+    assert "set -Eeuo pipefail" in script
+    assert "9DC858229FC7DD38854AE2D88D81803C0EBFCD88" in script
+    assert '"docker-ce-rootless-extras=${docker_package_version}"' in script
+    assert "no shared subordinate UID/GID range is available" in script
+    assert "sudo systemctl stop docker.service docker.socket" in script
+    assert 'runtime="/run/user/${service_uid}"' in script
+    assert "sudo loginctl enable-linger" in script
+    assert "Delegate=cpu cpuset io memory pids" in script
+    assert 'sudo systemctl restart "user@${service_uid}.service"' in script
+    assert 'DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime}/bus"' in script
+    assert "systemctl --user show-environment" in script
+    assert "systemd-run --user" in script
+    assert "--property=Delegate=yes" in script
+    assert '--data-root="$data_root"' in script
+    assert '--exec-root="$exec_root"' in script
+    assert 'test "$cgroup_driver" != none' in script
+    assert "cleanup_rootless_job" in script
+    assert "--signal=KILL" in script
+    assert "uv run pytest -q tests/test_sandbox_live.py" in script

@@ -69,11 +69,14 @@ and 60 seconds), with no model tools or repository credentials. Its GitHub probe
 requests: prepare-only deployments verify target reads and warn about excess or unreportable token
 scopes; guarded automatic publication also verifies an existing fork's reported push permission, or
 clearly labels classic-scope evidence as inferred without attempting fork creation. For Docker,
-`doctor` launches the pinned image with networking and Linux capabilities disabled and verifies the
-entrypoints and explicit Python modules named by operator-owned validation commands. Repository-local
-scripts and project-dependent behavior remain the responsibility of the real isolated validation
-run. An explicitly configured unsafe-local backend checks the host toolchain and does not require
-Docker.
+`doctor` verifies the daemon's exact structured security options, then launches the pinned image with
+networking and Linux capabilities disabled. It proves a service-owned `0700` bind mount can be read
+and written with the expected host ownership and confirms effective cgroup v2 memory, swap, CPU, and
+PID limits before checking the entrypoints and explicit Python modules named by operator-owned
+validation commands. The same structured resource-support and daemon-identity check runs immediately
+before every later container launch. Repository-local scripts and project-dependent behavior remain
+the responsibility of the real isolated validation run. An explicitly configured unsafe-local
+backend checks the host toolchain and does not require Docker.
 
 Copy [`autocontribute.example.yml`](autocontribute.example.yml) to `autocontribute.yml` and replace
 the example repositories with projects you understand. Define `validation.required_commands` for

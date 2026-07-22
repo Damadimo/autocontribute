@@ -14,8 +14,13 @@ concurrency:
 
 jobs:
   live-docker-isolation:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: Live Docker isolation (${{ matrix.docker_mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        docker_mode: [rootful, rootless]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -29,11 +34,327 @@ jobs:
           enable-cache: true
       - name: Install locked dependencies
         run: uv sync --locked --extra dev
-      - name: Preload pinned sandbox image
+      - name: Preload pinned sandbox image on rootful Docker
+        if: matrix.docker_mode == 'rootful'
         run: |
           image="$(uv run python -c 'from autocontribute.config import SandboxConfig; print(SandboxConfig().image)')"
           docker pull "$image"
-      - name: Exercise live Docker isolation
+      - name: Exercise live rootful Docker isolation
+        if: matrix.docker_mode == 'rootful'
         env:
           AUTOCONTRIBUTE_RUN_DOCKER_TESTS: "1"
         run: uv run pytest -q tests/test_sandbox_live.py
+      - name: Exercise live rootless Docker isolation
+        if: matrix.docker_mode == 'rootless'
+        env:
+          AUTOCONTRIBUTE_RUN_DOCKER_TESTS: "1"
+        run: |
+          set -Eeuo pipefail
+
+          daemon_pid=""
+          daemon_unit="autocontribute-rootless-docker-ci.service"
+          delegate_drop_in="/etc/systemd/system/user@.service.d/autocontribute-ci-delegate.conf"
+          delegate_installed=0
+          linger_was_enabled=1
+          user_manager_was_active=1
+          docker_apt_key=/etc/apt/keyrings/autocontribute-rootless-docker.asc
+          docker_apt_source=/etc/apt/sources.list.d/autocontribute-rootless-docker.list
+          show_rootless_diagnostics() {
+            sed -n '1,200p' "${RUNNER_TEMP}/rootless-dockerd.log" 2>/dev/null || true
+            if [[ -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
+              systemctl --user --no-pager --full status "$daemon_unit" || true
+            fi
+          }
+          cleanup_rootless_job() {
+            set +e
+            if [[ -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
+              systemctl --user stop --no-block "$daemon_unit" 2>/dev/null || true
+              for _cleanup_attempt in $(seq 1 20); do
+                daemon_state="$(
+                  systemctl --user show "$daemon_unit" --property=ActiveState --value \
+                    2>/dev/null || true
+                )"
+                if [[ "$daemon_state" != active && "$daemon_state" != activating && \
+                      "$daemon_state" != deactivating ]]; then
+                  break
+                fi
+                sleep 0.5
+              done
+              if [[ "$daemon_state" == active || "$daemon_state" == activating || \
+                    "$daemon_state" == deactivating ]]; then
+                systemctl --user kill --kill-whom=all --signal=KILL "$daemon_unit" \
+                  2>/dev/null || true
+              fi
+              systemctl --user reset-failed "$daemon_unit" 2>/dev/null || true
+            fi
+            if [[ "$delegate_installed" -eq 1 ]]; then
+              sudo rm -f -- "$delegate_drop_in"
+              sudo systemctl daemon-reload
+              if [[ "$user_manager_was_active" -eq 1 ]]; then
+                sudo systemctl restart "user@${service_uid}.service" 2>/dev/null || true
+              else
+                sudo systemctl stop "user@${service_uid}.service" 2>/dev/null || true
+              fi
+            fi
+            if [[ "$linger_was_enabled" -eq 0 ]]; then
+              sudo loginctl disable-linger "$account" 2>/dev/null || true
+            fi
+            sudo rm -f -- "$docker_apt_source" "$docker_apt_key"
+          }
+          trap cleanup_rootless_job EXIT
+
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            ca-certificates curl dbus-user-session fuse-overlayfs gnupg slirp4netns uidmap
+
+          docker_package_version="$(
+            dpkg-query --show --showformat='${Version}' docker-ce 2>/dev/null
+          )"
+          docker_cli_version="$(
+            dpkg-query --show --showformat='${Version}' docker-ce-cli 2>/dev/null
+          )"
+          test -n "$docker_package_version"
+          test "$docker_cli_version" = "$docker_package_version"
+
+          docker_key="${RUNNER_TEMP}/docker-release.asc"
+          curl --fail --location --proto '=https' --show-error --silent --tlsv1.2 \
+            https://download.docker.com/linux/ubuntu/gpg \
+            --output "$docker_key"
+          key_metadata="$(gpg --batch --no-options --show-keys --with-colons "$docker_key")"
+          key_count="$(
+            awk -F: '$1 == "pub" { count += 1 } END { print count + 0 }' \
+              <<<"$key_metadata"
+          )"
+          key_fingerprint="$(
+            awk -F: '$1 == "fpr" { print $10; exit }' <<<"$key_metadata"
+          )"
+          test "$key_count" = 1
+          test "$key_fingerprint" = 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+
+          architecture="$(dpkg --print-architecture)"
+          . /etc/os-release
+          test "${ID:-}" = ubuntu
+          test "${VERSION_CODENAME:-}" = noble
+          test "$architecture" = amd64
+          sudo install -d -m 0755 /etc/apt/keyrings
+          sudo install -m 0644 "$docker_key" "$docker_apt_key"
+          printf '%s\n' \
+            "deb [arch=${architecture} signed-by=${docker_apt_key}] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
+            | sudo tee "$docker_apt_source" >/dev/null
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            "docker-ce-rootless-extras=${docker_package_version}"
+          installed_extras_version="$(
+            dpkg-query --show --showformat='${Version}' docker-ce-rootless-extras
+          )"
+          test "$installed_extras_version" = "$docker_package_version"
+          for command_name in \
+            docker dockerd-rootless.sh fuse-overlayfs newgidmap newuidmap \
+            rootlesskit setsid slirp4netns; do
+            command -v "$command_name" >/dev/null
+          done
+          unset command_name
+
+          account="$(id --user --name)"
+          subordinate_range="$(
+            AUTOCONTRIBUTE_ACCOUNT="$account" uv run --frozen python - <<'PY'
+          import os
+          from pathlib import Path
+
+          account = os.environ["AUTOCONTRIBUTE_ACCOUNT"]
+
+          def ranges(path: str) -> list[tuple[str, int, int]]:
+              parsed = []
+              for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+                  name, start, count = raw_line.split(":")
+                  parsed.append((name, int(start), int(count)))
+              return parsed
+
+          uid_ranges = ranges("/etc/subuid")
+          gid_ranges = ranges("/etc/subgid")
+          uid_owned = {(start, count) for name, start, count in uid_ranges if name == account}
+          gid_owned = {(start, count) for name, start, count in gid_ranges if name == account}
+          existing = sorted(
+              (start, count)
+              for start, count in uid_owned & gid_owned
+              if count >= 65_536
+          )
+          if existing:
+              start, count = existing[0]
+              print(f"existing:{start}:{count}")
+              raise SystemExit
+
+          occupied = [(start, start + count) for _, start, count in uid_ranges + gid_ranges]
+          count = 65_536
+          for start in range(1_048_576, 16_777_216, count):
+              end = start + count
+              if all(end <= used_start or start >= used_end for used_start, used_end in occupied):
+                  print(f"new:{start}:{count}")
+                  raise SystemExit
+          raise SystemExit("no shared subordinate UID/GID range is available")
+          PY
+          )"
+          IFS=: read -r range_action range_start range_count <<<"$subordinate_range"
+          [[ "$range_start" =~ ^[1-9][0-9]*$ ]]
+          [[ "$range_count" =~ ^[1-9][0-9]*$ ]]
+          if [[ "$range_action" == new ]]; then
+            range_end="$((range_start + range_count - 1))"
+            sudo usermod \
+              --add-subuids "${range_start}-${range_end}" \
+              --add-subgids "${range_start}-${range_end}" \
+              "$account"
+          elif [[ "$range_action" != existing ]]; then
+            printf '%s\n' 'invalid subordinate-range selection' >&2
+            exit 1
+          fi
+          for subordinate_file in /etc/subuid /etc/subgid; do
+            awk -F: -v account="$account" -v start="$range_start" -v count="$range_count" \
+              '$1 == account && $2 == start && $3 == count { found += 1 }
+               END { exit found != 1 }' \
+              "$subordinate_file"
+          done
+
+          sudo systemctl stop docker.service docker.socket
+          test ! -S /var/run/docker.sock
+
+          service_uid="$(id --user)"
+          service_gid="$(id --group)"
+          test "$(stat --file-system --format=%T /sys/fs/cgroup)" = cgroup2fs
+
+          if ! sudo systemctl is-active --quiet "user@${service_uid}.service"; then
+            user_manager_was_active=0
+          fi
+          if [[ "$(loginctl show-user "$account" --property=Linger --value)" != yes ]]; then
+            linger_was_enabled=0
+            sudo loginctl enable-linger "$account"
+          fi
+          sudo install -d -m 0755 /etc/systemd/system/user@.service.d
+          sudo test ! -e "$delegate_drop_in"
+          printf '%s\n' \
+            '[Service]' \
+            'Delegate=cpu cpuset io memory pids' \
+            | sudo tee "$delegate_drop_in" >/dev/null
+          sudo chmod 0644 "$delegate_drop_in"
+          delegate_installed=1
+          sudo systemctl daemon-reload
+          sudo systemctl restart "user@${service_uid}.service"
+
+          runtime="/run/user/${service_uid}"
+          if [[ -L "$runtime" ]]; then
+            printf '%s\n' 'rootless runtime directory must not be a symlink' >&2
+            exit 1
+          fi
+          test -d "$runtime"
+          test "$(stat --format=%u "$runtime")" = "$service_uid"
+          test "$(stat --format=%g "$runtime")" = "$service_gid"
+          test "$(stat --format=%a "$runtime")" = 700
+
+          export XDG_RUNTIME_DIR="$runtime"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime}/bus"
+          user_manager_ready=0
+          for _attempt in $(seq 1 20); do
+            if [[ -S "${runtime}/bus" ]] && systemctl --user show-environment >/dev/null 2>&1; then
+              user_manager_ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          test "$user_manager_ready" -eq 1
+          test "$(stat --format=%u "${runtime}/bus")" = "$service_uid"
+          test "$(stat --format=%g "${runtime}/bus")" = "$service_gid"
+
+          user_manager_cgroup="$(
+            sudo systemctl show "user@${service_uid}.service" \
+              --property=ControlGroup --value
+          )"
+          [[ "$user_manager_cgroup" == /* ]]
+          user_manager_cgroup_path="/sys/fs/cgroup${user_manager_cgroup}"
+          test -f "${user_manager_cgroup_path}/cgroup.controllers"
+          for controller in cpu cpuset io memory pids; do
+            grep --word-regexp --quiet "$controller" \
+              "${user_manager_cgroup_path}/cgroup.controllers"
+          done
+          unset controller
+
+          rootless_state="${RUNNER_TEMP}/autocontribute-rootless-docker"
+          data_root="${rootless_state}/data"
+          exec_root="${rootless_state}/exec"
+          install -d -m 0700 "$rootless_state" "$data_root" "$exec_root"
+          data_root="$(readlink --canonicalize "$data_root")"
+          exec_root="$(readlink --canonicalize "$exec_root")"
+          export DOCKER_HOST="unix://${runtime}/docker.sock"
+          unset DOCKER_CONTEXT DOCKER_CERT_PATH DOCKER_TLS_VERIFY
+
+          rootless_daemon="$(command -v dockerd-rootless.sh)"
+          systemd-run --user \
+              --unit="$daemon_unit" \
+              --collect \
+              --property=Type=exec \
+              --property=Delegate=yes \
+              --property=KillMode=mixed \
+              --property=TimeoutStopSec=10s \
+              --property="StandardOutput=append:${RUNNER_TEMP}/rootless-dockerd.log" \
+              --property="StandardError=append:${RUNNER_TEMP}/rootless-dockerd.log" \
+              --setenv="DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" \
+              --setenv="DOCKER_HOST=$DOCKER_HOST" \
+              --setenv="HOME=$HOME" \
+              --setenv="PATH=$PATH" \
+              --setenv="RUNNER_TRACKING_ID=" \
+              --setenv="XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" \
+              "$rootless_daemon" \
+              --data-root="$data_root" \
+              --exec-root="$exec_root" \
+              --host="$DOCKER_HOST" \
+              --pidfile="${rootless_state}/docker.pid" \
+              --storage-driver=fuse-overlayfs
+          daemon_pid="$(
+            systemctl --user show "$daemon_unit" --property=MainPID --value
+          )"
+          [[ "$daemon_pid" =~ ^[1-9][0-9]*$ ]]
+
+          daemon_cgroup="$(
+            systemctl --user show "$daemon_unit" --property=ControlGroup --value
+          )"
+          [[ "$daemon_cgroup" == /* ]]
+          daemon_cgroup_path="/sys/fs/cgroup${daemon_cgroup}"
+          test -f "${daemon_cgroup_path}/cgroup.controllers"
+          for controller in cpu cpuset io memory pids; do
+            grep --word-regexp --quiet "$controller" \
+              "${daemon_cgroup_path}/cgroup.controllers"
+          done
+          unset controller
+
+          ready=0
+          for _attempt in $(seq 1 60); do
+            if ! systemctl --user is-active --quiet "$daemon_unit"; then
+              show_rootless_diagnostics
+              exit 1
+            fi
+            if docker info >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            show_rootless_diagnostics
+            exit 1
+          fi
+          mode="$(
+            uv run python -c \
+              'from autocontribute.sandbox import detect_docker_daemon_mode; print(detect_docker_daemon_mode())'
+          )"
+          test "$mode" = rootless
+          test "$(docker info --format '{{.DockerRootDir}}')" = "$data_root"
+          test "$(docker info --format '{{.CgroupVersion}}')" = 2
+          cgroup_driver="$(docker info --format '{{.CgroupDriver}}')"
+          test -n "$cgroup_driver"
+          test "$cgroup_driver" != none
+          test "$(docker version --format '{{.Client.Version}}')" = \
+            "$(docker version --format '{{.Server.Version}}')"
+          printf 'Rootless Docker cgroup driver: %s\n' "$cgroup_driver"
+          image="$(uv run python -c 'from autocontribute.config import SandboxConfig; print(SandboxConfig().image)')"
+          docker pull "$image"
+          kill -0 "$daemon_pid"
+          systemctl --user is-active --quiet "$daemon_unit"
+          uv run pytest -q tests/test_sandbox_live.py

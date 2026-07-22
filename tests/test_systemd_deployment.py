@@ -401,6 +401,8 @@ def test_services_have_failure_signaling_and_core_hardening() -> None:
     assert _one(health_timer, "Timer", "OnUnitInactiveSec") == "15m"
     failure = (SYSTEMD / "libexec" / "autocontribute-record-failure").read_text(encoding="utf-8")
     assert "last-failure" in failure
+    failure_unit = _directives(SYSTEMD / "autocontribute-failure@.service")
+    assert _one(failure_unit, "Service", "SyslogLevel") == "err"
 
 
 def test_no_unit_embeds_secret_values_or_enables_automatic_publication() -> None:

@@ -48,6 +48,16 @@ directory, a fresh temporary home, no inherited environment, no network, no capa
 socket, and explicit CPU/memory/PID/time limits. Local command execution is rejected unless the user
 opts into `allow_unsafe_local: true`.
 
+Immediately before every Docker launch, the control process parses one bounded structured daemon
+probe. It requires cgroup v2, a real cgroup driver, and reported memory, swap, CPU-quota, and PID-limit
+support, then recognizes rootless operation only from one exact `name=rootless` security option. A
+rootful daemon runs repository code as the caller's nonzero UID/GID. A verified rootless daemon
+instead uses UID/GID `0:0` inside its user namespace, which maps to the unprivileged daemon owner and
+is the only identity able to use that owner's private bind mounts. Namespace root does not relax the
+sandbox: all Linux capabilities remain dropped, no-new-privileges remains set, and the container root
+filesystem remains read-only. Malformed, duplicated, unsupported user-namespace-remapping,
+unenforced resource controls, or failed daemon probes stop the run.
+
 Mandatory commands are operator-owned and resolved by canonical repository name before model work.
 Model-proposed commands are supplementary. The complete suite must fit the command budget and every
 required command must be observed passing; the orchestrator never truncates checks to manufacture a

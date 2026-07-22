@@ -140,6 +140,10 @@ Do not perform this drill on a third-party repository. On hosted runners, also v
 verified snapshot is restored: a fresh ephemeral database cannot preserve or demonstrate a prior
 stop.
 
-The separate **Security integration** workflow runs repository-controlled commands inside a real
-Docker daemon each week. It verifies that host environment values, network access, Linux
-capabilities, the container root filesystem, and Git metadata remain isolated.
+The separate **Security integration** workflow runs repository-controlled commands against both
+rootful and rootless Docker daemons each week. It verifies numeric identity and host file ownership,
+effective cgroup v2 resource limits, host-environment and network denial, zero Linux capabilities,
+no-new-privileges, and read-only container-root and Git-metadata mounts. This hosted regression check
+does not replace deployed-host verification of the dedicated rootless socket, systemd delegation,
+private runtime paths, or the service account's inability to reach the rootful host socket; the
+packaged preflight and deployment procedure remain authoritative for those host-specific boundaries.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -9,10 +10,10 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 
 from autocontribute.config import SandboxConfig
 from autocontribute.domain import CommandResult
@@ -23,6 +24,50 @@ _CONTAINER_WORKSPACE: Final = "/workspace"
 _MAX_CAPTURE_BYTES: Final = 2_000_000
 _TRUNCATED_MARKER: Final = b"\n[output truncated by autocontribute]\n"
 _SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_DOCKER_RUNTIME_INFO_FORMAT: Final = (
+    '{"security_options":{{json .SecurityOptions}},'
+    '"cgroup_version":{{json .CgroupVersion}},'
+    '"cgroup_driver":{{json .CgroupDriver}},'
+    '"memory_limit":{{json .MemoryLimit}},'
+    '"swap_limit":{{json .SwapLimit}},'
+    '"cpu_cfs_period":{{json .CPUCfsPeriod}},'
+    '"cpu_cfs_quota":{{json .CPUCfsQuota}},'
+    '"pids_limit":{{json .PidsLimit}}}'
+)
+_DOCKER_RUNTIME_INFO_KEYS: Final = frozenset(
+    {
+        "security_options",
+        "cgroup_version",
+        "cgroup_driver",
+        "memory_limit",
+        "swap_limit",
+        "cpu_cfs_period",
+        "cpu_cfs_quota",
+        "pids_limit",
+    }
+)
+_DOCKER_RESOURCE_CAPABILITIES: Final = (
+    "memory_limit",
+    "swap_limit",
+    "cpu_cfs_period",
+    "cpu_cfs_quota",
+    "pids_limit",
+)
+_DOCKER_CLIENT_ENV_NAMES: Final = (
+    "DOCKER_API_VERSION",
+    "DOCKER_CERT_PATH",
+    "DOCKER_CONFIG",
+    "DOCKER_CONTEXT",
+    "DOCKER_HOST",
+    "DOCKER_TLS_VERIFY",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "XDG_CONFIG_HOME",
+    "XDG_RUNTIME_DIR",
+)
+
+DockerDaemonMode = Literal["rootful", "rootless"]
 
 
 class SandboxRunner:
@@ -32,6 +77,9 @@ class SandboxRunner:
         self.config = config
         self.docker_binary = docker_binary
         self._commands_run = 0
+        # Keep daemon discovery, container launch, and timeout cleanup on the same
+        # Docker endpoint even if the parent process mutates its environment later.
+        self._docker_environment = docker_client_environment()
         if config.backend == "local" and not config.allow_unsafe_local:
             raise SandboxError("Local execution requires allow_unsafe_local=true")
         if not docker_binary or "\0" in docker_binary:
@@ -63,6 +111,19 @@ class SandboxRunner:
         """Return the unused per-run command budget."""
 
         return max(0, self.config.max_commands - self._commands_run)
+
+    @property
+    def docker_daemon_mode(self) -> DockerDaemonMode:
+        """Return the verified Docker daemon mode used by this runner."""
+
+        if self.config.backend != "docker":
+            raise SandboxError("Docker daemon mode is unavailable for the local backend")
+        # Re-probe immediately before every launch. A long validation run must
+        # never retain rootless UID 0 if its endpoint is replaced by a rootful daemon.
+        return detect_docker_daemon_mode(
+            self.docker_binary,
+            environment=self._docker_environment,
+        )
 
     def run_all(
         self,
@@ -137,7 +198,7 @@ class SandboxRunner:
         if cidfile.exists() and cidfile.is_symlink():
             raise SandboxError("Docker cidfile cannot be a symlink")
 
-        uid, gid = _non_root_identity()
+        uid, gid = docker_container_identity(self.docker_daemon_mode)
         arguments = [
             self.docker_binary,
             "run",
@@ -206,6 +267,7 @@ class SandboxRunner:
                         stderr=subprocess.DEVNULL,
                         check=False,
                         timeout=10,
+                        env=self._docker_environment,
                     )
                 # The original timeout/result remains the useful failure;
                 # Docker's --rm and daemon cleanup are the final fallback.
@@ -215,7 +277,7 @@ class SandboxRunner:
                 command=command,
                 cwd=workspace,
                 timeout_seconds=self.config.command_timeout_seconds,
-                environment=None,
+                environment=self._docker_environment,
                 timeout_cleanup=cleanup,
             )
 
@@ -374,11 +436,86 @@ def _non_root_identity() -> tuple[int, int]:
     getgid = getattr(os, "getgid", None)
     uid = getuid() if getuid is not None else 65_532
     gid = getgid() if getgid is not None else 65_532
-    if uid == 0:
-        uid = 65_532
-    if gid == 0:
-        gid = 65_532
+    if uid == 0 or gid == 0:
+        raise SandboxError("Rootful Docker sandbox cannot be launched by host root")
     return uid, gid
+
+
+def docker_container_identity(mode: DockerDaemonMode) -> tuple[int, int]:
+    """Return the safe in-container identity for a verified daemon mode."""
+
+    if mode == "rootless":
+        # Root in a rootless daemon's user namespace maps to the unprivileged
+        # daemon owner on the host. That mapping is required to access private
+        # service-owned bind mounts. The sandbox still drops every capability,
+        # sets no-new-privileges, and keeps the container root filesystem read-only.
+        return 0, 0
+    if mode == "rootful":
+        return _non_root_identity()
+    raise SandboxError("Docker daemon mode is invalid")
+
+
+def detect_docker_daemon_mode(
+    docker_binary: str = "docker",
+    *,
+    environment: dict[str, str] | None = None,
+) -> DockerDaemonMode:
+    """Classify a daemon that proves the required identity and resource boundaries."""
+
+    if not docker_binary or "\0" in docker_binary:
+        raise SandboxError("Docker binary is invalid")
+    client_environment = docker_client_environment() if environment is None else environment
+    try:
+        result = subprocess.run(
+            [docker_binary, "info", "--format", _DOCKER_RUNTIME_INFO_FORMAT],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+            env=client_environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SandboxError("Could not verify Docker daemon runtime information") from exc
+    if result.returncode != 0:
+        raise SandboxError("Could not verify Docker daemon runtime information")
+    try:
+        runtime_info = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise SandboxError("Docker daemon returned malformed runtime information") from exc
+    if not isinstance(runtime_info, dict) or set(runtime_info) != _DOCKER_RUNTIME_INFO_KEYS:
+        raise SandboxError("Docker daemon returned malformed runtime information")
+    options = runtime_info["security_options"]
+    if not isinstance(options, list) or not all(isinstance(option, str) for option in options):
+        raise SandboxError("Docker daemon returned malformed runtime information")
+    cgroup_driver = runtime_info["cgroup_driver"]
+    if (
+        runtime_info["cgroup_version"] != "2"
+        or not isinstance(cgroup_driver, str)
+        or not cgroup_driver
+        or cgroup_driver.casefold() == "none"
+        or any(runtime_info[name] is not True for name in _DOCKER_RESOURCE_CAPABILITIES)
+    ):
+        raise SandboxError("Docker daemon does not enforce required cgroup v2 resource controls")
+    rootless_count = sum(option == "name=rootless" for option in options)
+    if rootless_count > 1:
+        raise SandboxError("Docker daemon returned ambiguous rootless security options")
+    if any(option == "name=userns" for option in options):
+        raise SandboxError("Docker daemon user namespace remapping is unsupported")
+    return "rootless" if rootless_count == 1 else "rootful"
+
+
+def docker_client_environment(
+    source: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Copy only Docker endpoint and client settings, never provider credentials."""
+
+    values = os.environ if source is None else source
+    environment = {"PATH": values.get("PATH", "")}
+    for name in _DOCKER_CLIENT_ENV_NAMES:
+        if value := values.get(name):
+            environment[name] = value
+    return environment
 
 
 def _read_container_id(cidfile: Path) -> str | None:
@@ -399,4 +536,11 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
             process.kill()
 
 
-__all__ = ["DockerSandbox", "SandboxRunner"]
+__all__ = [
+    "DockerDaemonMode",
+    "DockerSandbox",
+    "SandboxRunner",
+    "detect_docker_daemon_mode",
+    "docker_client_environment",
+    "docker_container_identity",
+]

@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 import autocontribute.doctor as doctor
-from autocontribute.config import AutocontributeConfig
+from autocontribute.config import AutocontributeConfig, SandboxConfig
 from autocontribute.exceptions import CircuitBreakerTrigger, GitHubSafetyError
 from autocontribute.github import GitHubClient
 from autocontribute.store import RunStore
@@ -139,6 +139,11 @@ def test_active_breaker_skips_billed_model_and_github_probes(
         doctor,
         "_offline_toolchain_check",
         lambda _config: doctor.DoctorCheck("offline validation toolchain", True, "available"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_docker_bind_mount_check",
+        lambda _config: doctor.DoctorCheck("sandbox private bind mount", True, "available"),
     )
     monkeypatch.setattr(
         doctor,
@@ -283,6 +288,11 @@ def test_doctor_redacts_configured_and_recognizable_credentials_from_provider_er
         doctor,
         "_offline_toolchain_check",
         lambda _config: doctor.DoctorCheck("offline validation toolchain", True, "available"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_docker_bind_mount_check",
+        lambda _config: doctor.DoctorCheck("sandbox private bind mount", True, "available"),
     )
     monkeypatch.setattr(doctor, "_github_checks", lambda *_args, **_kwargs: [])
 
@@ -452,11 +462,15 @@ def test_toolchain_parser_fails_closed_when_requirements_cannot_be_proved(
         doctor._toolchain_requirements([command])
 
 
-def test_docker_toolchain_probe_matches_sandbox_isolation() -> None:
+def test_docker_toolchain_probe_matches_sandbox_isolation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("autocontribute.sandbox.os.getuid", lambda: 1000)
+    monkeypatch.setattr("autocontribute.sandbox.os.getgid", lambda: 1000)
     config = _config(command="python -m pytest")
     requirements = doctor._toolchain_requirements(["python -m pytest && ruff check ."])
 
-    command = doctor._docker_toolchain_probe(config, requirements)
+    command = doctor._docker_toolchain_probe(config, requirements, daemon_mode="rootful")
 
     assert command[:3] == ["docker", "run", "--rm"]
     assert "--pull=never" in command
@@ -469,6 +483,104 @@ def test_docker_toolchain_probe_matches_sandbox_isolation() -> None:
     assert config.sandbox.image in command
     assert "python -m pytest && ruff check ." not in command
     assert command[-4:] == ["python", "ruff", "python", "pytest"]
+
+
+def test_rootless_toolchain_probe_uses_verified_namespace_root() -> None:
+    config = _config(command="python -m pytest")
+    requirements = doctor._toolchain_requirements(["python -m pytest"])
+
+    command = doctor._docker_toolchain_probe(config, requirements, daemon_mode="rootless")
+
+    assert "--user=0:0" in command
+    assert "--network=none" in command
+    assert "--read-only" in command
+    assert "--cap-drop=ALL" in command
+    assert "--security-opt=no-new-privileges" in command
+
+
+def test_doctor_private_bind_probe_verifies_0700_mount_and_host_side_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    class ProbeRunner:
+        def __init__(self, config: object) -> None:
+            observed["config"] = config
+
+        def run(self, workspace: Path, command: str) -> SimpleNamespace:
+            observed["workspace_mode"] = workspace.stat().st_mode & 0o777
+            observed["command"] = command
+            assert (workspace / doctor._BIND_PROBE_INPUT).read_text(encoding="utf-8") == (
+                doctor._BIND_PROBE_INPUT_CONTENT
+            )
+            output = workspace / doctor._BIND_PROBE_OUTPUT
+            output.write_text(doctor._BIND_PROBE_OUTPUT_CONTENT, encoding="utf-8")
+            output.chmod(0o600)
+            return SimpleNamespace(passed=True, stderr="")
+
+        @property
+        def docker_daemon_mode(self) -> str:
+            return "rootless"
+
+    monkeypatch.setattr(doctor, "DockerSandbox", ProbeRunner)
+
+    check = doctor._docker_bind_mount_check(_config())
+
+    assert check.passed
+    assert observed["workspace_mode"] == 0o700
+    assert "cat .autocontribute-bind-input" in str(observed["command"])
+    assert "cat /sys/fs/cgroup/memory.max" in str(observed["command"])
+    probe_config = observed["config"]
+    assert isinstance(probe_config, SandboxConfig)
+    assert probe_config.memory == "128m"
+    assert probe_config.cpus == 1.0
+    assert probe_config.pids_limit == 32
+    assert "daemon-selected identity" in check.detail
+    assert "cgroup v2 limits" in check.detail
+    assert "host-side ownership" in check.detail
+
+
+def test_doctor_private_bind_probe_cannot_pass_without_host_side_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FalsePositiveRunner:
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def run(self, _workspace: Path, _command: str) -> SimpleNamespace:
+            return SimpleNamespace(passed=True, stderr="")
+
+    monkeypatch.setattr(doctor, "DockerSandbox", FalsePositiveRunner)
+
+    check = doctor._docker_bind_mount_check(_config())
+
+    assert not check.passed
+    assert "without a readable host-side output" in check.detail
+
+
+def test_doctor_docker_commands_keep_the_selected_rootless_endpoint_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+    monkeypatch.setenv("DOCKER_HOST", "unix:///run/user/123/docker.sock")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/123")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-doctor-subprocess")
+    monkeypatch.setattr(doctor.shutil, "which", lambda _tool: "/usr/bin/docker")
+
+    def fake_run(*_args: object, **kwargs: object) -> SimpleNamespace:
+        observed["environment"] = kwargs["env"]
+        return SimpleNamespace(returncode=0, stdout="27.0.0\n", stderr="")
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+
+    check = doctor._command_check("docker", ["docker", "info"])
+
+    assert check.passed
+    environment = observed["environment"]
+    assert isinstance(environment, dict)
+    assert environment["DOCKER_HOST"] == "unix:///run/user/123/docker.sock"
+    assert environment["XDG_RUNTIME_DIR"] == "/run/user/123"
+    assert "OPENAI_API_KEY" not in environment
 
 
 def test_local_toolchain_check_never_requires_docker(
@@ -489,6 +601,19 @@ def test_local_toolchain_check_never_requires_docker(
     assert check.passed
     assert check.warning
     assert "unsafe local host" in check.detail
+
+
+def test_offline_toolchain_fails_cleanly_for_rootful_daemon_under_host_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(doctor, "detect_docker_daemon_mode", lambda *_args, **_kwargs: "rootful")
+    monkeypatch.setattr("autocontribute.sandbox.os.getuid", lambda: 0)
+    monkeypatch.setattr("autocontribute.sandbox.os.getgid", lambda: 0)
+
+    check = doctor._offline_toolchain_check(_config())
+
+    assert not check.passed
+    assert "host root" in check.detail
 
 
 def test_offline_toolchain_fails_when_no_commands_are_configured() -> None:

@@ -39,4 +39,5 @@ ReadWritePaths=/var/lib/autocontribute/health
 
 StandardOutput=journal
 StandardError=journal
+SyslogLevel=err
 SyslogIdentifier=autocontribute-failure
