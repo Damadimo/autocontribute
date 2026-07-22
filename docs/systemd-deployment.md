@@ -32,6 +32,22 @@ lock: never run a second host, an ad-hoc CLI writer, or the hosted scheduler aga
 lineage. Keep the state on a local filesystem with working SQLite locks; do not place it on NFS or an
 eventually consistent mount.
 
+The supplied services also require `state` and the local backup directory to be separate, exact,
+non-bind ext4 mounts backed by whole filesystems and mounted nowhere else. Both must use
+`rw,nodev,nosuid,noexec`. The state filesystem is capped at 8 GiB and 262,144 inodes and must keep
+at least 1 GiB and 32,768 inodes available to the service account. The backup filesystem is capped
+at 64 GiB and 524,288 inodes and must keep at least 20 GiB and 262,144 inodes available. The larger
+backup reserve covers complete-bundle staging, a second SQLite consistency snapshot, the archive
+being written, and cleanup margin even when state approaches its ceiling. State and backup mounts
+must also be distinct from their parent filesystems and from one another, so either workload cannot
+fill the host root filesystem or consume the other's finalization reserve.
+
+Worker, doctor, and backup wrappers verify these boundaries before opening state or reading a
+credential; the 15-minute health service repeats the capacity checks from its read-only namespace.
+They stop rather than start new work below any reserve. The fixed ceilings are safety limits, not
+sizing targets. Provision the smaller reference sizes below, alert well before a reserve is reached,
+and expand only within the hard ceilings. The checked-in units never rotate or delete a backup.
+
 Every host-backed path writable by repository code is below the dedicated `state/workspaces` mount;
 the container's other writable path is its size-limited `/tmp` tmpfs. The supplied worker accepts
 only an exact, non-bind ext4 mount backed by one whole block device, mounted nowhere else, with
@@ -77,8 +93,8 @@ The reference units target systemd 252 or newer and a Linux distribution with:
 - Python 3.11 or 3.12, `uv`, Git, `flock`, GNU coreutils, util-linux `findmnt`, and e2fsprogs;
 - rootless Docker on cgroup v2 with systemd resource-controller delegation, including `newuidmap`,
   `newgidmap`, and a unique subordinate UID/GID range;
-- a dedicated, fully allocated (not thin-provisioned) block device of at most 20 GiB for
-  workspaces, plus durable disk for state and several backup generations; and
+- three dedicated, fully allocated (not thin-provisioned) block devices: no more than 8 GiB for
+  state, no more than 20 GiB for workspaces, and no more than 64 GiB for local backups; and
 - persistent time synchronization and outbound HTTPS for GitHub and the configured model API.
 
 Create a locked service account with a durable home. Allocate subordinate IDs that do not overlap
@@ -99,6 +115,71 @@ sudo loginctl enable-linger autocontribute
 The explicit private user group is required by every supplied unit and tmpfiles rule. Do not add
 the account to `docker`; the runtime preflight rejects that exact group even if a separately started
 rootless daemon appears healthy.
+
+### Provision bounded state and local-backup filesystems
+
+Allocate separate, fully provisioned logical volumes or partitions for durable state and local
+backups. Do not use a thin volume, sparse loopback file, network filesystem, or shared backing pool:
+an apparent filesystem ceiling cannot reserve physical capacity in any of those arrangements. A
+6 GiB state device and 48 GiB backup device are the reference sizes. They leave headroom under the
+runtime ceilings while accommodating the fixed reserves and several maximum-size bundle
+generations. Workload history determines the real retention window; capacity planning must use
+observed bundle sizes and the off-host replication service-level objective.
+
+The following destructive formatting example assumes an operator has already resolved two unused,
+fully allocated devices. **`mkfs.ext4` destroys all data on its argument. Verify both exact devices
+with the host storage tooling before running it.** The requested inode counts can be rounded by
+ext4, so the runtime check verifies the actual superblock totals.
+
+```bash
+state_device=/dev/mapper/autocontribute-state
+backup_device=/dev/mapper/autocontribute-backups
+test -b "$state_device"
+test -b "$backup_device"
+test "$state_device" != "$backup_device"
+test -z "$(findmnt --noheadings --source "$state_device")"
+test -z "$(findmnt --noheadings --source "$backup_device")"
+sudo mkfs.ext4 -L autocontribute-state -m 1 -N 131072 -- "$state_device"
+sudo mkfs.ext4 -L autocontribute-backups -m 0 -N 393216 -- "$backup_device"
+sudo install -d -o autocontribute -g autocontribute -m 0700 \
+  /var/lib/autocontribute/state \
+  /var/backups/autocontribute
+sudo blkid --output value --match-tag UUID -- "$state_device"
+sudo blkid --output value --match-tag UUID -- "$backup_device"
+unset state_device backup_device
+```
+
+Add each returned, independently verified UUID to `/etc/fstab`. These mounts must precede the
+nested workspace mount during boot and must never be mounted at a second path:
+
+```fstab
+UUID=STATE_UUID_FROM_BLKID /var/lib/autocontribute/state ext4 rw,nodev,nosuid,noexec 0 2
+UUID=BACKUP_UUID_FROM_BLKID /var/backups/autocontribute ext4 rw,nodev,nosuid,noexec 0 2
+```
+
+Mount both, set the mounted filesystem roots' metadata, and verify the actual totals and available
+capacity as the service account. GNU `stat` `%a` reports blocks available to an unprivileged user,
+so it excludes ext4 blocks reserved for root.
+
+```bash
+sudo mount /var/lib/autocontribute/state
+sudo mount /var/backups/autocontribute
+sudo chown autocontribute:autocontribute \
+  /var/lib/autocontribute/state \
+  /var/backups/autocontribute
+sudo chmod 0700 \
+  /var/lib/autocontribute/state \
+  /var/backups/autocontribute
+findmnt --target /var/lib/autocontribute/state --output TARGET,SOURCE,FSTYPE,OPTIONS
+findmnt --target /var/backups/autocontribute --output TARGET,SOURCE,FSTYPE,OPTIONS
+sudo -u autocontribute stat --file-system \
+  --format='block_size=%S blocks=%b available=%a inodes=%c free_inodes=%d' \
+  /var/lib/autocontribute/state \
+  /var/backups/autocontribute
+```
+
+Do not create the nested workspace filesystem until the state mount is active. A directory created
+under an unmounted placeholder would be hidden later and can create a divergent state lineage.
 
 ### Provision the bounded workspace filesystem
 
@@ -357,10 +438,13 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/autocontribute.conf
 sudo systemctl daemon-reload
 ```
 
-Run `systemd-tmpfiles` while the workspace filesystem is mounted so its filesystem root receives the
-required ownership and mode. Both credential-bearing services declare `RequiresMountsFor=` and still
-repeat the exact mount and capacity verification at every invocation; an accidentally unmounted
-directory on the parent filesystem is rejected rather than used as a fallback.
+Run `systemd-tmpfiles` only while all three filesystems are mounted so their filesystem roots receive
+the required ownership and mode. Worker, doctor, backup, and health declare `RequiresMountsFor=` for
+durable storage, and the credential-bearing services also require the workspace mount. Their
+wrappers still repeat exact mount and capacity verification at every invocation; an accidentally
+unmounted directory on a parent filesystem is rejected rather than used as a fallback. The worker
+and backup additionally bind the Python store to the preflight-verified state root, so changing
+`storage.path` cannot redirect writes around these checks.
 
 Validate the installed files on the target host. `systemd-analyze security` is advisory; review
 every relaxation instead of chasing a score that breaks rootless Docker or durable state.
@@ -426,8 +510,14 @@ systemctl show autocontribute-worker.service \
 systemctl show autocontribute-backup.service \
   -p ActiveState -p Result -p ExecMainStatus -p ExecMainStartTimestamp -p ExecMainExitTimestamp
 sudo -u autocontribute /usr/local/libexec/autocontribute-healthcheck
-df --block-size=1 /var/lib/autocontribute/state/workspaces
-df --inodes /var/lib/autocontribute/state/workspaces
+df --block-size=1 \
+  /var/lib/autocontribute/state \
+  /var/lib/autocontribute/state/workspaces \
+  /var/backups/autocontribute
+df --inodes \
+  /var/lib/autocontribute/state \
+  /var/lib/autocontribute/state/workspaces \
+  /var/backups/autocontribute
 sudo journalctl \
   -u autocontribute-worker.service \
   -u autocontribute-backup.service \
@@ -436,8 +526,11 @@ sudo journalctl \
   --since '24 hours ago'
 ```
 
-The health timer fails when the last successful worker is older than 18 hours or the last complete
-backup is older than 36 hours. Every worker, backup, doctor, or health failure invokes
+The health timer fails when the last successful worker is older than 18 hours, the last complete
+backup is older than 36 hours, either durable filesystem violates its fixed ceiling, or state or
+backup headroom falls below a fixed reserve. The worker, doctor, and backup apply the same writable
+storage check before doing work; low backup capacity therefore stops new contributions even while a
+recent backup stamp is still fresh. Every worker, backup, doctor, or health failure invokes
 `autocontribute-failure@.service`, which writes the last failed unit and UTC time to
 `/var/lib/autocontribute/health/last-failure` and emits an error-priority journal event. Forward
 those events to the existing host alerting system, or add another `OnFailure=` target in a drop-in.
@@ -451,6 +544,14 @@ never remove a `submitting` workspace unless remote reconciliation has proven th
 or the contribution is being abandoned through the incident procedure. Complete state bundles
 intentionally exclude target repositories, so deleting a workspace is not repaired by restoring a
 normal backup.
+
+Alert before state reaches 75% of either its byte or inode total and before local backups consume
+half of either total. Those operational thresholds intentionally precede the hard reserves. Do not
+"fix" a headroom failure by relaxing the checked-in constants or moving files onto the parent
+filesystem. Quiesce the worker, complete off-host replication, and follow the acknowledged deletion
+procedure below. If state itself approaches a reserve, keep the worker stopped, create a verified
+backup if the reserve check still permits it, and investigate unexpected evidence growth rather
+than deleting live lineage records.
 
 Autocontribute redacts known credential forms, but issue text, proposed changes, command output, and
 public URLs are operational evidence and may appear in the journal. Never log decrypted credentials
@@ -611,6 +712,24 @@ eligibility checks mirror the portable-evidence boundary: a prepared terminal wo
 removed unless its patch and validation artifact can be verified without the checkout. A complete
 bundle taken afterward still validates the retained durable generation.
 
+Local deletion is an operator action, never a timer action. Before removing one exact bundle:
+
+1. Compute and record its local SHA-256 digest, byte size, immutable off-host object/version ID, and
+   retention-lock expiry.
+2. Have the replication system acknowledge that exact version, then independently read the stored
+   object back and verify the same byte size and SHA-256 digest. A successful upload command or an
+   object-store ETag is not a cryptographic acknowledgement.
+3. Persist that receipt outside this host, verify that at least two other restorable generations
+   remain, and periodically prove them through the recovery drill below.
+4. Stop `autocontribute-backup.service`, re-resolve the one intended local pathname without a glob,
+   compare it to the receipt once more, and only then delete that exact file.
+
+If the provider cannot return the original bytes for independent hashing, has no immutable version
+identity, or has not acknowledged retention, do not delete the local generation. This project does
+not yet ship a provider-specific replication/receipt protocol, so it cannot safely automate local
+retention. The fixed backup reserve turns missing acknowledgement into a visible fail-closed stop
+instead of silently discarding the last trustworthy recovery point.
+
 At least once per release, restore a copied bundle into a fresh path on a non-production host using
 the same packaged version and configuration except for `storage.path`. The restore target must not
 exist:
@@ -633,12 +752,47 @@ Do not drill against the live state path. A complete backup may fail when a `sub
 stored commit because its workspace is intentionally excluded; reconcile or finish that exact
 publication on the persistent worker rather than bypassing the check.
 
-For real recovery, keep all timers stopped, preserve the damaged or newer state as forensic data,
-and restore into an absent `/var/lib/autocontribute/state`. Start in `review_required` mode without
-the automatic-publish opt-in. Run `doctor`, inspect `safety status`, list every known upstream PR,
-and reconcile lifecycle state before allowing another attempt. A stale restore can forget a
-publication reservation, gate hold, lifecycle signal, or breaker event and must never be treated as
-safe merely because its archive checksum passes.
+For real recovery, keep all timers stopped and preserve the damaged or newer state device as
+forensic data. The live storage root is a mount point and therefore cannot itself satisfy the CLI's
+absent-target rule. Provision a new compliant state device, mount it at a temporary recovery mount,
+and restore into an absent staging directory on that replacement filesystem. After the command has
+fully verified the bundle, promote only its four supported top-level entries to the replacement
+filesystem root while it is still offline. Do not perform this promotion on the live device.
+
+```bash
+recovery_mount=/mnt/autocontribute-state-recovery
+test "$(findmnt --noheadings --raw --output TARGET --target "$recovery_mount")" = "$recovery_mount"
+test ! -e "$recovery_mount/restored"
+# recovery-only.yml must set storage.path to /mnt/autocontribute-state-recovery/restored.
+sudo -u autocontribute \
+  /opt/autocontribute/current/.venv/bin/autocontribute \
+  state restore --complete \
+  --input /trusted/autocontribute-state.bundle.zip \
+  --config /path/to/recovery-only.yml
+test -f "$recovery_mount/restored/state.sqlite3"
+test -d "$recovery_mount/restored/runs"
+test -d "$recovery_mount/restored/evaluations"
+test -d "$recovery_mount/restored/workspaces"
+sudo -u autocontribute mv -- \
+  "$recovery_mount/restored/state.sqlite3" \
+  "$recovery_mount/restored/runs" \
+  "$recovery_mount/restored/evaluations" \
+  "$recovery_mount/restored/workspaces" \
+  "$recovery_mount/"
+sudo -u autocontribute rmdir -- "$recovery_mount/restored"
+sudo sync -f "$recovery_mount"
+unset recovery_mount
+```
+
+If this offline promotion is interrupted, discard or reformat only the new replacement device and
+retry from the retained bundle; never guess which partial files are current. Once complete, unmount
+the replacement, update `/etc/fstab` to its verified UUID, mount it at
+`/var/lib/autocontribute/state`, recreate and mount a compliant workspace filesystem, and run the
+packaged capacity checks before starting any service. Start in `review_required` mode without the
+automatic-publish opt-in. Run `doctor`, inspect `safety status`, list every known upstream PR, and
+reconcile lifecycle state before allowing another attempt. A stale restore can forget a publication
+reservation, gate hold, lifecycle signal, or breaker event and must never be treated as safe merely
+because its archive checksum passes.
 
 ## Upgrade and rollback
 

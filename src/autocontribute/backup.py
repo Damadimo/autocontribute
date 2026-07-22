@@ -97,7 +97,7 @@ def create_state_bundle(
             raise StateError("Durable state changed during backup; retry after active work stops")
         second_snapshot.unlink()
 
-        staged_store = RunStore(staging)
+        staged_store = RunStore._for_offline_verification(staging)
         staged_store.verify_event_chains()
         _validate_run_manifests(staged_store)
         _validate_workspace_independent_recovery(staged_store)
@@ -189,7 +189,7 @@ def restore_state_bundle(root: Path, source: Path) -> Path:
                     raise StateError(f"Backup bundle checksum mismatch: {relative}")
 
         _validate_restorable_database(staging / "state.sqlite3")
-        restored_store = RunStore(staging)
+        restored_store = RunStore._for_offline_verification(staging)
         restored_store.verify_event_chains()
         _validate_run_manifests(restored_store)
         _validate_workspace_independent_recovery(restored_store)

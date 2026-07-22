@@ -4,6 +4,7 @@ Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-
 Wants=network-online.target
 After=network-online.target
 RequiresMountsFor=/var/lib/autocontribute/state/workspaces
+RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute
 OnFailure=autocontribute-failure@%n.service
 StartLimitIntervalSec=8h
 StartLimitBurst=2
@@ -28,6 +29,7 @@ ExecStartPre=/usr/bin/test -r /etc/autocontribute/autocontribute.yml
 ExecStartPre=/usr/bin/test -d /var/lib/autocontribute/state
 ExecStartPre=/usr/bin/test -d /var/lib/autocontribute/state/workspaces
 ExecStartPre=/usr/bin/test -d /var/lib/autocontribute/tmp
+ExecStartPre=/usr/bin/test -d /var/backups/autocontribute
 ExecStart=/usr/bin/flock --exclusive --timeout 7200 /var/lib/autocontribute/operation.lock /usr/local/libexec/autocontribute-worker
 ExecStartPost=/usr/bin/touch /var/lib/autocontribute/health/worker-success
 

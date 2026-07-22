@@ -6,6 +6,8 @@ umask 077
 readonly executable="${AUTOCONTRIBUTE_EXECUTABLE:-/opt/autocontribute/current/.venv/bin/autocontribute}"
 readonly config="${AUTOCONTRIBUTE_CONFIG:-/etc/autocontribute/autocontribute.yml}"
 readonly backup_directory="${AUTOCONTRIBUTE_BACKUP_DIRECTORY:-/var/backups/autocontribute}"
+readonly state_root="/var/lib/autocontribute/state"
+readonly storage_capacity_check="/usr/local/libexec/autocontribute-storage-capacity-check"
 
 if [[ ! -x "$executable" || ! -r "$config" ]]; then
   printf 'Autocontribute backup prerequisites are unavailable\n' >&2
@@ -15,6 +17,12 @@ if [[ ! -d "$backup_directory" || -L "$backup_directory" || ! -w "$backup_direct
   printf 'Autocontribute backup directory is unavailable or unsafe\n' >&2
   exit 1
 fi
+if [[ ! -x "$storage_capacity_check" ]]; then
+  printf 'Autocontribute storage capacity check is unavailable\n' >&2
+  exit 1
+fi
+"$storage_capacity_check" "$state_root" "$backup_directory" --writable
+export AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT="$state_root"
 
 timestamp="$(date --utc +%Y%m%dT%H%M%S.%NZ)"
 readonly timestamp

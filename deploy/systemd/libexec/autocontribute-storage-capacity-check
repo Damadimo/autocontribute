@@ -1,0 +1,270 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+umask 077
+
+readonly state_root="${1:-}"
+readonly backup_root="${2:-}"
+readonly access_mode="${3:---writable}"
+
+# These ceilings bound collateral host impact even when an operator provisions a larger device by
+# mistake. The free-space floors preserve enough room for one worst-case complete bundle and for
+# state finalization; they are deliberately not configurable through the service environment.
+readonly state_maximum_bytes=8589934592
+readonly state_maximum_inodes=262144
+readonly state_minimum_available_bytes=1073741824
+readonly state_minimum_free_inodes=32768
+readonly backup_maximum_bytes=68719476736
+readonly backup_maximum_inodes=524288
+readonly backup_minimum_available_bytes=21474836480
+readonly backup_minimum_free_inodes=262144
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+if [[
+  $# -lt 2 ||
+  $# -gt 3 ||
+  ("$access_mode" != --writable &&
+    "$access_mode" != --state-writable &&
+    "$access_mode" != --read-only) ||
+  "$state_root" != /* ||
+  "$backup_root" != /* ||
+  "$state_root" == / ||
+  "$backup_root" == / ||
+  "$state_root" == *[[:space:]]* ||
+  "$backup_root" == *[[:space:]]* ||
+  "$state_root" == */../* ||
+  "$backup_root" == */../* ||
+  "$state_root" == */./* ||
+  "$backup_root" == */./* ||
+  "$state_root" == "$backup_root" ||
+  "$state_root" == "$backup_root/"* ||
+  "$backup_root" == "$state_root/"*
+]]; then
+  fail 'Autocontribute storage capacity check received invalid paths or arguments'
+fi
+if [[ "$UID" == 0 ]]; then
+  fail 'Autocontribute storage capacity check must not run as root'
+fi
+
+service_gid="$(id --group)" || fail 'Autocontribute could not verify the service group'
+readonly service_gid
+state_mount_device=""
+backup_mount_device=""
+
+check_mount() {
+  local label="$1"
+  local path="$2"
+  local maximum_bytes="$3"
+  local maximum_inodes="$4"
+  local minimum_available_bytes="$5"
+  local minimum_free_inodes="$6"
+  local result_variable="$7"
+  local canonical owner group mode
+  local mount_records mount_device mount_record_count mount_table
+  local matching_mount_count candidate_device candidate_target candidate_filesystem
+  local candidate_root candidate_options trailing
+  local path_device parent_path parent_device filesystem_limits
+  local block_size total_blocks available_blocks total_inodes free_inodes
+  local required_available_blocks expected_access saw_read_only saw_writable
+
+  expected_access=read-only
+  if [[ "$access_mode" == --writable ||
+    ("$access_mode" == --state-writable && "$label" == state) ]]; then
+    expected_access=writable
+  fi
+
+  if [[ ! -d "$path" || -L "$path" ]]; then
+    fail "Autocontribute $label storage mount is unavailable"
+  fi
+  canonical="$(realpath "$path")" || fail "Autocontribute could not canonicalize $label storage"
+  if [[ "$canonical" != "$path" ]]; then
+    fail "Autocontribute $label storage must be an exact real path"
+  fi
+
+  owner="$(stat --format=%u -- "$path")" || fail "Autocontribute could not inspect $label storage"
+  group="$(stat --format=%g -- "$path")" || fail "Autocontribute could not inspect $label storage"
+  mode="$(stat --format=%a -- "$path")" || fail "Autocontribute could not inspect $label storage"
+  if [[ "$owner" != "$UID" || "$group" != "$service_gid" || "$mode" != 700 ]]; then
+    fail "Autocontribute $label storage has unsafe ownership or permissions"
+  fi
+  if [[ "$expected_access" == writable && ! -w "$path" ]]; then
+    fail "Autocontribute $label storage is not writable"
+  fi
+  if [[ "$expected_access" == read-only && -w "$path" ]]; then
+    fail "Autocontribute $label storage is writable in a read-only service namespace"
+  fi
+
+  mount_records="$(
+    findmnt --noheadings --raw --mountpoint "$path" \
+      --output TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN
+  )" || fail "Autocontribute could not resolve the $label storage mount"
+  mount_device=""
+  mount_record_count=0
+  saw_read_only=false
+  saw_writable=false
+  while read -r \
+    candidate_target candidate_filesystem candidate_root candidate_options candidate_device \
+    trailing; do
+    mount_record_count=$((mount_record_count + 1))
+    if [[ -n "$trailing" || "$candidate_target" != "$path" ]]; then
+      fail "Autocontribute $label storage is not an exact dedicated mount"
+    fi
+    if [[ "$candidate_filesystem" != ext4 ]]; then
+      fail "Autocontribute $label storage must use ext4 with a fixed inode table"
+    fi
+    if [[ "$candidate_root" != / ]]; then
+      fail "Autocontribute $label storage mount must expose one whole filesystem"
+    fi
+    if [[ ! "$candidate_device" =~ ^[0-9]+:[0-9]+$ ]]; then
+      fail "Autocontribute $label storage reported an invalid device number"
+    fi
+    if [[ ",$candidate_options," == *,rw,* && ",$candidate_options," == *,ro,* ]]; then
+      fail "Autocontribute $label storage mount has ambiguous access options"
+    fi
+    case ",$candidate_options," in
+      *,rw,*) saw_writable=true ;;
+      *,ro,*)
+        saw_read_only=true
+        if [[ "$expected_access" == writable ]]; then
+          fail "Autocontribute $label storage mount is not writable"
+        fi
+        ;;
+      *) fail "Autocontribute $label storage mount has ambiguous access options" ;;
+    esac
+    case ",$candidate_options," in
+      *,nodev,*) ;;
+      *) fail "Autocontribute $label storage mount must use nodev" ;;
+    esac
+    case ",$candidate_options," in
+      *,nosuid,*) ;;
+      *) fail "Autocontribute $label storage mount must use nosuid" ;;
+    esac
+    case ",$candidate_options," in
+      *,noexec,*) ;;
+      *) fail "Autocontribute $label storage mount must use noexec" ;;
+    esac
+    case ",$candidate_options," in
+      *,bind,* | *,rbind,*) fail "Autocontribute $label storage cannot be a bind mount" ;;
+    esac
+    if [[ -z "$mount_device" ]]; then
+      mount_device="$candidate_device"
+    elif [[ "$candidate_device" != "$mount_device" ]]; then
+      fail "Autocontribute $label storage mount is layered over another device"
+    fi
+  done <<< "$mount_records"
+  if [[ "$mount_record_count" -lt 1 || -z "$mount_device" ]]; then
+    fail "Autocontribute $label storage mount is unavailable"
+  fi
+  if [[ "$saw_writable" != true ]]; then
+    fail "Autocontribute $label storage mount has no writable backing layer"
+  fi
+  if [[ "$expected_access" == read-only && "$saw_read_only" != true ]]; then
+    fail "Autocontribute $label storage lacks a read-only service namespace layer"
+  fi
+
+  mount_table="$(findmnt --noheadings --raw --output MAJ:MIN,TARGET)" || \
+    fail 'Autocontribute could not inspect the host mount table'
+  matching_mount_count=0
+  while read -r candidate_device candidate_target trailing; do
+    if [[ -n "$trailing" ]]; then
+      if [[ "$candidate_device" == "$mount_device" || "$candidate_target" == "$path" ]]; then
+        fail "Autocontribute $label storage has ambiguous mount-table metadata"
+      fi
+      continue
+    fi
+    if [[ "$candidate_target" == "$path" && "$candidate_device" != "$mount_device" ]]; then
+      fail "Autocontribute $label storage mount is layered over another device"
+    fi
+    if [[ "$candidate_device" == "$mount_device" && "$candidate_target" != "$path" ]]; then
+      fail "Autocontribute $label storage device is mounted at another host path"
+    fi
+    if [[ "$candidate_device" == "$mount_device" && "$candidate_target" == "$path" ]]; then
+      matching_mount_count=$((matching_mount_count + 1))
+    fi
+  done <<< "$mount_table"
+  if [[ "$matching_mount_count" -lt 1 ]]; then
+    fail "Autocontribute $label storage device is absent from the host mount table"
+  fi
+
+  path_device="$(stat --format=%d -- "$path")" || \
+    fail "Autocontribute could not inspect the $label storage device"
+  parent_path="${path%/*}"
+  if [[ -z "$parent_path" ]]; then
+    parent_path=/
+  fi
+  parent_device="$(stat --format=%d -- "$parent_path")" || \
+    fail "Autocontribute could not inspect the $label storage parent device"
+  if [[ ! "$path_device" =~ ^[0-9]+$ || ! "$parent_device" =~ ^[0-9]+$ ]]; then
+    fail "Autocontribute $label storage reported invalid device metadata"
+  fi
+  if [[ "$path_device" == "$parent_device" ]]; then
+    fail "Autocontribute $label storage is not isolated on a separate filesystem"
+  fi
+
+  filesystem_limits="$(
+    stat --file-system --format=%S:%b:%a:%c:%d -- "$path"
+  )" || fail "Autocontribute could not inspect $label storage filesystem limits"
+  IFS=: read -r \
+    block_size total_blocks available_blocks total_inodes free_inodes trailing \
+    <<< "$filesystem_limits"
+  if [[
+    ! "$block_size" =~ ^[1-9][0-9]*$ ||
+    ! "$total_blocks" =~ ^[1-9][0-9]*$ ||
+    ! "$available_blocks" =~ ^(0|[1-9][0-9]*)$ ||
+    ! "$total_inodes" =~ ^[1-9][0-9]*$ ||
+    ! "$free_inodes" =~ ^(0|[1-9][0-9]*)$ ||
+    ${#block_size} -gt 11 ||
+    ${#total_blocks} -gt 11 ||
+    ${#available_blocks} -gt 11 ||
+    ${#total_inodes} -gt 11 ||
+    ${#free_inodes} -gt 11 ||
+    -n "$trailing"
+  ]]; then
+    fail "Autocontribute $label storage filesystem reported invalid limits"
+  fi
+  if (( available_blocks > total_blocks || free_inodes > total_inodes )); then
+    fail "Autocontribute $label storage filesystem reported inconsistent limits"
+  fi
+  if (( block_size > maximum_bytes || total_blocks > maximum_bytes / block_size )); then
+    fail "Autocontribute $label storage filesystem exceeds the byte ceiling"
+  fi
+  if (( total_inodes > maximum_inodes )); then
+    fail "Autocontribute $label storage filesystem exceeds the inode ceiling"
+  fi
+  required_available_blocks=$(((minimum_available_bytes + block_size - 1) / block_size))
+  if (( available_blocks < required_available_blocks )); then
+    fail "Autocontribute $label storage has less than the required byte headroom"
+  fi
+  if (( free_inodes < minimum_free_inodes )); then
+    fail "Autocontribute $label storage has less than the required inode headroom"
+  fi
+
+  printf -v "$result_variable" '%s' "$mount_device"
+}
+
+check_mount \
+  state \
+  "$state_root" \
+  "$state_maximum_bytes" \
+  "$state_maximum_inodes" \
+  "$state_minimum_available_bytes" \
+  "$state_minimum_free_inodes" \
+  state_mount_device
+check_mount \
+  backup \
+  "$backup_root" \
+  "$backup_maximum_bytes" \
+  "$backup_maximum_inodes" \
+  "$backup_minimum_available_bytes" \
+  "$backup_minimum_free_inodes" \
+  backup_mount_device
+
+if [[ "$state_mount_device" == "$backup_mount_device" ]]; then
+  fail 'Autocontribute state and backup storage must use separate filesystems'
+fi
+
+printf 'Autocontribute durable state and local backup capacity are safe\n'

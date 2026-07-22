@@ -16,6 +16,7 @@ ROOT = Path(__file__).parents[1]
 SYSTEMD = ROOT / "deploy" / "systemd"
 LOCK_PATH = "/var/lib/autocontribute/operation.lock"
 ROOTLESS_CHECK = SYSTEMD / "libexec" / "autocontribute-rootless-docker-check"
+STORAGE_CAPACITY_CHECK = SYSTEMD / "libexec" / "autocontribute-storage-capacity-check"
 WORKSPACE_QUOTA_CHECK = SYSTEMD / "libexec" / "autocontribute-workspace-quota-check"
 
 
@@ -328,6 +329,226 @@ esac
     )
 
 
+def _run_storage_capacity_check(
+    case_directory: Path,
+    *,
+    state_mount_device: str = "253:8",
+    backup_mount_device: str = "253:9",
+    state_mount_options: str = "rw,nosuid,nodev,noexec,relatime",
+    backup_mount_options: str = "rw,nosuid,nodev,noexec,relatime",
+    state_mount_target: str | None = None,
+    backup_mount_target: str | None = None,
+    state_filesystem_type: str = "ext4",
+    backup_filesystem_type: str = "ext4",
+    state_filesystem_root: str = "/",
+    backup_filesystem_root: str = "/",
+    state_mount_records: str | None = None,
+    backup_mount_records: str | None = None,
+    mount_table: str | None = None,
+    state_owner: int | None = None,
+    backup_owner: int | None = None,
+    state_group: int | None = None,
+    backup_group: int | None = None,
+    state_mode: str = "700",
+    backup_mode: str = "700",
+    state_stat_device: str = "2050",
+    backup_stat_device: str = "2051",
+    state_parent_device: str = "2048",
+    backup_parent_device: str = "2049",
+    state_block_size: str = "4096",
+    state_total_blocks: str = "1572864",
+    state_available_blocks: str = "524288",
+    state_total_inodes: str = "131072",
+    state_free_inodes: str = "65536",
+    backup_block_size: str = "4096",
+    backup_total_blocks: str = "12582912",
+    backup_available_blocks: str = "6291456",
+    backup_total_inodes: str = "393216",
+    backup_free_inodes: str = "300000",
+    access_mode: str = "--writable",
+    state_effectively_writable: bool | None = None,
+    backup_effectively_writable: bool | None = None,
+) -> subprocess.CompletedProcess[str]:
+    case_directory.mkdir()
+    state = case_directory / "state-parent" / "state"
+    backup = case_directory / "backup-parent" / "backup"
+    state.mkdir(mode=0o700, parents=True)
+    backup.mkdir(mode=0o700, parents=True)
+    if state_effectively_writable is None:
+        state_effectively_writable = access_mode != "--read-only"
+    if backup_effectively_writable is None:
+        backup_effectively_writable = access_mode == "--writable"
+    if not state_effectively_writable:
+        state.chmod(0o500)
+    if not backup_effectively_writable:
+        backup.chmod(0o500)
+    fake_bin = case_directory / "bin"
+    fake_bin.mkdir()
+    uid = os.getuid()
+    gid = os.getgid()
+    resolved_state_mount_target = state_mount_target or os.fspath(state)
+    resolved_backup_mount_target = backup_mount_target or os.fspath(backup)
+    resolved_state_mount_records = (
+        state_mount_records
+        if state_mount_records is not None
+        else "{target} {filesystem} {root} {options} {device}\n"
+    ).format(
+        target=resolved_state_mount_target,
+        state=state,
+        backup=backup,
+        filesystem=state_filesystem_type,
+        root=state_filesystem_root,
+        options=state_mount_options,
+        device=state_mount_device,
+    )
+    resolved_backup_mount_records = (
+        backup_mount_records
+        if backup_mount_records is not None
+        else "{target} {filesystem} {root} {options} {device}\n"
+    ).format(
+        target=resolved_backup_mount_target,
+        state=state,
+        backup=backup,
+        filesystem=backup_filesystem_type,
+        root=backup_filesystem_root,
+        options=backup_mount_options,
+        device=backup_mount_device,
+    )
+    resolved_mount_table = (
+        mount_table or "0:1 /\n{state_device} {state}\n{backup_device} {backup}\n0:2 /proc\n"
+    ).format(
+        state_device=state_mount_device,
+        backup_device=backup_mount_device,
+        state=state,
+        backup=backup,
+    )
+
+    _write_executable(
+        fake_bin / "id",
+        """#!/bin/sh
+set -eu
+[ "$*" = '--group' ]
+printf '%s\n' "$TEST_SERVICE_GID"
+""",
+    )
+    _write_executable(
+        fake_bin / "findmnt",
+        """#!/bin/sh
+set -eu
+if [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--mountpoint' ]; then
+  path=$4
+  [ "$5" = '--output' ]
+  [ "$6" = 'TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN' ]
+  case "$path" in
+    "$TEST_STATE") printf '%s' "$TEST_STATE_MOUNT_RECORDS" ;;
+    "$TEST_BACKUP") printf '%s' "$TEST_BACKUP_MOUNT_RECORDS" ;;
+    *) exit 80 ;;
+  esac
+elif [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--output' ]; then
+  [ "$4" = 'MAJ:MIN,TARGET' ]
+  printf '%s' "$TEST_MOUNT_TABLE"
+else
+  exit 81
+fi
+""",
+    )
+    _write_executable(
+        fake_bin / "stat",
+        """#!/bin/sh
+set -eu
+if [ "$1" = '--file-system' ]; then
+  [ "$2" = '--format=%S:%b:%a:%c:%d' ]
+  [ "$3" = '--' ]
+  case "$4" in
+    "$TEST_STATE") printf '%s:%s:%s:%s:%s\n' \
+      "$TEST_STATE_BLOCK_SIZE" "$TEST_STATE_TOTAL_BLOCKS" \
+      "$TEST_STATE_AVAILABLE_BLOCKS" "$TEST_STATE_TOTAL_INODES" \
+      "$TEST_STATE_FREE_INODES" ;;
+    "$TEST_BACKUP") printf '%s:%s:%s:%s:%s\n' \
+      "$TEST_BACKUP_BLOCK_SIZE" "$TEST_BACKUP_TOTAL_BLOCKS" \
+      "$TEST_BACKUP_AVAILABLE_BLOCKS" "$TEST_BACKUP_TOTAL_INODES" \
+      "$TEST_BACKUP_FREE_INODES" ;;
+    *) exit 82 ;;
+  esac
+  exit 0
+fi
+[ "$2" = '--' ]
+path=$3
+case "$1:$path" in
+  --format=%u:"$TEST_STATE") printf '%s\n' "$TEST_STATE_OWNER" ;;
+  --format=%g:"$TEST_STATE") printf '%s\n' "$TEST_STATE_GROUP" ;;
+  --format=%a:"$TEST_STATE") printf '%s\n' "$TEST_STATE_MODE" ;;
+  --format=%d:"$TEST_STATE") printf '%s\n' "$TEST_STATE_DEVICE" ;;
+  --format=%u:"$TEST_BACKUP") printf '%s\n' "$TEST_BACKUP_OWNER" ;;
+  --format=%g:"$TEST_BACKUP") printf '%s\n' "$TEST_BACKUP_GROUP" ;;
+  --format=%a:"$TEST_BACKUP") printf '%s\n' "$TEST_BACKUP_MODE" ;;
+  --format=%d:"$TEST_BACKUP") printf '%s\n' "$TEST_BACKUP_DEVICE" ;;
+  --format=%d:"$TEST_STATE_PARENT") printf '%s\n' "$TEST_STATE_PARENT_DEVICE" ;;
+  --format=%d:"$TEST_BACKUP_PARENT") printf '%s\n' "$TEST_BACKUP_PARENT_DEVICE" ;;
+  *) exit 83 ;;
+esac
+""",
+    )
+
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "TEST_BACKUP": os.fspath(backup),
+        "TEST_BACKUP_AVAILABLE_BLOCKS": backup_available_blocks,
+        "TEST_BACKUP_BLOCK_SIZE": backup_block_size,
+        "TEST_BACKUP_DEVICE": backup_stat_device,
+        "TEST_BACKUP_FILESYSTEM_ROOT": backup_filesystem_root,
+        "TEST_BACKUP_FILESYSTEM_TYPE": backup_filesystem_type,
+        "TEST_BACKUP_FREE_INODES": backup_free_inodes,
+        "TEST_BACKUP_GROUP": str(gid if backup_group is None else backup_group),
+        "TEST_BACKUP_MODE": backup_mode,
+        "TEST_BACKUP_MOUNT_DEVICE": backup_mount_device,
+        "TEST_BACKUP_MOUNT_OPTIONS": backup_mount_options,
+        "TEST_BACKUP_MOUNT_RECORDS": resolved_backup_mount_records,
+        "TEST_BACKUP_MOUNT_TARGET": resolved_backup_mount_target,
+        "TEST_BACKUP_OWNER": str(uid if backup_owner is None else backup_owner),
+        "TEST_BACKUP_PARENT": os.fspath(backup.parent),
+        "TEST_BACKUP_PARENT_DEVICE": backup_parent_device,
+        "TEST_BACKUP_TOTAL_BLOCKS": backup_total_blocks,
+        "TEST_BACKUP_TOTAL_INODES": backup_total_inodes,
+        "TEST_MOUNT_TABLE": resolved_mount_table,
+        "TEST_SERVICE_GID": str(gid),
+        "TEST_STATE": os.fspath(state),
+        "TEST_STATE_AVAILABLE_BLOCKS": state_available_blocks,
+        "TEST_STATE_BLOCK_SIZE": state_block_size,
+        "TEST_STATE_DEVICE": state_stat_device,
+        "TEST_STATE_FILESYSTEM_ROOT": state_filesystem_root,
+        "TEST_STATE_FILESYSTEM_TYPE": state_filesystem_type,
+        "TEST_STATE_FREE_INODES": state_free_inodes,
+        "TEST_STATE_GROUP": str(gid if state_group is None else state_group),
+        "TEST_STATE_MODE": state_mode,
+        "TEST_STATE_MOUNT_DEVICE": state_mount_device,
+        "TEST_STATE_MOUNT_OPTIONS": state_mount_options,
+        "TEST_STATE_MOUNT_RECORDS": resolved_state_mount_records,
+        "TEST_STATE_MOUNT_TARGET": resolved_state_mount_target,
+        "TEST_STATE_OWNER": str(uid if state_owner is None else state_owner),
+        "TEST_STATE_PARENT": os.fspath(state.parent),
+        "TEST_STATE_PARENT_DEVICE": state_parent_device,
+        "TEST_STATE_TOTAL_BLOCKS": state_total_blocks,
+        "TEST_STATE_TOTAL_INODES": state_total_inodes,
+    }
+    test_script = case_directory / "storage-capacity-check"
+    _write_executable(test_script, STORAGE_CAPACITY_CHECK.read_text(encoding="utf-8"))
+    return subprocess.run(
+        [
+            "bash",
+            os.fspath(test_script),
+            os.fspath(state),
+            os.fspath(backup),
+            access_mode,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+
 def test_systemd_bundle_contains_expected_units_and_executable_helpers() -> None:
     expected = {
         "autocontribute-backup.service",
@@ -349,6 +570,7 @@ def test_systemd_bundle_contains_expected_units_and_executable_helpers() -> None
         "autocontribute-healthcheck",
         "autocontribute-record-failure",
         "autocontribute-rootless-docker-check",
+        "autocontribute-storage-capacity-check",
         "autocontribute-worker",
         "autocontribute-workspace-quota-check",
     }
@@ -372,12 +594,26 @@ def test_ci_runs_real_version_controlled_systemd_validation() -> None:
     baseline = next(
         step for step in steps if step["name"] == "Require the controlled systemd baseline"
     )
+    storage_smoke = next(
+        step
+        for step in steps
+        if step["name"] == "Exercise durable storage preflight in a hardened service"
+    )
     verify = next(step for step in steps if step["name"] == "Verify system and timer units")
     security = next(
         step for step in steps if step["name"] == "Enforce service hardening exposure ceilings"
     )
 
     assert '[[ "$systemd_major" != "255" ]]' in baseline["run"]
+    assert "systemd-run" in storage_smoke["run"]
+    assert "autocontribute-storage-capacity-check" in storage_smoke["run"]
+    assert "truncate --size 24G" in storage_smoke["run"]
+    assert "Production storage" in storage_smoke["run"]
+    assert '--property="ReadWritePaths=$state_parent $backup_mount"' in storage_smoke["run"]
+    assert '--property="ReadWritePaths=$state_parent"' in storage_smoke["run"]
+    assert '"$state_mount" "$backup_mount" --state-writable' in storage_smoke["run"]
+    assert '--property="ReadOnlyPaths=$state_mount $backup_mount"' in storage_smoke["run"]
+    assert '"$state_mount" "$backup_mount" --read-only' in storage_smoke["run"]
     assert "systemd-analyze verify" in verify["run"]
     assert "--recursive-errors=no" in verify["run"]
     assert "systemd-analyze security" in security["run"]
@@ -440,6 +676,14 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
     assert "set -euo pipefail" in helper
     assert helper.index(headroom_call) < helper.index(check_call)
     assert helper.index(headroom_call) < credential_read
+    storage_call = '"$storage_capacity_check" "$state_root" "$backup_root" --state-writable'
+    assert storage_call in helper
+    assert helper.index(storage_call) < helper.index(structural_call)
+    assert helper.index(storage_call) < helper.index('credential_value="$(<"$credential_path")"')
+    assert helper.index(structural_call) < helper.index(check_call)
+    assert helper.index(structural_call) < helper.index('credential_value="$(<"$credential_path")"')
+    assert 'export AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT="$workspace_root"' in helper
+    assert 'export AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT="$state_root"' in helper
 
 
 def test_workspace_quota_check_accepts_bounded_dedicated_ext4_mount(tmp_path: Path) -> None:
@@ -591,6 +835,313 @@ def test_workspace_quota_check_rejects_unsafe_mount_metadata(tmp_path: Path) -> 
         assert "unsafe ownership or permissions" in result.stderr
 
 
+def test_storage_capacity_check_accepts_isolated_bounded_mounts(tmp_path: Path) -> None:
+    result = _run_storage_capacity_check(tmp_path / "valid")
+
+    assert result.returncode == 0, result.stderr
+    assert "capacity are safe" in result.stdout
+
+
+def test_storage_capacity_check_accepts_read_only_monitor_namespace(tmp_path: Path) -> None:
+    result = _run_storage_capacity_check(
+        tmp_path / "read-only",
+        state_mount_records=(
+            "{state} ext4 / rw,nosuid,nodev,noexec,relatime 253:8\n"
+            "{state} ext4 / ro,nosuid,nodev,noexec,relatime 253:8\n"
+        ),
+        backup_mount_records=(
+            "{backup} ext4 / rw,nosuid,nodev,noexec,relatime 253:9\n"
+            "{backup} ext4 / ro,nosuid,nodev,noexec,relatime 253:9\n"
+        ),
+        access_mode="--read-only",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_storage_capacity_check_accepts_worker_namespace(tmp_path: Path) -> None:
+    result = _run_storage_capacity_check(
+        tmp_path / "worker",
+        backup_mount_records=(
+            "{backup} ext4 / rw,nosuid,nodev,noexec,relatime 253:9\n"
+            "{backup} ext4 / ro,nosuid,nodev,noexec,relatime 253:9\n"
+        ),
+        access_mode="--state-writable",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_storage_capacity_check_requires_writable_state_for_worker(tmp_path: Path) -> None:
+    result = _run_storage_capacity_check(
+        tmp_path / "worker-read-only-state",
+        state_mount_records=(
+            "{state} ext4 / rw,nosuid,nodev,noexec,relatime 253:8\n"
+            "{state} ext4 / ro,nosuid,nodev,noexec,relatime 253:8\n"
+        ),
+        backup_mount_records=(
+            "{backup} ext4 / rw,nosuid,nodev,noexec,relatime 253:9\n"
+            "{backup} ext4 / ro,nosuid,nodev,noexec,relatime 253:9\n"
+        ),
+        access_mode="--state-writable",
+    )
+
+    assert result.returncode != 0
+    assert "state storage mount is not writable" in result.stderr
+
+
+def test_storage_capacity_check_rejects_writable_worker_backup_namespace(
+    tmp_path: Path,
+) -> None:
+    result = _run_storage_capacity_check(
+        tmp_path / "worker-writable-backup",
+        access_mode="--state-writable",
+        backup_effectively_writable=True,
+    )
+
+    assert result.returncode != 0
+    assert "backup storage is writable in a read-only service namespace" in result.stderr
+
+
+def test_storage_capacity_check_rejects_worker_backup_without_read_only_layer(
+    tmp_path: Path,
+) -> None:
+    result = _run_storage_capacity_check(
+        tmp_path / "worker-missing-read-only-layer",
+        access_mode="--state-writable",
+    )
+
+    assert result.returncode != 0
+    assert "backup storage lacks a read-only service namespace layer" in result.stderr
+
+
+def test_storage_capacity_check_rejects_read_only_mount_without_writable_backing(
+    tmp_path: Path,
+) -> None:
+    result = _run_storage_capacity_check(
+        tmp_path / "read-only-without-backing",
+        state_mount_options="ro,nosuid,nodev,noexec,relatime",
+        backup_mount_records=(
+            "{backup} ext4 / rw,nosuid,nodev,noexec,relatime 253:9\n"
+            "{backup} ext4 / ro,nosuid,nodev,noexec,relatime 253:9\n"
+        ),
+        access_mode="--read-only",
+    )
+
+    assert result.returncode != 0
+    assert "state storage mount has no writable backing layer" in result.stderr
+
+
+def test_storage_capacity_check_accepts_same_target_namespace_layers(tmp_path: Path) -> None:
+    result = _run_storage_capacity_check(
+        tmp_path / "same-target-layers",
+        state_mount_records=(
+            "{state} ext4 / rw,nosuid,nodev,noexec,relatime 253:8\n"
+            "{state} ext4 / rw,nosuid,nodev,noexec,relatime 253:8\n"
+        ),
+        backup_mount_records=(
+            "{backup} ext4 / rw,nosuid,nodev,noexec,relatime 253:9\n"
+            "{backup} ext4 / rw,nosuid,nodev,noexec,relatime 253:9\n"
+        ),
+        mount_table=("253:8 {state}\n253:8 {state}\n253:9 {backup}\n253:9 {backup}\n"),
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_storage_capacity_check_accepts_exact_ceiling_and_headroom_boundaries(
+    tmp_path: Path,
+) -> None:
+    result = _run_storage_capacity_check(
+        tmp_path / "exact-boundaries",
+        state_total_blocks="2097152",
+        state_available_blocks="262144",
+        state_total_inodes="262144",
+        state_free_inodes="32768",
+        backup_total_blocks="16777216",
+        backup_available_blocks="5242880",
+        backup_total_inodes="524288",
+        backup_free_inodes="262144",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "overrides", "message"),
+    (
+        (
+            "state-byte-ceiling",
+            {"state_total_blocks": "2097153"},
+            "state storage filesystem exceeds the byte ceiling",
+        ),
+        (
+            "backup-byte-ceiling",
+            {"backup_total_blocks": "16777217"},
+            "backup storage filesystem exceeds the byte ceiling",
+        ),
+        (
+            "state-inode-ceiling",
+            {"state_total_inodes": "262145"},
+            "state storage filesystem exceeds the inode ceiling",
+        ),
+        (
+            "backup-inode-ceiling",
+            {"backup_total_inodes": "524289"},
+            "backup storage filesystem exceeds the inode ceiling",
+        ),
+        (
+            "state-byte-headroom",
+            {"state_available_blocks": "262143"},
+            "state storage has less than the required byte headroom",
+        ),
+        (
+            "backup-byte-headroom",
+            {"backup_available_blocks": "5242879"},
+            "backup storage has less than the required byte headroom",
+        ),
+        (
+            "state-inode-headroom",
+            {"state_free_inodes": "32767"},
+            "state storage has less than the required inode headroom",
+        ),
+        (
+            "backup-inode-headroom",
+            {"backup_free_inodes": "262143"},
+            "backup storage has less than the required inode headroom",
+        ),
+        (
+            "overlong-statfs-field",
+            {"state_total_blocks": "999999999999999999999999"},
+            "state storage filesystem reported invalid limits",
+        ),
+        (
+            "noncanonical-statfs-field",
+            {"backup_available_blocks": "0006291456"},
+            "backup storage filesystem reported invalid limits",
+        ),
+    ),
+)
+def test_storage_capacity_check_enforces_fixed_ceilings_and_headroom(
+    tmp_path: Path,
+    name: str,
+    overrides: dict[str, str],
+    message: str,
+) -> None:
+    result = _run_storage_capacity_check(tmp_path / name, **overrides)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "overrides", "message"),
+    (
+        (
+            "shared-filesystem",
+            {"backup_mount_device": "253:8"},
+            "state storage device is mounted at another host path",
+        ),
+        (
+            "state-parent-filesystem",
+            {"state_stat_device": "2048"},
+            "state storage is not isolated on a separate filesystem",
+        ),
+        (
+            "backup-parent-filesystem",
+            {"backup_stat_device": "2049"},
+            "backup storage is not isolated on a separate filesystem",
+        ),
+        (
+            "state-wrong-target",
+            {"state_mount_target": "/var/lib/autocontribute"},
+            "state storage is not an exact dedicated mount",
+        ),
+        (
+            "state-second-target",
+            {"mount_table": ("253:8 {state}\n253:8 /mnt/state-alias\n253:9 {backup}\n")},
+            "state storage device is mounted at another host path",
+        ),
+        (
+            "state-layered-other-device",
+            {
+                "state_mount_records": (
+                    "{state} ext4 / rw,nosuid,nodev,noexec 253:8\n"
+                    "{state} ext4 / rw,nosuid,nodev,noexec 253:10\n"
+                )
+            },
+            "state storage mount is layered over another device",
+        ),
+        (
+            "state-hidden-device-layer",
+            {"mount_table": ("253:8 {state}\n253:10 {state}\n253:9 {backup}\n")},
+            "state storage mount is layered over another device",
+        ),
+        (
+            "unsafe-inner-layer",
+            {
+                "state_mount_records": (
+                    "{state} ext4 / rw,nosuid,nodev,noexec 253:8\n"
+                    "{state} ext4 / rw,nosuid,nodev 253:8\n"
+                )
+            },
+            "state storage mount must use noexec",
+        ),
+        (
+            "backup-bind",
+            {"backup_mount_options": "rw,nosuid,nodev,noexec,bind"},
+            "backup storage cannot be a bind mount",
+        ),
+        (
+            "missing-noexec",
+            {"state_mount_options": "rw,nosuid,nodev"},
+            "state storage mount must use noexec",
+        ),
+        (
+            "wrong-filesystem",
+            {"backup_filesystem_type": "xfs"},
+            "backup storage must use ext4",
+        ),
+        (
+            "read-only-operation",
+            {"state_mount_options": "ro,nosuid,nodev,noexec"},
+            "state storage mount is not writable",
+        ),
+        (
+            "ambiguous-access",
+            {"state_mount_options": "rw,ro,nosuid,nodev,noexec"},
+            "state storage mount has ambiguous access options",
+        ),
+    ),
+)
+def test_storage_capacity_check_rejects_unenforced_storage_boundaries(
+    tmp_path: Path,
+    name: str,
+    overrides: dict[str, str],
+    message: str,
+) -> None:
+    result = _run_storage_capacity_check(tmp_path / name, **overrides)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+
+
+def test_storage_capacity_check_rejects_unsafe_mount_metadata(tmp_path: Path) -> None:
+    cases: tuple[tuple[str, dict[str, int | str]], ...] = (
+        ("state-owner", {"state_owner": os.getuid() + 1}),
+        ("backup-group", {"backup_group": os.getgid() + 1}),
+        ("state-mode", {"state_mode": "750"}),
+        ("backup-mode", {"backup_mode": "770"}),
+    )
+    for name, overrides in cases:
+        result = _run_storage_capacity_check(
+            tmp_path / name,
+            **overrides,  # type: ignore[arg-type]
+        )
+        assert result.returncode != 0
+        assert "unsafe ownership or permissions" in result.stderr
+
+
 def test_rootless_docker_check_accepts_only_the_exact_option_and_clears_context(
     tmp_path: Path,
 ) -> None:
@@ -707,11 +1258,32 @@ def test_worker_doctor_and_complete_backup_share_one_exclusive_lock() -> None:
     assert "--overwrite" not in backup
     assert "date --utc +%Y%m%dT%H%M%S.%NZ" in backup
     assert 'chmod 0400 -- "$destination"' in backup
+    backup_capacity_call = '"$storage_capacity_check" "$state_root" "$backup_directory" --writable'
+    assert backup_capacity_call in backup
+    assert backup.index(backup_capacity_call) < backup.index('"$executable" state backup')
+    assert 'export AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT="$state_root"' in backup
+
+    health = (SYSTEMD / "libexec" / "autocontribute-healthcheck").read_text(encoding="utf-8")
+    health_capacity_call = '"$storage_capacity_check" "$state_root" "$backup_root" --read-only'
+    assert health_capacity_call in health
+    assert health.index(health_capacity_call) < health.index("check_stamp worker")
 
     backup_unit = (SYSTEMD / "autocontribute-backup.service").read_text(encoding="utf-8")
     assert "PrivateNetwork=yes" in backup_unit
     assert "LoadCredential" not in backup_unit
     assert "ReadWritePaths=/var/backups/autocontribute /var/lib/autocontribute" in backup_unit
+
+    for name in (
+        "autocontribute-worker.service",
+        "autocontribute-doctor.service",
+        "autocontribute-backup.service",
+        "autocontribute-health.service",
+    ):
+        storage_unit = (SYSTEMD / name).read_text(encoding="utf-8")
+        assert (
+            "RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute"
+            in storage_unit
+        )
 
     for name in ("autocontribute-health.service", "autocontribute-failure@.service"):
         signal_unit = (SYSTEMD / name).read_text(encoding="utf-8")
@@ -775,7 +1347,15 @@ def test_tmpfiles_keeps_state_private_and_docs_cover_safe_recovery() -> None:
     assert "21,474,836,480 bytes" in guide
     assert "524,288 inodes" in guide
     assert "rw,nodev,nosuid" in guide
+    assert "state filesystem is capped at 8 GiB and 262,144 inodes" in guide
+    assert "backup filesystem is capped" in guide
+    assert "64 GiB and 524,288 inodes" in guide
+    assert "at least 20 GiB and 262,144 inodes available" in guide
+    assert "never a timer action" in guide
+    assert "SHA-256 digest" in guide
+    assert "provider-specific replication/receipt protocol" in guide
     assert "AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT" not in guide
+    assert "AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT" not in guide
 
 
 def test_docs_apply_sensitive_dropins_to_both_execution_services() -> None:

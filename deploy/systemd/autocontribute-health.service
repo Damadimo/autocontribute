@@ -2,6 +2,7 @@
 Description=Check Autocontribute worker and backup freshness
 Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
 OnFailure=autocontribute-failure@%n.service
+RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute
 
 [Service]
 Type=oneshot
@@ -38,7 +39,7 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 KeyringMode=private
-ReadOnlyPaths=/var/lib/autocontribute/health
+ReadOnlyPaths=/var/lib/autocontribute/health /var/lib/autocontribute/state /var/backups/autocontribute
 
 StandardOutput=journal
 StandardError=journal

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import stat
 import zipfile
 from pathlib import Path
@@ -146,6 +147,27 @@ def test_complete_state_bundle_round_trip_is_checksummed_and_atomic(tmp_path: Pa
     restored = RunStore(restored_database.parent)
     assert restored.get(run.run_id) == run
     assert restored.artifact_dir(run.run_id).joinpath("review-note.txt").read_text() == "evidence\n"
+
+
+def test_complete_bundle_verifies_staging_with_live_root_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = RunStore(tmp_path / "source")
+    run = source.create_run()
+    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT", os.fspath(source.root))
+    monkeypatch.setenv(
+        "AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT",
+        os.fspath(source.workspaces_dir),
+    )
+
+    bundle = create_state_bundle(source, tmp_path / "backups" / "state.zip")
+    restored_database = restore_state_bundle(tmp_path / "restored", bundle)
+
+    monkeypatch.delenv("AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT")
+    monkeypatch.delenv("AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT")
+    restored = RunStore(restored_database.parent)
+    assert restored.get(run.run_id) == run
 
 
 def test_complete_bundle_rejects_unanchored_evaluation_file(tmp_path: Path) -> None:

@@ -15,6 +15,43 @@ from autocontribute.exceptions import StateError
 from autocontribute.store import CURRENT_SCHEMA_VERSION, RunStore
 
 
+def test_required_storage_root_binds_store_to_verified_mount(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required = tmp_path / "state"
+    required.mkdir()
+    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT", os.fspath(required))
+
+    store = RunStore(required)
+
+    assert store.root == required
+
+
+def test_required_storage_root_rejects_storage_bypass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    required = tmp_path / "bounded"
+    required.mkdir()
+    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT", os.fspath(required))
+
+    with pytest.raises(StateError, match="bypasses the required storage root"):
+        RunStore(tmp_path / "unbounded")
+
+
+@pytest.mark.parametrize("required", ("", "relative/state"))
+def test_required_storage_root_rejects_invalid_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    required: str,
+) -> None:
+    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT", required)
+
+    with pytest.raises(StateError, match="Required storage root"):
+        RunStore(tmp_path / "state")
+
+
 def test_required_workspace_root_binds_storage_to_verified_mount(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

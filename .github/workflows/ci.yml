@@ -162,6 +162,158 @@ jobs:
             --property=RestrictSUIDSGID=yes \
             --property="ReadWritePaths=$smoke_root" \
             /usr/local/libexec/autocontribute-workspace-quota-check --headroom "$workspace_mount"
+      - name: Exercise durable storage preflight in a hardened service
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          backup_image=""
+          backup_loop=""
+          backup_mount=""
+          backup_parent=""
+          smoke_root=""
+          state_image=""
+          state_loop=""
+          state_mount=""
+          state_parent=""
+
+          cleanup_storage_smoke() {
+            local exit_status=$?
+            local cleanup_failed=0
+            local mounts_detached=1
+            trap - EXIT
+            set +e
+
+            for cleanup_mount in "$backup_mount" "$state_mount"; do
+              if [[ -n "$cleanup_mount" ]] && mountpoint --quiet -- "$cleanup_mount"; then
+                if ! sudo umount -- "$cleanup_mount"; then
+                  echo "Failed to unmount storage smoke-test filesystem: $cleanup_mount" >&2
+                  cleanup_failed=1
+                  mounts_detached=0
+                fi
+              fi
+            done
+            if [[ "$mounts_detached" -eq 1 ]]; then
+              for cleanup_loop in "$backup_loop" "$state_loop"; do
+                if [[ -n "$cleanup_loop" ]] && ! sudo losetup --detach "$cleanup_loop"; then
+                  echo "Failed to detach storage smoke-test loop device: $cleanup_loop" >&2
+                  cleanup_failed=1
+                  mounts_detached=0
+                fi
+              done
+            fi
+            if [[ "$mounts_detached" -eq 1 && -n "$smoke_root" ]]; then
+              for cleanup_image in "$backup_image" "$state_image"; do
+                if [[ -n "$cleanup_image" ]]; then
+                  rm -f -- "$cleanup_image" || cleanup_failed=1
+                fi
+              done
+              for cleanup_directory in \
+                "$backup_mount" "$state_mount" "$backup_parent" "$state_parent" "$smoke_root"; do
+                if [[ -d "$cleanup_directory" ]] && ! rmdir -- "$cleanup_directory"; then
+                  echo "Failed to remove storage smoke-test directory: $cleanup_directory" >&2
+                  cleanup_failed=1
+                fi
+              done
+            fi
+            if [[ "$exit_status" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
+              exit_status=1
+            fi
+            exit "$exit_status"
+          }
+          trap cleanup_storage_smoke EXIT
+
+          for required_command in \
+            findmnt losetup mkfs.ext4 mount mountpoint realpath systemd-run truncate umount; do
+            command -v "$required_command" >/dev/null
+          done
+          unset required_command
+          test "$(cat /proc/1/comm)" = systemd
+
+          smoke_root="$(mktemp --directory \
+            "${RUNNER_TEMP}/autocontribute-storage-capacity.XXXXXX")"
+          smoke_root="$(realpath "$smoke_root")"
+          state_image="${smoke_root}/state.ext4"
+          backup_image="${smoke_root}/backup.ext4"
+          state_parent="${smoke_root}/state-parent"
+          backup_parent="${smoke_root}/backup-parent"
+          state_mount="${state_parent}/state"
+          backup_mount="${backup_parent}/backups"
+          install -d -m 0700 \
+            "$state_parent" "$backup_parent" "$state_mount" "$backup_mount"
+
+          # Sparse files are acceptable only for this disposable boundary test. Production storage
+          # must be fully allocated as documented in docs/systemd-deployment.md.
+          truncate --size 2G "$state_image"
+          truncate --size 24G "$backup_image"
+          state_loop="$(sudo losetup --find --show "$state_image")"
+          backup_loop="$(sudo losetup --find --show "$backup_image")"
+          if [[ ! "$state_loop" =~ ^/dev/loop[0-9]+$ || ! "$backup_loop" =~ ^/dev/loop[0-9]+$ ]]; then
+            echo "losetup returned an unexpected storage smoke-test device path" >&2
+            exit 1
+          fi
+          sudo mkfs.ext4 -q -m 1 -N 65536 "$state_loop"
+          sudo mkfs.ext4 -q -m 0 -N 393216 "$backup_loop"
+          sudo mount -t ext4 -o nodev,nosuid,noexec -- "$state_loop" "$state_mount"
+          sudo mount -t ext4 -o nodev,nosuid,noexec -- "$backup_loop" "$backup_mount"
+
+          service_uid="$(id --user)"
+          service_gid="$(id --group)"
+          test "$service_uid" -ne 0
+          sudo chown "${service_uid}:${service_gid}" "$state_mount" "$backup_mount"
+          chmod 0700 "$state_mount" "$backup_mount"
+
+          storage_unit="autocontribute-storage-capacity-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          sudo systemd-run \
+            --unit="${storage_unit}-backup.service" \
+            --wait \
+            --collect \
+            --pipe \
+            --property=Type=exec \
+            --property="User=$service_uid" \
+            --property="Group=$service_gid" \
+            --property=NoNewPrivileges=yes \
+            --property=PrivateDevices=yes \
+            --property=PrivateTmp=yes \
+            --property=ProtectSystem=strict \
+            --property=RestrictSUIDSGID=yes \
+            --property="ReadWritePaths=$state_parent $backup_mount" \
+            /usr/local/libexec/autocontribute-storage-capacity-check \
+              "$state_mount" "$backup_mount" --writable
+
+          sudo systemd-run \
+            --unit="${storage_unit}-worker.service" \
+            --wait \
+            --collect \
+            --pipe \
+            --property=Type=exec \
+            --property="User=$service_uid" \
+            --property="Group=$service_gid" \
+            --property=NoNewPrivileges=yes \
+            --property=PrivateDevices=yes \
+            --property=PrivateTmp=yes \
+            --property=ProtectSystem=strict \
+            --property=RestrictSUIDSGID=yes \
+            --property="ReadWritePaths=$state_parent" \
+            /usr/local/libexec/autocontribute-storage-capacity-check \
+              "$state_mount" "$backup_mount" --state-writable
+
+          sudo systemd-run \
+            --unit="${storage_unit}-health.service" \
+            --wait \
+            --collect \
+            --pipe \
+            --property=Type=exec \
+            --property="User=$service_uid" \
+            --property="Group=$service_gid" \
+            --property=NoNewPrivileges=yes \
+            --property=PrivateDevices=yes \
+            --property=PrivateTmp=yes \
+            --property=ProtectSystem=strict \
+            --property=RestrictSUIDSGID=yes \
+            --property="ReadOnlyPaths=$state_mount $backup_mount" \
+            /usr/local/libexec/autocontribute-storage-capacity-check \
+              "$state_mount" "$backup_mount" --read-only
       - name: Verify system and timer units
         shell: bash
         env:

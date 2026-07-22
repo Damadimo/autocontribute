@@ -4,6 +4,7 @@ Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-
 OnFailure=autocontribute-failure@%n.service
 StartLimitIntervalSec=8h
 StartLimitBurst=2
+RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute
 
 [Service]
 Type=oneshot
