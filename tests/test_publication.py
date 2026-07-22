@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import replace
@@ -46,9 +47,21 @@ from autocontribute.store import RunStore
 
 
 def _git(repository: Path, *arguments: str) -> str:
+    # Keep commit fixtures independent of developer Git configuration and environment-driven
+    # attribution hooks. Publication uses the same isolated configuration boundary in production.
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", "/tmp"),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
     result = subprocess.run(
         ["git", "-c", "commit.gpgsign=false", *arguments],
         cwd=repository,
+        env=environment,
         capture_output=True,
         text=True,
         check=False,
