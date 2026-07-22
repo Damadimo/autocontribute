@@ -1,0 +1,14 @@
+[Unit]
+Description=Back up complete Autocontribute state daily
+Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
+
+[Timer]
+OnCalendar=*-*-* 03:17:00 UTC
+Persistent=yes
+RandomizedDelaySec=15m
+FixedRandomDelay=yes
+AccuracySec=1m
+Unit=autocontribute-backup.service
+
+[Install]
+WantedBy=timers.target

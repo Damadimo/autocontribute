@@ -1,0 +1,83 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+umask 077
+
+readonly executable="${AUTOCONTRIBUTE_EXECUTABLE:-/opt/autocontribute/current/.venv/bin/autocontribute}"
+readonly config="${AUTOCONTRIBUTE_CONFIG:-/etc/autocontribute/autocontribute.yml}"
+readonly credential_names="${AUTOCONTRIBUTE_CREDENTIAL_NAMES:-}"
+readonly credential_directory="${CREDENTIALS_DIRECTORY:-}"
+readonly operation="${1:-run}"
+readonly runtime_directory="/run/user/$UID"
+readonly docker_socket="$runtime_directory/docker.sock"
+
+if [[ ! -x "$executable" ]]; then
+  printf 'Autocontribute executable is unavailable\n' >&2
+  exit 1
+fi
+if [[ ! -r "$config" ]]; then
+  printf 'Autocontribute configuration is unavailable\n' >&2
+  exit 1
+fi
+if [[ ! -d "$runtime_directory" || -L "$runtime_directory" || ! -S "$docker_socket" || -L "$docker_socket" ]]; then
+  printf 'Autocontribute rootless Docker socket is unavailable\n' >&2
+  exit 1
+fi
+readonly docker_socket_owner="$(stat --format=%u -- "$docker_socket")"
+if [[ "$docker_socket_owner" != "$UID" ]]; then
+  printf 'Autocontribute Docker socket is not owned by the service account\n' >&2
+  exit 1
+fi
+if [[ -z "$credential_names" || -z "$credential_directory" ]]; then
+  printf 'Autocontribute systemd credentials are not configured\n' >&2
+  exit 1
+fi
+
+declare -A loaded_credentials=()
+for credential_name in $credential_names; do
+  if [[ ! "$credential_name" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+    printf 'An Autocontribute credential has an invalid environment name\n' >&2
+    exit 1
+  fi
+  case "$credential_name" in
+    AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH | BASH* | CDPATH | ENV | GIT_* | HOME | IFS | LD_* | PATH | PYTHON* | SHELL | XDG_*)
+      printf 'An Autocontribute credential uses a reserved environment name\n' >&2
+      exit 1
+      ;;
+  esac
+  if [[ -n "${loaded_credentials[$credential_name]:-}" ]]; then
+    printf 'An Autocontribute credential name is duplicated\n' >&2
+    exit 1
+  fi
+  loaded_credentials[$credential_name]=1
+
+  credential_path="$credential_directory/$credential_name"
+  if [[ ! -f "$credential_path" || -L "$credential_path" ]]; then
+    printf 'A required Autocontribute credential is unavailable\n' >&2
+    exit 1
+  fi
+  credential_value="$(<"$credential_path")"
+  if [[ -z "$credential_value" || "$credential_value" == *$'\n'* ]]; then
+    printf 'A required Autocontribute credential is empty or multiline\n' >&2
+    exit 1
+  fi
+  printf -v "$credential_name" '%s' "$credential_value"
+  export "$credential_name"
+  unset credential_value credential_path
+done
+
+unset credential_name loaded_credentials
+export XDG_RUNTIME_DIR="$runtime_directory"
+export DOCKER_HOST="unix://$docker_socket"
+case "$operation" in
+  doctor)
+    exec "$executable" doctor --non-interactive --config "$config"
+    ;;
+  run)
+    exec "$executable" run --scheduled --config "$config"
+    ;;
+  *)
+    printf 'Unsupported Autocontribute systemd operation\n' >&2
+    exit 1
+    ;;
+esac

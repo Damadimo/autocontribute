@@ -1,0 +1,46 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+readonly health_directory="${AUTOCONTRIBUTE_HEALTH_DIRECTORY:-/var/lib/autocontribute/health}"
+readonly worker_max_age="${AUTOCONTRIBUTE_WORKER_MAX_AGE_SECONDS:-64800}"
+readonly backup_max_age="${AUTOCONTRIBUTE_BACKUP_MAX_AGE_SECONDS:-129600}"
+
+if [[ ! "$worker_max_age" =~ ^[1-9][0-9]*$ || ! "$backup_max_age" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'Autocontribute health age limits are invalid\n' >&2
+  exit 1
+fi
+if [[ ! -d "$health_directory" || -L "$health_directory" ]]; then
+  printf 'Autocontribute health directory is unavailable or unsafe\n' >&2
+  exit 1
+fi
+
+readonly now="$(date +%s)"
+failures=()
+
+check_stamp() {
+  local label="$1"
+  local maximum_age="$2"
+  local stamp="$health_directory/$3"
+  local modified age
+
+  if [[ ! -f "$stamp" || -L "$stamp" ]]; then
+    failures+=("$label has never completed successfully")
+    return
+  fi
+  modified="$(stat --format=%Y -- "$stamp")"
+  age=$((now - modified))
+  if ((age < 0 || age > maximum_age)); then
+    failures+=("$label success is stale (${age}s old; limit ${maximum_age}s)")
+  fi
+}
+
+check_stamp worker "$worker_max_age" worker-success
+check_stamp backup "$backup_max_age" backup-success
+
+if ((${#failures[@]})); then
+  printf 'Autocontribute health check failed:\n' >&2
+  printf ' - %s\n' "${failures[@]}" >&2
+  exit 1
+fi
+
+printf 'Autocontribute worker and complete backup are fresh\n'

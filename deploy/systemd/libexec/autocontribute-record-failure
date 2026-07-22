@@ -1,0 +1,26 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+umask 077
+
+readonly failed_unit="${1:-unknown}"
+readonly health_directory="${AUTOCONTRIBUTE_HEALTH_DIRECTORY:-/var/lib/autocontribute/health}"
+
+if [[ ! "$failed_unit" =~ ^[A-Za-z0-9@_.-]+$ ]]; then
+  printf 'Refusing to record an invalid systemd unit name\n' >&2
+  exit 1
+fi
+if [[ ! -d "$health_directory" || -L "$health_directory" || ! -w "$health_directory" ]]; then
+  printf 'Autocontribute health directory is unavailable or unsafe\n' >&2
+  exit 1
+fi
+
+readonly timestamp="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+temporary="$(mktemp --tmpdir="$health_directory" .last-failure.XXXXXX)"
+trap 'rm -f -- "$temporary"' EXIT
+printf '%s %s\n' "$timestamp" "$failed_unit" >"$temporary"
+chmod 0600 -- "$temporary"
+mv -fT -- "$temporary" "$health_directory/last-failure"
+trap - EXIT
+
+printf 'Autocontribute unit failed: %s at %s\n' "$failed_unit" "$timestamp" >&2

@@ -1,0 +1,14 @@
+[Unit]
+Description=Run Autocontribute twice daily
+Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
+
+[Timer]
+OnCalendar=*-*-* 09,21:17:00 UTC
+Persistent=yes
+RandomizedDelaySec=15m
+FixedRandomDelay=yes
+AccuracySec=1m
+Unit=autocontribute-worker.service
+
+[Install]
+WantedBy=timers.target

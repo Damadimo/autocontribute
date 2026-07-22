@@ -97,7 +97,9 @@ the lineage variable directly. Before downloading state for local approval/publi
 workflow's `lock_for_handoff=true`
 dispatch; it uploads the complete handoff artifact before writing the irreversible marker that
 permanently stops the hosted lineage, so lifecycle state cannot fork. See
-[Scheduled operation](docs/scheduled-operation.md).
+[Scheduled operation](docs/scheduled-operation.md). For a durable Linux worker with rootless Docker,
+encrypted systemd credentials, mutually exclusive complete backups, and health signaling, see the
+[operator-managed systemd deployment](docs/systemd-deployment.md).
 
 ## The contribution pipeline
 
@@ -316,7 +318,8 @@ See [SECURITY.md](SECURITY.md) before enabling a schedule and [CONTRIBUTING.md](
 working on the agent itself.
 
 Design details live in [Architecture](docs/architecture.md), [Quality policy](docs/quality-policy.md),
-[Staging](docs/staging.md), and [Scheduled operation](docs/scheduled-operation.md).
+[Staging](docs/staging.md), [Scheduled operation](docs/scheduled-operation.md), and the
+[operator-managed systemd deployment](docs/systemd-deployment.md).
 
 ## Development
 

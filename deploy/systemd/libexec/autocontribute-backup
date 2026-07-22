@@ -1,0 +1,31 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+umask 077
+
+readonly executable="${AUTOCONTRIBUTE_EXECUTABLE:-/opt/autocontribute/current/.venv/bin/autocontribute}"
+readonly config="${AUTOCONTRIBUTE_CONFIG:-/etc/autocontribute/autocontribute.yml}"
+readonly backup_directory="${AUTOCONTRIBUTE_BACKUP_DIRECTORY:-/var/backups/autocontribute}"
+
+if [[ ! -x "$executable" || ! -r "$config" ]]; then
+  printf 'Autocontribute backup prerequisites are unavailable\n' >&2
+  exit 1
+fi
+if [[ ! -d "$backup_directory" || -L "$backup_directory" || ! -w "$backup_directory" ]]; then
+  printf 'Autocontribute backup directory is unavailable or unsafe\n' >&2
+  exit 1
+fi
+
+readonly timestamp="$(date --utc +%Y%m%dT%H%M%S.%NZ)"
+readonly destination="$backup_directory/autocontribute-state-$timestamp-$$.bundle.zip"
+if [[ -e "$destination" || -L "$destination" ]]; then
+  printf 'Autocontribute backup destination unexpectedly exists\n' >&2
+  exit 1
+fi
+
+"$executable" state backup \
+  --complete \
+  --config "$config" \
+  --output "$destination"
+chmod 0400 -- "$destination"
+printf 'Verified complete Autocontribute backup created: %s\n' "$destination"

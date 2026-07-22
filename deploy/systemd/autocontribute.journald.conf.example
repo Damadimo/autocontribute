@@ -1,0 +1,7 @@
+[Journal]
+Storage=persistent
+Compress=yes
+Seal=yes
+SystemMaxUse=1G
+MaxRetentionSec=30day
+MaxFileSec=1day

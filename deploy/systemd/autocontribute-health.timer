@@ -1,0 +1,13 @@
+[Unit]
+Description=Monitor Autocontribute operation freshness
+Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
+
+[Timer]
+OnBootSec=20m
+OnUnitInactiveSec=15m
+RandomizedDelaySec=2m
+AccuracySec=1m
+Unit=autocontribute-health.service
+
+[Install]
+WantedBy=timers.target
