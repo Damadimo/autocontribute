@@ -24,11 +24,16 @@ from autocontribute.domain import (
     utc_now,
 )
 from autocontribute.exceptions import CircuitBreakerTrigger, StateError
+from autocontribute.lifecycle import (
+    PullRequestLifecycleSnapshot,
+    parse_lifecycle_snapshot_json,
+)
 
 CURRENT_SCHEMA_VERSION: Final = 5
 _MAX_GENERATION: Final = 2**63 - 1
 _MAX_ACTIVE_CIRCUIT_BREAKER_TRIGGERS: Final = 10_000
 _MAX_LIFECYCLE_SNAPSHOT_BYTES: Final = 2_000_000
+_MAX_LIFECYCLE_SNAPSHOT_CORPUS: Final = 100_000
 _MAX_RUN_CORPUS: Final = 10_000
 _MAX_EVALUATION_EVENT_CORPUS: Final = 10_000
 _REQUIRED_STORAGE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT"
@@ -227,6 +232,12 @@ class Lease:
 
 @dataclass(frozen=True, slots=True)
 class LifecycleSnapshot:
+    """One verified row; ``observed_at`` is non-authoritative storage metadata.
+
+    Upstream outcome decisions must use timestamps inside ``snapshot_json`` and immutable ledger
+    order. The local polling time neither contributes to the fingerprint nor proves an outcome.
+    """
+
     run_id: str
     fingerprint: str
     observed_at: datetime
@@ -967,6 +978,9 @@ class RunStore:
         _verify_circuit_breaker_evidence(connection)
         if expected_version >= 4:
             _verify_event_anchors(connection)
+        else:
+            _verify_unanchored_event_chains(connection)
+        _verify_lifecycle_snapshot_evidence(connection, collect=False)
         if expected_version == 4:
             _verify_publication_gate_holds(connection)
         if expected_version >= 5:
@@ -2404,9 +2418,11 @@ class RunStore:
         """Persist one immutable lifecycle observation, deduplicated by its fingerprint."""
 
         normalized_run_id = _lease_identity(run_id, field="run id")
-        normalized_fingerprint = _lease_identity(fingerprint, field="lifecycle fingerprint")
-        normalized_snapshot = _validated_snapshot_json(snapshot_json)
         observed_at = utc_now()
+        normalized_fingerprint = _sha256_identity(fingerprint, field="lifecycle fingerprint")
+        parsed_snapshot = _validated_snapshot_json(snapshot_json, observed_at=observed_at)
+        if parsed_snapshot.fingerprint() != normalized_fingerprint:
+            raise ValueError("lifecycle fingerprint does not match the canonical snapshot")
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             if (
@@ -2416,6 +2432,12 @@ class RunStore:
                 is None
             ):
                 raise StateError(f"Unknown run: {normalized_run_id}")
+            _verify_event_anchors(connection, selected_run_id=normalized_run_id)
+            _verify_lifecycle_snapshot_evidence(
+                connection,
+                selected_run_id=normalized_run_id,
+                collect=False,
+            )
             existing = connection.execute(
                 """
                 SELECT snapshot_json FROM lifecycle_snapshots
@@ -2424,7 +2446,7 @@ class RunStore:
                 (normalized_run_id, normalized_fingerprint),
             ).fetchone()
             if existing is not None:
-                if str(existing["snapshot_json"]) != normalized_snapshot:
+                if str(existing["snapshot_json"]) != snapshot_json:
                     raise StateError(
                         "Lifecycle fingerprint was reused for different snapshot content"
                     )
@@ -2439,7 +2461,7 @@ class RunStore:
                     normalized_run_id,
                     normalized_fingerprint,
                     observed_at.isoformat(),
-                    normalized_snapshot,
+                    snapshot_json,
                 ),
             )
             self._append_event(
@@ -2451,26 +2473,16 @@ class RunStore:
         return True
 
     def lifecycle_snapshots(self, run_id: str) -> builtins.list[LifecycleSnapshot]:
+        """Return strictly parsed snapshots in their verified per-run ledger order."""
+
         normalized_run_id = _lease_identity(run_id, field="run id")
         with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT fingerprint, observed_at, snapshot_json
-                FROM lifecycle_snapshots WHERE run_id = ? ORDER BY id
-                """,
-                (normalized_run_id,),
-            ).fetchall()
-        return [
-            LifecycleSnapshot(
-                run_id=normalized_run_id,
-                fingerprint=str(row["fingerprint"]),
-                observed_at=_stored_datetime(
-                    row["observed_at"], field="lifecycle observation time"
-                ),
-                snapshot_json=str(row["snapshot_json"]),
+            connection.execute("BEGIN")
+            _verify_event_anchors(connection, selected_run_id=normalized_run_id)
+            return _verify_lifecycle_snapshot_evidence(
+                connection,
+                selected_run_id=normalized_run_id,
             )
-            for row in rows
-        ]
 
     def trip_circuit_breaker(self, *, source: str, reason: str, trigger_hash: str) -> bool:
         """Trip persistently and make each new immutable trigger the active revision."""
@@ -3479,6 +3491,174 @@ def _verify_circuit_breaker_evidence(connection: sqlite3.Connection) -> None:
             raise StateError("Circuit-breaker state does not identify its latest trigger")
 
 
+def _verify_unanchored_event_chains(connection: sqlite3.Connection) -> None:
+    """Verify legacy v2/v3 hashes even though those schemas predate run-row anchors."""
+
+    run_rows = connection.execute("SELECT run_id FROM runs ORDER BY run_id").fetchall()
+    event_rows = connection.execute(
+        """
+        SELECT id, run_id, occurred_at, event_type, details_json,
+               previous_hash, event_hash
+        FROM events ORDER BY run_id ASC, id ASC
+        """
+    ).fetchall()
+    _verified_event_heads(run_rows, event_rows)
+
+
+def _verify_lifecycle_snapshot_evidence(
+    connection: sqlite3.Connection,
+    *,
+    selected_run_id: str | None = None,
+    collect: bool = True,
+) -> builtins.list[LifecycleSnapshot]:
+    """Strictly parse snapshot rows and reconcile them 1:1 with ledger events."""
+
+    if selected_run_id is None:
+        snapshot_count = connection.execute("SELECT count(*) FROM lifecycle_snapshots").fetchone()
+        event_count = connection.execute(
+            """
+            SELECT count(*) FROM events
+            WHERE event_type = 'lifecycle.snapshot.recorded'
+            """
+        ).fetchone()
+        snapshot_rows = connection.execute(
+            """
+            SELECT id, run_id, fingerprint, observed_at, snapshot_json
+            FROM lifecycle_snapshots ORDER BY id
+            """
+        )
+        event_rows = connection.execute(
+            """
+            SELECT id, run_id, details_json FROM events
+            WHERE event_type = 'lifecycle.snapshot.recorded'
+            ORDER BY id
+            """
+        )
+    else:
+        snapshot_count = connection.execute(
+            "SELECT count(*) FROM lifecycle_snapshots WHERE run_id = ?",
+            (selected_run_id,),
+        ).fetchone()
+        event_count = connection.execute(
+            """
+            SELECT count(*) FROM events
+            WHERE run_id = ? AND event_type = 'lifecycle.snapshot.recorded'
+            """,
+            (selected_run_id,),
+        ).fetchone()
+        snapshot_rows = connection.execute(
+            """
+            SELECT id, run_id, fingerprint, observed_at, snapshot_json
+            FROM lifecycle_snapshots WHERE run_id = ? ORDER BY id
+            """,
+            (selected_run_id,),
+        )
+        event_rows = connection.execute(
+            """
+            SELECT id, run_id, details_json FROM events
+            WHERE run_id = ? AND event_type = 'lifecycle.snapshot.recorded'
+            ORDER BY id
+            """,
+            (selected_run_id,),
+        )
+    if snapshot_count is None or snapshot_count[0] > _MAX_LIFECYCLE_SNAPSHOT_CORPUS:
+        raise StateError("Lifecycle snapshot corpus exceeds the configured safety bound")
+    if event_count is None or event_count[0] > _MAX_LIFECYCLE_SNAPSHOT_CORPUS:
+        raise StateError("Lifecycle snapshot event corpus exceeds the configured safety bound")
+
+    snapshot_values: dict[tuple[str, str], LifecycleSnapshot] = {}
+    snapshot_keys: set[tuple[str, str]] = set()
+    for row in snapshot_rows:
+        run_id_value = row["run_id"]
+        snapshot_json_value = row["snapshot_json"]
+        if not isinstance(run_id_value, str) or not run_id_value:
+            raise StateError("Lifecycle snapshot row contains an invalid run ID")
+        run_id = run_id_value
+        fingerprint = _stored_event_hash(
+            row["fingerprint"],
+            field=f"run {run_id} lifecycle fingerprint",
+        )
+        observed_at = _stored_canonical_utc_datetime(
+            row["observed_at"],
+            field=f"run {run_id} lifecycle observation time",
+        )
+        if not isinstance(snapshot_json_value, str):
+            raise StateError(f"Run {run_id} lifecycle snapshot is not stored as text")
+        try:
+            parsed = _validated_snapshot_json(
+                snapshot_json_value,
+                observed_at=observed_at,
+            )
+        except (TypeError, ValueError) as exc:
+            raise StateError(f"Run {run_id} lifecycle snapshot is invalid: {exc}") from exc
+        if parsed.fingerprint() != fingerprint:
+            raise StateError(f"Run {run_id} lifecycle snapshot fingerprint mismatch")
+        key = (run_id, fingerprint)
+        if key in snapshot_keys:
+            raise StateError(f"Run {run_id} has duplicate lifecycle snapshot rows")
+        snapshot_keys.add(key)
+        if collect:
+            snapshot_values[key] = LifecycleSnapshot(
+                run_id=run_id,
+                fingerprint=fingerprint,
+                observed_at=observed_at,
+                snapshot_json=snapshot_json_value,
+            )
+
+    event_keys: set[tuple[str, str]] = set()
+    event_order: builtins.list[tuple[str, str]] = []
+    for row in event_rows:
+        run_id_value = row["run_id"]
+        details_value = row["details_json"]
+        if not isinstance(run_id_value, str) or not run_id_value:
+            raise StateError("Lifecycle snapshot event contains an invalid run ID")
+        run_id = run_id_value
+        fingerprint = _lifecycle_event_fingerprint(details_value, run_id=run_id)
+        key = (run_id, fingerprint)
+        if key in event_keys:
+            raise StateError(f"Run {run_id} has duplicate lifecycle snapshot ledger events")
+        event_keys.add(key)
+        if collect:
+            event_order.append(key)
+
+    missing_events = snapshot_keys - event_keys
+    if missing_events:
+        run_id, _ = min(missing_events)
+        raise StateError(f"Run {run_id} lifecycle snapshot is missing its ledger event")
+    orphan_events = event_keys - snapshot_keys
+    if orphan_events:
+        run_id, _ = min(orphan_events)
+        raise StateError(f"Run {run_id} has an orphan lifecycle snapshot ledger event")
+    return [snapshot_values[key] for key in event_order] if collect else []
+
+
+def _lifecycle_event_fingerprint(value: object, *, run_id: str) -> str:
+    if not isinstance(value, str):
+        raise StateError(f"Run {run_id} lifecycle snapshot event details are invalid")
+    try:
+        parsed = json.loads(value, object_pairs_hook=_unique_lifecycle_event_object)
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        raise StateError(f"Run {run_id} lifecycle snapshot event details are invalid") from exc
+    if not isinstance(parsed, dict) or set(parsed) != {"fingerprint"}:
+        raise StateError(f"Run {run_id} lifecycle snapshot event details are invalid")
+    fingerprint = _stored_event_hash(
+        parsed["fingerprint"],
+        field=f"run {run_id} lifecycle event fingerprint",
+    )
+    if value != _canonical_json({"fingerprint": fingerprint}):
+        raise StateError(f"Run {run_id} lifecycle snapshot event details are not canonical")
+    return fingerprint
+
+
+def _unique_lifecycle_event_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate lifecycle event detail: {key}")
+        result[key] = value
+    return result
+
+
 def _verify_event_anchors(
     connection: sqlite3.Connection,
     *,
@@ -4070,6 +4250,13 @@ def _stored_datetime(value: object, *, field: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
+def _stored_canonical_utc_datetime(value: object, *, field: str) -> datetime:
+    parsed = _stored_datetime(value, field=field)
+    if not isinstance(value, str) or parsed.isoformat() != value:
+        raise StateError(f"Stored {field} is not a canonical UTC timestamp")
+    return parsed
+
+
 def _stored_run_status(value: object, *, run_id: str) -> RunStatus:
     try:
         return RunStatus(str(value))
@@ -4255,18 +4442,16 @@ def _canonical_publication_intent_text(value: str, *, field: str, maximum: int) 
     return normalized
 
 
-def _validated_snapshot_json(value: str) -> str:
+def _validated_snapshot_json(
+    value: str,
+    *,
+    observed_at: datetime,
+) -> PullRequestLifecycleSnapshot:
     if not isinstance(value, str):
         raise TypeError("lifecycle snapshot must be a JSON string")
     if len(value.encode("utf-8")) > _MAX_LIFECYCLE_SNAPSHOT_BYTES:
         raise ValueError("lifecycle snapshot exceeds the storage limit")
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise ValueError("lifecycle snapshot is not valid JSON") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("lifecycle snapshot must contain a JSON object")
-    return value
+    return parse_lifecycle_snapshot_json(value, observed_at=observed_at)
 
 
 def _lease_identity(value: str, *, field: str) -> str:

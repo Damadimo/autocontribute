@@ -22,6 +22,7 @@ from autocontribute.lifecycle import (
     LifecycleSignalKind,
     PullRequestLifecycleSnapshot,
     classify_lifecycle,
+    parse_lifecycle_snapshot_json,
     parse_pull_request_url,
     sync_open_pull_requests,
 )
@@ -47,6 +48,11 @@ def _pull_request(**changes: object) -> PullRequestDetails:
         "head_repository": "example/project",
         "issue_comment_count": 0,
         "review_comment_count": 0,
+        "title": "Fix lifecycle evidence",
+        "body": "",
+        "base_ref": "main",
+        "head_ref": "fix-lifecycle",
+        "head_label": "example:fix-lifecycle",
     }
     values.update(changes)
     return PullRequestDetails(**values)  # type: ignore[arg-type]
@@ -316,6 +322,41 @@ def test_observer_records_immutable_snapshot_and_deduplicates_signals() -> None:
     stored = json.loads(next(iter(store.snapshots.values())))
     assert "observed_at" not in stored
     assert stored["pull_request"]["number"] == 7
+
+
+def test_lifecycle_snapshot_strict_parser_round_trips_complete_evidence() -> None:
+    pull_request = _pull_request(
+        state="closed",
+        merged=True,
+        merged_at=NOW,
+        closed_at=NOW,
+        merge_commit_sha="c" * 40,
+        issue_comment_count=1,
+        review_comment_count=1,
+    )
+    reference = PullRequestReference(
+        identifier=60,
+        source_url="https://github.com/example/project/pull/8",
+        source_title="Revert the change",
+        source_body="Reverts example/project#7",
+        source_state="closed",
+        source_merged_at=NOW,
+        created_at=NOW,
+    )
+    snapshot = _snapshot(
+        pull_request=pull_request,
+        reviews=(_review(10, state="APPROVED"),),
+        issue_comments=(_comment(20, "Looks good."),),
+        review_comments=(_comment(21, "Resolved."),),
+        checks=(_check(30, "success"),),
+        statuses=(_status(40, "success"),),
+        references=(reference,),
+    )
+
+    parsed = parse_lifecycle_snapshot_json(snapshot.to_json(), observed_at=NOW)
+
+    assert parsed == snapshot
+    assert parsed.fingerprint() == snapshot.fingerprint()
 
 
 def test_classifier_ignores_untrusted_stop_text_and_superseded_ci_failures() -> None:

@@ -9,7 +9,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Final, Protocol
+from typing import Final, NoReturn, Protocol, cast
 from urllib.parse import urlparse
 
 from autocontribute.domain import RunManifest, RunStatus
@@ -29,6 +29,36 @@ _NONPASSING_CHECK_CONCLUSIONS = frozenset(
     {"action_required", "cancelled", "failure", "stale", "startup_failure", "timed_out"}
 )
 _FAILING_COMMIT_STATES = frozenset({"error", "failure"})
+_AUTHOR_ASSOCIATIONS = frozenset(
+    {
+        "COLLABORATOR",
+        "CONTRIBUTOR",
+        "FIRST_TIMER",
+        "FIRST_TIME_CONTRIBUTOR",
+        "MANNEQUIN",
+        "MEMBER",
+        "NONE",
+        "OWNER",
+    }
+)
+_REVIEW_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"})
+_CHECK_STATUSES = frozenset(
+    {"completed", "in_progress", "pending", "queued", "requested", "waiting"}
+)
+_CHECK_CONCLUSIONS = frozenset(
+    {
+        "action_required",
+        "cancelled",
+        "failure",
+        "neutral",
+        "skipped",
+        "stale",
+        "startup_failure",
+        "success",
+        "timed_out",
+    }
+)
+_COMMIT_STATES = frozenset({"error", "failure", "pending", "success"})
 _MAINTAINER_STOP = re.compile(
     r"(?:"
     r"\b(?:do\s+not|don't|stop|cease|hold\s+off|not\s+accepting|"
@@ -49,6 +79,7 @@ _NEGATED_STOP_DIRECTIVE = re.compile(
     re.IGNORECASE,
 )
 _PULL_REQUEST_PATH: Final = re.compile(r"/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+_REPOSITORY_NAME: Final = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _COMMIT_SHA: Final = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 MAX_LIFECYCLE_RUNS: Final = 1_000
 
@@ -149,6 +180,77 @@ class PullRequestLifecycleSnapshot:
         evidence = asdict(self)
         del evidence["observed_at"]
         return evidence
+
+
+def parse_lifecycle_snapshot_json(
+    value: str,
+    *,
+    observed_at: datetime,
+) -> PullRequestLifecycleSnapshot:
+    """Parse one exact canonical lifecycle payload without coercing stored values.
+
+    ``observed_at`` is storage metadata rather than GitHub evidence. It is carried on the
+    reconstructed object for compatibility, but is deliberately excluded from the fingerprint
+    and must never be used to establish an upstream outcome or order observations.
+    """
+
+    if not isinstance(value, str):
+        raise TypeError("lifecycle snapshot must be a JSON string")
+    try:
+        decoded: object = json.loads(
+            value,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("lifecycle snapshot is not valid JSON") from exc
+    payload = _exact_object(
+        decoded,
+        field="lifecycle snapshot",
+        keys={
+            "check_runs",
+            "commit_statuses",
+            "expected_head_sha",
+            "issue_comments",
+            "pull_request",
+            "references",
+            "review_comments",
+            "reviews",
+        },
+    )
+    snapshot = PullRequestLifecycleSnapshot(
+        observed_at=_aware_utc_timestamp(observed_at, field="lifecycle observation metadata"),
+        expected_head_sha=_full_sha(payload, "expected_head_sha", field="expected head SHA"),
+        pull_request=_parsed_pull_request(payload["pull_request"]),
+        reviews=tuple(
+            _parsed_review(item)
+            for item in _object_sequence(payload["reviews"], field="pull request reviews")
+        ),
+        issue_comments=tuple(
+            _parsed_comment(item)
+            for item in _object_sequence(payload["issue_comments"], field="issue comments")
+        ),
+        review_comments=tuple(
+            _parsed_comment(item)
+            for item in _object_sequence(payload["review_comments"], field="review comments")
+        ),
+        check_runs=tuple(
+            _parsed_check_run(item)
+            for item in _object_sequence(payload["check_runs"], field="check runs")
+        ),
+        commit_statuses=tuple(
+            _parsed_commit_status(item)
+            for item in _object_sequence(payload["commit_statuses"], field="commit statuses")
+        ),
+        references=tuple(
+            _parsed_reference(item)
+            for item in _object_sequence(payload["references"], field="pull request references")
+        ),
+    )
+    _validate_snapshot_shape(snapshot)
+    if snapshot.to_json() != value:
+        raise ValueError("lifecycle snapshot must use canonical JSON serialization")
+    return snapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,6 +468,478 @@ def parse_pull_request_url(value: str, *, api_origin: str) -> tuple[str, int]:
         raise StateError("Published run contains a non-canonical GitHub pull-request URL")
     repository = f"{match.group(1)}/{match.group(2)}"
     return repository, int(match.group(3))
+
+
+def _parsed_pull_request(value: object) -> PullRequestDetails:
+    record = _exact_object(
+        value,
+        field="pull request",
+        keys={
+            "base_ref",
+            "base_sha",
+            "body",
+            "closed_at",
+            "draft",
+            "head_label",
+            "head_ref",
+            "head_repository",
+            "head_sha",
+            "html_url",
+            "issue_comment_count",
+            "merge_commit_sha",
+            "merged",
+            "merged_at",
+            "number",
+            "repository",
+            "review_comment_count",
+            "state",
+            "title",
+            "updated_at",
+        },
+    )
+    pull_request = PullRequestDetails(
+        repository=_repository(record, "repository", field="pull request repository"),
+        number=_positive_integer(record, "number", field="pull request number"),
+        html_url=_text(record, "html_url", field="pull request URL"),
+        state=_choice(record, "state", field="pull request state", choices={"open", "closed"}),
+        draft=_boolean(record, "draft", field="pull request draft state"),
+        merged=_boolean(record, "merged", field="pull request merged state"),
+        updated_at=_timestamp(record, "updated_at", field="pull request update time"),
+        merged_at=_optional_timestamp(record, "merged_at", field="pull request merge time"),
+        closed_at=_optional_timestamp(record, "closed_at", field="pull request close time"),
+        merge_commit_sha=_optional_full_sha(
+            record,
+            "merge_commit_sha",
+            field="pull request merge commit SHA",
+        ),
+        head_sha=_full_sha(record, "head_sha", field="pull request head SHA"),
+        base_sha=_full_sha(record, "base_sha", field="pull request base SHA"),
+        head_repository=_repository(
+            record,
+            "head_repository",
+            field="pull request head repository",
+        ),
+        issue_comment_count=_nonnegative_integer(
+            record,
+            "issue_comment_count",
+            field="pull request issue comment count",
+        ),
+        review_comment_count=_nonnegative_integer(
+            record,
+            "review_comment_count",
+            field="pull request review comment count",
+        ),
+        title=_text(record, "title", field="pull request title"),
+        body=_text(record, "body", field="pull request body", empty=True),
+        base_ref=_text(record, "base_ref", field="pull request base ref"),
+        head_ref=_text(record, "head_ref", field="pull request head ref"),
+        head_label=_text(record, "head_label", field="pull request head label"),
+    )
+    if pull_request.merged and (
+        pull_request.state != "closed"
+        or pull_request.merged_at is None
+        or pull_request.closed_at is None
+    ):
+        raise ValueError("lifecycle snapshot contains inconsistent merged pull request state")
+    if not pull_request.merged and pull_request.merged_at is not None:
+        raise ValueError("lifecycle snapshot contains merged_at for an unmerged pull request")
+    if (pull_request.state == "closed") != (pull_request.closed_at is not None):
+        raise ValueError("lifecycle snapshot contains inconsistent pull request close state")
+    _validate_pull_request_url(pull_request)
+    return pull_request
+
+
+def _parsed_review(value: object) -> PullRequestReview:
+    record = _exact_object(
+        value,
+        field="pull request review",
+        keys={
+            "author",
+            "author_association",
+            "body",
+            "html_url",
+            "identifier",
+            "state",
+            "submitted_at",
+        },
+    )
+    return PullRequestReview(
+        identifier=_positive_integer(record, "identifier", field="review identifier"),
+        author=_text(record, "author", field="review author"),
+        author_association=_choice(
+            record,
+            "author_association",
+            field="review author association",
+            choices=_AUTHOR_ASSOCIATIONS,
+        ),
+        state=_choice(record, "state", field="review state", choices=_REVIEW_STATES),
+        body=_text(record, "body", field="review body", empty=True),
+        html_url=_text(record, "html_url", field="review URL"),
+        submitted_at=_optional_timestamp(record, "submitted_at", field="review submission time"),
+    )
+
+
+def _parsed_comment(value: object) -> GitHubComment:
+    record = _exact_object(
+        value,
+        field="pull request comment",
+        keys={
+            "author",
+            "author_association",
+            "body",
+            "created_at",
+            "html_url",
+            "identifier",
+            "updated_at",
+        },
+    )
+    return GitHubComment(
+        identifier=_positive_integer(record, "identifier", field="comment identifier"),
+        author=_text(record, "author", field="comment author"),
+        author_association=_choice(
+            record,
+            "author_association",
+            field="comment author association",
+            choices=_AUTHOR_ASSOCIATIONS,
+        ),
+        body=_text(record, "body", field="comment body", empty=True),
+        html_url=_text(record, "html_url", field="comment URL"),
+        created_at=_timestamp(record, "created_at", field="comment creation time"),
+        updated_at=_timestamp(record, "updated_at", field="comment update time"),
+    )
+
+
+def _parsed_check_run(value: object) -> CheckRunDetails:
+    record = _exact_object(
+        value,
+        field="check run",
+        keys={
+            "app_name",
+            "completed_at",
+            "conclusion",
+            "details_url",
+            "identifier",
+            "name",
+            "started_at",
+            "status",
+        },
+    )
+    status = _choice(record, "status", field="check run status", choices=_CHECK_STATUSES)
+    conclusion = _optional_choice(
+        record,
+        "conclusion",
+        field="check run conclusion",
+        choices=_CHECK_CONCLUSIONS,
+    )
+    completed_at = _optional_timestamp(record, "completed_at", field="check completion time")
+    if status == "completed" and (conclusion is None or completed_at is None):
+        raise ValueError("lifecycle snapshot contains an incomplete completed check run")
+    if status != "completed" and (conclusion is not None or completed_at is not None):
+        raise ValueError("lifecycle snapshot contains completion data for an incomplete check run")
+    return CheckRunDetails(
+        identifier=_positive_integer(record, "identifier", field="check run identifier"),
+        name=_text(record, "name", field="check run name"),
+        status=status,
+        conclusion=conclusion,
+        details_url=_text(record, "details_url", field="check run details URL", empty=True),
+        app_name=_text(record, "app_name", field="check run app name"),
+        started_at=_optional_timestamp(record, "started_at", field="check start time"),
+        completed_at=completed_at,
+    )
+
+
+def _parsed_commit_status(value: object) -> CommitStatusDetails:
+    record = _exact_object(
+        value,
+        field="commit status",
+        keys={
+            "context",
+            "created_at",
+            "creator",
+            "description",
+            "identifier",
+            "state",
+            "target_url",
+            "updated_at",
+        },
+    )
+    return CommitStatusDetails(
+        identifier=_positive_integer(record, "identifier", field="commit status identifier"),
+        context=_text(record, "context", field="commit status context"),
+        state=_choice(record, "state", field="commit status state", choices=_COMMIT_STATES),
+        description=_text(record, "description", field="commit status description", empty=True),
+        target_url=_text(record, "target_url", field="commit status target URL", empty=True),
+        creator=_text(record, "creator", field="commit status creator"),
+        created_at=_timestamp(record, "created_at", field="commit status creation time"),
+        updated_at=_timestamp(record, "updated_at", field="commit status update time"),
+    )
+
+
+def _parsed_reference(value: object) -> PullRequestReference:
+    record = _exact_object(
+        value,
+        field="pull request reference",
+        keys={
+            "created_at",
+            "identifier",
+            "source_body",
+            "source_merged_at",
+            "source_state",
+            "source_title",
+            "source_url",
+        },
+    )
+    return PullRequestReference(
+        identifier=_positive_integer(record, "identifier", field="reference identifier"),
+        source_url=_text(record, "source_url", field="reference source URL"),
+        source_title=_text(record, "source_title", field="reference source title", empty=True),
+        source_body=_text(record, "source_body", field="reference source body", empty=True),
+        source_state=_choice(
+            record,
+            "source_state",
+            field="reference source state",
+            choices={"open", "closed"},
+        ),
+        source_merged_at=_optional_timestamp(
+            record,
+            "source_merged_at",
+            field="reference source merge time",
+        ),
+        created_at=_timestamp(record, "created_at", field="reference creation time"),
+    )
+
+
+def _validate_snapshot_shape(snapshot: PullRequestLifecycleSnapshot) -> None:
+    for field, values, maximum in (
+        ("reviews", snapshot.reviews, 500),
+        ("issue comments", snapshot.issue_comments, 500),
+        ("review comments", snapshot.review_comments, 500),
+        ("check runs", snapshot.check_runs, 500),
+        ("commit statuses", snapshot.commit_statuses, 500),
+        ("references", snapshot.references, 1_000),
+    ):
+        if len(values) > maximum:
+            raise ValueError(f"lifecycle snapshot {field} exceed the collection limit")
+    if snapshot.pull_request.issue_comment_count != len(snapshot.issue_comments):
+        raise ValueError("lifecycle snapshot issue-comment count does not match its evidence")
+    if snapshot.pull_request.review_comment_count != len(snapshot.review_comments):
+        raise ValueError("lifecycle snapshot review-comment count does not match its evidence")
+    if snapshot.references and not snapshot.pull_request.merged:
+        raise ValueError(
+            "lifecycle snapshot contains revert references for an unmerged pull request"
+        )
+    if snapshot.reviews != tuple(sorted(snapshot.reviews, key=lambda review: review.identifier)):
+        raise ValueError("lifecycle snapshot reviews are not in canonical order")
+    if snapshot.issue_comments != tuple(
+        sorted(snapshot.issue_comments, key=lambda comment: comment.identifier)
+    ):
+        raise ValueError("lifecycle snapshot issue comments are not in canonical order")
+    if snapshot.review_comments != tuple(
+        sorted(snapshot.review_comments, key=lambda comment: comment.identifier)
+    ):
+        raise ValueError("lifecycle snapshot review comments are not in canonical order")
+    if snapshot.check_runs != tuple(
+        sorted(
+            snapshot.check_runs,
+            key=lambda check: (check.app_name.casefold(), check.name, check.identifier),
+        )
+    ):
+        raise ValueError("lifecycle snapshot check runs are not in canonical order")
+    if snapshot.commit_statuses != tuple(
+        sorted(
+            snapshot.commit_statuses,
+            key=lambda status: (
+                status.context.casefold(),
+                status.created_at,
+                status.identifier,
+            ),
+        )
+    ):
+        raise ValueError("lifecycle snapshot commit statuses are not in canonical order")
+    if snapshot.references != tuple(
+        sorted(snapshot.references, key=lambda reference: reference.identifier)
+    ):
+        raise ValueError("lifecycle snapshot references are not in canonical order")
+    for field, identifiers in (
+        ("reviews", [item.identifier for item in snapshot.reviews]),
+        ("issue comments", [item.identifier for item in snapshot.issue_comments]),
+        ("review comments", [item.identifier for item in snapshot.review_comments]),
+        ("check runs", [item.identifier for item in snapshot.check_runs]),
+        ("commit statuses", [item.identifier for item in snapshot.commit_statuses]),
+        ("references", [item.identifier for item in snapshot.references]),
+    ):
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError(f"lifecycle snapshot contains duplicate {field}")
+
+
+def _exact_object(value: object, *, field: str, keys: set[str]) -> dict[str, object]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{field} must be a JSON object")
+    record = cast("dict[str, object]", value)
+    if set(record) != keys:
+        raise ValueError(f"{field} does not have the exact supported fields")
+    return record
+
+
+def _object_sequence(value: object, *, field: str) -> list[object]:
+    if not isinstance(value, list):
+        raise ValueError(f"{field} must be a JSON array")
+    return cast("list[object]", value)
+
+
+def _text(
+    record: dict[str, object],
+    key: str,
+    *,
+    field: str,
+    empty: bool = False,
+) -> str:
+    value = record[key]
+    if (
+        not isinstance(value, str)
+        or "\0" in value
+        or (not empty and (not value or value != value.strip()))
+    ):
+        qualifier = "a string" if empty else "a nonempty canonical string"
+        raise ValueError(f"{field} must be {qualifier} without null bytes")
+    return value
+
+
+def _repository(record: dict[str, object], key: str, *, field: str) -> str:
+    value = _text(record, key, field=field)
+    if not _REPOSITORY_NAME.fullmatch(value) or any(
+        part in {".", ".."} for part in value.split("/")
+    ):
+        raise ValueError(f"{field} must use canonical owner/name syntax")
+    return value
+
+
+def _full_sha(record: dict[str, object], key: str, *, field: str) -> str:
+    value = _text(record, key, field=field)
+    if not _COMMIT_SHA.fullmatch(value) or value != value.casefold():
+        raise ValueError(f"{field} must be a canonical full Git SHA")
+    return value
+
+
+def _optional_full_sha(record: dict[str, object], key: str, *, field: str) -> str | None:
+    if record[key] is None:
+        return None
+    return _full_sha(record, key, field=field)
+
+
+def _validate_pull_request_url(pull_request: PullRequestDetails) -> None:
+    try:
+        parsed = urlparse(pull_request.html_url)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("pull request URL must be canonical") from exc
+    expected_path = f"/{pull_request.repository}/pull/{pull_request.number}"
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.path.casefold() != expected_path.casefold()
+    ):
+        raise ValueError("pull request URL must match its canonical repository and number")
+
+
+def _boolean(record: dict[str, object], key: str, *, field: str) -> bool:
+    value = record[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{field} must be a boolean")
+    return value
+
+
+def _positive_integer(record: dict[str, object], key: str, *, field: str) -> int:
+    value = record[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def _nonnegative_integer(record: dict[str, object], key: str, *, field: str) -> int:
+    value = record[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field} must be a nonnegative integer")
+    return value
+
+
+def _choice(
+    record: dict[str, object],
+    key: str,
+    *,
+    field: str,
+    choices: set[str] | frozenset[str],
+) -> str:
+    value = _text(record, key, field=field)
+    if value not in choices:
+        raise ValueError(f"{field} has an unsupported value")
+    return value
+
+
+def _optional_choice(
+    record: dict[str, object],
+    key: str,
+    *,
+    field: str,
+    choices: set[str] | frozenset[str],
+) -> str | None:
+    if record[key] is None:
+        return None
+    return _choice(record, key, field=field, choices=choices)
+
+
+def _timestamp(record: dict[str, object], key: str, *, field: str) -> datetime:
+    return _canonical_utc_timestamp(record[key], field=field)
+
+
+def _optional_timestamp(
+    record: dict[str, object],
+    key: str,
+    *,
+    field: str,
+) -> datetime | None:
+    if record[key] is None:
+        return None
+    return _canonical_utc_timestamp(record[key], field=field)
+
+
+def _canonical_utc_timestamp(value: object, *, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a canonical UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a canonical UTC timestamp") from exc
+    normalized = _aware_utc_timestamp(parsed, field=field)
+    if parsed.utcoffset() != UTC.utcoffset(parsed) or normalized.isoformat() != value:
+        raise ValueError(f"{field} must be a canonical UTC timestamp")
+    return normalized
+
+
+def _aware_utc_timestamp(value: datetime, *, field: str) -> datetime:
+    if not isinstance(value, datetime):
+        raise TypeError(f"{field} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field} must be timezone-aware")
+    return value.astimezone(UTC)
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"lifecycle snapshot contains duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"lifecycle snapshot contains invalid JSON constant: {value}")
 
 
 def sync_open_pull_requests(
@@ -800,6 +1374,7 @@ __all__ = [
     "LifecycleSyncResult",
     "PullRequestLifecycleSnapshot",
     "classify_lifecycle",
+    "parse_lifecycle_snapshot_json",
     "parse_pull_request_url",
     "sync_open_pull_requests",
 ]

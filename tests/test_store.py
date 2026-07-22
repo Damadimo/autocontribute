@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -12,6 +13,8 @@ import pytest
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.domain import IssueCandidate, RunManifest, RunStatus
 from autocontribute.exceptions import StateError
+from autocontribute.github import PullRequestDetails
+from autocontribute.lifecycle import PullRequestLifecycleSnapshot
 from autocontribute.store import CURRENT_SCHEMA_VERSION, RunStore
 
 
@@ -225,6 +228,89 @@ def _downgrade_current_database_to_v2(database: Path) -> None:
 def _set_status(store: RunStore, run: RunManifest, status: RunStatus) -> None:
     run.status = status
     store.save(run, event="test.status", details={"status": status.value})
+
+
+def _lifecycle_snapshot(*, head_sha: str = "a" * 40) -> PullRequestLifecycleSnapshot:
+    observed_at = datetime(2026, 7, 21, 12, tzinfo=UTC)
+    return PullRequestLifecycleSnapshot(
+        observed_at=observed_at,
+        expected_head_sha="a" * 40,
+        pull_request=PullRequestDetails(
+            repository="example/project",
+            number=7,
+            html_url="https://github.com/example/project/pull/7",
+            state="open",
+            draft=True,
+            merged=False,
+            updated_at=observed_at,
+            merged_at=None,
+            closed_at=None,
+            merge_commit_sha=None,
+            head_sha=head_sha,
+            base_sha="b" * 40,
+            head_repository="example/project",
+            issue_comment_count=0,
+            review_comment_count=0,
+            title="Fix lifecycle evidence",
+            body="",
+            base_ref="main",
+            head_ref="fix-lifecycle",
+            head_label="example:fix-lifecycle",
+        ),
+        reviews=(),
+        issue_comments=(),
+        review_comments=(),
+        check_runs=(),
+        commit_statuses=(),
+        references=(),
+    )
+
+
+def _append_lifecycle_snapshot_event(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    fingerprint: str,
+) -> None:
+    previous = connection.execute(
+        """
+        SELECT event_count, event_head_hash FROM runs WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    assert previous is not None
+    occurred_at = datetime(2026, 7, 22, 12, tzinfo=UTC).isoformat()
+    details_json = json.dumps(
+        {"fingerprint": fingerprint},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    payload = json.dumps(
+        {
+            "run_id": run_id,
+            "occurred_at": occurred_at,
+            "event_type": "lifecycle.snapshot.recorded",
+            "details": details_json,
+            "previous_hash": previous[1],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    event_hash = hashlib.sha256(payload.encode()).hexdigest()
+    connection.execute(
+        """
+        INSERT INTO events(
+            run_id, occurred_at, event_type, details_json, previous_hash, event_hash
+        ) VALUES (?, ?, 'lifecycle.snapshot.recorded', ?, ?, ?)
+        """,
+        (run_id, occurred_at, details_json, previous[1], event_hash),
+    )
+    connection.execute(
+        """
+        UPDATE runs SET event_count = ?, event_head_hash = ? WHERE run_id = ?
+        """,
+        (previous[0] + 1, event_hash, run_id),
+    )
 
 
 def _reserve_gate(
@@ -775,22 +861,21 @@ def test_snapshot_is_consistent_includes_wal_and_requires_explicit_overwrite(
     try:
         writer.execute("PRAGMA journal_mode = WAL")
         writer.execute("PRAGMA wal_autocheckpoint = 0")
-        writer.execute(
-            """
-            INSERT INTO lifecycle_snapshots(
-                run_id, fingerprint, observed_at, snapshot_json
-            ) VALUES (?, 'wal-only', ?, '{"state":"open"}')
-            """,
-            (run.run_id, datetime.now(UTC).isoformat()),
+        lifecycle_snapshot = _lifecycle_snapshot()
+        fingerprint = lifecycle_snapshot.fingerprint()
+        assert store.record_lifecycle_snapshot(
+            run.run_id,
+            fingerprint,
+            lifecycle_snapshot.to_json(),
         )
-        writer.commit()
 
         destination = tmp_path / "backups" / "state.sqlite3"
         assert store.create_snapshot(destination) == destination.resolve()
         with sqlite3.connect(destination) as backup:
             assert backup.execute("PRAGMA integrity_check").fetchone() == ("ok",)
             assert backup.execute(
-                "SELECT count(*) FROM lifecycle_snapshots WHERE fingerprint = 'wal-only'"
+                "SELECT count(*) FROM lifecycle_snapshots WHERE fingerprint = ?",
+                (fingerprint,),
             ).fetchone() == (1,)
 
         with pytest.raises(StateError, match="already exists"):
@@ -2014,21 +2099,198 @@ def test_heartbeat_guard_surfaces_fencing_takeover(tmp_path: Path) -> None:
 def test_lifecycle_snapshots_are_immutable_and_deduplicated(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     run = store.create_run()
-    snapshot = '{"state":"open","reviews":[]}'
+    lifecycle_snapshot = _lifecycle_snapshot()
+    snapshot = lifecycle_snapshot.to_json()
+    fingerprint = lifecycle_snapshot.fingerprint()
 
-    assert store.record_lifecycle_snapshot(run.run_id, "fingerprint", snapshot) is True
-    assert store.record_lifecycle_snapshot(run.run_id, "fingerprint", snapshot) is False
-    with pytest.raises(StateError, match="reused"):
-        store.record_lifecycle_snapshot(run.run_id, "fingerprint", '{"state":"closed"}')
+    assert store.record_lifecycle_snapshot(run.run_id, fingerprint, snapshot) is True
+    assert store.record_lifecycle_snapshot(run.run_id, fingerprint, snapshot) is False
+    changed = _lifecycle_snapshot(head_sha="c" * 40)
+    with pytest.raises(ValueError, match="fingerprint does not match"):
+        store.record_lifecycle_snapshot(run.run_id, fingerprint, changed.to_json())
     with pytest.raises(StateError, match="Unknown run"):
-        store.record_lifecycle_snapshot("missing", "fingerprint", snapshot)
+        store.record_lifecycle_snapshot("missing", fingerprint, snapshot)
     with pytest.raises(ValueError, match="valid JSON"):
-        store.record_lifecycle_snapshot(run.run_id, "other", "not-json")
+        store.record_lifecycle_snapshot(run.run_id, "b" * 64, "not-json")
 
     snapshots = store.lifecycle_snapshots(run.run_id)
     assert len(snapshots) == 1
     assert snapshots[0].snapshot_json == snapshot
     assert store.events(run.run_id)[-1]["event_type"] == "lifecycle.snapshot.recorded"
+
+
+def test_lifecycle_snapshot_rejects_noncanonical_and_structurally_invalid_json(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    snapshot = _lifecycle_snapshot()
+    payload = json.loads(snapshot.to_json())
+    payload["unsupported"] = True
+
+    with pytest.raises(ValueError, match="canonical JSON"):
+        store.record_lifecycle_snapshot(
+            run.run_id,
+            snapshot.fingerprint(),
+            f" {snapshot.to_json()}",
+        )
+    with pytest.raises(ValueError, match="exact supported fields"):
+        store.record_lifecycle_snapshot(
+            run.run_id,
+            snapshot.fingerprint(),
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+    duplicate_key = snapshot.to_json().replace(
+        '"check_runs":[]',
+        '"check_runs":[],"check_runs":[]',
+        1,
+    )
+    with pytest.raises(ValueError, match="duplicate JSON key"):
+        store.record_lifecycle_snapshot(run.run_id, snapshot.fingerprint(), duplicate_key)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    (
+        (("expected_head_sha",), "A" * 40, "full Git SHA"),
+        (("pull_request", "head_sha"), "short", "full Git SHA"),
+        (("pull_request", "merge_commit_sha"), "short", "full Git SHA"),
+        (("pull_request", "title"), "", "nonempty canonical string"),
+        (("pull_request", "base_ref"), "", "nonempty canonical string"),
+        (("pull_request", "repository"), "example/project/extra", "owner/name"),
+        (
+            ("pull_request", "html_url"),
+            "https://github.com/example/other/pull/7",
+            "canonical repository and number",
+        ),
+    ),
+)
+def test_lifecycle_snapshot_rejects_impossible_github_evidence(
+    tmp_path: Path,
+    path: tuple[str, ...],
+    value: object,
+    message: str,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    payload = json.loads(_lifecycle_snapshot().to_json())
+    target = payload
+    for component in path[:-1]:
+        target = target[component]
+    target[path[-1]] = value
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    with pytest.raises(ValueError, match=message):
+        store.record_lifecycle_snapshot(
+            run.run_id,
+            hashlib.sha256(encoded.encode()).hexdigest(),
+            encoded,
+        )
+
+
+def test_lifecycle_snapshot_read_recomputes_fingerprint_after_content_tamper(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    snapshot = _lifecycle_snapshot()
+    store.record_lifecycle_snapshot(run.run_id, snapshot.fingerprint(), snapshot.to_json())
+    changed = replace(
+        snapshot,
+        pull_request=replace(snapshot.pull_request, head_sha="c" * 40),
+    )
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE lifecycle_snapshots SET snapshot_json = ? WHERE run_id = ?",
+            (changed.to_json(), run.run_id),
+        )
+
+    with pytest.raises(StateError, match="fingerprint mismatch"):
+        store.lifecycle_snapshots(run.run_id)
+
+
+def test_lifecycle_snapshot_read_rejects_missing_event_with_valid_ledger_anchor(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    snapshot = _lifecycle_snapshot()
+    store.record_lifecycle_snapshot(run.run_id, snapshot.fingerprint(), snapshot.to_json())
+    with sqlite3.connect(store.database_path) as connection:
+        event = connection.execute(
+            """
+            SELECT id, previous_hash FROM events
+            WHERE run_id = ? AND event_type = 'lifecycle.snapshot.recorded'
+            """,
+            (run.run_id,),
+        ).fetchone()
+        assert event is not None
+        connection.execute("DELETE FROM events WHERE id = ?", (event[0],))
+        connection.execute(
+            """
+            UPDATE runs SET event_count = event_count - 1, event_head_hash = ?
+            WHERE run_id = ?
+            """,
+            (event[1], run.run_id),
+        )
+
+    with pytest.raises(StateError, match="missing its ledger event"):
+        store.lifecycle_snapshots(run.run_id)
+
+
+def test_lifecycle_snapshot_read_rejects_duplicate_event_with_valid_hash_chain(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    snapshot = _lifecycle_snapshot()
+    fingerprint = snapshot.fingerprint()
+    store.record_lifecycle_snapshot(run.run_id, fingerprint, snapshot.to_json())
+    with sqlite3.connect(store.database_path) as connection:
+        _append_lifecycle_snapshot_event(
+            connection,
+            run_id=run.run_id,
+            fingerprint=fingerprint,
+        )
+
+    with pytest.raises(StateError, match="duplicate lifecycle snapshot ledger events"):
+        store.lifecycle_snapshots(run.run_id)
+
+
+def test_lifecycle_snapshot_read_rejects_orphan_event(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    snapshot = _lifecycle_snapshot()
+    store.record_lifecycle_snapshot(run.run_id, snapshot.fingerprint(), snapshot.to_json())
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("DELETE FROM lifecycle_snapshots WHERE run_id = ?", (run.run_id,))
+
+    with pytest.raises(StateError, match="orphan lifecycle snapshot ledger event"):
+        store.lifecycle_snapshots(run.run_id)
+
+
+def test_backup_and_restore_validate_lifecycle_snapshot_integrity(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    snapshot = _lifecycle_snapshot()
+    store.record_lifecycle_snapshot(run.run_id, snapshot.fingerprint(), snapshot.to_json())
+    backup = store.create_snapshot(tmp_path / "backup.sqlite3")
+    with sqlite3.connect(backup) as connection:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        connection.execute(
+            "UPDATE lifecycle_snapshots SET observed_at = ? WHERE run_id = ?",
+            ("2026-07-21T08:00:00-04:00", run.run_id),
+        )
+
+    with pytest.raises(StateError, match="canonical UTC timestamp"):
+        RunStore.restore_snapshot(tmp_path / "restored", backup)
+
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("DELETE FROM lifecycle_snapshots WHERE run_id = ?", (run.run_id,))
+    destination = tmp_path / "rejected.sqlite3"
+    with pytest.raises(StateError, match="orphan lifecycle snapshot ledger event"):
+        store.create_snapshot(destination)
+    assert not destination.exists()
 
 
 def test_open_pull_request_enumeration_never_silently_truncates(tmp_path: Path) -> None:
