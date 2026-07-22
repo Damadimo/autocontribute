@@ -1781,78 +1781,88 @@ class Publisher:
             ttl=PUBLICATION_LEASE_TTL,
             heartbeat_interval=PUBLICATION_HEARTBEAT_INTERVAL,
         ) as lease_guard:
-            lease_guard.assert_owned()
-            manifest = self.store.get(run_id)
-            if manifest.status != RunStatus.SUBMITTING:
-                raise StateError(f"Run {run_id} cannot be reconciled from {manifest.status.value}")
-            if (
-                manifest.candidate is None
-                or manifest.repository is None
-                or manifest.proposal is None
-                or manifest.base_sha is None
-                or not manifest.branch_name
-            ):
-                raise StateError(f"Submitting run {run_id} lacks durable publication evidence")
-            context = _durable_publication_context(
-                self.config,
-                manifest,
-                login=self.github.authenticated_login(),
-                api_origin=self.github.api_origin,
+            return self._reconcile_submitting(run_id, lease_guard=lease_guard)
+
+    def _reconcile_submitting(
+        self,
+        run_id: str,
+        *,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> RunManifest:
+        """Reconcile under an already-owned publication lease."""
+
+        lease_guard.assert_owned()
+        manifest = self.store.get(run_id)
+        if manifest.status != RunStatus.SUBMITTING:
+            raise StateError(f"Run {run_id} cannot be reconciled from {manifest.status.value}")
+        if (
+            manifest.candidate is None
+            or manifest.repository is None
+            or manifest.proposal is None
+            or manifest.base_sha is None
+            or not manifest.branch_name
+        ):
+            raise StateError(f"Submitting run {run_id} lacks durable publication evidence")
+        context = _durable_publication_context(
+            self.config,
+            manifest,
+            login=self.github.authenticated_login(),
+            api_origin=self.github.api_origin,
+        )
+        login = context.login
+        lease_guard.assert_owned()
+        manifest = self.store.begin_publication(
+            manifest,
+            manifest.candidate.repository,
+            branch_name=manifest.branch_name,
+            publishing_login=context.login,
+            publishing_api_origin=context.api_origin,
+            commit_author_name=context.author_name,
+            commit_author_email=context.author_email,
+            commit_committer_name=context.committer_name,
+            commit_committer_email=context.committer_email,
+            publication_draft=context.draft,
+            publication_ready_for_review=context.ready_for_review,
+            max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
+            repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
+        )
+        assert manifest.candidate is not None
+        assert manifest.branch_name is not None
+        if not manifest.commit_sha:
+            if manifest.pull_request_creation_started:
+                self._stop_ambiguous_pull_request_creation(manifest)
+            raise PublicationResumeRequired(
+                f"Submitting run {run_id} has no stored commit or pull request yet"
             )
-            login = context.login
-            lease_guard.assert_owned()
-            manifest = self.store.begin_publication(
-                manifest,
+        head = f"{login}:{manifest.branch_name}"
+        existing_pr = manifest.pull_request_url
+        if existing_pr is None:
+            existing_pr = self.github.find_pull_request(
                 manifest.candidate.repository,
-                branch_name=manifest.branch_name,
-                publishing_login=context.login,
-                publishing_api_origin=context.api_origin,
-                commit_author_name=context.author_name,
-                commit_author_email=context.author_email,
-                commit_committer_name=context.committer_name,
-                commit_committer_email=context.committer_email,
-                publication_draft=context.draft,
-                publication_ready_for_review=context.ready_for_review,
-                max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
-                repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
+                head=head,
             )
-            assert manifest.candidate is not None
-            assert manifest.branch_name is not None
-            if not manifest.commit_sha:
-                if manifest.pull_request_creation_started:
-                    self._stop_ambiguous_pull_request_creation(manifest)
-                raise PublicationResumeRequired(
-                    f"Submitting run {run_id} has no stored commit or pull request yet"
-                )
-            head = f"{login}:{manifest.branch_name}"
-            existing_pr = manifest.pull_request_url
-            if existing_pr is None:
-                existing_pr = self.github.find_pull_request(
-                    manifest.candidate.repository,
-                    head=head,
-                )
-            if manifest.publication_compensation_reason is not None:
-                return self._reconcile_started_compensation(
-                    manifest,
-                    existing_pr=existing_pr,
-                    login=login,
-                    head=head,
-                    lease_guard=lease_guard,
-                )
-            if not existing_pr:
-                if manifest.pull_request_creation_started:
-                    self._stop_ambiguous_pull_request_creation(manifest)
-                raise PublicationResumeRequired(
-                    f"Submitting run {run_id} has no matching pull request; "
-                    "its pre-POST durable publication intent can be resumed idempotently"
-                )
-            return self._accept_existing_pull_request(
+        if manifest.publication_compensation_reason is not None:
+            return self._reconcile_started_compensation(
                 manifest,
-                existing_pr,
+                existing_pr=existing_pr,
                 login=login,
                 head=head,
                 lease_guard=lease_guard,
             )
+        if not existing_pr:
+            if manifest.pull_request_creation_started:
+                self._stop_ambiguous_pull_request_creation(manifest)
+            raise PublicationResumeRequired(
+                f"Submitting run {run_id} has no matching pull request; "
+                "its pre-POST durable publication intent can be resumed idempotently"
+            )
+        return self._accept_existing_pull_request(
+            manifest,
+            existing_pr,
+            login=login,
+            head=head,
+            lease_guard=lease_guard,
+        )
 
     def _reject_reconciled_pull_request(
         self,

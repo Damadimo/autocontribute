@@ -23,7 +23,12 @@ from autocontribute.config import (
     example_config,
     load_config,
 )
-from autocontribute.coordination import LeaseHeartbeatGuard
+from autocontribute.coordination import (
+    PUBLICATION_HEARTBEAT_INTERVAL,
+    PUBLICATION_LEASE_NAME,
+    PUBLICATION_LEASE_TTL,
+    LeaseHeartbeatGuard,
+)
 from autocontribute.deployment import compute_deployment_fingerprint
 from autocontribute.discovery import DiscoveryService
 from autocontribute.doctor import run_doctor
@@ -867,15 +872,19 @@ def _sync_lifecycle(
     reconciliation_failures: list[tuple[str, AutocontributeError]] = []
     with LeaseHeartbeatGuard(
         store,
-        "autocontribute.lifecycle",
-        ttl=timedelta(minutes=5),
-        heartbeat_interval=timedelta(minutes=1),
+        PUBLICATION_LEASE_NAME,
+        ttl=PUBLICATION_LEASE_TTL,
+        heartbeat_interval=PUBLICATION_HEARTBEAT_INTERVAL,
     ) as lease_guard:
         lease_guard.assert_owned()
         for manifest in store.list_submitting_runs():
             lease_guard.assert_owned()
             try:
-                publisher.reconcile_submitting(manifest.run_id)
+                reconcile_owned = getattr(publisher, "_reconcile_submitting", None)
+                if callable(reconcile_owned):
+                    reconcile_owned(manifest.run_id, lease_guard=lease_guard)
+                else:  # Narrow compatibility path for injected CLI test doubles.
+                    publisher.reconcile_submitting(manifest.run_id)
             except PublicationResumeRequired:
                 lease_guard.assert_owned()
                 retry_this_run = manifest.run_id == publication_retry_run_id
@@ -907,7 +916,11 @@ def _sync_lifecycle(
                     continue
                 lease_guard.assert_owned()
                 try:
-                    publisher.publish(manifest.run_id)
+                    publish_owned = getattr(publisher, "_publish", None)
+                    if callable(publish_owned):
+                        publish_owned(manifest.run_id, lease_guard=lease_guard)
+                    else:  # Narrow compatibility path for injected CLI test doubles.
+                        publisher.publish(manifest.run_id)
                 except AutocontributeError as resume_exc:
                     lease_guard.assert_owned()
                     reconciliation_failures.append((manifest.run_id, resume_exc))

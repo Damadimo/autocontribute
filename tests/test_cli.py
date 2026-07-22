@@ -1227,6 +1227,75 @@ def test_lifecycle_sync_reconciles_target_submitting_run_before_exact_publicatio
     ]
 
 
+def test_lifecycle_sync_reuses_one_publication_lease_for_recovery_and_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+    settings = load_config(config)
+    settings.publishing.mode = "auto"
+    monkeypatch.setenv(settings.publishing.auto_publish_env, "1")
+    store = RunStore(state)
+    submitting = store.create_run()
+    submitting.status = RunStatus.SUBMITTING
+    store.save(submitting, event="test.submitting", details={})
+    calls: list[str] = []
+
+    class FakePublisher:
+        def __init__(self, settings: object, owned_store: RunStore, github: object) -> None:
+            assert owned_store is store
+
+        def reconcile_submitting(self, run_id: str) -> None:
+            pytest.fail(f"nested public reconciliation attempted for {run_id}")
+
+        def publish(self, run_id: str) -> None:
+            pytest.fail(f"nested public publication attempted for {run_id}")
+
+        def _reconcile_submitting(self, run_id: str, *, lease_guard: object) -> None:
+            assert store.get_lease("autocontribute.publish") is not None
+            assert callable(getattr(lease_guard, "assert_owned", None))
+            lease_guard.assert_owned()  # type: ignore[attr-defined]
+            calls.append(f"reconcile:{run_id}")
+            raise PublicationResumeRequired("resume exact intent")
+
+        def _publish(self, run_id: str, *, lease_guard: object) -> None:
+            assert store.get_lease("autocontribute.publish") is not None
+            lease_guard.assert_owned()  # type: ignore[attr-defined]
+            calls.append(f"publish:{run_id}")
+
+    def fake_sync(
+        github: object,
+        observed_store: RunStore,
+        *,
+        assert_owned: Callable[[], object] | None = None,
+    ) -> LifecycleSyncResult:
+        assert observed_store is store
+        assert store.get_lease("autocontribute.publish") is not None
+        assert assert_owned is not None
+        assert_owned()
+        calls.append("observe")
+        return LifecycleSyncResult(observations=())
+
+    monkeypatch.setattr(cli, "Publisher", FakePublisher)
+    monkeypatch.setattr(cli, "sync_open_pull_requests", fake_sync)
+
+    result = cli._sync_lifecycle(
+        settings,
+        store,
+        object(),  # type: ignore[arg-type]
+        resume_submitting_publications=True,
+    )
+
+    assert result == LifecycleSyncResult(observations=())
+    assert calls == [
+        f"reconcile:{submitting.run_id}",
+        f"publish:{submitting.run_id}",
+        "observe",
+    ]
+
+
 def test_lifecycle_sync_resumes_only_the_explicit_manual_retry_target(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
@@ -1357,10 +1426,10 @@ def test_lifecycle_sync_stops_reconciliation_after_lease_takeover(
 
         def reconcile_submitting(self, run_id: str) -> None:
             calls.append(f"reconcile:{run_id}")
-            lease = store.get_lease("autocontribute.lifecycle")
+            lease = store.get_lease("autocontribute.publish")
             assert lease is not None
             takeover = store.acquire_lease(
-                "autocontribute.lifecycle",
+                "autocontribute.publish",
                 "replacement-worker",
                 ttl=timedelta(minutes=5),
                 now=lease.expires_at,
