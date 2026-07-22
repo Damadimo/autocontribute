@@ -203,8 +203,9 @@ custom model names cannot be priced safely from a hard-coded table.
 
 Scheduled runs are prepare-only by default. `publishing.mode: auto` is supported for deliberate,
 calibrated deployments, but configuration validation restricts the initial pilot to exactly one
-explicit repository, no owner-wide discovery, draft PRs, one new PR per day, and at least a seven-day
-same-repository cooldown. It also requires `AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH=1` at runtime. Rate
+explicit repository, no owner-wide discovery, PRs staged as drafts before an exact ready-for-review
+transition, one new PR per day, and at least a seven-day same-repository cooldown. It also requires
+`AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH=1` at runtime. Rate
 limits, maximum open/new PR counts, same-repository cooldowns, duplicate checks, issue assignment,
 policy changes, or base-branch drift stop publication.
 

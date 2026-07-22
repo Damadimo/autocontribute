@@ -35,6 +35,7 @@ from autocontribute.domain import RunManifest, RunStatus
 from autocontribute.evaluation import EvaluationStore
 from autocontribute.exceptions import (
     GitHubError,
+    GitHubSafetyError,
     PolicyError,
     PublicationResumeRequired,
     RepositoryError,
@@ -71,6 +72,7 @@ class _PublicationContext:
     committer_name: str
     committer_email: str
     draft: bool
+    ready_for_review: bool
 
 
 def has_visible_disclosure(body: str, disclosure: str) -> bool:
@@ -223,6 +225,7 @@ def _publication_context(
         committer_name=name,
         committer_email=email,
         draft=config.publishing.draft,
+        ready_for_review=config.publishing.ready_for_review,
     )
 
 
@@ -240,6 +243,7 @@ def _bind_publication_context(
         "commit_committer_name": context.committer_name,
         "commit_committer_email": context.committer_email,
         "publication_draft": context.draft,
+        "publication_ready_for_review": context.ready_for_review,
     }
     present = {name: getattr(manifest, name) for name in fields}
     if all(value is None for value in present.values()):
@@ -284,9 +288,15 @@ def _durable_publication_context(
         "commit committer email": manifest.commit_committer_email,
     }
     missing = [name for name, value in required.items() if not value]
-    if missing or manifest.publication_draft is None:
+    if (
+        missing
+        or manifest.publication_draft is None
+        or manifest.publication_ready_for_review is None
+    ):
         if manifest.publication_draft is None:
             missing.append("pull-request draft state")
+        if manifest.publication_ready_for_review is None:
+            missing.append("pull-request ready-for-review state")
         raise PolicyError(
             "Submitting run is missing durable publication context: " + ", ".join(missing)
         )
@@ -328,6 +338,7 @@ def _durable_publication_context(
         committer_name=manifest.commit_committer_name,
         committer_email=manifest.commit_committer_email,
         draft=manifest.publication_draft,
+        ready_for_review=manifest.publication_ready_for_review,
     )
 
 
@@ -335,6 +346,12 @@ def _required_publication_draft(manifest: RunManifest) -> bool:
     if manifest.publication_draft is None:
         raise PolicyError("Run is missing its durable pull-request draft intent")
     return manifest.publication_draft
+
+
+def _required_publication_ready_for_review(manifest: RunManifest) -> bool:
+    if manifest.publication_ready_for_review is None:
+        raise PolicyError("Run is missing its durable pull-request ready-for-review intent")
+    return manifest.publication_ready_for_review
 
 
 def build_approval_review(
@@ -381,7 +398,8 @@ def build_approval_review(
         manifest,
         diff=patch,
         disclosure=config.policy.ai_disclosure,
-        draft=config.publishing.draft,
+        draft=context.draft,
+        ready_for_review=context.ready_for_review,
     )
     return ApprovalReview(
         run=manifest,
@@ -504,6 +522,7 @@ class Publisher:
                 commit_committer_name=context.committer_name,
                 commit_committer_email=context.committer_email,
                 publication_draft=context.draft,
+                publication_ready_for_review=context.ready_for_review,
                 max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
                 repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
             )
@@ -661,6 +680,7 @@ class Publisher:
                         "publishing_login": context.login,
                         "publishing_api_origin": context.api_origin,
                         "publication_draft": str(context.draft).lower(),
+                        "publication_ready_for_review": str(context.ready_for_review).lower(),
                     },
                 )
         login = context.login
@@ -671,6 +691,7 @@ class Publisher:
                 diff=patch,
                 disclosure=self.config.policy.ai_disclosure,
                 draft=context.draft,
+                ready_for_review=context.ready_for_review,
             )
             validate_approval(manifest.approval, approval_manifest)
         branch = manifest.branch_name or self._branch_name(manifest)
@@ -696,6 +717,7 @@ class Publisher:
                 commit_committer_name=context.committer_name,
                 commit_committer_email=context.committer_email,
                 publication_draft=context.draft,
+                publication_ready_for_review=context.ready_for_review,
                 max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
                 repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
                 evaluation_corpus_cursor=evaluation_corpus_cursor,
@@ -993,6 +1015,13 @@ class Publisher:
                 commit_sha=commit_sha,
                 lease_guard=lease_guard,
             )
+        created_pull_request = self._ensure_pull_request_ready_for_review(
+            manifest,
+            created_pull_request,
+            head=head,
+            fork=fork,
+            lease_guard=lease_guard,
+        )
         self.store.assert_circuit_breaker_clear()
         lease_guard.assert_owned()
         self.store.transition(manifest, RunStatus.PR_OPEN, reason="pull request opened")
@@ -1049,6 +1078,165 @@ class Publisher:
                 f"stopped and the canonical URL must be reconciled: {created.html_url}"
             ) from exc
 
+    def _ensure_pull_request_ready_for_review(
+        self,
+        manifest: RunManifest,
+        details: PullRequestDetails,
+        *,
+        head: str,
+        fork: str,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> PullRequestDetails:
+        """Finish the durably authorized draft-to-ready transition for one exact PR."""
+
+        should_be_ready = _required_publication_ready_for_review(manifest)
+        if not should_be_ready:
+            if manifest.pull_request_ready_started or manifest.pull_request_ready_completed:
+                raise StateError("Draft publication has inconsistent ready-for-review evidence")
+            return details
+        if (
+            manifest.commit_sha is None
+            or manifest.pull_request_url is None
+            or manifest.branch_name is None
+        ):
+            raise StateError(
+                "Ready-for-review publication lacks durable PR, branch, or commit identity"
+            )
+        mismatches = tuple(
+            mismatch
+            for mismatch in self._created_pull_request_mismatches(
+                details,
+                manifest=manifest,
+                head=head,
+                fork=fork,
+                commit_sha=manifest.commit_sha,
+            )
+            if mismatch != "draft state"
+        )
+        if mismatches:
+            self._trip_publication_breaker(
+                source="publication:ready_for_review_identity_mismatch",
+                reason=(
+                    "The pull request selected for ready-for-review differs from durable "
+                    "publication intent; autonomous publication is stopped"
+                ),
+                evidence={
+                    "url": details.html_url,
+                    "head_sha": details.head_sha,
+                    "mismatches": ",".join(mismatches),
+                },
+            )
+            raise PublicationResumeRequired(
+                "The pull request cannot be marked ready because its exact identity changed"
+            )
+        if manifest.pull_request_ready_completed:
+            if details.draft:
+                self._trip_publication_breaker(
+                    source="publication:ready_for_review_regressed",
+                    reason=(
+                        "A pull request durably confirmed ready for review is a draft again; "
+                        "autonomous publication is stopped"
+                    ),
+                    evidence={"url": details.html_url, "head_sha": details.head_sha},
+                )
+                raise PublicationResumeRequired(
+                    "The pull request reverted to draft after ready-for-review confirmation"
+                )
+            return details
+
+        if not manifest.pull_request_ready_started:
+            manifest.pull_request_ready_started = True
+            self.store.assert_circuit_breaker_clear()
+            lease_guard.assert_owned()
+            self.store.save(
+                manifest,
+                event="pull_request.ready_for_review.started",
+                details={
+                    "url": details.html_url,
+                    "repository": details.repository,
+                    "number": str(details.number),
+                    "head_sha": details.head_sha,
+                },
+            )
+
+        confirmed = details
+        if details.draft:
+            self.store.assert_circuit_breaker_clear()
+            lease_guard.assert_owned()
+            try:
+                confirmed = self.github.mark_pull_request_ready_for_review(
+                    details.repository,
+                    details.number,
+                    expected_url=manifest.pull_request_url,
+                    expected_head_repository=fork,
+                    expected_head_ref=manifest.branch_name,
+                    expected_head_sha=manifest.commit_sha,
+                )
+            except GitHubSafetyError:
+                raise
+            except Exception as exc:
+                # A transport or response failure may follow a successful mutation. Re-read the
+                # exact PR once; a still-draft result remains safely retryable from SUBMITTING.
+                try:
+                    confirmed = self.github.get_pull_request(
+                        details.repository,
+                        details.number,
+                    )
+                except Exception as reconciliation_exc:
+                    raise PublicationResumeRequired(
+                        "Ready-for-review may have succeeded, but GitHub state could not be "
+                        "reconciled; the run remains submitting"
+                    ) from reconciliation_exc
+                if confirmed.draft:
+                    raise PublicationResumeRequired(
+                        "GitHub did not confirm ready-for-review; the exact draft PR remains "
+                        "durable and retryable"
+                    ) from exc
+
+        mismatches = tuple(
+            mismatch
+            for mismatch in self._created_pull_request_mismatches(
+                confirmed,
+                manifest=manifest,
+                head=head,
+                fork=fork,
+                commit_sha=manifest.commit_sha,
+            )
+            if mismatch != "draft state"
+        )
+        if mismatches or confirmed.draft:
+            self._trip_publication_breaker(
+                source="publication:ready_for_review_not_confirmed",
+                reason=(
+                    "GitHub did not confirm the exact pull request as ready for review; "
+                    "autonomous publication is stopped"
+                ),
+                evidence={
+                    "url": confirmed.html_url,
+                    "head_sha": confirmed.head_sha,
+                    "draft": str(confirmed.draft).lower(),
+                    "mismatches": ",".join(mismatches),
+                },
+            )
+            raise PublicationResumeRequired(
+                "The exact ready-for-review result could not be confirmed"
+            )
+
+        manifest.pull_request_ready_completed = True
+        self.store.assert_circuit_breaker_clear()
+        lease_guard.assert_owned()
+        self.store.save(
+            manifest,
+            event="pull_request.ready_for_review.completed",
+            details={
+                "url": confirmed.html_url,
+                "repository": confirmed.repository,
+                "number": str(confirmed.number),
+                "head_sha": confirmed.head_sha,
+            },
+        )
+        return confirmed
+
     def _created_pull_request_mismatches(
         self,
         created: PullRequestDetails,
@@ -1061,7 +1249,7 @@ class Publisher:
         assert (
             manifest.candidate and manifest.repository and manifest.proposal and manifest.base_sha
         )
-        expected = {
+        expected: dict[str, tuple[object, object]] = {
             "repository": (
                 created.repository.casefold(),
                 manifest.candidate.repository.casefold(),
@@ -1624,6 +1812,7 @@ class Publisher:
                 commit_committer_name=context.committer_name,
                 commit_committer_email=context.committer_email,
                 publication_draft=context.draft,
+                publication_ready_for_review=context.ready_for_review,
                 max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
                 repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
             )
@@ -1795,13 +1984,17 @@ class Publisher:
         elif manifest.pull_request_url != pull_request_url:
             raise StateError("Reconciled pull request differs from its durable canonical URL")
 
-        expected = {
+        expected: dict[str, tuple[object, object]] = {
             "base branch": (details.base_ref, manifest.repository.default_branch),
             "base commit": (details.base_sha.casefold(), manifest.base_sha.casefold()),
             "title": (details.title, manifest.proposal.pull_request_title),
             "body": (details.body, manifest.proposal.pull_request_body),
-            "draft state": (details.draft, _required_publication_draft(manifest)),
         }
+        if not _required_publication_ready_for_review(manifest):
+            expected["draft state"] = (
+                details.draft,
+                _required_publication_draft(manifest),
+            )
         remote_sha = self.github.ref_sha(expected_fork, f"heads/{manifest.branch_name}")
         if details.state == "open" and (
             remote_sha is None or remote_sha.casefold() != manifest.commit_sha.casefold()
@@ -1864,6 +2057,13 @@ class Publisher:
                 details,
                 mismatches=mismatches,
             )
+        self._ensure_pull_request_ready_for_review(
+            manifest,
+            details,
+            head=head,
+            fork=expected_fork,
+            lease_guard=lease_guard,
+        )
         lease_guard.assert_owned()
         self.store.transition(
             manifest,

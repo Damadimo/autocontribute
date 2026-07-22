@@ -19,7 +19,7 @@ from autocontribute.exceptions import PolicyError
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_FINGERPRINT_DOMAIN = b"autocontribute.approval.v3\x00"
+_FINGERPRINT_DOMAIN = b"autocontribute.approval.v4\x00"
 
 
 class ApprovalManifest(BaseModel):
@@ -31,7 +31,7 @@ class ApprovalManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: int = Field(default=3, frozen=True)
+    schema_version: int = Field(default=4, frozen=True)
     repository: str
     issue_number: int = Field(gt=0)
     base_sha: str
@@ -44,6 +44,7 @@ class ApprovalManifest(BaseModel):
     commit_committer_email: str
     base_branch: str
     draft: bool
+    ready_for_review: bool = False
     diff_sha256: str
     commit_message: str
     pull_request_title: str
@@ -191,6 +192,7 @@ def build_approval_manifest(
     diff: str | bytes,
     disclosure: str,
     draft: bool,
+    ready_for_review: bool = False,
 ) -> ApprovalManifest:
     """Extract the exact publishable fields from a ready run."""
 
@@ -236,6 +238,7 @@ def build_approval_manifest(
         commit_committer_email=run.commit_committer_email,
         base_branch=run.repository.default_branch,
         draft=draft,
+        ready_for_review=ready_for_review,
         diff_sha256=hash_diff(diff),
         commit_message=run.proposal.commit_message,
         pull_request_title=run.proposal.pull_request_title,

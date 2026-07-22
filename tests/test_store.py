@@ -1302,6 +1302,7 @@ def test_begin_publication_recovers_complete_legacy_submitting_intent_but_reject
     legacy = _publication_run(store)
     legacy.branch_name = "autocontribute/fix-exact-bug"
     legacy.publication_draft = True
+    legacy.publication_ready_for_review = False
     legacy.publishing_login = "octocat"
     legacy.publishing_api_origin = "https://api.github.com"
     legacy.commit_author_name = "Octo Cat"

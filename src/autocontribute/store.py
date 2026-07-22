@@ -315,6 +315,7 @@ class _ManifestArtifactSyncError(StateError):
 class _PublicationIntent:
     branch_name: str
     publication_draft: bool
+    publication_ready_for_review: bool
     publishing_login: str
     publishing_api_origin: str
     commit_author_name: str
@@ -326,6 +327,7 @@ class _PublicationIntent:
         return {
             "branch_name": self.branch_name,
             "publication_draft": self.publication_draft,
+            "publication_ready_for_review": self.publication_ready_for_review,
             "publishing_login": self.publishing_login,
             "publishing_api_origin": self.publishing_api_origin,
             "commit_author_name": self.commit_author_name,
@@ -339,6 +341,7 @@ class _PublicationIntent:
             "repository": repository,
             "branch": self.branch_name,
             "draft": "true" if self.publication_draft else "false",
+            "ready_for_review": "true" if self.publication_ready_for_review else "false",
             "publishing_login": self.publishing_login,
             "publishing_api_origin": self.publishing_api_origin,
             "commit_author_name": self.commit_author_name,
@@ -1576,6 +1579,7 @@ class RunStore:
         *,
         branch_name: str,
         publication_draft: bool,
+        publication_ready_for_review: bool = False,
         publishing_login: str,
         publishing_api_origin: str,
         commit_author_name: str,
@@ -1610,6 +1614,7 @@ class RunStore:
         intent = _publication_intent(
             branch_name=branch_name,
             publication_draft=publication_draft,
+            publication_ready_for_review=publication_ready_for_review,
             publishing_login=publishing_login,
             publishing_api_origin=publishing_api_origin,
             commit_author_name=commit_author_name,
@@ -4386,6 +4391,7 @@ def _publication_intent(
     *,
     branch_name: str,
     publication_draft: bool,
+    publication_ready_for_review: bool,
     publishing_login: str,
     publishing_api_origin: str,
     commit_author_name: str,
@@ -4395,6 +4401,10 @@ def _publication_intent(
 ) -> _PublicationIntent:
     if not isinstance(publication_draft, bool):
         raise TypeError("publication draft intent must be a boolean")
+    if not isinstance(publication_ready_for_review, bool):
+        raise TypeError("publication ready-for-review intent must be a boolean")
+    if publication_ready_for_review and not publication_draft:
+        raise ValueError("ready-for-review publication must be staged as a draft")
     return _PublicationIntent(
         branch_name=_canonical_publication_intent_text(
             branch_name,
@@ -4402,6 +4412,7 @@ def _publication_intent(
             maximum=255,
         ),
         publication_draft=publication_draft,
+        publication_ready_for_review=publication_ready_for_review,
         publishing_login=_canonical_publication_intent_text(
             publishing_login,
             field="publishing login",

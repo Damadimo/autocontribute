@@ -809,6 +809,7 @@ def test_auto_path_resyncs_lifecycle_immediately_before_publisher(
         "    example/project: [python -m pytest]\n"
         "publishing:\n"
         "  mode: auto\n"
+        "  ready_for_review: true\n"
         "  max_open_pull_requests: 1\n"
         "models:\n"
         "  scout:\n"

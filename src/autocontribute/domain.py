@@ -337,9 +337,12 @@ class RunManifest(DomainModel):
     commit_committer_name: str | None = None
     commit_committer_email: str | None = None
     publication_draft: bool | None = None
+    publication_ready_for_review: bool | None = None
     branch_name: str | None = None
     commit_sha: str | None = None
     pull_request_creation_started: bool = False
+    pull_request_ready_started: bool = False
+    pull_request_ready_completed: bool = False
     publication_compensation_reason: (
         Literal[
             "pre_pr_base_moved",

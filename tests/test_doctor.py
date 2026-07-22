@@ -53,6 +53,7 @@ def _auto_config() -> AutocontributeConfig:
             "publishing": {
                 "mode": "auto",
                 "draft": True,
+                "ready_for_review": True,
                 "max_new_pull_requests_per_day": 1,
                 "max_open_pull_requests": 1,
                 "repository_cooldown_days": 7,

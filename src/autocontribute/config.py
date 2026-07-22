@@ -359,6 +359,7 @@ class PublishingConfig(StrictModel):
     approval_expires_hours: int = Field(default=24, ge=1, le=168)
     branch_prefix: str = "autocontribute"
     draft: bool = True
+    ready_for_review: bool = False
     max_new_pull_requests_per_day: int = Field(default=1, ge=1, le=5)
     max_open_pull_requests: int = Field(default=2, ge=1, le=20)
     repository_cooldown_days: int = Field(default=7, ge=0, le=365)
@@ -370,6 +371,14 @@ class PublishingConfig(StrictModel):
         if not _ENV_NAME.fullmatch(value):
             raise ValueError("auto_publish_env must be an environment variable name")
         return value
+
+    @model_validator(mode="after")
+    def ready_transition_starts_from_a_draft(self) -> PublishingConfig:
+        if self.ready_for_review and not self.draft:
+            raise ValueError(
+                "publishing.draft must be true when publishing.ready_for_review is enabled"
+            )
+        return self
 
 
 def auto_publish_opt_in_enabled(config: PublishingConfig) -> bool:
@@ -461,6 +470,8 @@ class AutocontributeConfig(StrictModel):
                 auto_violations.append("github.owners must be empty")
             if not self.publishing.draft:
                 auto_violations.append("publishing.draft must be true")
+            if not self.publishing.ready_for_review:
+                auto_violations.append("publishing.ready_for_review must be true")
             if self.publishing.max_new_pull_requests_per_day != 1:
                 auto_violations.append("publishing.max_new_pull_requests_per_day must equal 1")
             if self.publishing.max_open_pull_requests != 1:
@@ -675,6 +686,7 @@ publishing:
   mode: review_required             # guarded `auto` is limited to one explicit repository
   approval_expires_hours: 24
   draft: true
+  ready_for_review: false
   max_new_pull_requests_per_day: 1
   max_open_pull_requests: 2
   repository_cooldown_days: 7

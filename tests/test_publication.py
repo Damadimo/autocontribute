@@ -94,6 +94,7 @@ def _ready_run(
     tmp_path: Path,
     *,
     guarded_auto: bool = False,
+    ready_for_review: bool = False,
 ) -> tuple[AutocontributeConfig, RunStore, str, IssueCandidate]:
     config = AutocontributeConfig.model_validate(
         {
@@ -104,6 +105,8 @@ def _ready_run(
     )
     if guarded_auto:
         _enable_guarded_auto_mode(config)
+    elif ready_for_review:
+        config.publishing.ready_for_review = True
     store = RunStore(config.storage.path)
     run = store.create_run(deployment_fingerprint=compute_deployment_fingerprint(config))
     source = tmp_path / "source"
@@ -299,6 +302,7 @@ def _enable_guarded_auto_mode(config: AutocontributeConfig) -> None:
     config.models.critic.immutable_response_model_attested = True
     config.budget.max_model_cost_usd_per_run = Decimal("10")
     config.publishing.max_open_pull_requests = 1
+    config.publishing.ready_for_review = True
     config.publishing.mode = "auto"
 
 
@@ -311,6 +315,7 @@ def _remove_human_publication_context(manifest) -> None:  # type: ignore[no-unty
     manifest.commit_committer_name = None
     manifest.commit_committer_email = None
     manifest.publication_draft = None
+    manifest.publication_ready_for_review = None
 
 
 class FakePublishingGitHub:
@@ -347,6 +352,7 @@ class FakePublishingGitHub:
         self.pull_request_base_sha = sha
         self.pull_request_head_repository = f"{login}/project"
         self.created_expected_head_sha: str | None = None
+        self.created_pull_request_draft: bool | None = None
 
     def authenticated_login(self) -> str:
         self.calls.append("authenticated_login")
@@ -447,6 +453,7 @@ class FakePublishingGitHub:
     def create_pull_request(self, *args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
         self.calls.append("create_pull_request")
         self.created_expected_head_sha = kwargs.get("expected_head_sha")
+        self.created_pull_request_draft = kwargs["draft"]
         self.last_head = kwargs["head"]
         self.pull_request_title = kwargs["title"]
         self.pull_request_body = kwargs["body"]
@@ -471,6 +478,27 @@ class FakePublishingGitHub:
         assert current.head_sha.casefold() == expected_head_sha.casefold()
         assert not current.merged
         self.pull_request_state = "closed"
+        self.mutated = True
+        return self._pull_request_details(repository, number)
+
+    def mark_pull_request_ready_for_review(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_url: str,
+        expected_head_repository: str,
+        expected_head_ref: str,
+        expected_head_sha: str,
+    ) -> PullRequestDetails:
+        self.calls.append("mark_pull_request_ready_for_review")
+        current = self._pull_request_details(repository, number)
+        assert current.html_url == expected_url
+        assert current.head_repository.casefold() == expected_head_repository.casefold()
+        assert current.head_ref == expected_head_ref
+        assert current.head_sha.casefold() == expected_head_sha.casefold()
+        assert current.state == "open" and not current.merged
+        self.pull_request_draft = False
         self.mutated = True
         return self._pull_request_details(repository, number)
 
@@ -1423,6 +1451,117 @@ def test_auto_mode_publishes_only_after_measured_shadow_gate(
     assert published.pull_request_url == "https://github.com/example/project/pull/7"
     assert published.publishing_login == "octocat"
     assert published.publishing_api_origin == "https://api.github.com"
+    assert github.created_pull_request_draft is True
+    assert not github.pull_request_draft
+    assert github.calls.index("create_pull_request") < github.calls.index(
+        "mark_pull_request_ready_for_review"
+    )
+    durable = store.get(run_id)
+    assert durable.pull_request_ready_started
+    assert durable.pull_request_ready_completed
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    started = event_types.index("pull_request.ready_for_review.started")
+    completed = event_types.index("pull_request.ready_for_review.completed")
+    final_transition = len(event_types) - 1 - event_types[::-1].index("run.transitioned")
+    assert event_types.index("pull_request.created.response") < started < completed
+    assert completed < final_transition
+
+
+def test_ready_for_review_recovers_after_remote_success_before_durable_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path, ready_for_review=True)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_save = store.save
+    completion_crashed = False
+
+    def save_then_crash(
+        saved_manifest,  # type: ignore[no-untyped-def]
+        *,
+        event: str,
+        details: dict[str, str],
+    ) -> None:
+        nonlocal completion_crashed
+        if event == "pull_request.ready_for_review.completed" and not completion_crashed:
+            completion_crashed = True
+            raise RuntimeError("simulated crash before ready completion persistence")
+        original_save(saved_manifest, event=event, details=details)
+
+    monkeypatch.setattr(store, "save", save_then_crash)
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha: setattr(github, "branch_sha", commit_sha),
+    )
+
+    with pytest.raises(RuntimeError, match="ready completion persistence"):
+        publisher.publish(run_id)
+
+    stranded = store.get(run_id)
+    assert stranded.status == RunStatus.SUBMITTING
+    assert stranded.pull_request_ready_started
+    assert not stranded.pull_request_ready_completed
+    assert not github.pull_request_draft
+    assert github.calls.count("mark_pull_request_ready_for_review") == 1
+
+    monkeypatch.setattr(store, "save", original_save)
+    recovered = publisher.reconcile_submitting(run_id)
+
+    assert recovered.status == RunStatus.PR_OPEN
+    assert recovered.pull_request_ready_completed
+    assert github.calls.count("mark_pull_request_ready_for_review") == 1
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert event_types.count("pull_request.ready_for_review.started") == 1
+    assert event_types.count("pull_request.ready_for_review.completed") == 1
+
+
+def test_ambiguous_ready_for_review_is_reconciled_before_a_safe_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path, ready_for_review=True)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_mark_ready = github.mark_pull_request_ready_for_review
+    attempts = 0
+
+    def ambiguous_ready(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
+        nonlocal attempts
+        del args, kwargs
+        attempts += 1
+        github.calls.append("mark_pull_request_ready_for_review")
+        raise TimeoutError("ready-for-review response was lost")
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha: setattr(github, "branch_sha", commit_sha),
+    )
+    monkeypatch.setattr(github, "mark_pull_request_ready_for_review", ambiguous_ready)
+
+    with pytest.raises(PublicationResumeRequired, match="did not confirm ready-for-review"):
+        publisher.publish(run_id)
+
+    stranded = store.get(run_id)
+    assert stranded.status == RunStatus.SUBMITTING
+    assert stranded.pull_request_ready_started
+    assert not stranded.pull_request_ready_completed
+    assert github.pull_request_draft
+    assert attempts == 1
+
+    monkeypatch.setattr(github, "mark_pull_request_ready_for_review", original_mark_ready)
+    recovered = publisher.reconcile_submitting(run_id)
+
+    assert recovered.status == RunStatus.PR_OPEN
+    assert recovered.pull_request_ready_completed
+    assert not github.pull_request_draft
+    assert attempts == 1
 
 
 def test_retry_recovers_exact_local_commit_after_crash_before_commit_persistence(

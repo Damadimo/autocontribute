@@ -143,13 +143,19 @@ def _prepared_run(store: RunStore) -> RunManifest:
     return run
 
 
-def _published_run(store: RunStore, *, canonical_event: str) -> RunManifest:
+def _published_run(
+    store: RunStore,
+    *,
+    canonical_event: str,
+    ready_for_review: bool = False,
+) -> RunManifest:
     run = _prepared_run(store)
     run = store.begin_publication(
         run,
         "example/project",
         branch_name=f"autocontribute/issue-42-{run.run_id}",
         publication_draft=True,
+        publication_ready_for_review=ready_for_review,
         publishing_login="octocat",
         publishing_api_origin="https://api.github.com",
         commit_author_name="Octocat",
@@ -184,6 +190,25 @@ def _published_run(store: RunStore, *, canonical_event: str) -> RunManifest:
         },
     }
     store.save(run, event=canonical_event, details=canonical_details[canonical_event])
+    if ready_for_review:
+        ready_details = {
+            "url": run.pull_request_url,
+            "repository": "example/project",
+            "number": "7",
+            "head_sha": run.commit_sha,
+        }
+        run.pull_request_ready_started = True
+        store.save(
+            run,
+            event="pull_request.ready_for_review.started",
+            details=ready_details,
+        )
+        run.pull_request_ready_completed = True
+        store.save(
+            run,
+            event="pull_request.ready_for_review.completed",
+            details=ready_details,
+        )
     store.transition(run, RunStatus.PR_OPEN, reason="fixture publication completed")
     return run
 
@@ -390,6 +415,80 @@ def test_complete_published_run_is_workspace_independent(
     create_state_bundle(store, tmp_path / "published.bundle.zip")
 
 
+def test_complete_ready_for_review_run_is_workspace_independent(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    run = _published_run(
+        store,
+        canonical_event="pull_request.created.response",
+        ready_for_review=True,
+    )
+
+    report = collect_terminal_workspaces(
+        store,
+        older_than=timedelta(days=7),
+        execute=True,
+        now=_future(run),
+    )
+
+    assert report.deleted == 1
+    assert report.errors == 0
+
+
+def test_incomplete_ready_for_review_evidence_retains_workspace(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    run = _prepared_run(store)
+    run = store.begin_publication(
+        run,
+        "example/project",
+        branch_name=f"autocontribute/issue-42-{run.run_id}",
+        publication_draft=True,
+        publication_ready_for_review=True,
+        publishing_login="octocat",
+        publishing_api_origin="https://api.github.com",
+        commit_author_name="Octocat",
+        commit_author_email="octocat@users.noreply.github.com",
+        commit_committer_name="Octocat",
+        commit_committer_email="octocat@users.noreply.github.com",
+        max_per_utc_day=10,
+        repository_cooldown=timedelta(0),
+    )
+    run.commit_sha = "c" * 40
+    run.pull_request_creation_started = True
+    run.pull_request_url = "https://github.com/example/project/pull/7"
+    canonical_details = {
+        "url": run.pull_request_url,
+        "repository": "example/project",
+        "number": "7",
+        "state": "open",
+        "head_sha": run.commit_sha,
+        "base_sha": run.base_sha,
+    }
+    store.save(run, event="pull_request.created.response", details=canonical_details)
+    run.pull_request_ready_started = True
+    store.save(
+        run,
+        event="pull_request.ready_for_review.started",
+        details={
+            "url": run.pull_request_url,
+            "repository": "example/project",
+            "number": "7",
+            "head_sha": run.commit_sha,
+        },
+    )
+    store.transition(run, RunStatus.PR_OPEN, reason="fixture omitted ready completion")
+
+    report = collect_terminal_workspaces(
+        store,
+        older_than=timedelta(days=7),
+        execute=True,
+        now=_future(run),
+    )
+
+    assert report.retained == report.errors == 1
+    assert "incomplete ready-for-review transition" in report.items[0].reason
+    assert store.workspaces_dir.joinpath(run.run_id).is_dir()
+
+
 def test_published_run_without_canonical_pr_event_is_retained(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     run = _prepared_run(store)
@@ -431,6 +530,7 @@ def test_published_run_without_publication_intent_event_is_retained(tmp_path: Pa
     store.transition(run, RunStatus.SUBMITTING, reason="fixture bypassed publication intent")
     run.branch_name = f"autocontribute/issue-42-{run.run_id}"
     run.publication_draft = True
+    run.publication_ready_for_review = False
     run.publishing_login = "octocat"
     run.publishing_api_origin = "https://api.github.com"
     run.commit_author_name = run.commit_committer_name = "Octocat"

@@ -382,6 +382,16 @@ def _validate_published_identity(manifest: RunManifest) -> None:
         raise StateError("published run is missing its durable Git identity")
     if manifest.publication_draft is None:
         raise StateError("published run is missing its durable draft intent")
+    if manifest.publication_ready_for_review is None:
+        raise StateError("published run is missing its durable ready-for-review intent")
+    if manifest.publication_ready_for_review and not manifest.publication_draft:
+        raise StateError("published run has an invalid ready-for-review publication intent")
+    if manifest.pull_request_ready_completed and not manifest.pull_request_ready_started:
+        raise StateError("published run completed ready-for-review without a started intent")
+    if not manifest.publication_ready_for_review and (
+        manifest.pull_request_ready_started or manifest.pull_request_ready_completed
+    ):
+        raise StateError("published draft run has unexpected ready-for-review evidence")
 
 
 def _validate_published_event_proof(store: RunStore, manifest: RunManifest) -> None:
@@ -397,6 +407,7 @@ def _validate_published_event_proof(store: RunStore, manifest: RunManifest) -> N
     assert manifest.commit_committer_name is not None
     assert manifest.commit_committer_email is not None
     assert manifest.publication_draft is not None
+    assert manifest.publication_ready_for_review is not None
     assert manifest.commit_sha is not None
     assert manifest.base_sha is not None
 
@@ -414,6 +425,7 @@ def _validate_published_event_proof(store: RunStore, manifest: RunManifest) -> N
         "repository": manifest.candidate.repository.casefold(),
         "branch": manifest.branch_name,
         "draft": "true" if manifest.publication_draft else "false",
+        "ready_for_review": "true" if manifest.publication_ready_for_review else "false",
         "publishing_login": manifest.publishing_login,
         "publishing_api_origin": manifest.publishing_api_origin,
         "commit_author_name": manifest.commit_author_name,
@@ -429,6 +441,7 @@ def _validate_published_event_proof(store: RunStore, manifest: RunManifest) -> N
         api_origin=manifest.publishing_api_origin,
     )
     canonical_indices: list[int] = []
+    terminal_canonical_indices: list[int] = []
     for index, event in enumerate(events):
         event_type = event["event_type"]
         if event_type not in _CANONICAL_PR_EVENTS:
@@ -442,20 +455,87 @@ def _validate_published_event_proof(store: RunStore, manifest: RunManifest) -> N
             number=number,
         ):
             canonical_indices.append(index)
+            if details.get("state") in {"closed", "closed_unmerged", "merged"}:
+                terminal_canonical_indices.append(index)
     if not canonical_indices:
         raise StateError("published run lacks canonical pull-request persistence evidence")
+
+    ready_started = [
+        index
+        for index, event in enumerate(events)
+        if event["event_type"] == "pull_request.ready_for_review.started"
+        and _ready_for_review_event_matches(
+            _event_details(event),
+            manifest=manifest,
+            repository=repository,
+            number=number,
+        )
+    ]
+    ready_completed = [
+        index
+        for index, event in enumerate(events)
+        if event["event_type"] == "pull_request.ready_for_review.completed"
+        and _ready_for_review_event_matches(
+            _event_details(event),
+            manifest=manifest,
+            repository=repository,
+            number=number,
+        )
+    ]
+    all_ready_events = [
+        event
+        for event in events
+        if event["event_type"]
+        in {
+            "pull_request.ready_for_review.started",
+            "pull_request.ready_for_review.completed",
+        }
+    ]
+    if manifest.publication_ready_for_review:
+        if manifest.pull_request_ready_started != (len(ready_started) == 1):
+            raise StateError("published run has inconsistent ready-for-review start evidence")
+        if manifest.pull_request_ready_completed != (len(ready_completed) == 1):
+            raise StateError("published run has inconsistent ready-for-review completion evidence")
+        if len(all_ready_events) != len(ready_started) + len(ready_completed):
+            raise StateError("published run has malformed or duplicate ready-for-review evidence")
+        if manifest.pull_request_ready_started and not manifest.pull_request_ready_completed:
+            raise StateError("published run has an incomplete ready-for-review transition")
+    elif all_ready_events:
+        raise StateError("published draft run has unexpected ready-for-review events")
 
     for transition_index, event in enumerate(events):
         if event["event_type"] != "run.transitioned":
             continue
         transition = _event_details(event)
-        if (
+        if not (
             transition.get("from") == RunStatus.SUBMITTING.value
             and transition.get("to") == RunStatus.PR_OPEN.value
             and bool(transition.get("reason"))
+        ):
+            continue
+        if not manifest.publication_ready_for_review and any(
+            intent_index < canonical_index < transition_index
+            for canonical_index in canonical_indices
+        ):
+            return
+        if (
+            manifest.publication_ready_for_review
+            and manifest.pull_request_ready_completed
+            and any(
+                intent_index < canonical_index < started_index < completed_index < transition_index
+                for canonical_index in canonical_indices
+                for started_index in ready_started
+                for completed_index in ready_completed
+            )
+        ):
+            return
+        if (
+            manifest.publication_ready_for_review
+            and not manifest.pull_request_ready_started
+            and not manifest.pull_request_ready_completed
             and any(
                 intent_index < canonical_index < transition_index
-                for canonical_index in canonical_indices
+                for canonical_index in terminal_canonical_indices
             )
         ):
             return
@@ -508,22 +588,43 @@ def _canonical_pr_event_matches(
     return False
 
 
+def _ready_for_review_event_matches(
+    details: dict[str, str],
+    *,
+    manifest: RunManifest,
+    repository: str,
+    number: int,
+) -> bool:
+    return details == {
+        "url": manifest.pull_request_url,
+        "repository": repository,
+        "number": str(number),
+        "head_sha": manifest.commit_sha,
+    }
+
+
 def _has_manifest_publication_state(manifest: RunManifest) -> bool:
-    return manifest.pull_request_creation_started or any(
-        value is not None
-        for value in (
-            manifest.publishing_login,
-            manifest.publishing_api_origin,
-            manifest.commit_author_name,
-            manifest.commit_author_email,
-            manifest.commit_committer_name,
-            manifest.commit_committer_email,
-            manifest.publication_draft,
-            manifest.branch_name,
-            manifest.commit_sha,
-            manifest.publication_compensation_reason,
-            manifest.pull_request_url,
+    return (
+        manifest.pull_request_creation_started
+        or any(
+            value is not None
+            for value in (
+                manifest.publishing_login,
+                manifest.publishing_api_origin,
+                manifest.commit_author_name,
+                manifest.commit_author_email,
+                manifest.commit_committer_name,
+                manifest.commit_committer_email,
+                manifest.publication_draft,
+                manifest.publication_ready_for_review,
+                manifest.branch_name,
+                manifest.commit_sha,
+                manifest.publication_compensation_reason,
+                manifest.pull_request_url,
+            )
         )
+        or manifest.pull_request_ready_started
+        or manifest.pull_request_ready_completed
     )
 
 

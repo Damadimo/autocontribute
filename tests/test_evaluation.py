@@ -183,6 +183,7 @@ def test_prepared_evaluation_survives_publication_lifecycle_changes(tmp_path: Pa
     run.commit_committer_name = "Octocat"
     run.commit_committer_email = "octocat@users.noreply.github.com"
     run.publication_draft = True
+    run.publication_ready_for_review = False
     store.save(run, event="fixture.publication_context_bound", details={})
     store.transition(run, RunStatus.APPROVED, reason="fixture approval")
     run.branch_name = "autocontribute/fixture"

@@ -703,7 +703,8 @@ Do not add the runtime opt-in during installation. First collect and grade the c
 100-run cohort in `review_required` mode, satisfy the measured gate, perform a successful recovery
 drill, and review the automatic pilot constraints in [Scheduled operation](scheduled-operation.md).
 The production configuration must use one explicit repository, immutable attested model IDs, draft
-PRs, at most one new PR per UTC day, and a repository cooldown of at least seven days.
+staging followed by the durable exact ready-for-review transition, at most one new PR per UTC day,
+and a repository cooldown of at least seven days.
 
 Only then change `publishing.mode` to `auto`, provision the narrowly scoped publication credential,
 and install the same root-owned opt-in drop-in for both services. The doctor is non-mutating and

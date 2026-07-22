@@ -390,6 +390,7 @@ models:
 publishing:
   mode: auto
   draft: true
+  ready_for_review: true
   max_open_pull_requests: 1
   max_new_pull_requests_per_day: 1
   repository_cooldown_days: 7
@@ -415,9 +416,12 @@ review mode for evidence collection or disable it to avoid two schedulers operat
 identity.
 
 Configuration rejects automatic mode unless exactly one repository is explicitly allowlisted, owner
-discovery is disabled, PRs remain drafts, at most one PR may be open or created per UTC day, and the
-repository cooldown is at least seven days. This deliberately keeps the first autonomous pilot to one
-repository and one global sandbox/toolchain recipe. The durable expert-evaluation gate and
+discovery is disabled, each PR is created as a draft and then moved to ready-for-review only after its
+canonical URL, repository, branch, and commit are durably verified, at most one PR may be open or
+created per UTC day, and the repository cooldown is at least seven days. The draft-to-ready mutation
+has its own started/completed intent, so an interrupted worker reconciles the exact PR before any
+retry. This deliberately keeps the first autonomous pilot to one repository and one global
+sandbox/toolchain recipe. The durable expert-evaluation gate and
 environment gate are also required; passing the evaluation gate does not enable publication by
 itself. Automatic mode still performs all quality, account, duplicate, and freshness checks.
 Immediately before any GitHub mutation, it transactionally records the run's reservation; this

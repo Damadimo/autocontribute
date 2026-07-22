@@ -90,6 +90,7 @@ class PullRequestDetails:
     base_ref: str = ""
     head_ref: str = ""
     head_label: str = ""
+    node_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1226,6 +1227,105 @@ class GitHubClient:
         )
         return replace(details, html_url=html_url)
 
+    def mark_pull_request_ready_for_review(
+        self,
+        repository: str,
+        number: int,
+        *,
+        expected_url: str,
+        expected_head_repository: str,
+        expected_head_ref: str,
+        expected_head_sha: str,
+    ) -> PullRequestDetails:
+        """Move one exact open draft PR to ready-for-review and verify the result."""
+
+        current = self.get_pull_request(repository, number)
+        self._validate_ready_for_review_identity(
+            current,
+            expected_url=expected_url,
+            expected_head_repository=expected_head_repository,
+            expected_head_ref=expected_head_ref,
+            expected_head_sha=expected_head_sha,
+        )
+        if current.state != "open" or current.merged:
+            raise GitHubError("Refusing to mark a non-open pull request ready for review")
+        if not current.draft:
+            return current
+
+        node_id = _graphql_node_id(current.node_id)
+        payload = _mapping(
+            self._request(
+                "POST",
+                _graphql_api_path(self.config.api_url),
+                json_body={
+                    "query": (
+                        "mutation MarkPullRequestReadyForReview($pullRequestId: ID!) { "
+                        "markPullRequestReadyForReview(input: {pullRequestId: $pullRequestId}) { "
+                        "pullRequest { id number url isDraft headRefOid } } }"
+                    ),
+                    "variables": {"pullRequestId": node_id},
+                },
+            ),
+            resource="ready-for-review mutation",
+        )
+        if payload.get("errors") is not None:
+            raise GitHubError("GitHub rejected the ready-for-review mutation")
+        data = _mapping(payload.get("data"), resource="ready-for-review mutation data")
+        result = _mapping(
+            data.get("markPullRequestReadyForReview"),
+            resource="ready-for-review mutation result",
+        )
+        returned = _mapping(
+            result.get("pullRequest"),
+            resource="ready-for-review pull request",
+        )
+        returned_number = _identifier(
+            returned.get("number"), resource="ready-for-review pull request"
+        )
+        returned_sha = _full_git_sha(
+            returned.get("headRefOid"),
+            field="ready-for-review pull request head SHA",
+        )
+        if (
+            _graphql_node_id(returned.get("id")) != node_id
+            or returned_number != number
+            or _nonempty(returned.get("url"), field="ready-for-review pull request URL")
+            != expected_url
+            or returned.get("isDraft") is not False
+            or returned_sha.casefold() != expected_head_sha.casefold()
+        ):
+            raise GitHubError("GitHub returned a different ready-for-review pull request")
+
+        confirmed = self.get_pull_request(repository, number)
+        self._validate_ready_for_review_identity(
+            confirmed,
+            expected_url=expected_url,
+            expected_head_repository=expected_head_repository,
+            expected_head_ref=expected_head_ref,
+            expected_head_sha=expected_head_sha,
+        )
+        if confirmed.state != "open" or confirmed.merged or confirmed.draft:
+            raise GitHubError("GitHub did not confirm the pull request is ready for review")
+        return confirmed
+
+    def _validate_ready_for_review_identity(
+        self,
+        details: PullRequestDetails,
+        *,
+        expected_url: str,
+        expected_head_repository: str,
+        expected_head_ref: str,
+        expected_head_sha: str,
+    ) -> None:
+        if details.html_url != expected_url:
+            raise GitHubError("Refusing to update a pull request with a different canonical URL")
+        self._validate_compensation_pull_request(
+            details,
+            expected_head_repository=expected_head_repository,
+            expected_head_ref=expected_head_ref,
+            expected_head_sha=expected_head_sha,
+        )
+
     def close_pull_request(
         self,
         repository: str,
@@ -1612,6 +1712,31 @@ def _parse_pull_request(
         base_ref=_nonempty(base.get("ref"), field="pull request base ref"),
         head_ref=_nonempty(head.get("ref"), field="pull request head ref"),
         head_label=_nonempty(head.get("label"), field="pull request head label"),
+        node_id=_graphql_node_id(data.get("node_id")),
+    )
+
+
+def _graphql_node_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 256
+        or any(not character.isprintable() for character in value)
+    ):
+        raise GitHubError("GitHub returned an invalid GraphQL node identifier")
+    return value
+
+
+def _graphql_api_path(value: object) -> str:
+    parsed = urlparse(str(value))
+    path = parsed.path.rstrip("/")
+    if parsed.hostname == "api.github.com" and not path:
+        return canonical_api_origin(value) + "/graphql"
+    if path.casefold().endswith("/api/v3"):
+        return canonical_api_origin(value) + path[: -len("/v3")] + "/graphql"
+    raise ConfigurationError(
+        "GitHub API URL does not expose a recognized GraphQL endpoint for ready-for-review"
     )
 
 

@@ -48,14 +48,15 @@ def _repository_payload(full_name: str) -> dict[str, object]:
     }
 
 
-def _pull_request_payload(*, merged: bool = False) -> dict[str, object]:
+def _pull_request_payload(*, merged: bool = False, draft: bool = False) -> dict[str, object]:
     return {
         "number": 7,
+        "node_id": "PR_fixture_node_7",
         "title": "Fix parser boundary",
         "body": "Fixes #42.",
         "html_url": "https://github.com/example/project/pull/7",
         "state": "closed" if merged else "open",
-        "draft": False,
+        "draft": draft,
         "merged": merged,
         "updated_at": "2026-07-21T13:00:00Z",
         "merged_at": "2026-07-21T12:30:00Z" if merged else None,
@@ -1132,6 +1133,124 @@ def test_create_pull_request_returns_closed_success_response_for_reconciliation(
 
     assert details.state == "closed"
     assert details.merged
+
+
+def test_mark_pull_request_ready_for_review_uses_exact_graphql_identity() -> None:
+    requests: list[tuple[str, str]] = []
+    get_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        requests.append((request.method, request.url.path))
+        if request.method == "GET":
+            get_count += 1
+            return httpx.Response(
+                200,
+                json=_pull_request_payload(draft=get_count == 1),
+            )
+        assert request.url.path == "/graphql"
+        body = request.read().decode("utf-8")
+        assert "PR_fixture_node_7" in body
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "markPullRequestReadyForReview": {
+                        "pullRequest": {
+                            "id": "PR_fixture_node_7",
+                            "number": 7,
+                            "url": "https://github.com/example/project/pull/7",
+                            "isDraft": False,
+                            "headRefOid": "a" * 40,
+                        }
+                    }
+                }
+            },
+        )
+
+    with _client(handler) as github:
+        details = github.mark_pull_request_ready_for_review(
+            "example/project",
+            7,
+            expected_url="https://github.com/example/project/pull/7",
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+        )
+
+    assert not details.draft
+    assert requests == [
+        ("GET", "/repos/example/project/pulls/7"),
+        ("POST", "/graphql"),
+        ("GET", "/repos/example/project/pulls/7"),
+    ]
+
+
+def test_mark_pull_request_ready_for_review_is_idempotent_when_already_ready() -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(200, json=_pull_request_payload())
+
+    with _client(handler) as github:
+        details = github.mark_pull_request_ready_for_review(
+            "example/project",
+            7,
+            expected_url="https://github.com/example/project/pull/7",
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+        )
+
+    assert not details.draft
+    assert methods == ["GET"]
+
+
+def test_mark_pull_request_ready_for_review_uses_ghes_graphql_path() -> None:
+    paths: list[str] = []
+    get_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_count
+        paths.append(request.url.path)
+        if request.method == "GET":
+            get_count += 1
+            payload = _pull_request_payload(draft=get_count == 1)
+            payload["html_url"] = "https://git.example.com/example/project/pull/7"
+            return httpx.Response(200, json=payload)
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "markPullRequestReadyForReview": {
+                        "pullRequest": {
+                            "id": "PR_fixture_node_7",
+                            "number": 7,
+                            "url": "https://git.example.com/example/project/pull/7",
+                            "isDraft": False,
+                            "headRefOid": "a" * 40,
+                        }
+                    }
+                }
+            },
+        )
+
+    with _client(handler, api_url="https://git.example.com/api/v3") as github:
+        github.mark_pull_request_ready_for_review(
+            "example/project",
+            7,
+            expected_url="https://git.example.com/example/project/pull/7",
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+        )
+
+    assert paths == [
+        "/api/v3/repos/example/project/pulls/7",
+        "/api/graphql",
+        "/api/v3/repos/example/project/pulls/7",
+    ]
 
 
 def test_close_pull_request_validates_identity_before_and_after_patch() -> None:

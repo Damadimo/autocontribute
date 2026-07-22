@@ -47,6 +47,13 @@ def test_defaults_disclose_autonomous_work_without_claiming_human_validation() -
     assert config.github.max_repository_inactivity_days == 180
 
 
+def test_ready_for_review_requires_draft_staging() -> None:
+    with pytest.raises(ValueError, match=r"publishing\.draft must be true"):
+        AutocontributeConfig.model_validate(
+            {"publishing": {"draft": False, "ready_for_review": True}}
+        )
+
+
 @pytest.mark.parametrize("days", [0, 3_651])
 def test_repository_inactivity_window_is_bounded(days: int) -> None:
     with pytest.raises(ValueError, match="max_repository_inactivity_days"):
@@ -96,6 +103,7 @@ def test_guarded_auto_mode_accepts_one_repository_weekly_draft_pilot() -> None:
             "publishing": {
                 "mode": "auto",
                 "draft": True,
+                "ready_for_review": True,
                 "max_new_pull_requests_per_day": 1,
                 "max_open_pull_requests": 1,
                 "repository_cooldown_days": 7,
@@ -119,6 +127,7 @@ def test_guarded_auto_mode_requires_the_dedicated_publication_switch() -> None:
                 "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
                 "publishing": {
                     "mode": "auto",
+                    "ready_for_review": True,
                     "max_open_pull_requests": 1,
                     "auto_publish_env": "CI",
                 },
@@ -143,6 +152,11 @@ def test_guarded_auto_mode_requires_the_dedicated_publication_switch() -> None:
             "github.owners must be empty",
         ),
         ({"repositories": ["example/project"]}, {"draft": False}, "draft must be true"),
+        (
+            {"repositories": ["example/project"]},
+            {"ready_for_review": False},
+            "ready_for_review must be true",
+        ),
         (
             {"repositories": ["example/project"]},
             {"max_new_pull_requests_per_day": 2},
@@ -176,7 +190,11 @@ def test_guarded_auto_mode_rejects_broader_rollout(
             {
                 "github": github,
                 "validation": {"required_commands": required_commands},
-                "publishing": {"mode": "auto", **publishing},
+                "publishing": {
+                    "mode": "auto",
+                    "ready_for_review": True,
+                    **publishing,
+                },
                 "models": _priced_models(),
                 "budget": {"max_model_cost_usd_per_run": "25"},
             }
@@ -206,7 +224,11 @@ def test_guarded_auto_mode_rejects_unsafe_runtime_policy(
     raw: dict[str, object] = {
         "github": {"repositories": ["example/project"]},
         "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-        "publishing": {"mode": "auto", "max_open_pull_requests": 1},
+        "publishing": {
+            "mode": "auto",
+            "ready_for_review": True,
+            "max_open_pull_requests": 1,
+        },
         "models": _priced_models(),
         "budget": {"max_model_cost_usd_per_run": "25"},
     }
@@ -220,7 +242,11 @@ def test_guarded_auto_requires_complete_pricing_and_usd_ceiling() -> None:
     base = {
         "github": {"repositories": ["example/project"]},
         "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-        "publishing": {"mode": "auto", "max_open_pull_requests": 1},
+        "publishing": {
+            "mode": "auto",
+            "ready_for_review": True,
+            "max_open_pull_requests": 1,
+        },
     }
 
     with pytest.raises(ValueError, match="pricing is required for every role"):
@@ -243,7 +269,11 @@ def test_guarded_auto_requires_exact_provider_model_attestation_for_every_role()
             {
                 "github": {"repositories": ["example/project"]},
                 "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-                "publishing": {"mode": "auto", "max_open_pull_requests": 1},
+                "publishing": {
+                    "mode": "auto",
+                    "ready_for_review": True,
+                    "max_open_pull_requests": 1,
+                },
                 "models": models,
                 "budget": {"max_model_cost_usd_per_run": "25"},
             }
@@ -263,7 +293,11 @@ def test_guarded_auto_requires_explicit_immutable_model_identity_attestation() -
             {
                 "github": {"repositories": ["example/project"]},
                 "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-                "publishing": {"mode": "auto", "max_open_pull_requests": 1},
+                "publishing": {
+                    "mode": "auto",
+                    "ready_for_review": True,
+                    "max_open_pull_requests": 1,
+                },
                 "models": models,
                 "budget": {"max_model_cost_usd_per_run": "25"},
             }
