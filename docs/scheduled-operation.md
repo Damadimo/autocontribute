@@ -186,6 +186,13 @@ evaluation cursor; migrated v2-v5 holds retain a null outcome cursor and cannot 
 recovery. Stop every older worker before this offline, one-way cutover and never restart one against
 the migrated lineage. Preserve a new v6 snapshot before the next ephemeral job.
 
+Store schema and lifecycle evidence format are separate lineages. Canonical unversioned lifecycle
+payloads can exist in any restorable store schema from v2 through v6. Restore preserves those rows
+and their fingerprints as `legacy_partial` evidence; it does not invent the commit chain, timeline
+events, timeline count, or node identities that older observers never recorded. Such rows remain
+inspectable for historical safety evidence but are ineligible to establish a successful upstream
+outcome. Obtain a new lifecycle evidence format-2 observation before relying on the outcome gate.
+
 > [!IMPORTANT]
 > The circuit breaker is persistent only within this durable state lineage. GitHub-hosted runners do
 > not retain a stop by themselves: if the verified snapshot is not saved and restored—or its cache is

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -21,6 +22,8 @@ from autocontribute.github import (
     PullRequestTimelineEvent,
 )
 from autocontribute.lifecycle import (
+    CURRENT_LIFECYCLE_EVIDENCE_VERSION,
+    LifecycleHistoryCapability,
     LifecycleObserver,
     LifecycleSignalKind,
     PullRequestLifecycleSnapshot,
@@ -206,6 +209,24 @@ def _snapshot(
         timeline_events=timeline_events,
         references=references,
     )
+
+
+def _legacy_snapshot_json(
+    snapshot: PullRequestLifecycleSnapshot,
+    *,
+    include_pull_request_node_id: bool = True,
+) -> str:
+    payload = json.loads(snapshot.to_json())
+    del payload["commits"]
+    del payload["evidence_version"]
+    del payload["timeline_events"]
+    del payload["timeline_item_count"]
+    del payload["pull_request"]["commit_count"]
+    if not include_pull_request_node_id:
+        del payload["pull_request"]["node_id"]
+    for reference in payload["references"]:
+        del reference["node_id"]
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 class FakeLifecycleGitHub:
@@ -451,6 +472,81 @@ def test_lifecycle_snapshot_strict_parser_round_trips_complete_evidence() -> Non
 
     assert parsed == snapshot
     assert parsed.fingerprint() == snapshot.fingerprint()
+    assert parsed.evidence_version == CURRENT_LIFECYCLE_EVIDENCE_VERSION
+    assert parsed.history_capability is LifecycleHistoryCapability.COMPLETE
+    assert parsed.has_complete_upstream_history
+
+
+def test_lifecycle_snapshot_parser_preserves_legacy_partial_evidence_without_fabrication() -> None:
+    pull_request = _pull_request(
+        state="closed",
+        merged=True,
+        merged_at=NOW,
+        closed_at=NOW,
+        merge_commit_sha="c" * 40,
+    )
+    reference = PullRequestReference(
+        identifier=60,
+        node_id="CRE_fixture_60",
+        source_url="https://github.com/example/project/pull/8",
+        source_title="Follow-up",
+        source_body="Tracks example/project#7",
+        source_state="open",
+        source_merged_at=None,
+        created_at=NOW,
+    )
+    encoded = _legacy_snapshot_json(_snapshot(pull_request=pull_request, references=(reference,)))
+
+    parsed = parse_lifecycle_snapshot_json(encoded, observed_at=NOW)
+
+    assert parsed.to_json() == encoded
+    assert parsed.fingerprint() == hashlib.sha256(encoded.encode()).hexdigest()
+    assert parsed.evidence_version == 1
+    assert parsed.history_capability is LifecycleHistoryCapability.LEGACY_PARTIAL
+    assert not parsed.has_complete_upstream_history
+    assert parsed.pull_request.commit_count is None
+    assert parsed.commits is None
+    assert parsed.timeline_item_count is None
+    assert parsed.timeline_events is None
+    assert parsed.references[0].node_id is None
+
+
+def test_lifecycle_snapshot_parser_preserves_earliest_pre_node_identity_payload() -> None:
+    encoded = _legacy_snapshot_json(
+        _snapshot(),
+        include_pull_request_node_id=False,
+    )
+
+    parsed = parse_lifecycle_snapshot_json(encoded, observed_at=NOW)
+
+    assert parsed.to_json() == encoded
+    assert parsed.pull_request.node_id == ""
+    assert not parsed.has_complete_upstream_history
+
+
+def test_lifecycle_snapshot_rejects_version_and_history_shape_tampering() -> None:
+    current_payload = json.loads(_snapshot().to_json())
+    current_payload["evidence_version"] = 1
+    wrong_version = json.dumps(current_payload, sort_keys=True, separators=(",", ":"))
+    with pytest.raises(ValueError, match="evidence version must be 2"):
+        parse_lifecycle_snapshot_json(wrong_version, observed_at=NOW)
+
+    legacy_payload = json.loads(_legacy_snapshot_json(_snapshot()))
+    legacy_payload["commits"] = []
+    mixed_shape = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"))
+    with pytest.raises(ValueError, match="exact supported fields"):
+        parse_lifecycle_snapshot_json(mixed_shape, observed_at=NOW)
+
+    legacy_payload.update(
+        {
+            "evidence_version": 2,
+            "timeline_events": [],
+            "timeline_item_count": 0,
+        }
+    )
+    promoted_shape = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"))
+    with pytest.raises(ValueError, match="exact supported fields"):
+        parse_lifecycle_snapshot_json(promoted_shape, observed_at=NOW)
 
 
 def test_lifecycle_snapshot_accepts_ordered_close_reopen_history() -> None:

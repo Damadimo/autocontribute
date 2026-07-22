@@ -14,7 +14,11 @@ from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.domain import IssueCandidate, RunManifest, RunStatus
 from autocontribute.exceptions import StateError
 from autocontribute.github import PullRequestCommit, PullRequestDetails
-from autocontribute.lifecycle import PullRequestLifecycleSnapshot
+from autocontribute.lifecycle import (
+    LifecycleHistoryCapability,
+    PullRequestLifecycleSnapshot,
+    parse_lifecycle_snapshot_json,
+)
 from autocontribute.store import CURRENT_SCHEMA_VERSION, RunStore
 
 
@@ -294,6 +298,20 @@ def _lifecycle_snapshot(*, head_sha: str = "a" * 40) -> PullRequestLifecycleSnap
         timeline_events=(),
         references=(),
     )
+
+
+def _legacy_lifecycle_snapshot_json(*, include_pull_request_node_id: bool = True) -> str:
+    payload = json.loads(_lifecycle_snapshot().to_json())
+    del payload["commits"]
+    del payload["evidence_version"]
+    del payload["timeline_events"]
+    del payload["timeline_item_count"]
+    del payload["pull_request"]["commit_count"]
+    if not include_pull_request_node_id:
+        del payload["pull_request"]["node_id"]
+    for reference in payload["references"]:
+        del reference["node_id"]
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def _append_lifecycle_snapshot_event(
@@ -2257,6 +2275,51 @@ def test_lifecycle_snapshots_are_immutable_and_deduplicated(tmp_path: Path) -> N
     assert store.events(run.run_id)[-1]["event_type"] == "lifecycle.snapshot.recorded"
 
 
+@pytest.mark.parametrize("schema_version", (2, 3, 4, 5, 6))
+@pytest.mark.parametrize("include_pull_request_node_id", (False, True))
+def test_pre_history_lifecycle_snapshot_restores_from_every_supported_schema(
+    tmp_path: Path,
+    schema_version: int,
+    include_pull_request_node_id: bool,
+) -> None:
+    store = RunStore(tmp_path / "source")
+    run = store.create_run()
+    snapshot_json = _legacy_lifecycle_snapshot_json(
+        include_pull_request_node_id=include_pull_request_node_id
+    )
+    fingerprint = hashlib.sha256(snapshot_json.encode()).hexdigest()
+    store.record_lifecycle_snapshot(run.run_id, fingerprint, snapshot_json)
+    snapshot = store.create_snapshot(tmp_path / "snapshots" / f"v{schema_version}.sqlite3")
+    if schema_version == 2:
+        _downgrade_current_database_to_v2(snapshot)
+    elif schema_version == 3:
+        _downgrade_current_database_to_v3(snapshot)
+    elif schema_version == 4:
+        _downgrade_current_database_to_v4(snapshot)
+    elif schema_version == 5:
+        _downgrade_current_database_to_v5(snapshot)
+
+    restored_root = tmp_path / f"restored-v{schema_version}"
+    restored = RunStore.restore_snapshot(restored_root, snapshot)
+    with sqlite3.connect(restored) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+        ).fetchone() == (schema_version,)
+
+    migrated = RunStore(restored_root)
+    rows = migrated.lifecycle_snapshots(run.run_id)
+    assert len(rows) == 1
+    parsed = parse_lifecycle_snapshot_json(
+        rows[0].snapshot_json,
+        observed_at=rows[0].observed_at,
+    )
+    assert parsed.to_json() == snapshot_json
+    assert parsed.fingerprint() == fingerprint
+    assert parsed.history_capability is LifecycleHistoryCapability.LEGACY_PARTIAL
+    assert not parsed.has_complete_upstream_history
+    assert bool(parsed.pull_request.node_id) is include_pull_request_node_id
+
+
 def test_lifecycle_snapshot_rejects_noncanonical_and_structurally_invalid_json(
     tmp_path: Path,
 ) -> None:
@@ -2342,6 +2405,25 @@ def test_lifecycle_snapshot_read_recomputes_fingerprint_after_content_tamper(
         connection.execute(
             "UPDATE lifecycle_snapshots SET snapshot_json = ? WHERE run_id = ?",
             (changed.to_json(), run.run_id),
+        )
+
+    with pytest.raises(StateError, match="fingerprint mismatch"):
+        store.lifecycle_snapshots(run.run_id)
+
+
+def test_legacy_lifecycle_snapshot_read_rejects_content_tamper(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    snapshot_json = _legacy_lifecycle_snapshot_json()
+    fingerprint = hashlib.sha256(snapshot_json.encode()).hexdigest()
+    store.record_lifecycle_snapshot(run.run_id, fingerprint, snapshot_json)
+    payload = json.loads(snapshot_json)
+    payload["pull_request"]["title"] = "Tampered legacy lifecycle evidence"
+    tampered = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE lifecycle_snapshots SET snapshot_json = ? WHERE run_id = ?",
+            (tampered, run.run_id),
         )
 
     with pytest.raises(StateError, match="fingerprint mismatch"):

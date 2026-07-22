@@ -255,6 +255,14 @@ again before GitHub mutations. A scheduled invocation first runs lifecycle synch
 candidate discovery, so new adverse evidence prevents model work. Inconsistent, incomplete, or
 unbounded lifecycle evidence fails closed.
 
+Lifecycle evidence format 2 explicitly retains the complete bounded commit chain, timeline count,
+state-changing timeline events, and immutable node identities needed to establish an upstream
+outcome. Canonical unversioned snapshots written before those fields existed remain verifiable and
+restorable as `legacy_partial` evidence, preserving their original JSON and fingerprint. Their
+missing history is represented as unavailable rather than an empty history, and they can still be
+inspected for safety signals, but they can never prove a successful upstream outcome. A fresh
+format-2 observation is required before outcome authority can be granted.
+
 Lifecycle synchronization attempts every bounded ambiguous `submitting` reconciliation while
 retaining any failures, then observes every tracked pull request, including newly reconciled ones,
 before reporting the retained failure. Thus one stranded publication cannot suppress fresh safety

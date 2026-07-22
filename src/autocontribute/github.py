@@ -34,7 +34,7 @@ class _Identified(Protocol):
 
 class _NodeIdentified(Protocol):
     @property
-    def node_id(self) -> str: ...
+    def node_id(self) -> str | None: ...
 
 
 IdentifiedT = TypeVar("IdentifiedT", bound=_Identified)
@@ -92,7 +92,9 @@ class PullRequestDetails:
     head_repository: str
     issue_comment_count: int
     review_comment_count: int
-    commit_count: int
+    # Legacy lifecycle payloads predate complete commit-history collection. GitHub reads always
+    # populate this value; ``None`` is reserved for strictly parsed historical evidence.
+    commit_count: int | None
     title: str = ""
     body: str = ""
     base_ref: str = ""
@@ -152,7 +154,9 @@ class PullRequestReference:
     """One PR-to-PR timeline reference used only as explicit revert evidence."""
 
     identifier: int
-    node_id: str
+    # Legacy lifecycle payloads retained the reference but not its immutable GraphQL identity.
+    # GitHub reads always populate this value; ``None`` is reserved for historical evidence.
+    node_id: str | None
     source_url: str
     source_title: str
     source_body: str
@@ -1225,11 +1229,23 @@ class GitHubClient:
         return PullRequestTimeline(
             item_count=len(data),
             events=tuple(
-                sorted(events, key=lambda item: (item.created_at, item.identifier, item.node_id))
+                sorted(
+                    events,
+                    key=lambda item: (
+                        item.created_at,
+                        item.identifier,
+                        _required_node_id(item),
+                    ),
+                )
             ),
             references=tuple(
                 sorted(
-                    references, key=lambda item: (item.created_at, item.identifier, item.node_id)
+                    references,
+                    key=lambda item: (
+                        item.created_at,
+                        item.identifier,
+                        _required_node_id(item),
+                    ),
                 )
             ),
         )
@@ -1649,12 +1665,19 @@ def _unique_records(records: list[IdentifiedT], *, resource: str) -> list[Identi
 
 
 def _require_unique_node_ids(records: Sequence[_NodeIdentified], *, resource: str) -> None:
-    node_ids = [record.node_id for record in records]
+    node_ids = [_required_node_id(record) for record in records]
     if len(node_ids) != len(set(node_ids)):
         raise GitHubError(
             f"GitHub returned duplicate {resource} node identities; "
             "lifecycle evidence may have changed"
         )
+
+
+def _required_node_id(record: _NodeIdentified) -> str:
+    node_id = record.node_id
+    if not isinstance(node_id, str) or not node_id:
+        raise GitHubError("GitHub omitted a required GraphQL node identity")
+    return node_id
 
 
 def _nonempty(value: object, *, field: str) -> str:
