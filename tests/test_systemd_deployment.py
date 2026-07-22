@@ -17,6 +17,7 @@ SYSTEMD = ROOT / "deploy" / "systemd"
 LOCK_PATH = "/var/lib/autocontribute/operation.lock"
 ROOTLESS_CHECK = SYSTEMD / "libexec" / "autocontribute-rootless-docker-check"
 STORAGE_CAPACITY_CHECK = SYSTEMD / "libexec" / "autocontribute-storage-capacity-check"
+DOCKER_DATA_CHECK = SYSTEMD / "libexec" / "autocontribute-docker-data-check"
 WORKSPACE_QUOTA_CHECK = SYSTEMD / "libexec" / "autocontribute-workspace-quota-check"
 
 
@@ -549,6 +550,213 @@ esac
     )
 
 
+def _run_docker_data_check(
+    case_directory: Path,
+    *,
+    check_mode: str = "--daemon",
+    docker_root_output: str | None = None,
+    docker_exit: int = 0,
+    mount_target: str | None = None,
+    mount_device: str = "253:8",
+    filesystem_type: str = "ext4",
+    filesystem_root: str = "/",
+    mount_options: str = "rw,nosuid,nodev,relatime",
+    mount_rows: str | None = None,
+    effective_mount_row: str | None = None,
+    mount_table: str | None = None,
+    data_owner: int | None = None,
+    data_group: int | None = None,
+    data_mode: str = "710",
+    data_stat_device: str = "2050",
+    parent_device: str = "2048",
+    block_size: str = "4096",
+    total_blocks: str = "6291456",
+    total_inodes: str = "524288",
+    available_blocks: str = "2097152",
+    available_inodes: str = "262144",
+) -> tuple[subprocess.CompletedProcess[str], str | None]:
+    case_directory.mkdir()
+    data_root = case_directory / "docker"
+    data_root.mkdir(mode=0o710)
+    fake_bin = case_directory / "bin"
+    fake_bin.mkdir()
+    probe_environment = case_directory / "docker-probe-environment"
+    uid = os.getuid()
+    gid = os.getgid()
+    resolved_target = mount_target or os.fspath(data_root)
+    mount_row_template = "{target} {filesystem_type} {filesystem_root} {mount_options} {device}\n"
+    base_mount_row = mount_row_template.format(
+        data_root=data_root,
+        device=mount_device,
+        filesystem_root=filesystem_root,
+        filesystem_type=filesystem_type,
+        mount_options=mount_options,
+        target=resolved_target,
+    )
+    readonly_options = ",".join(
+        "ro" if option == "rw" else option for option in mount_options.split(",")
+    )
+    readonly_mount_row = mount_row_template.format(
+        data_root=data_root,
+        device=mount_device,
+        filesystem_root=filesystem_root,
+        filesystem_type=filesystem_type,
+        mount_options=readonly_options,
+        target=resolved_target,
+    )
+    if mount_rows is None:
+        resolved_mount_rows = base_mount_row
+        if check_mode != "--mount-only":
+            resolved_mount_rows += readonly_mount_row
+    else:
+        resolved_mount_rows = mount_rows.format(
+            data_root=data_root,
+            device=mount_device,
+            filesystem_root=filesystem_root,
+            filesystem_type=filesystem_type,
+            mount_options=mount_options,
+            target=resolved_target,
+        )
+    resolved_effective_mount_row = (effective_mount_row or readonly_mount_row).format(
+        data_root=data_root,
+        device=mount_device,
+        filesystem_root=filesystem_root,
+        filesystem_type=filesystem_type,
+        mount_options=mount_options,
+        target=resolved_target,
+    )
+    resolved_mount_table = (mount_table or "0:1 /\n{device} {data_root}\n0:2 /proc\n").format(
+        device=mount_device,
+        data_root=data_root,
+    )
+    resolved_docker_output = (
+        docker_root_output if docker_root_output is not None else f'"{os.fspath(data_root)}"\n'
+    )
+
+    _write_executable(
+        fake_bin / "id",
+        """#!/bin/sh
+set -eu
+[ "$*" = '--group' ]
+printf '%s\n' "$TEST_SERVICE_GID"
+""",
+    )
+    _write_executable(
+        fake_bin / "findmnt",
+        """#!/bin/sh
+set -eu
+if [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--mountpoint' ]; then
+  [ "$4" = "$TEST_DOCKER_DATA_ROOT" ]
+  [ "$5" = '--output' ]
+  [ "$6" = 'TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN' ]
+  printf '%s' "$TEST_MOUNT_ROWS"
+elif [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--target' ]; then
+  [ "$4" = "$TEST_DOCKER_DATA_ROOT" ]
+  [ "$5" = '--output' ]
+  [ "$6" = 'TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN' ]
+  printf '%s' "$TEST_EFFECTIVE_MOUNT_ROW"
+elif [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--output' ]; then
+  [ "$4" = 'MAJ:MIN,TARGET' ]
+  printf '%s' "$TEST_MOUNT_TABLE"
+else
+  exit 81
+fi
+""",
+    )
+    _write_executable(
+        fake_bin / "stat",
+        """#!/bin/sh
+set -eu
+if [ "$1" = '--file-system' ]; then
+  [ "$2" = '--format=%S:%b:%c:%a:%d' ]
+  [ "$3" = '--' ]
+  [ "$4" = "$TEST_DOCKER_DATA_ROOT" ]
+  printf '%s:%s:%s:%s:%s\n' \
+    "$TEST_BLOCK_SIZE" "$TEST_TOTAL_BLOCKS" "$TEST_TOTAL_INODES" \
+    "$TEST_AVAILABLE_BLOCKS" "$TEST_AVAILABLE_INODES"
+  exit 0
+fi
+[ "$2" = '--' ]
+path=$3
+case "$1:$path" in
+  --format=%u:"$TEST_DOCKER_DATA_ROOT") printf '%s\n' "$TEST_DATA_OWNER" ;;
+  --format=%g:"$TEST_DOCKER_DATA_ROOT") printf '%s\n' "$TEST_DATA_GROUP" ;;
+  --format=%a:"$TEST_DOCKER_DATA_ROOT") printf '%s\n' "$TEST_DATA_MODE" ;;
+  --format=%d:"$TEST_DOCKER_DATA_ROOT") printf '%s\n' "$TEST_DATA_DEVICE" ;;
+  --format=%d:"$TEST_DOCKER_DATA_PARENT") printf '%s\n' "$TEST_PARENT_DEVICE" ;;
+  *) exit 82 ;;
+esac
+""",
+    )
+    _write_executable(
+        fake_bin / "timeout",
+        """#!/bin/sh
+set -eu
+[ "$1" = '--kill-after=5s' ]
+shift
+[ "$1" = '30s' ]
+shift
+exec "$@"
+""",
+    )
+    _write_executable(
+        fake_bin / "docker",
+        """#!/bin/sh
+set -eu
+[ "$1" = '--host' ]
+[ "$2" = "$DOCKER_HOST" ]
+[ "$3" = 'info' ]
+[ "$4" = '--format' ]
+[ "$5" = '{{json .DockerRootDir}}' ]
+printf '%s\n%s\n' "$DOCKER_HOST" "${DOCKER_CONTEXT-unset}" > "$TEST_PROBE_ENVIRONMENT"
+printf '%s' "$TEST_DOCKER_OUTPUT"
+exit "$TEST_DOCKER_EXIT"
+""",
+    )
+
+    environment = {
+        **os.environ,
+        "TEST_AVAILABLE_BLOCKS": available_blocks,
+        "TEST_AVAILABLE_INODES": available_inodes,
+        "DOCKER_CONTEXT": "must-be-cleared",
+        "DOCKER_HOST": "unix:///run/user/123/docker.sock",
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "TEST_BLOCK_SIZE": block_size,
+        "TEST_DATA_DEVICE": data_stat_device,
+        "TEST_DATA_GROUP": str(gid if data_group is None else data_group),
+        "TEST_DATA_MODE": data_mode,
+        "TEST_DATA_OWNER": str(uid if data_owner is None else data_owner),
+        "TEST_DOCKER_DATA_PARENT": os.fspath(data_root.parent),
+        "TEST_DOCKER_DATA_ROOT": os.fspath(data_root),
+        "TEST_DOCKER_EXIT": str(docker_exit),
+        "TEST_DOCKER_OUTPUT": resolved_docker_output,
+        "TEST_EFFECTIVE_MOUNT_ROW": resolved_effective_mount_row,
+        "TEST_FILESYSTEM_ROOT": filesystem_root,
+        "TEST_FILESYSTEM_TYPE": filesystem_type,
+        "TEST_MOUNT_DEVICE": mount_device,
+        "TEST_MOUNT_OPTIONS": mount_options,
+        "TEST_MOUNT_ROWS": resolved_mount_rows,
+        "TEST_MOUNT_TABLE": resolved_mount_table,
+        "TEST_MOUNT_TARGET": resolved_target,
+        "TEST_PARENT_DEVICE": parent_device,
+        "TEST_PROBE_ENVIRONMENT": os.fspath(probe_environment),
+        "TEST_SERVICE_GID": str(gid),
+        "TEST_TOTAL_BLOCKS": total_blocks,
+        "TEST_TOTAL_INODES": total_inodes,
+    }
+    result = subprocess.run(
+        ["bash", os.fspath(DOCKER_DATA_CHECK), check_mode, os.fspath(data_root)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    observed_environment = (
+        probe_environment.read_text(encoding="utf-8") if probe_environment.exists() else None
+    )
+    return result, observed_environment
+
+
 def test_systemd_bundle_contains_expected_units_and_executable_helpers() -> None:
     expected = {
         "autocontribute-backup.service",
@@ -567,6 +775,7 @@ def test_systemd_bundle_contains_expected_units_and_executable_helpers() -> None
     helpers = sorted((SYSTEMD / "libexec").iterdir())
     assert {path.name for path in helpers} == {
         "autocontribute-backup",
+        "autocontribute-docker-data-check",
         "autocontribute-healthcheck",
         "autocontribute-record-failure",
         "autocontribute-rootless-docker-check",
@@ -599,6 +808,11 @@ def test_ci_runs_real_version_controlled_systemd_validation() -> None:
         for step in steps
         if step["name"] == "Exercise durable storage preflight in a hardened service"
     )
+    docker_smoke = next(
+        step
+        for step in steps
+        if step["name"] == "Exercise bounded Docker data-root preflight in a hardened service"
+    )
     verify = next(step for step in steps if step["name"] == "Verify system and timer units")
     security = next(
         step for step in steps if step["name"] == "Enforce service hardening exposure ceilings"
@@ -614,6 +828,12 @@ def test_ci_runs_real_version_controlled_systemd_validation() -> None:
     assert '"$state_mount" "$backup_mount" --state-writable' in storage_smoke["run"]
     assert '--property="ReadOnlyPaths=$state_mount $backup_mount"' in storage_smoke["run"]
     assert '"$state_mount" "$backup_mount" --read-only' in storage_smoke["run"]
+    assert "autocontribute-docker-data-check" in docker_smoke["run"]
+    assert "fallocate --length 2G" in docker_smoke["run"]
+    assert "--mount-only" in docker_smoke["run"]
+    assert "--read-only-health" in docker_smoke["run"]
+    assert '--property="ReadWritePaths=$smoke_root"' in docker_smoke["run"]
+    assert '--property="ReadOnlyPaths=$docker_data_mount"' in docker_smoke["run"]
     assert "systemd-analyze verify" in verify["run"]
     assert "--recursive-errors=no" in verify["run"]
     assert "systemd-analyze security" in security["run"]
@@ -638,9 +858,11 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
     assert "LoadCredentialEncrypted=AUTOCONTRIBUTE_GITHUB_TOKEN:" in unit_text
     assert "EnvironmentFile=" not in unit_text
     assert "RequiresMountsFor=/var/lib/autocontribute/state/workspaces" in unit_text
+    assert "RequiresMountsFor=/var/lib/autocontribute/docker" in unit_text
 
     doctor_unit_text = (SYSTEMD / "autocontribute-doctor.service").read_text(encoding="utf-8")
     assert "RequiresMountsFor=/var/lib/autocontribute/state/workspaces" in doctor_unit_text
+    assert "RequiresMountsFor=/var/lib/autocontribute/docker" in doctor_unit_text
 
     helper = (SYSTEMD / "libexec" / "autocontribute-worker").read_text(encoding="utf-8")
     assert 'run --scheduled --config "$config"' in helper
@@ -670,6 +892,11 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
     check_call = (
         '"$rootless_docker_check" "$runtime_directory" "$docker_socket" "$rootful_docker_socket"'
     )
+    data_call = '"$docker_data_check" --daemon "$docker_data_root"'
+    assert data_call in helper
+    assert helper.index(check_call) < helper.index(data_call) < credential_read
+    assert 'export AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT="$docker_data_root"' in helper
+    assert "AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT" in helper
     assert helper.index(check_call) < helper.index('credential_value="$(<"$credential_path")"')
     assert "DOCKER_*" in helper
     assert "credential_value" in helper
@@ -1290,6 +1517,15 @@ def test_worker_doctor_and_complete_backup_share_one_exclusive_lock() -> None:
         assert "LoadCredential" not in signal_unit
         assert "EnvironmentFile=" not in signal_unit
 
+    health_unit = _directives(SYSTEMD / "autocontribute-health.service")
+    assert _one(health_unit, "Unit", "RequiresMountsFor") == "/var/lib/autocontribute/docker"
+    assert (
+        _one(health_unit, "Service", "ExecStartPre")
+        == "/usr/local/libexec/autocontribute-docker-data-check "
+        "--read-only-health /var/lib/autocontribute/docker"
+    )
+    assert "/var/lib/autocontribute/docker" in _one(health_unit, "Service", "ReadOnlyPaths")
+
 
 def test_services_have_failure_signaling_and_core_hardening() -> None:
     for name in (
@@ -1335,6 +1571,7 @@ def test_tmpfiles_keeps_state_private_and_docs_cover_safe_recovery() -> None:
         in tmpfiles
     )
     assert "d /var/backups/autocontribute 0700 autocontribute autocontribute -" in tmpfiles
+    assert "d /var/lib/autocontribute/docker 0710 autocontribute autocontribute -" in tmpfiles
 
     guide = (ROOT / "docs" / "systemd-deployment.md").read_text(encoding="utf-8")
     assert "state restore --complete" in guide
@@ -1351,6 +1588,9 @@ def test_tmpfiles_keeps_state_private_and_docs_cover_safe_recovery() -> None:
     assert "backup filesystem is capped" in guide
     assert "64 GiB and 524,288 inodes" in guide
     assert "at least 20 GiB and 262,144 inodes available" in guide
+    assert "at most 32 GiB" in guide
+    assert "at least 1 GiB" in guide
+    assert "16,384 inodes" in guide
     assert "never a timer action" in guide
     assert "SHA-256 digest" in guide
     assert "provider-specific replication/receipt protocol" in guide
@@ -1378,3 +1618,280 @@ def test_docs_apply_sensitive_dropins_to_both_execution_services() -> None:
     assert "Environment=AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH=1" in guide
     assert guide.count("sudo cmp --silent --") == 2
     assert guide.count("sudo systemctl daemon-reload") >= 2
+
+
+@pytest.mark.parametrize("data_mode", ["700", "710"])
+def test_docker_data_check_accepts_bounded_dedicated_ext4_mount_and_exact_daemon_root(
+    tmp_path: Path,
+    data_mode: str,
+) -> None:
+    result, observed_environment = _run_docker_data_check(
+        tmp_path / f"valid-{data_mode}",
+        data_mode=data_mode,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert observed_environment is not None
+    docker_host, docker_context = observed_environment.splitlines()
+    assert docker_host == "unix:///run/user/123/docker.sock"
+    assert docker_context == "unset"
+
+
+def test_docker_data_mount_only_check_does_not_contact_the_daemon(tmp_path: Path) -> None:
+    result, observed_environment = _run_docker_data_check(
+        tmp_path / "mount-only",
+        check_mode="--mount-only",
+        docker_exit=99,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert observed_environment is None
+
+
+def test_docker_data_read_only_health_check_accepts_namespace_layer_without_daemon(
+    tmp_path: Path,
+) -> None:
+    result, observed_environment = _run_docker_data_check(
+        tmp_path / "read-only-health",
+        check_mode="--read-only-health",
+        docker_exit=99,
+        mount_rows=(
+            "{data_root} ext4 / rw,nosuid,nodev,relatime 253:8\n"
+            "{data_root} ext4 / ro,nosuid,nodev,relatime 253:8\n"
+        ),
+        mount_table="253:8 {data_root}\n253:8 {data_root}\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert observed_environment is None
+
+
+@pytest.mark.parametrize(
+    ("name", "mount_rows", "message"),
+    (
+        (
+            "only-read-only",
+            "{data_root} ext4 / ro,nosuid,nodev,relatime 253:8\n",
+            "did not prove writable and read-only layers",
+        ),
+        (
+            "only-writable",
+            "{data_root} ext4 / rw,nosuid,nodev,relatime 253:8\n",
+            "did not prove writable and read-only layers",
+        ),
+        (
+            "read-only-layer-missing-nodev",
+            (
+                "{data_root} ext4 / rw,nosuid,nodev,relatime 253:8\n"
+                "{data_root} ext4 / ro,nosuid,relatime 253:8\n"
+            ),
+            "must use nodev",
+        ),
+        (
+            "read-only-layer-on-another-device",
+            (
+                "{data_root} ext4 / rw,nosuid,nodev,relatime 253:8\n"
+                "{data_root} ext4 / ro,nosuid,nodev,relatime 253:9\n"
+            ),
+            "another device layered",
+        ),
+        (
+            "ambiguous-read-only-layer",
+            (
+                "{data_root} ext4 / rw,nosuid,nodev,relatime 253:8\n"
+                "{data_root} ext4 / rw,ro,nosuid,nodev,relatime 253:8\n"
+            ),
+            "ambiguous access options",
+        ),
+    ),
+)
+def test_docker_data_read_only_health_check_rejects_unproved_namespace_layers(
+    tmp_path: Path,
+    name: str,
+    mount_rows: str,
+    message: str,
+) -> None:
+    result, observed_environment = _run_docker_data_check(
+        tmp_path / name,
+        check_mode="--read-only-health",
+        docker_exit=99,
+        mount_rows=mount_rows,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert observed_environment is None
+
+
+@pytest.mark.parametrize(
+    ("name", "effective_mount_row", "message"),
+    (
+        (
+            "writable",
+            "{data_root} ext4 / rw,nosuid,nodev,relatime 253:8\n",
+            "effective service view is not read-only",
+        ),
+        (
+            "other-device",
+            "{data_root} ext4 / ro,nosuid,nodev,relatime 253:9\n",
+            "does not match the safe mount",
+        ),
+        (
+            "missing-nodev",
+            "{data_root} ext4 / ro,nosuid,relatime 253:8\n",
+            "effective service view must use nodev",
+        ),
+        (
+            "ambiguous",
+            (
+                "{data_root} ext4 / ro,nosuid,nodev,relatime 253:8\n"
+                "{data_root} ext4 / ro,nosuid,nodev,relatime 253:8\n"
+            ),
+            "effective service view is ambiguous",
+        ),
+    ),
+)
+def test_docker_data_read_only_service_check_rejects_unsafe_effective_layer(
+    tmp_path: Path,
+    name: str,
+    effective_mount_row: str,
+    message: str,
+) -> None:
+    result, observed_environment = _run_docker_data_check(
+        tmp_path / f"{name}-effective-layer",
+        check_mode="--read-only-health",
+        docker_exit=99,
+        mount_rows=(
+            "{data_root} ext4 / ro,nosuid,nodev,relatime 253:8\n"
+            "{data_root} ext4 / rw,nosuid,nodev,relatime 253:8\n"
+        ),
+        effective_mount_row=effective_mount_row,
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert observed_environment is None
+
+
+def test_docker_data_check_accepts_same_target_namespace_layers(tmp_path: Path) -> None:
+    result, _ = _run_docker_data_check(
+        tmp_path / "same-target-layers",
+        mount_rows=(
+            "{data_root} ext4 / rw,nosuid,nodev,relatime 253:8\n"
+            "{data_root} ext4 / rw,nosuid,nodev,relatime 253:8\n"
+            "{data_root} ext4 / ro,nosuid,nodev,relatime 253:8\n"
+        ),
+        mount_table="253:8 {data_root}\n253:8 {data_root}\n253:8 {data_root}\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "overrides", "message"),
+    (
+        ("wrong-target", {"mount_target": "/var/lib/autocontribute"}, "exact dedicated mount"),
+        ("invalid-device", {"mount_device": "not-a-device"}, "invalid device number"),
+        ("subdirectory", {"filesystem_root": "/subdir"}, "whole filesystem"),
+        ("wrong-filesystem", {"filesystem_type": "xfs"}, "must use ext4"),
+        (
+            "read-only",
+            {"mount_options": "ro,nosuid,nodev"},
+            "did not prove writable and read-only layers",
+        ),
+        ("missing-nodev", {"mount_options": "rw,nosuid"}, "must use nodev"),
+        ("missing-nosuid", {"mount_options": "rw,nodev"}, "must use nosuid"),
+        ("bind", {"mount_options": "rw,nodev,nosuid,bind"}, "cannot be a bind"),
+        (
+            "alias-second-target",
+            {
+                "mount_table": (
+                    "0:1 /\n253:8 {data_root}\n253:8 /mnt/same-device-via-source-alias\n"
+                )
+            },
+            "another host path",
+        ),
+        (
+            "different-layered-device",
+            {
+                "mount_rows": (
+                    "{data_root} ext4 / rw,nodev,nosuid 253:8\n"
+                    "{data_root} ext4 / rw,nodev,nosuid 253:9\n"
+                ),
+                "mount_table": "253:8 {data_root}\n253:9 {data_root}\n",
+            },
+            "another device layered",
+        ),
+        ("same-device", {"parent_device": "2050"}, "separate filesystem"),
+        ("too-many-blocks", {"total_blocks": "8388609"}, "byte ceiling"),
+        ("too-many-inodes", {"total_inodes": "1048577"}, "inode ceiling"),
+        ("insufficient-free-bytes", {"available_blocks": "262143"}, "free byte headroom"),
+        ("insufficient-free-inodes", {"available_inodes": "16383"}, "free inode headroom"),
+        ("available-blocks-exceed-total", {"available_blocks": "6291457"}, "invalid limits"),
+        ("invalid-limits", {"block_size": "not-a-number"}, "invalid limits"),
+        (
+            "overflowing-limits",
+            {"total_blocks": "999999999999999999999999"},
+            "invalid limits",
+        ),
+    ),
+)
+def test_docker_data_check_rejects_unenforced_mount_boundaries(
+    tmp_path: Path,
+    name: str,
+    overrides: dict[str, str],
+    message: str,
+) -> None:
+    result, observed_environment = _run_docker_data_check(tmp_path / name, **overrides)
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert observed_environment is None
+
+
+def test_docker_data_check_rejects_unsafe_mount_metadata_before_daemon_probe(
+    tmp_path: Path,
+) -> None:
+    cases: tuple[tuple[str, dict[str, int | str]], ...] = (
+        ("owner", {"data_owner": os.getuid() + 1}),
+        ("group", {"data_group": os.getgid() + 1}),
+        ("group-write", {"data_mode": "770"}),
+        ("other-access", {"data_mode": "711"}),
+    )
+    for name, overrides in cases:
+        result, observed_environment = _run_docker_data_check(
+            tmp_path / name,
+            **overrides,  # type: ignore[arg-type]
+        )
+        assert result.returncode != 0
+        assert "unsafe ownership or permissions" in result.stderr
+        assert observed_environment is None
+
+
+def test_docker_data_check_rejects_daemon_root_alias_or_probe_failure(tmp_path: Path) -> None:
+    alias_result, _ = _run_docker_data_check(
+        tmp_path / "daemon-alias",
+        docker_root_output='"/var/lib/autocontribute/../autocontribute/docker"\n',
+    )
+    failed_result, _ = _run_docker_data_check(
+        tmp_path / "failed-daemon-probe",
+        docker_root_output='"/var/lib/autocontribute/docker"\n',
+        docker_exit=28,
+    )
+
+    assert alias_result.returncode != 0
+    assert "exact bounded data-root mount" in alias_result.stderr
+    assert failed_result.returncode != 0
+    assert "could not verify the Docker daemon data root" in failed_result.stderr
+
+
+def test_rootless_docker_user_service_checks_mount_before_daemon_start() -> None:
+    drop_in = (
+        SYSTEMD / "rootless-docker.service.d" / "10-autocontribute-data-root.conf"
+    ).read_text(encoding="utf-8")
+
+    assert drop_in == (
+        "[Service]\n"
+        "ExecStartPre=/usr/local/libexec/autocontribute-docker-data-check "
+        "--mount-only /var/lib/autocontribute/docker\n"
+    )

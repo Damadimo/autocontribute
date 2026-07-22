@@ -1,0 +1,184 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+umask 077
+
+readonly check_mode="${1:-}"
+readonly docker_data_root="${2:-}"
+readonly maximum_bytes=34359738368
+readonly maximum_inodes=1048576
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+if [[
+  $# -ne 2 ||
+  ( "$check_mode" != --mount-only && "$check_mode" != --daemon ) ||
+  ! "$docker_data_root" =~ ^/[A-Za-z0-9._/-]+$ ||
+  "$docker_data_root" == / ||
+  "$docker_data_root" == */ ||
+  "$docker_data_root" == *//* ||
+  "$docker_data_root" == */../* ||
+  "$docker_data_root" == */./*
+]]; then
+  fail 'Autocontribute Docker data-root check received an invalid mode, path, or arguments'
+fi
+if [[ "$UID" == 0 ]]; then
+  fail 'Autocontribute Docker data-root check must not run as root'
+fi
+if [[ ! -d "$docker_data_root" || -L "$docker_data_root" ]]; then
+  fail 'Autocontribute Docker data-root mount is unavailable'
+fi
+canonical_docker_data_root="$(realpath "$docker_data_root")" || \
+  fail 'Autocontribute could not canonicalize the Docker data-root mount'
+readonly canonical_docker_data_root
+if [[ "$canonical_docker_data_root" != "$docker_data_root" ]]; then
+  fail 'Autocontribute Docker data-root must be an exact real path without aliases'
+fi
+
+service_gid="$(id --group)" || fail 'Autocontribute could not verify the service group'
+readonly service_gid
+data_owner="$(stat --format=%u -- "$docker_data_root")" || \
+  fail 'Autocontribute could not inspect the Docker data-root mount'
+data_group="$(stat --format=%g -- "$docker_data_root")" || \
+  fail 'Autocontribute could not inspect the Docker data-root mount'
+data_mode="$(stat --format=%a -- "$docker_data_root")" || \
+  fail 'Autocontribute could not inspect the Docker data-root mount'
+readonly data_owner data_group data_mode
+if [[
+  "$data_owner" != "$UID" ||
+  "$data_group" != "$service_gid" ||
+  ( "$data_mode" != 700 && "$data_mode" != 710 )
+]]; then
+  fail 'Autocontribute Docker data-root mount has unsafe ownership or permissions'
+fi
+
+mount_rows="$(
+  findmnt --noheadings --raw --mountpoint "$docker_data_root" \
+    --output TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN
+)" || fail 'Autocontribute could not resolve the exact Docker data-root mount'
+readonly mount_rows
+mount_device=""
+mount_row_count=0
+while read -r mount_target filesystem_type filesystem_root mount_options candidate_device trailing; do
+  if [[ -n "$trailing" || "$mount_target" != "$docker_data_root" ]]; then
+    fail 'Autocontribute Docker data-root is not an exact dedicated mount'
+  fi
+  if [[ "$filesystem_type" != ext4 ]]; then
+    fail 'Autocontribute Docker data-root must use ext4 with a fixed inode table'
+  fi
+  if [[ "$filesystem_root" != / ]]; then
+    fail 'Autocontribute Docker data-root mount must expose one whole filesystem'
+  fi
+  if [[ ! "$candidate_device" =~ ^[0-9]+:[0-9]+$ ]]; then
+    fail 'Autocontribute Docker data-root mount reported an invalid device number'
+  fi
+  case ",$mount_options," in
+    *,rw,*) ;;
+    *) fail 'Autocontribute Docker data-root mount is not writable' ;;
+  esac
+  case ",$mount_options," in
+    *,nodev,*) ;;
+    *) fail 'Autocontribute Docker data-root mount must use nodev' ;;
+  esac
+  case ",$mount_options," in
+    *,nosuid,*) ;;
+    *) fail 'Autocontribute Docker data-root mount must use nosuid' ;;
+  esac
+  case ",$mount_options," in
+    *,bind,* | *,rbind,*)
+      fail 'Autocontribute Docker data-root mount cannot be a bind mount'
+      ;;
+  esac
+  if [[ -n "$mount_device" && "$candidate_device" != "$mount_device" ]]; then
+    fail 'Autocontribute Docker data-root has another device layered at its exact path'
+  fi
+  mount_device="$candidate_device"
+  mount_row_count=$((mount_row_count + 1))
+done <<< "$mount_rows"
+readonly mount_device mount_row_count
+unset mount_target filesystem_type filesystem_root mount_options candidate_device trailing
+if [[ "$mount_row_count" -lt 1 ]]; then
+  fail 'Autocontribute Docker data-root is not an exact dedicated mount'
+fi
+
+mount_table="$(
+  findmnt --noheadings --raw --output MAJ:MIN,TARGET
+)" || fail 'Autocontribute could not inspect the host mount table'
+readonly mount_table
+matching_mount_count=0
+while read -r candidate_device candidate_target trailing; do
+  if [[ -n "$trailing" ]]; then
+    fail 'Autocontribute host mount table returned malformed data'
+  fi
+  if [[ "$candidate_target" == "$docker_data_root" && "$candidate_device" != "$mount_device" ]]; then
+    fail 'Autocontribute Docker data-root has another device layered at its exact path'
+  fi
+  if [[ "$candidate_device" == "$mount_device" ]]; then
+    matching_mount_count=$((matching_mount_count + 1))
+  fi
+  if [[ "$candidate_device" == "$mount_device" && "$candidate_target" != "$docker_data_root" ]]; then
+    fail 'Autocontribute Docker data-root device is mounted at another host path'
+  fi
+done <<< "$mount_table"
+readonly matching_mount_count
+unset candidate_device candidate_target trailing
+if [[ "$matching_mount_count" -lt 1 ]]; then
+  fail 'Autocontribute Docker data-root device is mounted at another host path'
+fi
+
+data_stat_device="$(stat --format=%d -- "$docker_data_root")" || \
+  fail 'Autocontribute could not inspect the Docker data-root mount device'
+parent_device="$(stat --format=%d -- "${docker_data_root%/*}")" || \
+  fail 'Autocontribute could not inspect the Docker data-root parent device'
+readonly data_stat_device parent_device
+if [[ "$data_stat_device" == "$parent_device" ]]; then
+  fail 'Autocontribute Docker data-root is not isolated on a separate filesystem'
+fi
+
+filesystem_limits="$(
+  stat --file-system --format=%S:%b:%c -- "$docker_data_root"
+)" || fail 'Autocontribute could not inspect Docker data-root filesystem limits'
+readonly filesystem_limits
+IFS=: read -r block_size total_blocks total_inodes trailing <<< "$filesystem_limits"
+readonly block_size total_blocks total_inodes trailing
+if [[
+  ! "$block_size" =~ ^[1-9][0-9]*$ ||
+  ! "$total_blocks" =~ ^[1-9][0-9]*$ ||
+  ! "$total_inodes" =~ ^[1-9][0-9]*$ ||
+  "${#block_size}" -gt 11 ||
+  "${#total_blocks}" -gt 11 ||
+  "${#total_inodes}" -gt 7 ||
+  -n "$trailing"
+]]; then
+  fail 'Autocontribute Docker data-root filesystem reported invalid limits'
+fi
+if (( block_size > maximum_bytes || total_blocks > maximum_bytes / block_size )); then
+  fail 'Autocontribute Docker data-root filesystem exceeds the byte ceiling'
+fi
+if (( total_inodes > maximum_inodes )); then
+  fail 'Autocontribute Docker data-root filesystem exceeds the inode ceiling'
+fi
+
+if [[ "$check_mode" == --mount-only ]]; then
+  exit 0
+fi
+
+if [[ "${DOCKER_HOST:-}" != unix:///* ]]; then
+  fail 'Autocontribute Docker data-root check requires an explicit Unix daemon endpoint'
+fi
+unset DOCKER_CONTEXT DOCKER_CERT_PATH DOCKER_TLS_VERIFY
+docker_root_json=""
+if ! docker_root_json="$(
+  timeout --kill-after=5s 30s \
+    docker --host "$DOCKER_HOST" info --format '{{json .DockerRootDir}}' \
+    2>/dev/null
+)"; then
+  fail 'Autocontribute could not verify the Docker daemon data root'
+fi
+readonly docker_root_json
+if [[ "$docker_root_json" != "\"$docker_data_root\"" ]]; then
+  fail 'Autocontribute Docker daemon is not using the exact bounded data-root mount'
+fi

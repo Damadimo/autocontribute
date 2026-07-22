@@ -21,6 +21,7 @@ def _docker_runtime_info(
 ) -> str:
     information: dict[str, object] = {
         "security_options": security_options or ["name=seccomp,profile=builtin", "name=cgroupns"],
+        "docker_root_dir": "/var/lib/docker",
         "cgroup_version": "2",
         "cgroup_driver": "systemd",
         "memory_limit": True,
@@ -302,6 +303,98 @@ def test_docker_daemon_mode_rejects_userns_remapping(
         sandbox.detect_docker_daemon_mode()
 
 
+def test_docker_daemon_mode_enforces_the_required_bounded_data_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sandbox.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=_docker_runtime_info(
+                ["name=seccomp,profile=builtin", "name=rootless"],
+                docker_root_dir="/var/lib/autocontribute/docker",
+            ),
+        ),
+    )
+    environment = {
+        "PATH": "/bin",
+        "AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT": "/var/lib/autocontribute/docker",
+    }
+
+    assert sandbox.detect_docker_daemon_mode(environment=environment) == "rootless"
+
+
+def test_docker_daemon_mode_rejects_a_data_root_outside_the_required_mount(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sandbox.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=_docker_runtime_info(
+                ["name=seccomp,profile=builtin", "name=rootless"],
+                docker_root_dir="/var/lib/autocontribute/.local/share/docker",
+            ),
+        ),
+    )
+    environment = {
+        "PATH": "/bin",
+        "AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT": "/var/lib/autocontribute/docker",
+    }
+
+    with pytest.raises(SandboxError, match="outside the required bounded data-root"):
+        sandbox.detect_docker_daemon_mode(environment=environment)
+
+
+@pytest.mark.parametrize(
+    "docker_root_dir",
+    [None, "relative/docker", "/var/lib/docker\nforged", "/" + "a" * 4_096],
+)
+def test_docker_daemon_mode_rejects_malformed_data_root_information(
+    monkeypatch: pytest.MonkeyPatch,
+    docker_root_dir: object,
+) -> None:
+    monkeypatch.setattr(
+        sandbox.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=_docker_runtime_info(docker_root_dir=docker_root_dir),
+        ),
+    )
+
+    with pytest.raises(SandboxError, match="malformed runtime information"):
+        sandbox.detect_docker_daemon_mode()
+
+
+@pytest.mark.parametrize(
+    "required_root",
+    ["relative/docker", "/var/lib/autocontribute/docker/", "/var//lib/docker"],
+)
+def test_docker_daemon_mode_rejects_an_invalid_required_data_root(
+    monkeypatch: pytest.MonkeyPatch,
+    required_root: str,
+) -> None:
+    monkeypatch.setattr(
+        sandbox.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=_docker_runtime_info(),
+        ),
+    )
+
+    with pytest.raises(SandboxError, match="Required Docker data-root path is invalid"):
+        sandbox.detect_docker_daemon_mode(
+            environment={
+                "PATH": "/bin",
+                "AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT": required_root,
+            }
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -369,6 +462,7 @@ def test_runner_rechecks_daemon_mode_for_each_command_on_one_endpoint(
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 1000)
     monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
     monkeypatch.setenv("DOCKER_HOST", "unix:///private/changed-after-construction.sock")
+    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT", "/var/lib/autocontribute/docker")
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-docker-client")
     runner = SandboxRunner(SandboxConfig())
     monkeypatch.setenv("DOCKER_HOST", "unix:///private/different.sock")
@@ -382,4 +476,5 @@ def test_runner_rechecks_daemon_mode_for_each_command_on_one_endpoint(
     assert len(calls) == 2
     assert calls[0]["DOCKER_HOST"] == "unix:///private/changed-after-construction.sock"
     assert calls[1]["DOCKER_HOST"] == "unix:///private/changed-after-construction.sock"
+    assert calls[0]["AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT"] == ("/var/lib/autocontribute/docker")
     assert "OPENAI_API_KEY" not in calls[0]

@@ -23,6 +23,7 @@ Use this layout on one durable host:
 | `/etc/autocontribute/credentials/*.cred` | `root:root`, `0600` | Encrypted systemd credentials |
 | `/var/lib/autocontribute/state` | `autocontribute:autocontribute`, `0700` | Live SQLite, evidence, and evaluations |
 | `/var/lib/autocontribute/state/workspaces` | `autocontribute:autocontribute`, `0700` | Dedicated capacity-limited ext4 filesystem for target repositories and validation copies |
+| `/var/lib/autocontribute/docker` | `autocontribute:autocontribute`, `0710` | Dedicated capacity-limited ext4 filesystem for rootless Docker images, layers, and metadata |
 | `/var/lib/autocontribute/tmp` | `autocontribute:autocontribute`, `0700` | Private temporary files visible to the rootless Docker daemon |
 | `/var/backups/autocontribute` | `autocontribute:autocontribute`, `0700` | Local immutable-name complete bundles awaiting off-host replication |
 
@@ -61,20 +62,34 @@ and 65,536 free inodes before it reads credentials or begins billable/model work
 that redirects storage around the verified mount is rejected. Cleanup can retain recovery-critical
 trees; if the remaining filesystem still lacks that fixed headroom, the worker fails safely before
 starting a new attempt and requires operator review.
-`doctor` creates its writable Docker probe below the same bounded mount. Capacity for the rootless
-Docker daemon's own image and metadata store remains a separate operator-managed host concern; use
-only pre-pulled digest-pinned images and monitor that store as part of host capacity. Sandbox and
-doctor containers use Docker's `none` log driver so untrusted output cannot also accumulate in that
-store; attached stdout and stderr remain available directly to the controlling process.
+`doctor` creates its writable Docker probe below the same bounded mount.
+
+The rootless daemon's data root has an independent, dedicated boundary. The supplied checks require
+an exact, non-bind ext4 mount backed by one whole block device, mounted nowhere else, with
+`rw,nodev,nosuid`, at most 32 GiB (34,359,738,368 bytes) of addressable blocks, and at most
+1,048,576 fixed inodes. It also requires at least 1 GiB (1,073,741,824 bytes) and 16,384 inodes
+available to the service account. The rootless Docker user service checks that mount before
+`dockerd` starts, so a failed mount cannot silently move image writes onto the service home
+filesystem. Before either credential-bearing service reads a credential, the wrapper also requires
+Docker's structured `DockerRootDir` value to equal `/var/lib/autocontribute/docker` exactly. The
+worker and doctor receive an explicitly read-only child view of that path despite their writable
+service-state parent; the separately running rootless Docker service retains the writable host
+mount. The Python sandbox repeats the structured equality and headroom check before every container
+launch. This is an aggregate ceiling across images, layers, build cache, container writable layers,
+and daemon metadata, not a per-image quota. Use only pre-pulled digest-pinned images and alert before
+the filesystem fills. Sandbox and doctor containers use Docker's `none` log driver so untrusted
+output cannot also accumulate there; attached stdout and stderr remain available directly to the
+controlling process.
 
 The sandbox daemon must be rootless and owned by the dedicated `autocontribute` account. Membership
 in the host `docker` group or use of `/var/run/docker.sock` would give the worker root-equivalent
 control and defeats this deployment boundary. Before either the worker or doctor reads a systemd
 credential, the wrapper verifies that `/run/user/$UID` is an unsymlinked `0700` directory owned by
 the service identity, that its Docker socket is owned by that identity with mode `0600` or `0660`,
-and that the account cannot use the host socket. It then makes a 30-second bounded daemon probe and
-requires one exact `name=rootless` element in Docker's reported `SecurityOptions`. A failed or
-ambiguous check stops the service before the wrapper reads or exports any credential.
+and that the account cannot use the host socket. It then makes bounded daemon probes, requires one
+exact `name=rootless` element in Docker's reported `SecurityOptions`, and verifies the exact bounded
+data root. A failed or ambiguous check stops the service before the wrapper reads or exports any
+credential.
 
 The Python sandbox repeats a structured daemon check immediately before every container launch and
 also requires cgroup v2, a non-`none` driver, and Docker-reported memory, swap, CPU-quota, and PID
@@ -93,8 +108,8 @@ The reference units target systemd 252 or newer and a Linux distribution with:
 - Python 3.11 or 3.12, `uv`, Git, `flock`, GNU coreutils, util-linux `findmnt`, and e2fsprogs;
 - rootless Docker on cgroup v2 with systemd resource-controller delegation, including `newuidmap`,
   `newgidmap`, and a unique subordinate UID/GID range;
-- three dedicated, fully allocated (not thin-provisioned) block devices: no more than 8 GiB for
-  state, no more than 20 GiB for workspaces, and no more than 64 GiB for local backups; and
+- four dedicated, fully allocated (not thin-provisioned) block devices: no more than 8 GiB for
+  state, 20 GiB for workspaces, 32 GiB for rootless Docker data, and 64 GiB for local backups; and
 - persistent time synchronization and outbound HTTPS for GitHub and the configured model API.
 
 Create a locked service account with a durable home. Allocate subordinate IDs that do not overlap
@@ -242,7 +257,55 @@ CI exercises this preflight on a small loop-backed ext4 filesystem inside a hard
 systemd service. That loop device is only a disposable integration-test fixture; production must
 use the fully allocated dedicated storage described above.
 
-Install rootless Docker for that account using the distribution's supported procedure. Rootless
+### Provision the bounded rootless Docker data filesystem
+
+Choose a second dedicated, fully allocated logical volume or partition no larger than 32 GiB. The
+operator chooses the actual size from the dependency-complete pinned image set and monitoring
+headroom; the boundary does not assume that the full ceiling is available. Do not share the
+workspace device, use a thin volume, or use a sparse loopback file. The example assumes an unused,
+fully allocated 24 GiB device at `/dev/mapper/autocontribute-docker`. Resolve it independently and
+apply the same destructive-device warning as the workspace device.
+
+```bash
+docker_data_device=/dev/mapper/autocontribute-docker
+test -b "$docker_data_device"
+test -z "$(findmnt --noheadings --source "$docker_data_device")"
+sudo mkfs.ext4 -L autocontribute-docker -m 0 -N 524288 -- "$docker_data_device"
+sudo install -d -o autocontribute -g autocontribute -m 0710 \
+  /var/lib/autocontribute/docker
+sudo blkid --output value --match-tag UUID -- "$docker_data_device"
+unset docker_data_device
+```
+
+Add the independently verified UUID to `/etc/fstab`:
+
+```fstab
+UUID=DOCKER_UUID_FROM_BLKID /var/lib/autocontribute/docker ext4 rw,nodev,nosuid 0 2
+```
+
+Mount it and set the mounted filesystem root to Docker's private root-directory mode. The preflight
+accepts `0700` and Docker's normal `0710`; both require the account's private primary group and deny
+all access to other users.
+
+```bash
+sudo mount /var/lib/autocontribute/docker
+sudo chown autocontribute:autocontribute /var/lib/autocontribute/docker
+sudo chmod 0710 /var/lib/autocontribute/docker
+findmnt --target /var/lib/autocontribute/docker \
+  --output TARGET,SOURCE,FSTYPE,OPTIONS
+stat --file-system --format='block_size=%S blocks=%b inodes=%c' \
+  /var/lib/autocontribute/docker
+```
+
+The hard ceilings are 34,359,738,368 bytes and 1,048,576 inodes. The checker uses filesystem totals,
+not free-space snapshots, and compares mount identity by `MAJ:MIN`, so alternate device names cannot
+hide a second mount. It does not need access to the block node and therefore works with the supplied
+services' `PrivateDevices=yes`. CI runs its mount-only path against a real loop-backed ext4
+filesystem inside that same hardened service boundary; production still requires fully allocated
+storage.
+
+Install rootless Docker for that account using the distribution's supported procedure, but do not
+enable or start its user service yet. Rootless
 Docker can enforce the configured CPU, memory, swap, and PID limits only when cgroup v2 controllers
 are delegated through systemd; a daemon reporting cgroup driver `none` ignores those limits. On the
 dedicated host, install Docker's required user-manager delegation and restart the manager so the
@@ -259,6 +322,45 @@ sudo chmod 0644 /etc/systemd/system/user@.service.d/delegate.conf
 sudo systemctl daemon-reload
 ```
 
+Configure the rootless daemon before its first start. Install the mount checker from the same audited
+source revision that will supply the worker, then configure Docker's documented rootless
+`daemon.json` path. If that file already contains reviewed settings, merge the single `data-root`
+key instead of replacing them.
+
+```bash
+sudo install -d -o root -g root -m 0755 /usr/local/libexec
+sudo install -o root -g root -m 0755 \
+  deploy/systemd/libexec/autocontribute-docker-data-check \
+  /usr/local/libexec/autocontribute-docker-data-check
+sudo -u autocontribute \
+  /usr/local/libexec/autocontribute-docker-data-check \
+  --mount-only /var/lib/autocontribute/docker
+sudo install -d -o root -g autocontribute -m 0750 \
+  /var/lib/autocontribute/.config/docker
+sudoedit /var/lib/autocontribute/.config/docker/daemon.json
+sudo chown root:autocontribute /var/lib/autocontribute/.config/docker/daemon.json
+sudo chmod 0640 /var/lib/autocontribute/.config/docker/daemon.json
+python3 -m json.tool \
+  /var/lib/autocontribute/.config/docker/daemon.json >/dev/null
+sudo install -d -o root -g root -m 0755 /etc/systemd/user/docker.service.d
+sudo install -o root -g root -m 0644 \
+  deploy/systemd/rootless-docker.service.d/10-autocontribute-data-root.conf \
+  /etc/systemd/user/docker.service.d/10-autocontribute-data-root.conf
+```
+
+The reviewed `daemon.json` must contain this exact absolute value (alongside any other reviewed
+keys):
+
+```json
+{
+  "data-root": "/var/lib/autocontribute/docker"
+}
+```
+
+The system-wide user-service drop-in intentionally prevents any other account's rootless
+`docker.service` from starting on this dedicated host: its mount check requires the data root to be
+owned by the invoking UID and primary GID. Do not install this deployment on a shared host.
+
 Start the account's user manager explicitly and verify its private bus before enabling the Docker
 user service. This does not require changing the account's login shell:
 
@@ -267,6 +369,11 @@ autocontribute_uid="$(id -u autocontribute)"
 sudo systemctl restart "user@${autocontribute_uid}.service"
 test -S "/run/user/${autocontribute_uid}/bus"
 test "$(stat -c %u "/run/user/${autocontribute_uid}/bus")" = "$autocontribute_uid"
+sudo -u autocontribute env \
+  HOME=/var/lib/autocontribute \
+  XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${autocontribute_uid}/bus" \
+  systemctl --user daemon-reload
 sudo -u autocontribute env \
   HOME=/var/lib/autocontribute \
   XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
@@ -282,16 +389,18 @@ sudo -u autocontribute env \
   XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
   DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${autocontribute_uid}/bus" \
   DOCKER_HOST="unix:///run/user/${autocontribute_uid}/docker.sock" \
-  docker info
+  docker info --format \
+    'root={{json .DockerRootDir}} security={{json .SecurityOptions}} cgroup={{.CgroupVersion}}/{{.CgroupDriver}}'
 unset autocontribute_uid
 ```
 
-Confirm that the smoke test reports cgroup v2 with a driver other than `none`; `doctor` later proves
-the configured limits inside a real container. The packaged services repeat the
-ownership, permission, group, host-socket, and exact rootless-security-option checks on every
-invocation before the wrapper reads any file in the encrypted credential directory. Rootless Docker
-commonly creates a `0660` socket; this remains private because its owning runtime directory must be
-exactly `0700`.
+Confirm that the smoke test reports the exact configured data root, cgroup v2 with a driver other
+than `none`, and one exact `name=rootless` security option; `doctor` later proves the configured
+limits inside a real container. The packaged services repeat the ownership, permission, mount,
+capacity, group, host-socket, exact rootless-security-option, and exact `DockerRootDir` checks on
+every invocation before the wrapper reads any file in the encrypted credential directory. Rootless
+Docker commonly creates a `0660` socket; this remains private because its owning runtime directory
+must be exactly `0700`.
 
 Pre-pull every digest-pinned sandbox image as this user. Never use a tag in production. The service
 sets `TMPDIR=/var/lib/autocontribute/tmp` because Docker's daemon must see the CID files created by
@@ -438,13 +547,14 @@ sudo systemd-tmpfiles --create /etc/tmpfiles.d/autocontribute.conf
 sudo systemctl daemon-reload
 ```
 
-Run `systemd-tmpfiles` only while all three filesystems are mounted so their filesystem roots receive
+Run `systemd-tmpfiles` only while all four filesystems are mounted so their filesystem roots receive
 the required ownership and mode. Worker, doctor, backup, and health declare `RequiresMountsFor=` for
-durable storage, and the credential-bearing services also require the workspace mount. Their
-wrappers still repeat exact mount and capacity verification at every invocation; an accidentally
-unmounted directory on a parent filesystem is rejected rather than used as a fallback. The worker
-and backup additionally bind the Python store to the preflight-verified state root, so changing
-`storage.path` cannot redirect writes around these checks.
+the storage they inspect, and the credential-bearing services require both the workspace and Docker
+data mounts. Their wrappers still repeat exact mount and capacity verification at every invocation;
+an accidentally unmounted directory on a parent filesystem is rejected rather than used as a
+fallback. The worker and backup additionally bind the Python store to the preflight-verified state
+root, so changing `storage.path` cannot redirect writes around these checks. The separately installed
+rootless Docker drop-in performs the data-mount check before the daemon itself starts.
 
 Validate the installed files on the target host. `systemd-analyze security` is advisory; review
 every relaxation instead of chasing a score that breaks rootless Docker or durable state.
@@ -513,10 +623,12 @@ sudo -u autocontribute /usr/local/libexec/autocontribute-healthcheck
 df --block-size=1 \
   /var/lib/autocontribute/state \
   /var/lib/autocontribute/state/workspaces \
+  /var/lib/autocontribute/docker \
   /var/backups/autocontribute
 df --inodes \
   /var/lib/autocontribute/state \
   /var/lib/autocontribute/state/workspaces \
+  /var/lib/autocontribute/docker \
   /var/backups/autocontribute
 sudo journalctl \
   -u autocontribute-worker.service \
@@ -536,10 +648,13 @@ recent backup stamp is still fresh. Every worker, backup, doctor, or health fail
 those events to the existing host alerting system, or add another `OnFailure=` target in a drop-in.
 An on-host stamp alone is not a page and is lost with the host.
 
-Alert on workspace byte or inode consumption before either reaches 75%; this precedes the fixed
-start-of-run floors on the reference filesystem. Space exhaustion is a safe worker failure, but it
-can prevent publication recovery that still depends on a local commit. Stop
-the worker timer and service before removing workspaces. Inspect each run's durable status first;
+Alert on workspace and Docker-data byte or inode consumption before either reaches 75%; this
+precedes the fixed start-of-run floors on the reference filesystems. Docker data
+exhaustion stops new sandbox containers and must be resolved with both the worker and rootless daemon
+stopped; remove only understood cache or unused image data, never live daemon files directly. Space
+exhaustion is a safe worker failure, but workspace exhaustion can prevent publication recovery that
+still depends on a local commit. Stop the worker timer and service before removing workspaces.
+Inspect each run's durable status first;
 never remove a `submitting` workspace unless remote reconciliation has proven the exact commit exists
 or the contribution is being abandoned through the incident procedure. Complete state bundles
 intentionally exclude target repositories, so deleting a workspace is not repaired by restoring a
@@ -711,6 +826,10 @@ target workspaces are excluded and require separate secure recovery procedures. 
 eligibility checks mirror the portable-evidence boundary: a prepared terminal workspace is not
 removed unless its patch and validation artifact can be verified without the checkout. A complete
 bundle taken afterward still validates the retained durable generation.
+
+Rebuild Docker data on a freshly verified bounded filesystem by restoring the reviewed daemon
+configuration and pre-pulling the exact digest-pinned image; do not copy an unverified live daemon
+directory into the boundary.
 
 Local deletion is an operator action, never a timer action. Before removing one exact bundle:
 

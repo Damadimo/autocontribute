@@ -13,9 +13,11 @@ readonly docker_socket="$runtime_directory/docker.sock"
 readonly rootful_docker_socket="/var/run/docker.sock"
 readonly rootless_docker_check="/usr/local/libexec/autocontribute-rootless-docker-check"
 readonly storage_capacity_check="/usr/local/libexec/autocontribute-storage-capacity-check"
+readonly docker_data_check="/usr/local/libexec/autocontribute-docker-data-check"
 readonly workspace_quota_check="/usr/local/libexec/autocontribute-workspace-quota-check"
 readonly state_root="/var/lib/autocontribute/state"
 readonly backup_root="/var/backups/autocontribute"
+readonly docker_data_root="/var/lib/autocontribute/docker"
 readonly workspace_root="/var/lib/autocontribute/state/workspaces"
 
 case "$operation" in
@@ -42,6 +44,10 @@ if [[ ! -x "$storage_capacity_check" ]]; then
   printf 'Autocontribute storage capacity check is unavailable\n' >&2
   exit 1
 fi
+if [[ ! -x "$docker_data_check" ]]; then
+  printf 'Autocontribute Docker data-root boundary check is unavailable\n' >&2
+  exit 1
+fi
 if [[ ! -x "$workspace_quota_check" ]]; then
   printf 'Autocontribute workspace quota check is unavailable\n' >&2
   exit 1
@@ -62,6 +68,8 @@ export XDG_RUNTIME_DIR="$runtime_directory"
 export DOCKER_HOST="unix://$docker_socket"
 unset DOCKER_CONTEXT DOCKER_CERT_PATH DOCKER_TLS_VERIFY
 "$rootless_docker_check" "$runtime_directory" "$docker_socket" "$rootful_docker_socket"
+"$docker_data_check" --daemon "$docker_data_root"
+export AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT="$docker_data_root"
 
 if [[ -z "$credential_names" || -z "$credential_directory" ]]; then
   printf 'Autocontribute systemd credentials are not configured\n' >&2
@@ -75,7 +83,7 @@ for credential_name in $credential_names; do
     exit 1
   fi
   case "$credential_name" in
-    AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH | AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT | AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT | BASH* | CDPATH | DOCKER_* | ENV | GIT_* | HOME | IFS | LD_* | PATH | PYTHON* | SHELL | XDG_*)
+    AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH | AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT | AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT | AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT | BASH* | CDPATH | DOCKER_* | ENV | GIT_* | HOME | IFS | LD_* | PATH | PYTHON* | SHELL | XDG_*)
       printf 'An Autocontribute credential uses a reserved environment name\n' >&2
       exit 1
       ;;

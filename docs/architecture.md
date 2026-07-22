@@ -56,9 +56,18 @@ before loading credentials, and the store rejects any configured workspace path 
 mount. This host-storage boundary is deployment-specific; ordinary CLI and hosted runs must provide
 their own host disk controls.
 
+That deployment also gives the rootless daemon a separate dedicated ext4 data filesystem with
+verified aggregate byte and fixed-inode ceilings. A mount-only preflight stops the daemon before it
+can fall back to the service home, while the credential-bearing wrapper compares structured
+`DockerRootDir` output to the exact checked mount before loading credentials. It exports a
+non-secret boundary marker that makes every later structured sandbox probe repeat the exact
+comparison. The marker is absent for ordinary local and rootful review use, so those environments
+retain their own operator-managed disk policy.
+
 Immediately before every Docker launch, the control process parses one bounded structured daemon
-probe. It requires cgroup v2, a real cgroup driver, and reported memory, swap, CPU-quota, and PID-limit
-support, then recognizes rootless operation only from one exact `name=rootless` security option. A
+probe. It requires an absolute Docker data-root report, cgroup v2, a real cgroup driver, and reported
+memory, swap, CPU-quota, and PID-limit support, then recognizes rootless operation only from one exact
+`name=rootless` security option. A
 rootful daemon runs repository code as the caller's nonzero UID/GID. A verified rootless daemon
 instead uses UID/GID `0:0` inside its user namespace, which maps to the unprivileged daemon owner and
 is the only identity able to use that owner's private bind mounts. Namespace root does not relax the

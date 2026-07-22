@@ -314,6 +314,123 @@ jobs:
             --property="ReadOnlyPaths=$state_mount $backup_mount" \
             /usr/local/libexec/autocontribute-storage-capacity-check \
               "$state_mount" "$backup_mount" --read-only
+      - name: Exercise bounded Docker data-root preflight in a hardened service
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          docker_data_image=""
+          docker_data_mount=""
+          loop_device=""
+          smoke_root=""
+
+          cleanup_docker_data_smoke() {
+            local exit_status=$?
+            local cleanup_failed=0
+            local still_mounted=0
+            trap - EXIT
+            set +e
+
+            if [[ -n "$docker_data_mount" ]] && mountpoint --quiet -- "$docker_data_mount"; then
+              if ! sudo umount -- "$docker_data_mount"; then
+                echo "Failed to unmount the Docker data-root smoke-test filesystem" >&2
+                cleanup_failed=1
+                still_mounted=1
+              fi
+            fi
+            if [[ "$still_mounted" -eq 0 && -n "$loop_device" ]]; then
+              if sudo losetup --detach "$loop_device"; then
+                loop_device=""
+              else
+                echo "Failed to detach the Docker data-root smoke-test loop device" >&2
+                cleanup_failed=1
+              fi
+            fi
+            if [[ "$still_mounted" -eq 0 && -z "$loop_device" && -n "$smoke_root" ]]; then
+              if [[ -n "$docker_data_image" ]]; then
+                rm -f -- "$docker_data_image" || cleanup_failed=1
+              fi
+              for cleanup_directory in "$docker_data_mount" "$smoke_root"; do
+                if [[ -d "$cleanup_directory" ]] && ! rmdir -- "$cleanup_directory"; then
+                  echo "Failed to remove smoke-test directory: $cleanup_directory" >&2
+                  cleanup_failed=1
+                fi
+              done
+            fi
+            if [[ "$exit_status" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
+              exit_status=1
+            fi
+            exit "$exit_status"
+          }
+          trap cleanup_docker_data_smoke EXIT
+
+          for required_command in \
+            fallocate findmnt losetup mkfs.ext4 mount mountpoint realpath systemd-run umount; do
+            command -v "$required_command" >/dev/null
+          done
+          unset required_command
+          test "$(cat /proc/1/comm)" = systemd
+
+          smoke_root="$(mktemp --directory \
+            "${RUNNER_TEMP}/autocontribute-docker-data.XXXXXX")"
+          smoke_root="$(realpath "$smoke_root")"
+          docker_data_image="${smoke_root}/docker.ext4"
+          docker_data_mount="${smoke_root}/docker"
+          install -d -m 0710 "$docker_data_mount"
+          fallocate --length 2G "$docker_data_image"
+          loop_device="$(sudo losetup --find --show "$docker_data_image")"
+          if [[ ! "$loop_device" =~ ^/dev/loop[0-9]+$ ]]; then
+            echo "losetup returned an unexpected loop-device path" >&2
+            exit 1
+          fi
+          sudo mkfs.ext4 -q -m 0 -N 32768 "$loop_device"
+          sudo mount -t ext4 -o nodev,nosuid -- "$loop_device" "$docker_data_mount"
+
+          service_uid="$(id --user)"
+          service_gid="$(id --group)"
+          test "$service_uid" -ne 0
+          sudo chown "${service_uid}:${service_gid}" "$docker_data_mount"
+          chmod 0710 "$docker_data_mount"
+          test "$(stat --format=%u "$docker_data_mount")" = "$service_uid"
+          test "$(stat --format=%g "$docker_data_mount")" = "$service_gid"
+          test "$(stat --format=%a "$docker_data_mount")" = 710
+
+          data_unit="autocontribute-docker-data-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
+          sudo systemd-run \
+            --unit="$data_unit" \
+            --wait \
+            --collect \
+            --pipe \
+            --property=Type=exec \
+            --property="User=$service_uid" \
+            --property="Group=$service_gid" \
+            --property=NoNewPrivileges=yes \
+            --property=PrivateDevices=yes \
+            --property=PrivateTmp=yes \
+            --property=ProtectSystem=strict \
+            --property=RestrictSUIDSGID=yes \
+            --property="ReadWritePaths=$smoke_root" \
+            /usr/local/libexec/autocontribute-docker-data-check \
+            --mount-only "$docker_data_mount"
+
+          health_unit="autocontribute-docker-health-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.service"
+          sudo systemd-run \
+            --unit="$health_unit" \
+            --wait \
+            --collect \
+            --pipe \
+            --property=Type=exec \
+            --property="User=$service_uid" \
+            --property="Group=$service_gid" \
+            --property=NoNewPrivileges=yes \
+            --property=PrivateDevices=yes \
+            --property=PrivateTmp=yes \
+            --property=ProtectSystem=strict \
+            --property=RestrictSUIDSGID=yes \
+            --property="ReadWritePaths=$smoke_root" \
+            --property="ReadOnlyPaths=$docker_data_mount" \
+            /usr/local/libexec/autocontribute-docker-data-check \
+            --read-only-health "$docker_data_mount"
       - name: Verify system and timer units
         shell: bash
         env:

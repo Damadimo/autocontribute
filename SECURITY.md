@@ -26,6 +26,8 @@ suggested mitigation. Please do not include live credentials or data belonging t
 - Keep every sandbox image pinned to an audited `sha256` digest; mutable tags are rejected.
 - Keep sandbox networking disabled during validation and use a separate, credential-free dependency
   acquisition stage if a project requires downloads.
+- On a persistent worker, keep both repository workspaces and rootless Docker data on separate,
+  capacity-limited filesystems and require the exact mount checks in the supplied systemd guide.
 - Keep human approval enabled until acceptance, revision, and incident metrics justify a narrower
   automated policy.
 - Treat a GitHub `403`, `429`, abuse warning, maintainer stop request, or secret-scanner finding as a

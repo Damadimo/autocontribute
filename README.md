@@ -74,9 +74,11 @@ networking and Linux capabilities disabled. It proves a service-owned `0700` bin
 and written with the expected host ownership and confirms effective cgroup v2 memory, swap, CPU, and
 PID limits before checking the entrypoints and explicit Python modules named by operator-owned
 validation commands. The same structured resource-support and daemon-identity check runs immediately
-before every later container launch. Repository-local scripts and project-dependent behavior remain
-the responsibility of the real isolated validation run. An explicitly configured unsafe-local
-backend checks the host toolchain and does not require Docker.
+before every later container launch. The packaged systemd deployment also requires that structured
+probe's `DockerRootDir` to remain on its separately bounded filesystem; ordinary local and rootful
+review use keeps operator-managed Docker storage. Repository-local scripts and project-dependent
+behavior remain the responsibility of the real isolated validation run. An explicitly configured
+unsafe-local backend checks the host toolchain and does not require Docker.
 
 Copy [`autocontribute.example.yml`](autocontribute.example.yml) to `autocontribute.yml` and replace
 the example repositories with projects you understand. Define `validation.required_commands` for

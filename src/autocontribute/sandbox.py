@@ -26,6 +26,7 @@ _TRUNCATED_MARKER: Final = b"\n[output truncated by autocontribute]\n"
 _SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _DOCKER_RUNTIME_INFO_FORMAT: Final = (
     '{"security_options":{{json .SecurityOptions}},'
+    '"docker_root_dir":{{json .DockerRootDir}},'
     '"cgroup_version":{{json .CgroupVersion}},'
     '"cgroup_driver":{{json .CgroupDriver}},'
     '"memory_limit":{{json .MemoryLimit}},'
@@ -37,6 +38,7 @@ _DOCKER_RUNTIME_INFO_FORMAT: Final = (
 _DOCKER_RUNTIME_INFO_KEYS: Final = frozenset(
     {
         "security_options",
+        "docker_root_dir",
         "cgroup_version",
         "cgroup_driver",
         "memory_limit",
@@ -54,6 +56,7 @@ _DOCKER_RESOURCE_CAPABILITIES: Final = (
     "pids_limit",
 )
 _DOCKER_CLIENT_ENV_NAMES: Final = (
+    "AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT",
     "DOCKER_API_VERSION",
     "DOCKER_CERT_PATH",
     "DOCKER_CONFIG",
@@ -489,6 +492,27 @@ def detect_docker_daemon_mode(
     options = runtime_info["security_options"]
     if not isinstance(options, list) or not all(isinstance(option, str) for option in options):
         raise SandboxError("Docker daemon returned malformed runtime information")
+    docker_root_dir = runtime_info["docker_root_dir"]
+    if (
+        not isinstance(docker_root_dir, str)
+        or not docker_root_dir.startswith("/")
+        or len(docker_root_dir) > 4_096
+        or any(ord(character) < 32 or ord(character) == 127 for character in docker_root_dir)
+    ):
+        raise SandboxError("Docker daemon returned malformed runtime information")
+    required_docker_root = client_environment.get("AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT")
+    if required_docker_root is not None:
+        if (
+            not required_docker_root.startswith("/")
+            or os.path.normpath(required_docker_root) != required_docker_root
+            or len(required_docker_root) > 4_096
+            or any(
+                ord(character) < 32 or ord(character) == 127 for character in required_docker_root
+            )
+        ):
+            raise SandboxError("Required Docker data-root path is invalid")
+        if docker_root_dir != required_docker_root:
+            raise SandboxError("Docker daemon is outside the required bounded data-root")
     cgroup_driver = runtime_info["cgroup_driver"]
     if (
         runtime_info["cgroup_version"] != "2"
@@ -509,7 +533,7 @@ def detect_docker_daemon_mode(
 def docker_client_environment(
     source: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Copy only Docker endpoint and client settings, never provider credentials."""
+    """Copy only Docker endpoint and boundary settings, never provider credentials."""
 
     values = os.environ if source is None else source
     environment = {"PATH": values.get("PATH", "")}

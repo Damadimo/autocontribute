@@ -549,6 +549,42 @@ def test_ci_exercises_workspace_quota_preflight_on_a_real_hardened_mount() -> No
     assert "rm -rf" not in script
 
 
+def test_ci_exercises_docker_data_preflight_on_a_real_hardened_mount() -> None:
+    document = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    job = document["jobs"]["systemd-deployment"]
+    steps = job["steps"]
+    install = next(
+        step
+        for step in steps
+        if step["name"] == "Make packaged helpers available to executable validation"
+    )
+    smoke = next(
+        step
+        for step in steps
+        if step["name"] == "Exercise bounded Docker data-root preflight in a hardened service"
+    )
+    script = smoke["run"]
+
+    assert job["runs-on"] == "ubuntu-24.04"
+    assert steps.index(install) < steps.index(smoke)
+    assert 'test "$(cat /proc/1/comm)" = systemd' in script
+    assert 'fallocate --length 64M "$docker_data_image"' in script
+    assert 'sudo losetup --find --show "$docker_data_image"' in script
+    assert 'sudo mkfs.ext4 -q -N 8192 "$loop_device"' in script
+    assert 'sudo mount -t ext4 -o nodev,nosuid -- "$loop_device" "$docker_data_mount"' in script
+    assert 'chmod 0710 "$docker_data_mount"' in script
+    assert "sudo systemd-run" in script
+    assert "--property=PrivateDevices=yes" in script
+    assert "--property=ProtectSystem=strict" in script
+    assert '--property="ReadWritePaths=$smoke_root"' in script
+    assert "/usr/local/libexec/autocontribute-docker-data-check" in script
+    assert '--mount-only "$docker_data_mount"' in script
+    assert "trap cleanup_docker_data_smoke EXIT" in script
+    assert 'sudo umount -- "$docker_data_mount"' in script
+    assert 'sudo losetup --detach "$loop_device"' in script
+    assert "rm -rf" not in script
+
+
 def test_security_integration_pins_uv_version() -> None:
     document = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "security-integration.yml").read_text()
