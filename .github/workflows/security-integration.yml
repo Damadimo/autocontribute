@@ -234,7 +234,17 @@ jobs:
           done
 
           sudo systemctl stop docker.service docker.socket
-          test ! -S /var/run/docker.sock
+          if sudo systemctl is-active --quiet docker.service || \
+             sudo systemctl is-active --quiet docker.socket; then
+            printf 'Rootful Docker units remained active after shutdown\n' >&2
+            exit 1
+          fi
+          if docker --host unix:///var/run/docker.sock info >/dev/null 2>&1; then
+            printf 'Rootful Docker remained reachable after shutdown\n' >&2
+            exit 1
+          fi
+          sudo rm -f -- /var/run/docker.sock
+          sudo test ! -e /var/run/docker.sock
 
           service_uid="$(id --user)"
           service_gid="$(id --group)"

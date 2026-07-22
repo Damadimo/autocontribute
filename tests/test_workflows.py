@@ -551,6 +551,8 @@ def test_security_integration_exercises_rootful_and_rootless_resource_boundaries
     assert "Required rootless command is unavailable" in script
     assert "no shared subordinate UID/GID range is available" in script
     assert "sudo systemctl stop docker.service docker.socket" in script
+    assert "Rootful Docker remained reachable after shutdown" in script
+    assert "sudo rm -f -- /var/run/docker.sock" in script
     assert 'runtime="/run/user/${service_uid}"' in script
     assert "sudo loginctl enable-linger" in script
     assert "Delegate=cpu cpuset io memory pids" in script
