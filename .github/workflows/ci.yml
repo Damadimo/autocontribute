@@ -36,6 +36,88 @@ jobs:
       - name: Scan complete history for secrets
         run: '"$(go env GOPATH)/bin/gitleaks" git --redact --verbose .'
 
+  systemd-deployment:
+    # Keep the systemd major version fixed so parser behavior and security scoring cannot drift
+    # underneath the checked-in exposure ceilings. Ubuntu 24.04 ships systemd 255.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Require the controlled systemd baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          systemd-analyze --version
+          systemd_major="$(systemd-analyze --version | awk 'NR == 1 { print $2 }')"
+          if [[ "$systemd_major" != "255" ]]; then
+            echo "Expected systemd 255 on the pinned Ubuntu 24.04 runner, got $systemd_major" >&2
+            exit 1
+          fi
+      - name: Make packaged helpers available to executable validation
+        run: |
+          sudo install -d -o root -g root -m 0755 /usr/local/libexec
+          sudo install -o root -g root -m 0755 \
+            deploy/systemd/libexec/* \
+            /usr/local/libexec/
+      - name: Verify system and timer units
+        shell: bash
+        env:
+          SYSTEMD_LOG_COLOR: "0"
+          SYSTEMD_PAGER: cat
+        run: |
+          set -euo pipefail
+          mapfile -t units < <(
+            find deploy/systemd -maxdepth 1 -type f \
+              \( -name '*.service' -o -name '*.timer' \) \
+              -print | sort
+          )
+          if [[ "${#units[@]}" -ne 8 ]]; then
+            echo "Expected exactly eight packaged systemd units" >&2
+            exit 1
+          fi
+          systemd-analyze verify \
+            --man=no \
+            --recursive-errors=no \
+            "${units[@]}"
+      - name: Enforce service hardening exposure ceilings
+        shell: bash
+        env:
+          SYSTEMD_LOG_COLOR: "0"
+          SYSTEMD_PAGER: cat
+        run: |
+          set -euo pipefail
+          # systemd expresses its 0.0-10.0 score as tenths in --threshold (0-100).
+          declare -Ar exposure_ceiling=(
+            [autocontribute-worker.service]=40
+            [autocontribute-doctor.service]=40
+            [autocontribute-backup.service]=30
+            [autocontribute-health.service]=30
+            [autocontribute-failure@.service]=30
+          )
+          mapfile -t services < <(
+            find deploy/systemd -maxdepth 1 -type f -name '*.service' -print | sort
+          )
+          if [[ "${#services[@]}" -ne "${#exposure_ceiling[@]}" ]]; then
+            echo "Every packaged service must have an explicit exposure ceiling" >&2
+            exit 1
+          fi
+          for service_path in "${services[@]}"; do
+            service="${service_path##*/}"
+            ceiling="${exposure_ceiling[$service]:-}"
+            if [[ -z "$ceiling" ]]; then
+              echo "Missing security exposure ceiling for $service" >&2
+              exit 1
+            fi
+            systemd-analyze security \
+              --offline=yes \
+              --threshold="$ceiling" \
+              --no-pager \
+              "$service_path"
+          done
+
   test:
     strategy:
       fail-fast: false

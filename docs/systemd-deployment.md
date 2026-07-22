@@ -275,6 +275,11 @@ sudo systemctl daemon-reload
 
 Validate the installed files on the target host. `systemd-analyze security` is advisory; review
 every relaxation instead of chasing a score that breaks rootless Docker or durable state.
+CI also parses every packaged unit with systemd 255 on Ubuntu 24.04 and fails on parser warnings.
+It performs an offline security assessment of every service, with an exposure ceiling of 4.0 for
+the networked worker and doctor and 3.0 for the private-network backup, health, and failure units.
+These are regression ceilings, not a substitute for reviewing the full report or validating the
+installed units against the target host's systemd version.
 
 ```bash
 sudo systemd-analyze verify \

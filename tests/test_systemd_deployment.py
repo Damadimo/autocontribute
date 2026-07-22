@@ -9,6 +9,8 @@ import tempfile
 from collections import defaultdict
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).parents[1]
 SYSTEMD = ROOT / "deploy" / "systemd"
 LOCK_PATH = "/var/lib/autocontribute/operation.lock"
@@ -218,6 +220,32 @@ def test_systemd_bundle_contains_expected_units_and_executable_helpers() -> None
             text=True,
         )
         assert result.returncode == 0, result.stderr
+
+
+def test_ci_runs_real_version_controlled_systemd_validation() -> None:
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    job = workflow["jobs"]["systemd-deployment"]
+
+    assert job["runs-on"] == "ubuntu-24.04"
+    steps = job["steps"]
+    baseline = next(
+        step for step in steps if step["name"] == "Require the controlled systemd baseline"
+    )
+    verify = next(step for step in steps if step["name"] == "Verify system and timer units")
+    security = next(
+        step for step in steps if step["name"] == "Enforce service hardening exposure ceilings"
+    )
+
+    assert '[[ "$systemd_major" != "255" ]]' in baseline["run"]
+    assert "systemd-analyze verify" in verify["run"]
+    assert "--recursive-errors=no" in verify["run"]
+    assert "systemd-analyze security" in security["run"]
+    assert "--offline=yes" in security["run"]
+    assert "[autocontribute-worker.service]=40" in security["run"]
+    assert "[autocontribute-doctor.service]=40" in security["run"]
+    assert "[autocontribute-backup.service]=30" in security["run"]
+    assert "[autocontribute-health.service]=30" in security["run"]
+    assert "[autocontribute-failure@.service]=30" in security["run"]
 
 
 def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
