@@ -15,7 +15,8 @@ if [[ ! -d "$health_directory" || -L "$health_directory" || ! -w "$health_direct
   exit 1
 fi
 
-readonly timestamp="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+timestamp="$(date --utc +%Y-%m-%dT%H:%M:%SZ)"
+readonly timestamp
 temporary="$(mktemp --tmpdir="$health_directory" .last-failure.XXXXXX)"
 trap 'rm -f -- "$temporary"' EXIT
 printf '%s %s\n' "$timestamp" "$failed_unit" >"$temporary"

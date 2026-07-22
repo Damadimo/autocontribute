@@ -14,7 +14,8 @@ if [[ ! -d "$health_directory" || -L "$health_directory" ]]; then
   exit 1
 fi
 
-readonly now="$(date +%s)"
+now="$(date +%s)"
+readonly now
 failures=()
 
 check_stamp() {

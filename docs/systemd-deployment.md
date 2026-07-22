@@ -31,7 +31,12 @@ eventually consistent mount.
 
 The sandbox daemon must be rootless and owned by the dedicated `autocontribute` account. Membership
 in the host `docker` group or use of `/var/run/docker.sock` would give the worker root-equivalent
-control and defeats this deployment boundary.
+control and defeats this deployment boundary. Before either the worker or doctor reads a systemd
+credential, the wrapper verifies that `/run/user/$UID` is an unsymlinked `0700` directory owned by
+the service identity, that its Docker socket is owned by that identity with mode `0600` or `0660`,
+and that the account cannot use the host socket. It then makes a 30-second bounded daemon probe and
+requires one exact `name=rootless` element in Docker's reported `SecurityOptions`. A failed or
+ambiguous check stops the service before the wrapper reads or exports any credential.
 
 ## Host prerequisites
 
@@ -48,11 +53,18 @@ another account's ranges; the numbers below are examples and must be checked aga
 
 ```bash
 sudo useradd --system --create-home \
+  --user-group \
   --home-dir /var/lib/autocontribute \
   --shell /usr/sbin/nologin autocontribute
 sudo usermod --add-subuids 200000-265535 --add-subgids 200000-265535 autocontribute
+test "$(id -gn autocontribute)" = autocontribute
+getent group autocontribute
 sudo loginctl enable-linger autocontribute
 ```
+
+The explicit private user group is required by every supplied unit and tmpfiles rule. Do not add
+the account to `docker`; the runtime preflight rejects that exact group even if a separately started
+rootless daemon appears healthy.
 
 Install rootless Docker for that account using the distribution's supported procedure. Start its
 user manager and user service without changing the account's login shell:
@@ -72,6 +84,12 @@ sudo -u autocontribute env \
   docker info
 unset autocontribute_uid
 ```
+
+The final `docker info` is only an installation smoke test. The packaged services repeat the
+ownership, permission, group, host-socket, and exact rootless-security-option checks on every
+invocation before the wrapper reads any file in the encrypted credential directory. Rootless Docker
+commonly creates a `0660` socket; this remains private because its owning runtime directory must be
+exactly `0700`.
 
 Pre-pull every digest-pinned sandbox image as this user. Never use a tag in production. The service
 sets `TMPDIR=/var/lib/autocontribute/tmp` because Docker's daemon must see the CID files created by
@@ -157,8 +175,22 @@ The worker wrapper copies named systemd credentials into its process environment
 `exec`; it never prints them. Because processes owned by the same Unix user can be a credential
 boundary risk, keep this account locked and dedicated to Autocontribute and its rootless daemon.
 
-For another API-key environment name, add a service drop-in that resets and rebuilds both lists. The
-GitHub credential remains required. For example:
+For another API-key environment name, install the same drop-in for both the worker and doctor. Each
+unit independently defines the default encrypted credentials, so changing only one leaves the two
+execution paths inconsistent. Create both directories and edit both named files:
+
+```bash
+sudo install -d -o root -g root -m 0755 \
+  /etc/systemd/system/autocontribute-worker.service.d \
+  /etc/systemd/system/autocontribute-doctor.service.d
+sudoedit \
+  /etc/systemd/system/autocontribute-worker.service.d/40-provider-credentials.conf \
+  /etc/systemd/system/autocontribute-doctor.service.d/40-provider-credentials.conf
+```
+
+Put this identical content in each file. The empty assignment resets the inherited encrypted-
+credential list, and the later environment assignment replaces the default credential-name value.
+The GitHub credential remains required:
 
 ```ini
 [Service]
@@ -173,6 +205,17 @@ Create that credential with `systemd-creds encrypt --name=VENDOR_API_KEY` and ma
 multiline values. If encrypted credentials are unavailable, use a root-only plaintext source with a
 carefully reviewed `LoadCredential=` drop-in; do not use `Environment=`, `EnvironmentFile=`, or a
 world-readable shell profile for secrets.
+
+After any provider drop-in change, verify that the two files are identical, reload systemd, then
+start the doctor before the worker. Credential overrides are not complete until both services have
+been updated.
+
+```bash
+sudo cmp --silent -- \
+  /etc/systemd/system/autocontribute-worker.service.d/40-provider-credentials.conf \
+  /etc/systemd/system/autocontribute-doctor.service.d/40-provider-credentials.conf
+sudo systemctl daemon-reload
+```
 
 Credential rotation is atomic between invocations: write a new encrypted file beside the old one,
 set its owner and mode, rename it over the old path, and start `autocontribute-doctor.service`.
@@ -299,11 +342,31 @@ The production configuration must use one explicit repository, immutable atteste
 PRs, at most one new PR per UTC day, and a repository cooldown of at least seven days.
 
 Only then change `publishing.mode` to `auto`, provision the narrowly scoped publication credential,
-and add this root-owned drop-in with `systemctl edit autocontribute-worker.service`:
+and install the same root-owned opt-in drop-in for both services. The doctor is non-mutating and
+cannot publish; it needs the opt-in only so its automatic-publication kill-switch check validates the
+exact environment that the worker will receive.
+
+```bash
+sudo install -d -o root -g root -m 0755 \
+  /etc/systemd/system/autocontribute-worker.service.d \
+  /etc/systemd/system/autocontribute-doctor.service.d
+sudoedit \
+  /etc/systemd/system/autocontribute-worker.service.d/50-auto-publish.conf \
+  /etc/systemd/system/autocontribute-doctor.service.d/50-auto-publish.conf
+```
+
+Put this identical content in each file, then reload systemd:
 
 ```ini
 [Service]
 Environment=AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH=1
+```
+
+```bash
+sudo cmp --silent -- \
+  /etc/systemd/system/autocontribute-worker.service.d/50-auto-publish.conf \
+  /etc/systemd/system/autocontribute-doctor.service.d/50-auto-publish.conf
+sudo systemctl daemon-reload
 ```
 
 Run the doctor service and a manual worker under observation, create and replicate a new complete
@@ -322,10 +385,18 @@ sudo systemctl disable --now autocontribute-worker.timer
 sudo systemctl stop autocontribute-worker.service
 ```
 
-For automatic mode, also remove the `AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH=1` drop-in and reload systemd.
-Removing it prevents future scheduled GitHub writes, including resuming a stranded publication; a
-future worker still performs read-only remote reconciliation. Revoke the GitHub credential if host
-integrity or token secrecy is uncertain.
+For automatic mode, also remove both dedicated opt-in drop-ins and reload systemd. Removing the
+worker copy prevents future scheduled GitHub writes, including resuming a stranded publication; a
+future worker still performs read-only remote reconciliation. Removing the doctor copy keeps its
+preflight consistent with the disabled worker. Revoke the GitHub credential if host integrity or
+token secrecy is uncertain.
+
+```bash
+sudo rm -- \
+  /etc/systemd/system/autocontribute-worker.service.d/50-auto-publish.conf \
+  /etc/systemd/system/autocontribute-doctor.service.d/50-auto-publish.conf
+sudo systemctl daemon-reload
+```
 
 Once the worker is quiescent, record a persistent safety stop under the shared lock:
 

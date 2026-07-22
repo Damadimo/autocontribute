@@ -10,6 +10,8 @@ readonly credential_directory="${CREDENTIALS_DIRECTORY:-}"
 readonly operation="${1:-run}"
 readonly runtime_directory="/run/user/$UID"
 readonly docker_socket="$runtime_directory/docker.sock"
+readonly rootful_docker_socket="/var/run/docker.sock"
+readonly rootless_docker_check="/usr/local/libexec/autocontribute-rootless-docker-check"
 
 if [[ ! -x "$executable" ]]; then
   printf 'Autocontribute executable is unavailable\n' >&2
@@ -19,15 +21,15 @@ if [[ ! -r "$config" ]]; then
   printf 'Autocontribute configuration is unavailable\n' >&2
   exit 1
 fi
-if [[ ! -d "$runtime_directory" || -L "$runtime_directory" || ! -S "$docker_socket" || -L "$docker_socket" ]]; then
-  printf 'Autocontribute rootless Docker socket is unavailable\n' >&2
+if [[ ! -x "$rootless_docker_check" ]]; then
+  printf 'Autocontribute rootless Docker boundary check is unavailable\n' >&2
   exit 1
 fi
-readonly docker_socket_owner="$(stat --format=%u -- "$docker_socket")"
-if [[ "$docker_socket_owner" != "$UID" ]]; then
-  printf 'Autocontribute Docker socket is not owned by the service account\n' >&2
-  exit 1
-fi
+export XDG_RUNTIME_DIR="$runtime_directory"
+export DOCKER_HOST="unix://$docker_socket"
+unset DOCKER_CONTEXT DOCKER_CERT_PATH DOCKER_TLS_VERIFY
+"$rootless_docker_check" "$runtime_directory" "$docker_socket" "$rootful_docker_socket"
+
 if [[ -z "$credential_names" || -z "$credential_directory" ]]; then
   printf 'Autocontribute systemd credentials are not configured\n' >&2
   exit 1
@@ -40,7 +42,7 @@ for credential_name in $credential_names; do
     exit 1
   fi
   case "$credential_name" in
-    AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH | BASH* | CDPATH | ENV | GIT_* | HOME | IFS | LD_* | PATH | PYTHON* | SHELL | XDG_*)
+    AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH | BASH* | CDPATH | DOCKER_* | ENV | GIT_* | HOME | IFS | LD_* | PATH | PYTHON* | SHELL | XDG_*)
       printf 'An Autocontribute credential uses a reserved environment name\n' >&2
       exit 1
       ;;
@@ -62,13 +64,11 @@ for credential_name in $credential_names; do
     exit 1
   fi
   printf -v "$credential_name" '%s' "$credential_value"
-  export "$credential_name"
+  export "${credential_name?}"
   unset credential_value credential_path
 done
 
 unset credential_name loaded_credentials
-export XDG_RUNTIME_DIR="$runtime_directory"
-export DOCKER_HOST="unix://$docker_socket"
 case "$operation" in
   doctor)
     exec "$executable" doctor --non-interactive --config "$config"

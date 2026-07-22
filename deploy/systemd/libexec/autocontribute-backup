@@ -16,7 +16,8 @@ if [[ ! -d "$backup_directory" || -L "$backup_directory" || ! -w "$backup_direct
   exit 1
 fi
 
-readonly timestamp="$(date --utc +%Y%m%dT%H%M%S.%NZ)"
+timestamp="$(date --utc +%Y%m%dT%H%M%S.%NZ)"
+readonly timestamp
 readonly destination="$backup_directory/autocontribute-state-$timestamp-$$.bundle.zip"
 if [[ -e "$destination" || -L "$destination" ]]; then
   printf 'Autocontribute backup destination unexpectedly exists\n' >&2

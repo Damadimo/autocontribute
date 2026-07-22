@@ -1,0 +1,95 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+umask 077
+
+readonly runtime_directory="${1:-}"
+readonly docker_socket="${2:-}"
+readonly rootful_docker_socket="${3:-}"
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+if [[
+  $# -ne 3 || -z "$runtime_directory" ||
+  "$docker_socket" != "$runtime_directory/docker.sock" ||
+  -z "$rootful_docker_socket"
+]]; then
+  fail 'Autocontribute rootless Docker check received invalid paths'
+fi
+if [[ "$UID" == 0 ]]; then
+  fail 'Autocontribute rootless Docker must not run as root'
+fi
+
+service_gid="$(id --group)" || fail 'Autocontribute could not verify the service group'
+readonly service_gid
+service_group_names="$(id --groups --name)" || fail 'Autocontribute could not verify supplementary groups'
+readonly service_group_names
+for service_group_name in $service_group_names; do
+  if [[ "$service_group_name" == "docker" ]]; then
+    fail 'Autocontribute service account must not belong to the docker group'
+  fi
+done
+unset service_group_name
+
+if [[ ! -d "$runtime_directory" || -L "$runtime_directory" ]]; then
+  fail 'Autocontribute rootless Docker runtime directory is unavailable'
+fi
+runtime_owner="$(stat --format=%u -- "$runtime_directory")" || \
+  fail 'Autocontribute could not inspect the Docker runtime directory'
+runtime_group="$(stat --format=%g -- "$runtime_directory")" || \
+  fail 'Autocontribute could not inspect the Docker runtime directory'
+runtime_mode="$(stat --format=%a -- "$runtime_directory")" || \
+  fail 'Autocontribute could not inspect the Docker runtime directory'
+readonly runtime_owner runtime_group runtime_mode
+if [[ "$runtime_owner" != "$UID" || "$runtime_group" != "$service_gid" || "$runtime_mode" != 700 ]]; then
+  fail 'Autocontribute rootless Docker runtime directory has unsafe ownership or permissions'
+fi
+
+if [[ ! -S "$docker_socket" || -L "$docker_socket" ]]; then
+  fail 'Autocontribute rootless Docker socket is unavailable'
+fi
+docker_socket_owner="$(stat --format=%u -- "$docker_socket")" || \
+  fail 'Autocontribute could not inspect the Docker socket'
+docker_socket_group="$(stat --format=%g -- "$docker_socket")" || \
+  fail 'Autocontribute could not inspect the Docker socket'
+docker_socket_mode="$(stat --format=%a -- "$docker_socket")" || \
+  fail 'Autocontribute could not inspect the Docker socket'
+readonly docker_socket_owner docker_socket_group docker_socket_mode
+if [[ "$docker_socket_owner" != "$UID" || "$docker_socket_group" != "$service_gid" ]]; then
+  fail 'Autocontribute Docker socket is not owned by the service account'
+fi
+if [[ "$docker_socket_mode" != 600 && "$docker_socket_mode" != 660 ]]; then
+  fail 'Autocontribute Docker socket has unsafe permissions'
+fi
+
+if [[ -S "$rootful_docker_socket" && ( -r "$rootful_docker_socket" || -w "$rootful_docker_socket" ) ]]; then
+  fail 'Autocontribute service account can access the host Docker socket'
+fi
+
+export XDG_RUNTIME_DIR="$runtime_directory"
+export DOCKER_HOST="unix://$docker_socket"
+unset DOCKER_CONTEXT DOCKER_CERT_PATH DOCKER_TLS_VERIFY
+
+docker_security_options=""
+if ! docker_security_options="$(
+  timeout --kill-after=5s 30s \
+    docker --host "$DOCKER_HOST" info \
+    --format '{{range .SecurityOptions}}{{println .}}{{end}}' \
+    2>/dev/null
+)"; then
+  fail 'Autocontribute could not verify the rootless Docker daemon'
+fi
+
+rootless_option_count=0
+while IFS= read -r docker_security_option; do
+  if [[ "$docker_security_option" == "name=rootless" ]]; then
+    rootless_option_count=$((rootless_option_count + 1))
+  fi
+done <<< "$docker_security_options"
+unset docker_security_option docker_security_options
+if [[ "$rootless_option_count" -ne 1 ]]; then
+  fail 'Autocontribute Docker daemon did not report the exact rootless security option'
+fi
