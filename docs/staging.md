@@ -1,24 +1,35 @@
 # Staging and live end-to-end checks
 
-Never use a third-party upstream repository for the first live run. Create a dedicated fixture
-repository owned by the operator, give it realistic contribution guidance and small synthetic issues,
-and use `.github/workflows/staging.yml` to perform read-only shadow runs against it.
+Never use a third-party upstream repository for the first live run. Create a dedicated, entirely
+synthetic fixture repository owned by the operator, give it realistic contribution guidance and
+small synthetic issues, and use `.github/workflows/staging.yml` to perform read-only shadow runs
+against it. The fixture must currently be public: Autocontribute deliberately rejects private
+repositories as contribution targets and performs unauthenticated source fetches. Do not place real
+credentials, private code, personal data, or other non-public material in the fixture.
 
 ## Required setup
 
-1. Create a repository used only for Autocontribute fixtures. Do not point staging at a real upstream.
-2. Copy `autocontribute.staging.example.yml` to `autocontribute.staging.yml`, replace the repository
-   placeholder with that exact fixture repository, and review the pinned sandbox image and validation
-   recipe. Verify the model pricing ceilings against the dedicated provider project before running;
-   they are operator-maintained conservative inputs, not a bundled pricing table. The hosted workflow
-   requires the Docker backend, disabled validation networking, and no unsafe-local opt-in. Its
-   aggregate model ceiling plus worst-case sandbox command budget must not exceed 180 minutes; the
-   four-hour job timeout leaves the remaining hour for preflight and state finalization.
+1. Create a public repository used only for non-sensitive Autocontribute fixtures. Do not point
+   staging at a real upstream. A private fixture is not a supported shortcut: it would require an
+   explicit allowlist plus a host-bound authenticated-clone design.
+2. For this deployment, review the checked-in `autocontribute.staging.yml`. For another account, copy
+   `autocontribute.staging.example.yml` to that path and replace the repository placeholder with the
+   exact fixture repository. Review the pinned sandbox image and validation recipe. Verify the model
+   pricing ceilings against the dedicated provider project before running; they are
+   operator-maintained conservative inputs, not a bundled pricing table. The hosted workflow requires
+   the Docker backend, disabled validation networking, and no unsafe-local opt-in. Its aggregate model
+   ceiling plus worst-case sandbox command budget must not exceed 180 minutes; the four-hour job timeout
+   leaves the remaining hour for preflight and state finalization.
+   Keep the fixture's 11-command budget: it covers one baseline reproduction and the five-command
+   deduplicated validation suite both before and after the single bounded critic-repair pass.
 3. Add `OPENAI_API_KEY` and a read-only `AUTOCONTRIBUTE_STAGING_GITHUB_TOKEN` as repository secrets.
-   Use a dedicated provider project and GitHub App installation where possible. Also add
-   `AUTOCONTRIBUTE_STAGING_STATE_TOKEN`, using an expiring fine-grained PAT restricted to this control
-   repository with only **Variables: Read and write** (plus implicit metadata read). Grant it no
-   contents, issues, pull-request, or Actions access, and rotate it independently.
+   Use a dedicated provider project. The target token must be either an expiring fine-grained PAT or a
+   GitHub App **user access token** because preflight identifies its account with `GET /user`; a plain
+   installation token is not sufficient. Restrict it to the fixture repository with read-only metadata,
+   contents, issues, and pull-request access. Also add `AUTOCONTRIBUTE_STAGING_STATE_TOKEN`, using an
+   expiring fine-grained PAT restricted to this control repository with only **Variables: Read and
+   write** (plus implicit metadata read). Grant it no contents, issues, pull-request, or Actions access,
+   and rotate it independently.
 4. Set `AUTOCONTRIBUTE_STAGING_REPOSITORY` to the fixture's `owner/repository` name.
 5. Set `AUTOCONTRIBUTE_STAGING_ENABLED=true`, then manually dispatch **Staging shadow run** from the
    default branch with a fixture issue reference and `bootstrap_state=true`. This flag is required
@@ -27,15 +38,17 @@ and use `.github/workflows/staging.yml` to perform read-only shadow runs against
 
 The shadow workflow's `GITHUB_TOKEN` has only `contents: read`. Only the dedicated state token is
 exposed to the three steps that resolve, claim, and commit
-`AUTOCONTRIBUTE_STAGING_STATE_LINEAGE`; use an equivalently scoped short-lived GitHub App installation
-token for a longer-lived deployment. The workflow restores the committed exact cache generation,
-validates the local state and all live dependencies while leaving that pointer unchanged, then rereads
-and claims the same generation immediately before preparation. Preflight failures are retryable
-without changing the committed pointer. After saving the replacement cache, it independently requires
-an exact-key, lookup-only cache hit because the save action can reduce upload failures to warnings. It
-advances the variable only after that verification and the evidence artifact are successful. An
-`in-progress` value means a post-claim run did not commit; investigate that run and its evidence instead
-of editing the variable.
+`AUTOCONTRIBUTE_STAGING_STATE_LINEAGE`; unlike the target token, this credential may be an equivalently
+scoped short-lived GitHub App installation token for a longer-lived deployment. The workflow restores
+the committed exact cache generation, validates its local state and configuration, and preloads the
+sandbox image while leaving that pointer unchanged. Failures before the claim are retryable without
+changing the committed pointer. The workflow then rereads and claims the same generation before it
+syncs lifecycle state, validates the live GitHub and model dependencies, and attempts preparation.
+After a claim, it snapshots the resulting state even when one of those steps fails. It independently
+requires an exact-key, lookup-only cache hit because the save action can reduce upload failures to
+warnings, and advances the variable only after that verification and the evidence artifact are
+successful. An `in-progress` value means a post-claim run did not commit; investigate that run and its
+evidence instead of editing the variable.
 
 The workflow enforces one explicit repository, disables owner-wide discovery, requires
 `review_required` mode, requires draft publication configuration, and never invokes the publication

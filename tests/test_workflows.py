@@ -3,7 +3,30 @@ from pathlib import Path
 import pytest
 import yaml
 
+from autocontribute.config import load_config
+
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_checked_in_staging_config_is_safe_for_the_operator_fixture() -> None:
+    settings = load_config(ROOT / "autocontribute.staging.yml")
+
+    assert settings.github.repositories == ["Damadimo/autocontribute-staging-fixture"]
+    assert settings.github.owners == []
+    assert settings.validation.required_commands == {
+        "damadimo/autocontribute-staging-fixture": [
+            "python tools/lint.py",
+            "python tools/typecheck.py",
+            "python -m unittest discover -s tests/unit -v",
+            "python -m unittest discover -s tests/integration -v",
+        ]
+    }
+    assert settings.publishing.mode == "review_required"
+    assert settings.publishing.draft is True
+    assert settings.sandbox.backend == "docker"
+    assert settings.sandbox.network == "none"
+    assert settings.sandbox.max_commands == 11
+    assert settings.storage.path == ROOT / ".autocontribute-staging"
 
 
 @pytest.mark.parametrize(

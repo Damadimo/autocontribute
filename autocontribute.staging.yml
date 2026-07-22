@@ -1,13 +1,13 @@
-# Shadow-run configuration for a repository owned by the operator.
+# Read-only shadow-run configuration for the operator-owned staging fixture.
 identity:
-  name: "Staging Operator"
-  email: "your-handle@users.noreply.github.com"
+  name: "Autocontribute Staging"
+  email: "70027166+Damadimo@users.noreply.github.com"
 
 github:
   auth: token
   token_env: AUTOCONTRIBUTE_STAGING_GITHUB_TOKEN
   repositories:
-    - YOUR_ACCOUNT/autocontribute-staging-fixture
+    - Damadimo/autocontribute-staging-fixture
   owners: []
   include_labels: ["autocontribute-e2e"]
   exclude_labels: ["security", "blocked", "needs design", "discussion"]
@@ -22,16 +22,13 @@ models:
   scout: &staging_model
     provider: openai
     model: gpt-5.6
-    # Required for `publishing.mode: auto`: copy the exact immutable model ID returned by the API.
-    # expected_response_model: gpt-5.6-YYYY-MM-DD
-    # immutable_response_model_attested: true  # only after verifying the provider contract
     api_key_env: OPENAI_API_KEY
     reasoning_effort: high
     reasoning_mode: standard
     max_input_tokens: 500000
     max_output_tokens: 40000
     timeout_seconds: 900
-    # Conservative price ceilings, not a built-in price table. Verify for the selected model.
+    # Operator-maintained conservative ceilings, not a bundled pricing table.
     pricing:
       input_usd_per_million_tokens: 10
       cached_input_usd_per_million_tokens: 10
@@ -44,8 +41,6 @@ models:
 
 sandbox:
   backend: docker
-  # The first fixture intentionally uses only Python's standard library. Replace this image with a
-  # digest-pinned, dependency-complete image before adding another repository ecosystem.
   image: >-
     python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a
   network: none
@@ -58,7 +53,7 @@ sandbox:
 
 validation:
   required_commands:
-    YOUR_ACCOUNT/autocontribute-staging-fixture:
+    Damadimo/autocontribute-staging-fixture:
       - python tools/lint.py
       - python tools/typecheck.py
       - python -m unittest discover -s tests/unit -v
@@ -90,7 +85,6 @@ publishing:
   mode: review_required
   approval_expires_hours: 12
   draft: true
-  # These limits use durable schema-v5 reservations if a reviewed fixture is manually published.
   max_new_pull_requests_per_day: 1
   max_open_pull_requests: 1
   repository_cooldown_days: 30

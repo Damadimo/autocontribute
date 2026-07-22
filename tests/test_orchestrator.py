@@ -147,6 +147,20 @@ class FixedProvider:
         )
 
 
+class SequenceProvider(FixedProvider):
+    def __init__(self, outputs: list[Any], model: str) -> None:
+        if not outputs:
+            raise ValueError("SequenceProvider requires at least one output")
+        self.outputs = outputs
+        super().__init__(outputs[0], model)
+
+    def generate(self, **request: object) -> ModelResult[Any]:
+        if self.calls >= len(self.outputs):
+            raise AssertionError("SequenceProvider received an unexpected extra call")
+        self.output = self.outputs[self.calls]
+        return super().generate(**request)
+
+
 class PassingSandbox:
     def __init__(self, *, remaining_commands: int = 8) -> None:
         self.remaining_commands = remaining_commands
@@ -320,6 +334,151 @@ def test_full_prepare_pipeline_reaches_exact_approval_boundary(tmp_path: Path, m
         (store.artifact_dir(manifest.run_id) / "model-calls.json").read_text(encoding="utf-8")
     )
     assert all(call["cost_usd"] == "unknown" for call in model_calls)
+
+
+def test_critic_repair_is_skipped_when_exact_validation_suite_exceeds_remaining_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "sandbox": {"max_commands": 3},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    approved_review = providers["critic"].output
+    assert isinstance(approved_review, CriticReview)
+    providers["critic"].output = approved_review.model_copy(
+        update={
+            "verdict": "reject",
+            "summary": "The patch still has one blocking concern.",
+            "blocking_findings": ["Add a clarifying implementation comment."],
+            "issue_requirements_missing": ["Clarifying comment"],
+        }
+    )
+    sandbox = PassingSandbox(remaining_commands=3)
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.REJECTED
+    assert manifest.error is None
+    assert manifest.model_calls == 3
+    assert providers["builder"].calls == 1
+    assert providers["critic"].calls == 1
+    assert sandbox.remaining_commands == 0
+    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
+
+
+def test_critic_repair_reuses_exact_validation_suite_when_it_fits_remaining_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "sandbox": {"max_commands": 5},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    initial_proposal = providers["builder"].output
+    approved_review = providers["critic"].output
+    assert isinstance(initial_proposal, PatchProposal)
+    assert isinstance(approved_review, CriticReview)
+    repair_proposal = initial_proposal.model_copy(
+        update={
+            "summary": "Return the documented value with the requested clarification.",
+            "validation_commands": [
+                TRUSTED_COMMAND,
+                "python -m unittest discover -s tests/repair -v",
+            ],
+            "edits": [
+                FileEdit(
+                    operation="replace",
+                    path="app.py",
+                    find="    return 2\n",
+                    replace="    return 2  # documented boundary\n",
+                    content=None,
+                    rationale="Resolve the independent review blocker.",
+                )
+            ],
+        }
+    )
+    rejecting_review = approved_review.model_copy(
+        update={
+            "verdict": "reject",
+            "summary": "The patch still has one blocking concern.",
+            "blocking_findings": ["Add a clarifying implementation comment."],
+            "issue_requirements_missing": ["Clarifying comment"],
+        }
+    )
+    providers["builder"] = SequenceProvider(
+        [initial_proposal, repair_proposal],
+        "gpt-5.6",
+    )
+    providers["critic"] = SequenceProvider(
+        [rejecting_review, approved_review],
+        "gpt-5.6",
+    )
+    sandbox = PassingSandbox(remaining_commands=5)
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.READY_FOR_APPROVAL
+    assert manifest.model_calls == 5
+    assert providers["builder"].calls == 2
+    assert providers["critic"].calls == 2
+    assert sandbox.remaining_commands == 0
+    assert manifest.proposal is not None
+    assert manifest.proposal.validation_commands == [TRUSTED_COMMAND]
+    assert sandbox.validation_batches == [
+        [TRUSTED_COMMAND, REPRODUCTION_COMMAND],
+        [TRUSTED_COMMAND, REPRODUCTION_COMMAND],
+    ]
 
 
 def test_clone_uses_the_exact_sha_used_for_repository_policy_reads(

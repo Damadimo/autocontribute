@@ -384,12 +384,13 @@ class Orchestrator:
 
         self._assert_operational()
         self.store.transition(manifest, RunStatus.VALIDATING, reason="running isolated checks")
-        commands[:] = self._validate(
-            workspace,
+        validation_suite = self._validation_suite(
             plan,
             proposal,
             required_commands=required_validation_commands,
         )
+        initial_proposal_validation_commands = list(proposal.validation_commands)
+        commands[:] = self._validate(workspace, validation_suite)
         manifest.patched_validation = list(commands)
         self._assert_operational()
         self.store.save(
@@ -410,6 +411,7 @@ class Orchestrator:
             and review.blocking_findings
             and all(result.passed for result in commands)
             and self._has_model_capacity(manifest, ("builder", "critic"))
+            and self._has_sandbox_capacity(len(validation_suite))
         ):
             self._assert_operational()
             self.store.transition(
@@ -435,7 +437,9 @@ class Orchestrator:
                 ),
                 output_type=PatchProposal,
             )
-            proposal = self._with_disclosure(repair_result.output)
+            proposal = self._with_disclosure(repair_result.output).model_copy(
+                update={"validation_commands": initial_proposal_validation_commands}
+            )
             manifest.proposal = proposal
             validate_publication_text(manifest)
             validate_pull_request_template(proposal.pull_request_body, guidance)
@@ -448,12 +452,7 @@ class Orchestrator:
                 RunStatus.VALIDATING,
                 reason="revalidating repaired patch",
             )
-            commands[:] = self._validate(
-                workspace,
-                plan,
-                proposal,
-                required_commands=required_validation_commands,
-            )
+            commands[:] = self._validate(workspace, validation_suite)
             manifest.patched_validation = list(commands)
             self._assert_operational()
             self.store.transition(
@@ -559,16 +558,16 @@ class Orchestrator:
         )
         return result.output
 
-    def _validate(
-        self,
-        workspace: RepositoryWorkspace,
+    @staticmethod
+    def _validation_suite(
         plan: ContributionPlan,
         proposal: PatchProposal,
         *,
         required_commands: Sequence[str],
-    ) -> list[CommandResult]:
-        self._assert_operational()
-        commands = list(
+    ) -> list[str]:
+        """Build the immutable command suite used for initial and repair validation."""
+
+        return list(
             dict.fromkeys(
                 [
                     *required_commands,
@@ -578,10 +577,17 @@ class Orchestrator:
                 ]
             )
         )
+
+    def _validate(
+        self,
+        workspace: RepositoryWorkspace,
+        commands: Sequence[str],
+    ) -> list[CommandResult]:
+        self._assert_operational()
         if not commands:
             raise PolicyError("No operator-owned validation commands are configured")
-        remaining = getattr(self.sandbox, "remaining_commands", self.config.sandbox.max_commands)
-        if len(commands) > remaining:
+        remaining = self.sandbox.remaining_commands
+        if not self._has_sandbox_capacity(len(commands)):
             raise PolicyError(
                 f"Complete validation suite requires {len(commands)} command(s), but only "
                 f"{remaining} sandbox command(s) remain; refusing to truncate validation"
@@ -890,6 +896,13 @@ class Orchestrator:
                 output_tokens=profile.max_output_tokens,
             )
         return maximum_cost <= cost_limit
+
+    def _has_sandbox_capacity(self, command_count: int) -> bool:
+        """Return whether the exact command count fits the remaining run budget."""
+
+        if command_count < 0:
+            raise ValueError("command_count cannot be negative")
+        return command_count <= self.sandbox.remaining_commands
 
     def _read_context(
         self,
