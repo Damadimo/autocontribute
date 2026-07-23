@@ -37,13 +37,7 @@ models:
   builder: *staging_model
   critic:
     <<: *staging_model
-    model: gpt-5.5-pro
     reasoning_mode: null
-    pricing:
-      input_usd_per_million_tokens: 30
-      cached_input_usd_per_million_tokens: 30
-      cache_write_usd_per_million_tokens: 30
-      output_usd_per_million_tokens: 180
 
 sandbox:
   backend: docker
