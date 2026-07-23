@@ -405,28 +405,29 @@ Actions cache as the durability boundary for autonomous publication.
 The hosted review workflow uses `AUTOCONTRIBUTE_STATE_LINEAGE` as an external fail-closed pointer to
 one exact cache generation. It advances that pointer only after a verified snapshot is saved and
 the evidence artifact uploads, and refuses both stale prefix fallback and unfinished generations.
-It accepts the exact current v7 key or exact, repository-bound v6, v5, v4, or v3 keys as one-way
+It accepts the exact current v8 key or exact, repository-bound v7, v6, v5, v4, or v3 keys as one-way
 migration sources, checks that each key and snapshot schema agree, and writes every new generation
-under a v7 key. Its
-explicit handoff is one-way: after state is downloaded for publication, continue on persistent
+under a v8 key. Its explicit handoff is one-way: after state is downloaded for publication, continue
+on persistent
 operator-managed storage rather than restarting the hosted schedule from an older cache.
 
-The current state/cache lineage is schema v7. Restore accepts an exact canonical v7, v6, v5, v4, v3,
-or v2 snapshot; older schemas migrate when the next command opens the store. Schema v3 introduced
+The current state/cache lineage is schema v8. Restore accepts an exact canonical v8, v7, v6, v5, v4,
+v3, or v2 snapshot; older schemas migrate when the next command opens the store. Schema v3 introduced
 durable publication reservations; v4 added atomic per-run event anchors, persistent lease
 generations, and crash-persistent evaluation-gate holds. Schema v5 adds durable manifest-artifact
 synchronization and cross-checks reservation/hold rows against their hash-chained ledger evidence.
 Schema v6 adds
 `publication_gate_holds.outcome_corpus_cursor`: every new automatic hold atomically binds both
 evaluation and outcome cursors, while migrated v2-v5 holds retain a null outcome cursor and cannot
-authorize automatic recovery. Schema v7 adds the durable issue-revision column, the
-`candidate_retry_authorizations` table, a case-insensitive candidate-revision lookup index, and a
-case-insensitive partial unique index for active candidates. Its migration validates every bounded
-run row against its manifest, transactionally backfills revisions for rows that selected a
-candidate, and rejects duplicate active attempts before installing the unique index; malformed or
-mismatched evidence rolls the migration back. The upgrade is an offline, one-way cutover: stop all
-older workers before opening restored state with v7, never restart them against the migrated
-lineage, and take a fresh v7 backup before continuing. Never resume
+authorize automatic recovery. Schema v7 adds the durable issue-revision column and the original
+`runs_candidate_revision_idx`. Its migration validates every bounded run row against its manifest and
+transactionally backfills revisions for rows that selected a candidate. Schema v8 adds the
+`candidate_retry_authorizations` table and case-insensitive partial unique
+`runs_active_candidate_idx`, and rebuilds `runs_candidate_revision_idx` with `NOCASE`. The validated
+v7-to-v8 migration rejects duplicate active attempts before installing the unique index; malformed
+or mismatched evidence rolls the migration back. The upgrade is an offline, one-way cutover: stop
+all older workers before opening restored state with v8, never restart them against the migrated
+lineage, and take a fresh v8 backup before continuing. Never resume
 automatic publication from a stale or partial restore, because missing reservation, gate-hold,
 outcome-cursor, issue-revision, retry-authorization, active-claim, artifact-sync, evaluation-anchor,
 or lease-generation history can invalidate safety decisions.

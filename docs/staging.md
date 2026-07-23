@@ -130,18 +130,19 @@ The matching `state restore --complete` verifies and promotes SQLite, run bundle
 one generation into an absent storage root. The hosted workflow continues to use SQLite-only mode
 because its immutable cache and evidence artifact already persist all three parts together.
 
-The staging cache writes unique `autocontribute-staging-state-v7-...` keys and restores only the key
-named by the external lineage variable. Exact repository- and runner-bound v6, v5, v4, or v3 keys
+The staging cache writes unique `autocontribute-staging-state-v8-...` keys and restores only the key
+named by the external lineage variable. Exact repository- and runner-bound v7, v6, v5, v4, or v3 keys
 already committed in that variable are one-way legacy inputs: the workflow checks that each snapshot
-matches its declared schema, migrates it, and saves the replacement under a v7 key. The v6-to-v7
-migration transactionally verifies historical candidate rows against their manifests and backfills
-durable issue revisions. It also creates the durable retry-authorization table, case-insensitive
-revision lookup, and case-insensitive unique-active-candidate index after rejecting any duplicate
-active claim; a mismatch or duplicate leaves the v6 source unchanged. The workflow never falls back
-to a stale prefix or accepts arbitrary legacy keys. Never use `bootstrap_state=true` or edit the
-variable to bypass a failed save, migration, or missing lineage. Although the shadow workflow never
-publishes, preserve the matching snapshot, run bundles, and evaluation records together for any
-later operator-reviewed fixture publication.
+matches its declared schema, migrates it, and saves the replacement under a v8 key. The v6-to-v7
+migration transactionally verifies historical candidate rows against their manifests, backfills
+durable issue revisions, and creates the original revision lookup index. The validated v7-to-v8
+migration creates the durable retry-authorization table, rebuilds that lookup with `NOCASE`, and adds
+the case-insensitive unique-active-candidate index after rejecting any duplicate active claim. A
+mismatch or duplicate leaves the source schema unchanged. The workflow never falls back to a stale
+prefix or accepts arbitrary legacy keys. Never use `bootstrap_state=true` or edit the variable to
+bypass a failed save, migration, or missing lineage. Although the shadow workflow never publishes,
+preserve the matching snapshot, run bundles, and evaluation records together for any later
+operator-reviewed fixture publication.
 
 If staging is left at an `in-progress` claim, set `AUTOCONTRIBUTE_STAGING_ENABLED=false` and use
 **Recover staging hosted state** from the default branch; never rewrite

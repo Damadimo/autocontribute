@@ -190,8 +190,8 @@ GitHub-hosted runners are ephemeral. Each job first resolves the external
 `committed:<exact-cache-key>` lineage without changing it. It restores only that exact cache
 key—never an older prefix match—installs the locked application, validates the hosted configuration,
 and promotes and verifies the snapshot in the runner's local storage. The lineage key declares v3,
-v4, v5, v6, or v7; the job verifies that the canonical snapshot has that exact schema, then opens it
-and completes any required migration to v7. A cache, setup, configuration, dependency, or
+v4, v5, v6, v7, or v8; the job verifies that the canonical snapshot has that exact schema, then opens
+it and completes any required migration to v8. A cache, setup, configuration, dependency, or
 local-restore failure therefore leaves the external committed generation unchanged and retryable.
 
 Immediately before lifecycle/model work—or the snapshot-only handoff—the job rereads the lineage,
@@ -257,19 +257,19 @@ grades.
 The cache is operational continuity, not an approval record or permanent backup. GitHub may evict
 caches. The live SQLite database and its WAL/SHM files, target-repository workspaces,
 `autocontribute.yml`, API keys, and GitHub credentials are never cached. Current jobs write exact
-`autocontribute-state-v7-...` keys selected by the external lineage variable. They accept an exact
-v7 key or exact repository- and runner-bound v6/v5/v4/v3 keys already committed in that variable. The
-older keys are one-way upgrade bridges: their snapshots must match the declared schema, are migrated
-before work, and are replaced by a newly saved v7 generation. There is no prefix fallback, arbitrary
-legacy-key acceptance, or externally pointed v2 cache path; do not rename a cache or rewrite the
-variable to force acceptance.
+`autocontribute-state-v8-...` keys selected by the external lineage variable. They accept an exact
+v8 key or exact repository- and runner-bound v7/v6/v5/v4/v3 keys already committed in that variable.
+The older keys are one-way upgrade bridges: their snapshots must match the declared schema, are
+migrated before work, and are replaced by a newly saved v8 generation. There is no prefix fallback,
+arbitrary legacy-key acceptance, or externally pointed v2 cache path; do not rename a cache or
+rewrite the variable to force acceptance.
 
-The current schema is v7. Restore accepts only an exact canonical v7, v6, v5, v4, v3, or v2 database,
-including the expected tables and indexes and the absence of extra views or triggers. A v4, v5, or
-newer snapshot's full event ledger is recomputed and compared with every run's count/head anchor, and
-its publication state is validated before promotion. A v2 or v3 snapshot receives its exact
+The current schema is v8. Restore accepts only an exact canonical v8, v7, v6, v5, v4, v3, or v2
+database, including the expected tables and indexes and the absence of extra views or triggers. A v4,
+v5, or newer snapshot's full event ledger is recomputed and compared with every run's count/head
+anchor, and its publication state is validated before promotion. A v2 or v3 snapshot receives its exact
 historical structural and evidence validation and is promoted unchanged; the next command that opens
-`RunStore` migrates it transactionally through v3, v4, v5, v6, and v7. The v2-to-v3 step backfills
+`RunStore` migrates it transactionally through v3, v4, v5, v6, v7, and v8. The v2-to-v3 step backfills
 durable publication reservations for `submitting` and `pr_open` runs at migration time,
 intentionally making the current UTC-day limit and repository cooldown conservative. The v3-to-v4
 step validates every legacy event chain, creates the atomic count/head anchors, seeds persistent
@@ -280,19 +280,20 @@ hash-chained events so incomplete state cannot reset capacity or silently remove
 hold. The v5-to-v6 step adds
 `publication_gate_holds.outcome_corpus_cursor`. Every new automatic hold atomically binds it with the
 evaluation cursor; migrated v2-v5 holds retain a null outcome cursor and cannot authorize automatic
-recovery. The v6-to-v7 step adds `runs.issue_revision`, the
-`candidate_retry_authorizations` table, a `NOCASE` candidate-revision lookup index, and a `NOCASE`
-partial unique index over active repository/issue claims. It validates the bounded run corpus against
-each saved manifest, backfills the revision for every historical candidate row, and rejects any
-pre-existing duplicate active candidate before creating the index. A malformed manifest,
-row/manifest identity mismatch, invalid issue evidence, or duplicate active claim aborts without
-leaving a partial v7 database. Current-schema validation also cross-checks each authorization against
-the new and prior run evidence and its unique override event, and rejects an orphan override event.
-Stop every older worker before this offline, one-way cutover and never restart one against the
-migrated lineage. Preserve a new v7 snapshot before the next ephemeral job.
+recovery. The v6-to-v7 step adds `runs.issue_revision` and the original
+`runs_candidate_revision_idx`. It validates the bounded run corpus against each saved manifest and
+backfills the revision for every historical candidate row; a malformed manifest, row/manifest
+identity mismatch, or invalid issue evidence leaves the v6 source unchanged. The validated v7-to-v8
+step creates `candidate_retry_authorizations`, rebuilds `runs_candidate_revision_idx` with `NOCASE`,
+and adds the `NOCASE` partial unique `runs_active_candidate_idx` over active repository/issue claims.
+It rejects any pre-existing duplicate active candidate before creating the unique index, and any
+failure rolls the complete migration back to v7. Current-schema validation also cross-checks each
+authorization against the new and prior run evidence and its unique override event, and rejects an
+orphan override event. Stop every older worker before this offline, one-way cutover and never restart
+one against the migrated lineage. Preserve a new v8 snapshot before the next ephemeral job.
 
 Store schema and lifecycle evidence format are separate lineages. Canonical unversioned lifecycle
-payloads can exist in any restorable store schema from v2 through v7. Restore preserves those rows
+payloads can exist in any restorable store schema from v2 through v8. Restore preserves those rows
 and their fingerprints as `legacy_partial` evidence; it does not invent the commit chain, timeline
 events, timeline count, or node identities that older observers never recorded. Such rows remain
 inspectable for historical safety evidence but are ineligible to establish a successful upstream
@@ -328,8 +329,8 @@ exact claim only after a fresh generation and immutable evidence have been verif
 2. Dispatch **Recover production hosted state** from the default branch with
    `recovery_action=promote_claimed`, the copied value as `expected_claim`,
    `legacy_claim_intent=reject`, and `restore_over_unusable_claimant=false`. This first probes the exact
-   destination cache named by the v2 claim envelope. This can be an exact pre-upgrade v3-v6 claimant
-   or the exact current v7 claimant. If GitHub has evicted that cache, it instead downloads the
+   destination cache named by the v2 claim envelope. This can be an exact pre-upgrade v3-v7 claimant
+   or the exact current v8 claimant. If GitHub has evicted that cache, it instead downloads the
    unexpired `autocontribute-<run-id>-<attempt>` evidence artifact from the exact claimant run. It
    validates the configuration, schema, SQLite state, run evidence, evaluations, and complete-bundle
    invariants before saving a fresh cache generation and 30-day recovery artifact.
@@ -395,14 +396,14 @@ on an operator-managed persistent worker so the resulting `submitting`/`pr_open`
 observations, reservations, and circuit breaker stay in one durable lineage.
 
 SQLite-only `state restore` accepts only a regular, non-symlink snapshot, copies it into the
-configured storage root, verifies SQLite integrity and an exact v7, v6, v5, v4, v3, or v2 schema,
+configured storage root, verifies SQLite integrity and an exact v8, v7, v6, v5, v4, v3, or v2 schema,
 and atomically promotes it. For v4 and newer schemas, it also validates the complete event ledger,
 durable run anchors, and publication state. It refuses to overwrite
 an existing live database or its WAL, SHM, or journal files. Remove nothing to force a restore: point
 a fresh storage root at the recovered snapshot or investigate the existing state first. After restoring
 v2 or v3, run `uv run autocontribute safety status`, `uv run autocontribute runs list`, or
 `uv run autocontribute doctor` to open and migrate the store. `state backup` also opens and migrates
-the store before snapshotting it. Take a new v7 backup before relying on the recovered lineage.
+the store before snapshotting it. Take a new v8 backup before relying on the recovered lineage.
 
 Use the same committed `autocontribute.yml` when reviewing. The approval hash binds the issue, base
 commit, patch, checks, and proposed PR text; publication reconstructs the target workspace from the
