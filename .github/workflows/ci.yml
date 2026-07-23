@@ -316,6 +316,7 @@ jobs:
             --property=ProtectSystem=strict \
             --property=RestrictSUIDSGID=yes \
             --property="ReadWritePaths=$state_parent" \
+            --property="ReadOnlyPaths=$backup_mount" \
             /usr/local/libexec/autocontribute-storage-capacity-check \
               "$state_mount" "$backup_mount" --state-writable
 

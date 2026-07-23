@@ -1540,6 +1540,7 @@ def test_ci_runs_real_version_controlled_systemd_validation() -> None:
     assert "Production storage" in storage_smoke["run"]
     assert '--property="ReadWritePaths=$state_parent $backup_mount"' in storage_smoke["run"]
     assert '--property="ReadWritePaths=$state_parent"' in storage_smoke["run"]
+    assert '--property="ReadOnlyPaths=$backup_mount"' in storage_smoke["run"]
     assert '"$state_mount" "$backup_mount" --state-writable' in storage_smoke["run"]
     assert '--property="ReadOnlyPaths=$state_mount $backup_mount"' in storage_smoke["run"]
     assert '"$state_mount" "$backup_mount" --read-only' in storage_smoke["run"]
