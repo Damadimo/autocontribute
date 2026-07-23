@@ -179,8 +179,8 @@ def _legacy_database(root: Path) -> RunManifest:
     return run
 
 
-def _downgrade_current_database_to_v6(database: Path) -> None:
-    """Remove only issue revisions, leaving the exact canonical v6 schema behind."""
+def _downgrade_current_database_to_v7(database: Path) -> None:
+    """Remove the v8 objects, leaving the exact canonical v7 schema behind."""
 
     connection = sqlite3.connect(database)
     try:
@@ -189,6 +189,26 @@ def _downgrade_current_database_to_v6(database: Path) -> None:
             """
             DROP TABLE candidate_retry_authorizations;
             DROP INDEX runs_active_candidate_idx;
+            DROP INDEX runs_candidate_revision_idx;
+            CREATE INDEX runs_candidate_revision_idx
+            ON runs(repository, issue_number, issue_revision, status);
+            UPDATE schema_metadata SET schema_version = 7 WHERE singleton = 1;
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _downgrade_current_database_to_v6(database: Path) -> None:
+    """Remove issue revisions from canonical v7, leaving canonical v6 behind."""
+
+    _downgrade_current_database_to_v7(database)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        connection.executescript(
+            """
             DROP INDEX runs_candidate_revision_idx;
             ALTER TABLE runs DROP COLUMN issue_revision;
             UPDATE schema_metadata SET schema_version = 6 WHERE singleton = 1;
@@ -887,7 +907,7 @@ def test_artifact_path_cannot_escape_run_directory(tmp_path: Path) -> None:
         store.write_artifact(run.run_id, "../secret", "no")
 
 
-def test_fresh_database_has_current_version_and_all_v7_tables(tmp_path: Path) -> None:
+def test_fresh_database_has_current_version_and_all_v8_tables(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
 
     with sqlite3.connect(store.database_path) as connection:
@@ -924,7 +944,7 @@ def test_fresh_database_has_current_version_and_all_v7_tables(tmp_path: Path) ->
             ).fetchall()
         ]
 
-    assert store.schema_version == CURRENT_SCHEMA_VERSION == 7
+    assert store.schema_version == CURRENT_SCHEMA_VERSION == 8
     assert "issue_revision" in run_columns
     assert [row[2] for row in revision_index] == [
         "repository",
@@ -977,11 +997,94 @@ def test_legacy_database_migrates_transactionally_without_losing_data(tmp_path: 
 
     store = RunStore(root)
 
-    assert store.schema_version == CURRENT_SCHEMA_VERSION == 7
+    assert store.schema_version == CURRENT_SCHEMA_VERSION == 8
     assert store.get(legacy.run_id) == legacy
     assert len(store.events(legacy.run_id)) == 1
     assert store.circuit_breaker_status().is_tripped is False
     store.verify_event_chains()
+
+
+def test_v7_migration_preserves_rows_and_installs_fenced_candidate_claim_schema(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = RunStore(root)
+    candidate_run = _candidate_run(store, status=RunStatus.SKIPPED)
+    ordinary_run = store.create_run()
+    with closing(sqlite3.connect(store.database_path)) as connection:
+        expected_runs = connection.execute(
+            """
+            SELECT run_id, status, repository, issue_number, issue_revision,
+                   created_at, updated_at, manifest_json, event_count, event_head_hash
+            FROM runs ORDER BY run_id
+            """
+        ).fetchall()
+        expected_events = connection.execute(
+            """
+            SELECT id, run_id, occurred_at, event_type, details_json,
+                   previous_hash, event_hash
+            FROM events ORDER BY id
+            """
+        ).fetchall()
+    _downgrade_current_database_to_v7(store.database_path)
+
+    with closing(sqlite3.connect(store.database_path)) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+        ).fetchone() == (7,)
+        assert connection.execute(
+            """
+            SELECT count(*) FROM sqlite_master
+            WHERE name IN ('candidate_retry_authorizations', 'runs_active_candidate_idx')
+            """
+        ).fetchone() == (0,)
+        assert [
+            row[4]
+            for row in connection.execute(
+                "PRAGMA index_xinfo(runs_candidate_revision_idx)"
+            ).fetchall()
+            if row[5]
+        ] == ["BINARY", "BINARY", "BINARY", "BINARY"]
+
+    migrated = RunStore(root)
+
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
+    assert migrated.get(candidate_run.run_id) == candidate_run
+    assert migrated.get(ordinary_run.run_id) == ordinary_run
+    with sqlite3.connect(migrated.database_path) as connection:
+        assert (
+            connection.execute(
+                """
+            SELECT run_id, status, repository, issue_number, issue_revision,
+                   created_at, updated_at, manifest_json, event_count, event_head_hash
+            FROM runs ORDER BY run_id
+            """
+            ).fetchall()
+            == expected_runs
+        )
+        assert (
+            connection.execute(
+                """
+            SELECT id, run_id, occurred_at, event_type, details_json,
+                   previous_hash, event_hash
+            FROM events ORDER BY id
+            """
+            ).fetchall()
+            == expected_events
+        )
+        assert [
+            row[4]
+            for row in connection.execute(
+                "PRAGMA index_xinfo(runs_candidate_revision_idx)"
+            ).fetchall()
+            if row[5]
+        ] == ["NOCASE", "BINARY", "BINARY", "BINARY"]
+        indexes = {row[1]: row for row in connection.execute("PRAGMA index_list(runs)").fetchall()}
+        assert indexes["runs_active_candidate_idx"][2] == 1
+        assert indexes["runs_active_candidate_idx"][4] == 1
+        assert connection.execute(
+            "SELECT count(*) FROM candidate_retry_authorizations"
+        ).fetchone() == (0,)
 
 
 def test_v6_migration_backfills_issue_revision_and_accepts_publication_only_identity(
@@ -1003,7 +1106,7 @@ def test_v6_migration_backfills_issue_revision_and_accepts_publication_only_iden
 
     migrated = RunStore(root)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 7
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
     with sqlite3.connect(migrated.database_path) as connection:
         candidate_row = connection.execute(
             "SELECT issue_revision FROM runs WHERE run_id = ?",
@@ -1083,7 +1186,7 @@ def test_v6_migration_rejects_candidate_row_identity_tampering(
         }
 
 
-def test_v6_migration_rejects_duplicate_active_candidate_attempts_transactionally(
+def test_v7_migration_rejects_duplicate_active_candidate_attempts_transactionally(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "state"
@@ -1099,17 +1202,20 @@ def test_v6_migration_rejects_duplicate_active_candidate_attempts_transactionall
         status=RunStatus.QUEUED,
     )
     assert first.candidate is not None
-    _downgrade_current_database_to_v6(store.database_path)
+    first_revision = compute_issue_revision(first.candidate)
+    _downgrade_current_database_to_v7(store.database_path)
     second.candidate = first.candidate.model_copy(deep=True)
     with closing(sqlite3.connect(store.database_path)) as connection:
         connection.execute(
             """
-            UPDATE runs SET repository = ?, issue_number = ?, manifest_json = ?
+            UPDATE runs
+            SET repository = ?, issue_number = ?, issue_revision = ?, manifest_json = ?
             WHERE run_id = ?
             """,
             (
                 second.candidate.repository,
                 second.candidate.number,
+                first_revision,
                 second.model_dump_json(),
                 second.run_id,
             ),
@@ -1122,20 +1228,22 @@ def test_v6_migration_rejects_duplicate_active_candidate_attempts_transactionall
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute(
             "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-        ).fetchone() == (6,)
-        assert "issue_revision" not in {
-            row[1] for row in connection.execute("PRAGMA table_info(runs)")
-        }
+        ).fetchone() == (7,)
+        assert "issue_revision" in {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
         assert connection.execute(
             """
             SELECT count(*) FROM sqlite_master
-            WHERE name IN (
-                'candidate_retry_authorizations',
-                'runs_candidate_revision_idx',
-                'runs_active_candidate_idx'
-            )
+            WHERE name IN ('candidate_retry_authorizations', 'runs_active_candidate_idx')
             """
         ).fetchone() == (0,)
+        assert [
+            row[4]
+            for row in connection.execute(
+                "PRAGMA index_xinfo(runs_candidate_revision_idx)"
+            ).fetchall()
+            if row[5]
+        ] == ["BINARY", "BINARY", "BINARY", "BINARY"]
+        assert RunStore._schema_manifest(connection) == RunStore._expected_schema_manifest(7)
 
 
 def test_candidate_history_lookup_uses_nocase_revision_index(tmp_path: Path) -> None:
@@ -1505,7 +1613,7 @@ def test_v3_migration_backfills_event_heads_and_active_lease_generation(tmp_path
 
     migrated = RunStore(root)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 7
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
     migrated.verify_event_chains()
     with sqlite3.connect(migrated.database_path) as connection:
         anchor = connection.execute(
@@ -1661,7 +1769,7 @@ def test_v5_migration_fences_a_pre_outcome_hold_from_automatic_recovery(
 
     migrated = RunStore(root)
 
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 7
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
     with sqlite3.connect(migrated.database_path) as connection:
         assert connection.execute(
             """
@@ -2022,7 +2130,7 @@ def test_restore_snapshot_accepts_exact_v2_then_initialization_migrates_it(
     with sqlite3.connect(restored) as connection:
         assert connection.execute("SELECT schema_version FROM schema_metadata").fetchone() == (2,)
     migrated = RunStore(restored_root)
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 7
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
     assert migrated.get(run.run_id).run_id == run.run_id
 
 
@@ -2311,6 +2419,78 @@ def test_candidate_claim_rejects_wrong_and_stale_lease_generations(tmp_path: Pat
 
     assert disposition.state is CandidateAttemptState.AVAILABLE
     assert store.get(run.run_id).candidate == run.candidate
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("repository", " example/project"),
+        ("repository", "example /project"),
+        ("number", 0),
+        ("number", -1),
+    ),
+)
+def test_candidate_claim_rejects_noncanonical_identity_without_mutation(
+    tmp_path: Path,
+    field: str,
+    value: str | int,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    _set_status(store, run, RunStatus.DISCOVERING)
+    original_updated_at = run.updated_at
+    original_events = store.events(run.run_id)
+    artifact_path = store.artifact_dir(run.run_id) / "manifest.json"
+    original_artifact = artifact_path.read_bytes()
+    with sqlite3.connect(store.database_path) as connection:
+        original_row = connection.execute(
+            """
+            SELECT status, repository, issue_number, issue_revision, updated_at,
+                   manifest_json, event_count, event_head_hash
+            FROM runs WHERE run_id = ?
+            """,
+            (run.run_id,),
+        ).fetchone()
+    run.candidate = _issue_candidate().model_copy(update={field: value})
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        f"invalid-identity-{run.run_id}",
+        ttl=timedelta(minutes=5),
+    )
+    assert lease is not None
+
+    try:
+        with pytest.raises(StateError, match="canonical issue identity"):
+            store.claim_candidate(run, lease=lease)
+    finally:
+        assert store.release_lease(lease.name, lease.owner, lease.generation)
+
+    assert run.updated_at == original_updated_at
+    assert artifact_path.read_bytes() == original_artifact
+    assert store.events(run.run_id) == original_events
+    persisted = store.get(run.run_id)
+    assert persisted.status is RunStatus.DISCOVERING
+    assert persisted.candidate is None
+    with sqlite3.connect(store.database_path) as connection:
+        assert (
+            connection.execute(
+                """
+            SELECT status, repository, issue_number, issue_revision, updated_at,
+                   manifest_json, event_count, event_head_hash
+            FROM runs WHERE run_id = ?
+            """,
+                (run.run_id,),
+            ).fetchone()
+            == original_row
+        )
+        assert connection.execute(
+            "SELECT count(*) FROM candidate_retry_authorizations WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT count(*) FROM manifest_artifact_sync WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone() == (0,)
 
 
 def test_unchanged_suppressed_candidate_claim_requires_atomic_retry_authorization(
@@ -4259,7 +4439,7 @@ def test_lifecycle_snapshots_are_immutable_and_deduplicated(tmp_path: Path) -> N
     assert store.events(run.run_id)[-1]["event_type"] == "lifecycle.snapshot.recorded"
 
 
-@pytest.mark.parametrize("schema_version", (2, 3, 4, 5, 6, 7))
+@pytest.mark.parametrize("schema_version", (2, 3, 4, 5, 6, 7, 8))
 @pytest.mark.parametrize("include_pull_request_node_id", (False, True))
 def test_pre_history_lifecycle_snapshot_restores_from_every_supported_schema(
     tmp_path: Path,
@@ -4284,6 +4464,8 @@ def test_pre_history_lifecycle_snapshot_restores_from_every_supported_schema(
         _downgrade_current_database_to_v5(snapshot)
     elif schema_version == 6:
         _downgrade_current_database_to_v6(snapshot)
+    elif schema_version == 7:
+        _downgrade_current_database_to_v7(snapshot)
 
     restored_root = tmp_path / f"restored-v{schema_version}"
     restored = RunStore.restore_snapshot(restored_root, snapshot)
@@ -4823,6 +5005,78 @@ def test_pr_open_manifest_write_failure_keeps_committed_state_and_repairs_on_reo
     assert RunManifest.model_validate_json(artifact_path.read_bytes()) == repaired.get(run.run_id)
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM manifest_artifact_sync").fetchone() == (0,)
+
+
+def test_candidate_claim_manifest_write_failure_repairs_committed_outbox_on_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    store = RunStore(root)
+    run = store.create_run()
+    _set_status(store, run, RunStatus.DISCOVERING)
+    artifact_path = store.artifact_dir(run.run_id) / "manifest.json"
+    stale_artifact = artifact_path.read_bytes()
+    candidate = _issue_candidate()
+    revision = compute_issue_revision(candidate)
+    run.candidate = candidate
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        "claim-artifact-failure-worker",
+        ttl=timedelta(minutes=5),
+    )
+    assert lease is not None
+
+    def fail_manifest_write(_manifest: RunManifest) -> None:
+        raise OSError("injected candidate manifest write failure")
+
+    monkeypatch.setattr(store, "_write_manifest", fail_manifest_write)
+    try:
+        with pytest.raises(StateError, match="Could not synchronize manifest artifact"):
+            store.claim_candidate(run, lease=lease)
+    finally:
+        assert store.release_lease(lease.name, lease.owner, lease.generation)
+
+    assert RunManifest.model_validate_json(stale_artifact).candidate is None
+    assert artifact_path.read_bytes() == stale_artifact
+    committed = store.get(run.run_id)
+    assert committed.candidate == candidate
+    assert committed.updated_at == run.updated_at
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            """
+            SELECT repository, issue_number, issue_revision FROM runs
+            WHERE run_id = ?
+            """,
+            (run.run_id,),
+        ).fetchone() == (candidate.repository, candidate.number, revision)
+        assert connection.execute(
+            """
+            SELECT count(*) FROM events
+            WHERE run_id = ? AND event_type = 'candidate.selected'
+            """,
+            (run.run_id,),
+        ).fetchone() == (1,)
+        assert connection.execute(
+            "SELECT count(*) FROM manifest_artifact_sync WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone() == (1,)
+
+    repaired = RunStore(root)
+
+    repaired_manifest = repaired.get(run.run_id)
+    assert repaired_manifest == committed
+    assert RunManifest.model_validate_json(artifact_path.read_bytes()) == repaired_manifest
+    assert [
+        event["event_type"]
+        for event in repaired.events(run.run_id)
+        if event["event_type"] == "candidate.selected"
+    ] == ["candidate.selected"]
+    with sqlite3.connect(repaired.database_path) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM manifest_artifact_sync WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone() == (0,)
 
 
 def test_compensation_manifest_write_failure_repairs_without_reacquiring_the_hold(
