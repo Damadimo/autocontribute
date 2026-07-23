@@ -35,12 +35,12 @@ jobs:
       - name: Preload immutable CCCL sandbox
         env:
           SANDBOX_IMAGE: >-
-            rapidsai/devcontainers@sha256:dea01ef9fe0f500a50aa4eb3645979d73661de4e6d813ea0c82bc1171234fb9e
+            rapidsai/devcontainers@sha256:bf29a9a555e214c27deb0b8a952837de225d7fde94071fc61ec3a343e13ce641
         run: docker pull "$SANDBOX_IMAGE"
       - name: Run baseline debugger checks inside the production sandbox boundary
         env:
           SANDBOX_IMAGE: >-
-            rapidsai/devcontainers@sha256:dea01ef9fe0f500a50aa4eb3645979d73661de4e6d813ea0c82bc1171234fb9e
+            rapidsai/devcontainers@sha256:bf29a9a555e214c27deb0b8a952837de225d7fde94071fc61ec3a343e13ce641
         run: |
           timeout --signal=TERM --kill-after=5s 600s docker run --rm \
             --pull=never \
@@ -68,9 +68,9 @@ jobs:
             HOME=/tmp \
             TMPDIR=/tmp \
             PATH=/usr/local/cuda/bin:/usr/local/python/current/bin:/usr/local/py-utils/bin:/usr/local/jupyter:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-            CC=gcc \
-            CXX=g++ \
-            CUDAHOSTCXX=g++ \
+            CC=clang \
+            CXX=clang++ \
+            CUDAHOSTCXX=clang++ \
             CCCL_BUILD_INFIX=autocontribute \
             LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
             CI=1 \

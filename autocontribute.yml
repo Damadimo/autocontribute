@@ -41,7 +41,7 @@ models:
 sandbox:
   backend: docker
   image: >-
-    rapidsai/devcontainers@sha256:dea01ef9fe0f500a50aa4eb3645979d73661de4e6d813ea0c82bc1171234fb9e
+    rapidsai/devcontainers@sha256:bf29a9a555e214c27deb0b8a952837de225d7fde94071fc61ec3a343e13ce641
   network: none
   command_timeout_seconds: 600
   memory: 8g
@@ -54,7 +54,7 @@ validation:
     NVIDIA/cccl:
       - >-
         export PATH=/usr/local/cuda/bin:/usr/local/python/current/bin:/usr/local/py-utils/bin:/usr/local/jupyter:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin;
-        export CC=gcc CXX=g++ CUDAHOSTCXX=g++ CCCL_BUILD_INFIX=autocontribute
+        export CC=clang CXX=clang++ CUDAHOSTCXX=clang++ CCCL_BUILD_INFIX=autocontribute
         LD_LIBRARY_PATH=/usr/local/cuda/lib64;
         git diff --check &&
         python -m compileall -q libcudacxx/share/libcudacxx libcudacxx/test/debugging &&
