@@ -8,7 +8,7 @@ import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import timedelta
 from decimal import ROUND_FLOOR, Decimal
 from typing import Literal, TypeVar, cast
@@ -63,11 +63,22 @@ from autocontribute.prompts import (
     planning_prompt,
     repair_prompt,
     review_prompt,
+    validation_repair_prompt,
 )
 from autocontribute.providers import ModelProvider, ModelResult, create_provider
 from autocontribute.publication import has_visible_disclosure, validate_publication_text
-from autocontribute.quality import QualityEvaluator, secret_findings
-from autocontribute.redaction import redact_model_input, redact_text, truncate_artifact
+from autocontribute.quality import (
+    QualityEvaluator,
+    actionable_validation_failure_reason,
+    infrastructure_failure_reason,
+    secret_findings,
+)
+from autocontribute.redaction import (
+    MAX_ARTIFACT_CHARACTERS,
+    redact_model_input,
+    redact_text,
+    truncate_artifact,
+)
 from autocontribute.reporting import render_run_report
 from autocontribute.repository import ContextEntry, RepositoryWorkspace, TextMatch
 from autocontribute.sandbox import SandboxRunner
@@ -82,6 +93,29 @@ _RUN_HEARTBEAT_INTERVAL = timedelta(minutes=1)
 _STALE_RUN_AGE = timedelta(hours=2)
 _MAX_GUIDANCE_FILES = 30
 _MAX_GUIDANCE_CHARACTERS = 80_000
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidationOutcome:
+    """Scrubbed evidence plus a classification computed from bounded raw output."""
+
+    results: tuple[CommandResult, ...]
+    failed_commands: int
+    actionable_failure_reasons: tuple[str, ...]
+
+    @property
+    def actionable_failure(self) -> bool:
+        return self.failed_commands > 0 and self.failed_commands == len(
+            self.actionable_failure_reasons
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _ScrubbedCommand:
+    """A persisted/model-visible command result and its structural truncation provenance."""
+
+    result: CommandResult
+    was_truncated: bool
 
 
 class Orchestrator:
@@ -481,7 +515,8 @@ class Orchestrator:
             required_commands=required_validation_commands,
         )
         initial_proposal_validation_commands = list(proposal.validation_commands)
-        commands[:] = self._validate(workspace, validation_suite)
+        initial_validation = self._validate(workspace, validation_suite)
+        commands[:] = initial_validation.results
         manifest.patched_validation = list(commands)
         self._assert_operational()
         self.store.save(
@@ -493,6 +528,71 @@ class Orchestrator:
             },
         )
 
+        validation_repair_request: str | None = None
+        if (
+            initial_validation.actionable_failure
+            and self._has_model_capacity(manifest, ("builder", "critic"))
+            and self._has_sandbox_capacity(len(validation_suite))
+        ):
+            self._assert_operational()
+            current_files = self._read_context(
+                workspace,
+                list(dict.fromkeys([*plan.files_to_read, *workspace.changed_paths()])),
+            )
+            candidate_request = validation_repair_prompt(
+                issue,
+                plan,
+                guidance=guidance,
+                files=current_files,
+                current_diff=workspace.diff(),
+                command_results=commands,
+            )
+            if self._fits_model_input(
+                role="builder",
+                instructions=BUILDER_INSTRUCTIONS,
+                prompt=candidate_request,
+                output_type=PatchProposal,
+            ):
+                validation_repair_request = candidate_request
+
+        repair_used = validation_repair_request is not None
+        if validation_repair_request is not None:
+            self._assert_operational()
+            self.store.transition(
+                manifest,
+                RunStatus.IMPLEMENTING,
+                reason="one bounded repair pass for actionable validation failure",
+            )
+            proposal = self._apply_repair(
+                manifest,
+                workspace,
+                prompt=validation_repair_request,
+                eligibility=eligibility,
+                repository=repository.full_name,
+                guidance=guidance,
+                repository_guidance=scoped_repository_guidance,
+                context_paths=context_paths,
+                initial_validation_commands=initial_proposal_validation_commands,
+            )
+            self._assert_operational()
+            self.store.transition(
+                manifest,
+                RunStatus.VALIDATING,
+                reason="revalidating patch after validation-driven repair",
+            )
+            repaired_validation = self._validate(workspace, validation_suite)
+            commands[:] = repaired_validation.results
+            manifest.patched_validation = list(commands)
+            self._assert_operational()
+            self.store.save(
+                manifest,
+                event="validation.repair.completed",
+                details={
+                    "passed": str(all(result.passed for result in commands)),
+                    "commands": str(len(commands)),
+                },
+            )
+
         self._assert_operational()
         self.store.transition(manifest, RunStatus.CRITIQUING, reason="fresh-context review")
         review = self._review(
@@ -503,60 +603,62 @@ class Orchestrator:
             commands,
         )
 
+        critic_repair_request: str | None = None
         if (
-            review.verdict == "reject"
+            not repair_used
+            and review.verdict == "reject"
             and review.blocking_findings
             and all(result.passed for result in commands)
             and self._has_model_capacity(manifest, ("builder", "critic"))
             and self._has_sandbox_capacity(len(validation_suite))
         ):
             self._assert_operational()
+            current_files = self._read_context(
+                workspace,
+                list(dict.fromkeys([*plan.files_to_read, *workspace.changed_paths()])),
+            )
+            candidate_request = repair_prompt(
+                issue,
+                plan,
+                guidance=guidance,
+                files=current_files,
+                current_diff=workspace.diff(),
+                blocking_findings=review.blocking_findings,
+            )
+            if self._fits_model_input(
+                role="builder",
+                instructions=BUILDER_INSTRUCTIONS,
+                prompt=candidate_request,
+                output_type=PatchProposal,
+            ):
+                critic_repair_request = candidate_request
+
+        if critic_repair_request is not None:
+            self._assert_operational()
             self.store.transition(
                 manifest,
                 RunStatus.IMPLEMENTING,
                 reason="one bounded repair pass for critic blockers",
             )
-            current_files = self._read_context(
-                workspace,
-                list(dict.fromkeys([*plan.files_to_read, *workspace.changed_paths()])),
-            )
-            repair_result = self._call_model(
+            proposal = self._apply_repair(
                 manifest,
-                role="builder",
-                instructions=BUILDER_INSTRUCTIONS,
-                prompt=repair_prompt(
-                    issue,
-                    plan,
-                    guidance=guidance,
-                    files=current_files,
-                    current_diff=workspace.diff(),
-                    blocking_findings=review.blocking_findings,
-                ),
-                output_type=PatchProposal,
-            )
-            proposal = self._with_legal_commit_message(
-                self._with_disclosure(repair_result.output),
+                workspace,
+                prompt=critic_repair_request,
                 eligibility=eligibility,
                 repository=repository.full_name,
-            ).model_copy(update={"validation_commands": initial_proposal_validation_commands})
-            manifest.proposal = proposal
-            self._assert_guidance_accounted_for_paths(
-                workspace,
-                scoped_repository_guidance,
-                [*context_paths, *(edit.path for edit in proposal.edits)],
+                guidance=guidance,
+                repository_guidance=scoped_repository_guidance,
+                context_paths=context_paths,
+                initial_validation_commands=initial_proposal_validation_commands,
             )
-            validate_publication_text(manifest)
-            validate_pull_request_template(proposal.pull_request_body, guidance)
-            self._assert_operational()
-            workspace.apply_edits(proposal.edits)
-            self._stop_for_secret_findings(manifest, workspace, workspace.diff())
             self._assert_operational()
             self.store.transition(
                 manifest,
                 RunStatus.VALIDATING,
                 reason="revalidating repaired patch",
             )
-            commands[:] = self._validate(workspace, validation_suite)
+            repaired_validation = self._validate(workspace, validation_suite)
+            commands[:] = repaired_validation.results
             manifest.patched_validation = list(commands)
             self._assert_operational()
             self.store.transition(
@@ -674,6 +776,46 @@ class Orchestrator:
         )
         return result.output
 
+    def _apply_repair(
+        self,
+        manifest: RunManifest,
+        workspace: RepositoryWorkspace,
+        *,
+        prompt: str,
+        eligibility: EligibilityResult,
+        repository: str,
+        guidance: Mapping[str, str],
+        repository_guidance: Mapping[str, str],
+        context_paths: Sequence[str],
+        initial_validation_commands: Sequence[str],
+    ) -> PatchProposal:
+        """Apply one incremental builder repair through the same deterministic safety gates."""
+
+        repair_result = self._call_model(
+            manifest,
+            role="builder",
+            instructions=BUILDER_INSTRUCTIONS,
+            prompt=prompt,
+            output_type=PatchProposal,
+        )
+        proposal = self._with_legal_commit_message(
+            self._with_disclosure(repair_result.output),
+            eligibility=eligibility,
+            repository=repository,
+        ).model_copy(update={"validation_commands": list(initial_validation_commands)})
+        manifest.proposal = proposal
+        self._assert_guidance_accounted_for_paths(
+            workspace,
+            repository_guidance,
+            [*context_paths, *(edit.path for edit in proposal.edits)],
+        )
+        validate_publication_text(manifest)
+        validate_pull_request_template(proposal.pull_request_body, guidance)
+        self._assert_operational()
+        workspace.apply_edits(proposal.edits)
+        self._stop_for_secret_findings(manifest, workspace, workspace.diff())
+        return proposal
+
     @staticmethod
     def _load_repository_guidance(
         workspace: RepositoryWorkspace,
@@ -752,7 +894,7 @@ class Orchestrator:
         self,
         workspace: RepositoryWorkspace,
         commands: Sequence[str],
-    ) -> list[CommandResult]:
+    ) -> _ValidationOutcome:
         self._assert_operational()
         if not commands:
             raise PolicyError("No operator-owned validation commands are configured")
@@ -763,26 +905,45 @@ class Orchestrator:
                 f"{remaining} sandbox command(s) remain; refusing to truncate validation"
             )
         results = self.sandbox.run_all_isolated(workspace, commands, stop_on_failure=True)
+        scrubbed_commands = tuple(self._scrub_command(result) for result in results)
+        scrubbed_results = tuple(command.result for command in scrubbed_commands)
+        failed_commands = sum(not result.passed for result in results)
+        actionable_reasons = tuple(
+            raw_reason
+            for raw_result, scrubbed_command in zip(results, scrubbed_commands, strict=True)
+            if not raw_result.passed
+            if infrastructure_failure_reason(raw_result) is None
+            if not scrubbed_command.was_truncated
+            if (raw_reason := actionable_validation_failure_reason(raw_result)) is not None
+            if actionable_validation_failure_reason(scrubbed_command.result) == raw_reason
+        )
         self._assert_operational()
-        return [self._scrub_command(result) for result in results]
+        return _ValidationOutcome(
+            results=scrubbed_results,
+            failed_commands=failed_commands,
+            actionable_failure_reasons=actionable_reasons,
+        )
 
     def _run_command_isolated(self, workspace: RepositoryWorkspace, command: str) -> CommandResult:
         self._assert_operational()
-        result = self._scrub_command(self.sandbox.run_isolated(workspace, command))
+        result = self._scrub_command(self.sandbox.run_isolated(workspace, command)).result
         self._assert_operational()
         return result
 
-    def _scrub_command(self, result: CommandResult) -> CommandResult:
+    def _scrub_command(self, result: CommandResult) -> _ScrubbedCommand:
         secret_names = self._secret_env_names()
-        return result.model_copy(
-            update={
-                "stdout": truncate_artifact(
-                    redact_text(result.stdout, secret_env_names=secret_names)
-                ),
-                "stderr": truncate_artifact(
-                    redact_text(result.stderr, secret_env_names=secret_names)
-                ),
-            }
+        stdout = redact_model_input(result.stdout, secret_env_names=secret_names)
+        stderr = redact_model_input(result.stderr, secret_env_names=secret_names)
+        return _ScrubbedCommand(
+            result=result.model_copy(
+                update={
+                    "stdout": truncate_artifact(stdout),
+                    "stderr": truncate_artifact(stderr),
+                }
+            ),
+            was_truncated=(
+                len(stdout) > MAX_ARTIFACT_CHARACTERS or len(stderr) > MAX_ARTIFACT_CHARACTERS
+            ),
         )
 
     def _call_model(
@@ -1066,6 +1227,27 @@ class Orchestrator:
                 output_tokens=profile.max_output_tokens,
             )
         return maximum_cost <= cost_limit
+
+    def _fits_model_input(
+        self,
+        *,
+        role: Literal["scout", "builder", "critic"],
+        instructions: str,
+        prompt: str,
+        output_type: type[BaseModel],
+    ) -> bool:
+        """Return whether an optional request fits its model profile before state transition."""
+
+        try:
+            self._input_token_reservation(
+                self.config.model_for(role),
+                instructions=instructions,
+                prompt=prompt,
+                output_type=output_type,
+            )
+        except PolicyError:
+            return False
+        return True
 
     def _has_sandbox_capacity(self, command_count: int) -> bool:
         """Return whether the exact command count fits the remaining run budget."""

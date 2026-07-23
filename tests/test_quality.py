@@ -4,7 +4,11 @@ import pytest
 
 from autocontribute.config import AutocontributeConfig
 from autocontribute.domain import CommandResult, CriticReview, ReviewScores
-from autocontribute.quality import evaluate_quality
+from autocontribute.quality import (
+    actionable_validation_failure_reason,
+    evaluate_quality,
+    infrastructure_failure_reason,
+)
 
 
 def _review(
@@ -307,16 +311,112 @@ def test_required_validation_fails_when_a_required_command_failed() -> None:
     ("update", "reason"),
     [
         ({"exit_code": 124, "timed_out": True}, "timed out"),
+        ({"exit_code": -9}, "host signal"),
+        ({"exit_code": 125}, "could not be started"),
         ({"exit_code": 126}, "exit code 126"),
         ({"exit_code": 127}, "exit code 127"),
+        ({"exit_code": 130}, "external or resource-limit termination"),
+        ({"exit_code": 137}, "external or resource-limit termination"),
+        ({"exit_code": 143}, "external or resource-limit termination"),
         ({"stderr": "sh: tool: command not found"}, "not installed"),
         ({"stderr": "No such file or directory"}, "file or executable was missing"),
         ({"stdout": "no tests collected"}, "discovered no tests"),
+        ({"stdout": "No tests were executed!"}, "discovered no tests"),
         ({"stderr": "ModuleNotFoundError: No module named 'suite'"}, "module was unavailable"),
+        ({"stderr": "ImportError: No module named dependency"}, "module was unavailable"),
+        ({"stderr": "Error: Cannot find module 'dependency'"}, "module was unavailable"),
+        (
+            {"stderr": "Sources/App.swift:1:8: error: no such module 'Dependency'"},
+            "module was unavailable",
+        ),
+        (
+            {"stderr": "src/Main.hs:3:1: error: Could not find module 'Dependency'"},
+            "module was unavailable",
+        ),
+        (
+            {"stderr": "src/main.m:1:9: fatal error: module 'MissingSDK' not found"},
+            "module was unavailable",
+        ),
+        (
+            {"stderr": "src/main.swift:1:1: error: missing required module 'SwiftShims'"},
+            "module was unavailable",
+        ),
+        (
+            {"stderr": "src/Main.hs:3:1: error: Could not load module 'Missing.Package'"},
+            "module was unavailable",
+        ),
         ({"stderr": "npm ERR! Missing script: test"}, "script was missing"),
+        ({"stderr": 'error Command "test" not found.'}, "script was missing"),
+        (
+            {"stderr": "INTERNALERROR> AssertionError: plugin state was not initialized"},
+            "runner failed internally",
+        ),
+        (
+            {
+                "stderr": (
+                    '  File "/usr/local/lib/python3.9/site-packages/tool/core.py", line 7\n'
+                    "    match value:\n"
+                    "          ^\n"
+                    "SyntaxError: invalid syntax"
+                )
+            },
+            "package was incompatible",
+        ),
+        (
+            {"stderr": "error[E0463]: can't find crate for `std`\ntarget may not be installed"},
+            "dependency or type environment",
+        ),
+        (
+            {"stderr": "error[E0463]: can't find crate for `serde`"},
+            "dependency or type environment",
+        ),
+        (
+            {"stderr": "error TS2688: Cannot find type definition file for 'node'."},
+            "dependency or type environment",
+        ),
+        (
+            {"stderr": "Example.java:3: error: package dep does not exist"},
+            "dependency or type environment",
+        ),
+        (
+            {
+                "stderr": (
+                    "Program.cs(3,2): error CS0246: The type or namespace name 'Dep' "
+                    "could not be found"
+                )
+            },
+            "dependency or type environment",
+        ),
+        (
+            {"stderr": "[ERROR] COMPILATION ERROR: invalid target release: 21"},
+            "toolchain was unavailable",
+        ),
+        ({"stderr": "OSError: [Errno 28] No space left on device"}, "storage was unavailable"),
+        ({"stderr": "java.lang.OutOfMemoryError: Java heap space"}, "memory was exhausted"),
         ({"stderr": "Permission denied"}, "lacked permission"),
         ({"stderr": "curl: Could not resolve host: example.test"}, "name resolution failed"),
+        (
+            {"stderr": "npm ERR! getaddrinfo ENOTFOUND registry.npmjs.org"},
+            "name resolution failed",
+        ),
+        (
+            {"stderr": "java.net.UnknownHostException: repo.maven.apache.org"},
+            "name resolution failed",
+        ),
         ({"stderr": "OSError: Network is unreachable"}, "network was unavailable"),
+        ({"stderr": "curl: Could not connect to server"}, "network was unavailable"),
+        (
+            {"stderr": "FAILED test_remote.py - ProxyError: Cannot connect to proxy"},
+            "network was unavailable",
+        ),
+        (
+            {"stderr": "Cannot connect to the Docker daemon. Is the docker daemon running?"},
+            "Docker validation service",
+        ),
+        (
+            {"stderr": "[output truncated by autocontribute]"},
+            "output was truncated",
+        ),
     ],
 )
 def test_infrastructure_failures_are_not_regression_evidence(
@@ -324,6 +424,9 @@ def test_infrastructure_failures_are_not_regression_evidence(
 ) -> None:
     patched = _passing_command()
     baseline = patched.model_copy(update={"exit_code": 1, "stdout": "", "stderr": "", **update})
+
+    assert infrastructure_failure_reason(baseline) is not None
+    assert actionable_validation_failure_reason(baseline) is None
 
     report = evaluate_quality(
         diff=CLEAN_DIFF,
@@ -339,6 +442,75 @@ def test_infrastructure_failures_are_not_regression_evidence(
     evidence = _gate_evidence(report, "regression_evidence")
     assert "baseline failure rejected" in evidence
     assert reason in evidence
+
+
+def test_assertion_failure_is_actionable_validation_evidence() -> None:
+    result = _passing_command().model_copy(
+        update={"exit_code": 1, "stdout": "", "stderr": "AssertionError: expected 2"}
+    )
+
+    assert infrastructure_failure_reason(result) is None
+    assert actionable_validation_failure_reason(result) == "an assertion failed"
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "FAILED tests/test_value.py::test_value - assert 1 == 2",
+        "src/value.py:12:8: error: incompatible types in assignment",
+        "src/value.ts(12,8): error TS2322: Type 'str' is not assignable",
+        "error[E0308]: mismatched types\n --> src/lib.rs:12:8",
+        "[ERROR] src/main/java/Example.java:[12,8] incompatible types: String cannot be int",
+        "src/value.py:12:8: E501 line too long",
+    ],
+)
+def test_explicit_test_compile_and_lint_failures_are_actionable(stderr: str) -> None:
+    result = _passing_command().model_copy(update={"exit_code": 1, "stdout": "", "stderr": stderr})
+
+    assert actionable_validation_failure_reason(result) is not None
+
+
+def test_unknown_nonzero_failure_is_not_actionable() -> None:
+    result = _passing_command().model_copy(update={"exit_code": 1, "stdout": "", "stderr": ""})
+
+    assert infrastructure_failure_reason(result) is None
+    assert actionable_validation_failure_reason(result) is None
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "error TS2322: Type 'str' is not assignable",
+        "error[E0308]: mismatched types",
+        "COMPILATION ERROR",
+    ],
+)
+def test_unlocated_compiler_summary_is_not_actionable(stderr: str) -> None:
+    result = _passing_command().model_copy(update={"exit_code": 1, "stdout": "", "stderr": stderr})
+
+    assert infrastructure_failure_reason(result) is None
+    assert actionable_validation_failure_reason(result) is None
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "site-packages/tool.py line 1 " * 5_000,
+        "error[E1234]: " * 5_000,
+        "error CS0246: type x " * 5_000,
+    ],
+)
+def test_failure_classification_handles_repeated_signatures_without_overlap(stderr: str) -> None:
+    result = _passing_command().model_copy(update={"exit_code": 1, "stdout": "", "stderr": stderr})
+
+    assert actionable_validation_failure_reason(result) is None
+
+
+def test_passing_command_is_never_classified_as_infrastructure_failure() -> None:
+    result = _passing_command().model_copy(update={"stdout": "no tests collected"})
+
+    assert infrastructure_failure_reason(result) is None
+    assert actionable_validation_failure_reason(result) is None
 
 
 def test_missing_validation_and_unsafe_paths_fail_closed() -> None:

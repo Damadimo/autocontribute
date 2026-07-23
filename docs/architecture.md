@@ -138,9 +138,24 @@ queued -> discovering -> candidate_selected -> eligibility_checked -> planning
 Normal side exits: skipped, rejected, cancelled, failed
 ```
 
-The critic may trigger one bounded `critiquing -> implementing` repair loop. Every transition is
-persisted before subsequent work. Events form a per-run SHA-256 hash chain. The run row stores the
-authoritative event count and terminal hash; appending an event and advancing that anchor are one
+Each run has one bounded repair opportunity. A positively recognized assertion, test,
+source-located compiler/type-checker, or linter failure may trigger `validating -> implementing ->
+validating` before the first critic call. Deterministic infrastructure failures such as timeouts,
+missing tools or modules, permission failures, unavailable networking or proxies, unavailable
+dependencies/toolchains, empty test discovery, container launch/resource termination, and truncated
+command capture are never sent to the builder. This classification is computed from the bounded raw
+command result before its persisted/model-visible copy is redacted and truncated. The same positive
+classification must remain after redaction. If either model-visible output stream exceeds the
+100,000-character artifact limit, the entire result is non-repairable even when a diagnostic remains
+in its retained prefix; incomplete evidence cannot authorize a repair. An unrecognized nonzero
+failure is not assumed to be repository-actionable and cannot trigger repair. If initial validation
+passes, the fresh critic may instead trigger `critiquing -> implementing -> validating ->
+critiquing`. Either optional repair is skipped before its state transition when the exact repair
+request does not fit the configured builder profile.
+The exact initial command suite is immutable across either repair, and a run can never use both
+paths. Every transition is persisted before subsequent work. Events form a per-run SHA-256 hash
+chain. The run row stores the authoritative event count and terminal hash; appending an event and
+advancing that anchor are one
 transaction. Full validation recomputes the chain and compares both values, which makes tail
 truncation detectable. Manifest updates use an `updated_at` compare-and-swap so a stale in-memory copy
 cannot replace newer state or pull-request evidence. GitHub publication uses a stable branch, records

@@ -180,6 +180,35 @@ def repair_prompt(
     )
 
 
+def validation_repair_prompt(
+    issue: IssueCandidate,
+    plan: ContributionPlan,
+    *,
+    guidance: Mapping[str, str],
+    files: Mapping[str, str],
+    current_diff: str,
+    command_results: list[CommandResult],
+) -> str:
+    return "\n\n".join(
+        [
+            "<task>Repair the current patch to resolve its validation failures.</task>",
+            _untrusted_block("issue", issue.model_dump(mode="json")),
+            _untrusted_block("derived_plan", plan.model_dump(mode="json")),
+            _untrusted_block(
+                "validation_results",
+                [result.model_dump(mode="json") for result in command_results],
+            ),
+            _untrusted_block("current_diff", current_diff),
+            _untrusted_block("contribution_guidance", _documents(guidance)),
+            _untrusted_block("current_files", _documents(files)),
+            "Return incremental edits against current file contents and complete updated PR text. "
+            "Use the recorded command results only to diagnose the current failure; do not claim "
+            "that any repair or validation succeeded. The controller will rerun the unchanged "
+            "validation suite later.",
+        ]
+    )
+
+
 def _documents(values: Mapping[str, str]) -> list[dict[str, str]]:
     return [
         {
@@ -221,4 +250,5 @@ __all__ = [
     "planning_prompt",
     "repair_prompt",
     "review_prompt",
+    "validation_repair_prompt",
 ]

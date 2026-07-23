@@ -23,6 +23,8 @@ base commit, diff, commit message, and PR text before publication.
   and unverifiable changes are rejected.
 - Maker-checker: planning/implementation and final review are separate model calls; the critic gets
   fresh evidence rather than trusting the builder's claims.
+- Bounded self-correction: one actionable validation failure or one critic rejection may receive a
+  single repair pass, never both; infrastructure failures are not misrepresented as code defects.
 - Deterministic gates: diff size, forbidden paths, secrets, binaries, validation results, minimum
   dimension scores, and upstream freshness cannot be waived by a model.
 - Operator-owned checks: every allowlisted repository has mandatory validation commands that model

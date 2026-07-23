@@ -25,6 +25,7 @@ from autocontribute.exceptions import PolicyError, StateError
 from autocontribute.orchestrator import Orchestrator
 from autocontribute.preparation import validate_preparation_fingerprint
 from autocontribute.providers import ModelResult, ModelUsage
+from autocontribute.redaction import MAX_ARTIFACT_CHARACTERS, MODEL_INPUT_REDACTION
 from autocontribute.repository import RepositoryWorkspace
 from autocontribute.sandbox import SandboxRunner
 from autocontribute.store import Lease, RunStore
@@ -199,6 +200,50 @@ class PassingSandbox:
         ]
 
 
+class SequenceSandbox(PassingSandbox):
+    """Return actionable failures for selected validation calls."""
+
+    def __init__(
+        self,
+        *,
+        remaining_commands: int = 10,
+        failure_stderr: str = "AssertionError: expected the repaired boundary",
+        failing_validation_calls: set[int] | None = None,
+    ) -> None:
+        super().__init__(remaining_commands=remaining_commands)
+        self.validation_calls = 0
+        self.failure_stderr = failure_stderr
+        self.failing_validation_calls = frozenset(
+            {1} if failing_validation_calls is None else failing_validation_calls
+        )
+
+    def run_all_isolated(
+        self,
+        workspace: RepositoryWorkspace,
+        commands: list[str],
+        *,
+        stop_on_failure: bool = True,
+    ) -> list[CommandResult]:
+        del workspace
+        self.validation_batches.append(list(commands))
+        self.validation_calls += 1
+        results: list[CommandResult] = []
+        for command in commands:
+            failed = self.validation_calls in self.failing_validation_calls and not results
+            result = CommandResult(
+                command=command,
+                exit_code=1 if failed else 0,
+                duration_seconds=0.1,
+                stdout="" if failed else "1 passed",
+                stderr=self.failure_stderr if failed else "",
+            )
+            results.append(result)
+            self.remaining_commands -= 1
+            if stop_on_failure and not result.passed:
+                break
+        return results
+
+
 def _take_over_run_lease(orchestrator: Orchestrator, store: RunStore) -> Lease:
     guard = orchestrator._lease_guard
     assert guard is not None
@@ -334,6 +379,474 @@ def test_full_prepare_pipeline_reaches_exact_approval_boundary(tmp_path: Path, m
         (store.artifact_dir(manifest.run_id) / "model-calls.json").read_text(encoding="utf-8")
     )
     assert all(call["cost_usd"] == "unknown" for call in model_calls)
+
+
+def test_actionable_validation_failure_uses_the_single_repair_opportunity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "sandbox": {"max_commands": 10},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    initial_proposal = providers["builder"].output
+    assert isinstance(initial_proposal, PatchProposal)
+    repair_only_command = "python -m unittest discover -s tests/repair -v"
+    repair_proposal = initial_proposal.model_copy(
+        update={
+            "summary": "Repair the boundary implementation after validation.",
+            "validation_commands": [repair_only_command],
+            "edits": [
+                FileEdit(
+                    operation="replace",
+                    path="app.py",
+                    find="    return 2\n",
+                    replace="    return 2  # repaired after validation\n",
+                    content=None,
+                    rationale="Resolve the actionable validation failure.",
+                )
+            ],
+        }
+    )
+    providers["builder"] = SequenceProvider([initial_proposal, repair_proposal], "gpt-5.6")
+    sandbox = SequenceSandbox()
+    store = RunStore(config.storage.path)
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    expected_suite = [TRUSTED_COMMAND, REPRODUCTION_COMMAND]
+    assert manifest.status == RunStatus.READY_FOR_APPROVAL
+    assert manifest.model_calls == 4
+    assert providers["builder"].calls == 2
+    assert providers["critic"].calls == 1
+    assert sandbox.validation_batches == [expected_suite, expected_suite]
+    assert repair_only_command not in [
+        command for batch in sandbox.validation_batches for command in batch
+    ]
+    assert manifest.proposal is not None
+    assert manifest.proposal.validation_commands == [TRUSTED_COMMAND]
+    repair_prompt = str(providers["builder"].requests[1]["prompt"])
+    assert "AssertionError: expected the repaired boundary" in repair_prompt
+    critic_prompt = str(providers["critic"].requests[0]["prompt"])
+    assert "repaired after validation" in critic_prompt
+    assert "1 passed" in critic_prompt
+    events = store.events(manifest.run_id)
+    assert [event["event_type"] for event in events].count("validation.repair.completed") == 1
+    transitions = [
+        json.loads(event["details"])
+        for event in events
+        if event["event_type"] == "run.transitioned"
+    ]
+    assert [(event["from"], event["to"]) for event in transitions[-5:]] == [
+        ("implementing", "validating"),
+        ("validating", "implementing"),
+        ("implementing", "validating"),
+        ("validating", "critiquing"),
+        ("critiquing", "ready_for_approval"),
+    ]
+
+
+def test_actionable_validation_failure_skips_repair_when_suite_exceeds_remaining_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "sandbox": {"max_commands": 3},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    sandbox = SequenceSandbox(remaining_commands=3)
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.REJECTED
+    assert manifest.error is None
+    assert manifest.model_calls == 3
+    assert providers["builder"].calls == 1
+    assert providers["critic"].calls == 1
+    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
+
+
+def test_actionable_validation_failure_skips_repair_when_prompt_exceeds_model_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "models": {"builder": {"max_input_tokens": 20_000}},
+            "sandbox": {"max_commands": 10},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    sandbox = SequenceSandbox(
+        failure_stderr="AssertionError: actionable but oversized\n" + ("x" * 30_000)
+    )
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.REJECTED
+    assert manifest.error is None
+    assert manifest.model_calls == 3
+    assert providers["builder"].calls == 1
+    assert providers["critic"].calls == 1
+    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
+
+
+def test_failed_validation_repair_is_not_retried(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "sandbox": {"max_commands": 10},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    initial_proposal = providers["builder"].output
+    assert isinstance(initial_proposal, PatchProposal)
+    repair_proposal = initial_proposal.model_copy(
+        update={
+            "edits": [
+                FileEdit(
+                    operation="replace",
+                    path="app.py",
+                    find="    return 2\n",
+                    replace="    return 2  # repaired after validation\n",
+                    content=None,
+                    rationale="Resolve the actionable validation failure.",
+                )
+            ]
+        }
+    )
+    providers["builder"] = SequenceProvider([initial_proposal, repair_proposal], "gpt-5.6")
+    sandbox = SequenceSandbox(failing_validation_calls={1, 2})
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    expected_suite = [TRUSTED_COMMAND, REPRODUCTION_COMMAND]
+    assert manifest.status == RunStatus.REJECTED
+    assert manifest.error is None
+    assert manifest.model_calls == 4
+    assert providers["builder"].calls == 2
+    assert providers["critic"].calls == 1
+    assert sandbox.validation_batches == [expected_suite, expected_suite]
+
+
+def test_validation_repair_consumes_the_only_repair_opportunity_before_critic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "sandbox": {"max_commands": 10},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    initial_proposal = providers["builder"].output
+    approved_review = providers["critic"].output
+    assert isinstance(initial_proposal, PatchProposal)
+    assert isinstance(approved_review, CriticReview)
+    repair_proposal = initial_proposal.model_copy(
+        update={
+            "edits": [
+                FileEdit(
+                    operation="replace",
+                    path="app.py",
+                    find="    return 2\n",
+                    replace="    return 2  # repaired after validation\n",
+                    content=None,
+                    rationale="Resolve the actionable validation failure.",
+                )
+            ]
+        }
+    )
+    rejecting_review = approved_review.model_copy(
+        update={
+            "verdict": "reject",
+            "summary": "The repaired patch still has a blocker.",
+            "blocking_findings": ["The final implementation remains unclear."],
+            "issue_requirements_missing": ["Clear final implementation"],
+        }
+    )
+    providers["builder"] = SequenceProvider([initial_proposal, repair_proposal], "gpt-5.6")
+    providers["critic"] = SequenceProvider([rejecting_review], "gpt-5.6")
+    sandbox = SequenceSandbox()
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    expected_suite = [TRUSTED_COMMAND, REPRODUCTION_COMMAND]
+    assert manifest.status == RunStatus.REJECTED
+    assert manifest.error is None
+    assert manifest.model_calls == 4
+    assert providers["builder"].calls == 2
+    assert providers["critic"].calls == 1
+    assert sandbox.validation_batches == [expected_suite, expected_suite]
+
+
+def test_infrastructure_validation_failure_is_not_sent_to_builder_for_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "sandbox": {"max_commands": 10},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    failure_stderr = (
+        "AssertionError: visible but infrastructure-tainted failure\n"
+        + ("verbose validation output\n" * 5_000)
+        + ("ImportError: No module named fixture_dependency")
+    )
+    assert len(failure_stderr) > 100_000
+    sandbox = SequenceSandbox(failure_stderr=failure_stderr)
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.REJECTED
+    assert manifest.error is None
+    assert manifest.model_calls == 3
+    assert providers["builder"].calls == 1
+    assert providers["critic"].calls == 1
+    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
+
+
+def test_truncated_model_visible_failure_is_not_sent_to_builder_for_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "sandbox": {"max_commands": 10},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    failure_stderr = "AssertionError: visible\n" + ("x" * (MAX_ARTIFACT_CHARACTERS + 100))
+    sandbox = SequenceSandbox(failure_stderr=failure_stderr)
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.REJECTED
+    assert manifest.error is None
+    assert manifest.model_calls == 3
+    assert providers["builder"].calls == 1
+    assert providers["critic"].calls == 1
+    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
+
+
+def test_redaction_created_failure_signature_cannot_authorize_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    secret = "AssertionError-secret-value-472839"
+    monkeypatch.setenv("ASSERTIONERROR", secret)
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "models": {"builder": {"api_key_env": "ASSERTIONERROR"}},
+            "sandbox": {"max_commands": 10},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    sandbox = SequenceSandbox(failure_stderr=secret)
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=sandbox,  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(issue_reference="example/project#42")
+
+    assert manifest.status == RunStatus.REJECTED
+    assert manifest.error is None
+    assert manifest.model_calls == 3
+    assert providers["builder"].calls == 1
+    assert providers["critic"].calls == 1
+    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
+    critic_prompt = str(providers["critic"].requests[0]["prompt"])
+    assert secret not in critic_prompt
+    assert MODEL_INPUT_REDACTION in critic_prompt
 
 
 def test_critic_repair_is_skipped_when_exact_validation_suite_exceeds_remaining_budget(

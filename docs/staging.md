@@ -21,7 +21,8 @@ credentials, private code, personal data, or other non-public material in the fi
    ceiling plus worst-case sandbox command budget must not exceed 180 minutes; the four-hour job timeout
    leaves the remaining hour for preflight and state finalization.
    Keep the fixture's 11-command budget: it covers one baseline reproduction and the five-command
-   deduplicated validation suite both before and after the single bounded critic-repair pass.
+   deduplicated validation suite both before and after the single bounded validation- or
+   critic-driven repair pass.
 3. Protect the control repository's default branch before storing any hosted credential. Require pull
    requests, passing CI, and the exact **Security integration gate** check; apply the rule to
    administrators where supported, require at least one trusted approval for every pull request, and

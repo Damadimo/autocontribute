@@ -93,8 +93,12 @@ _GENERIC_SECRET = re.compile(
 _OBVIOUS_PLACEHOLDER = re.compile(
     r"(?i)(?:example|dummy|placeholder|change[-_]?me|test|fake|your[-_]?|x{4,})"
 )
-_INVALID_BASELINE_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+_INFRASTRUCTURE_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("the validation command was not installed", re.compile(r"\bcommand not found\b", re.I)),
+    (
+        "the test runner failed internally",
+        re.compile(r"(?m)^INTERNALERROR(?:>|:|\s)", re.I),
+    ),
     (
         "a required file or executable was missing",
         re.compile(r"\b(?:no such file or directory|file or directory not found)\b", re.I),
@@ -102,12 +106,77 @@ _INVALID_BASELINE_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "the test runner discovered no tests",
         re.compile(
-            r"\b(?:no tests (?:ran|found|collected)|collected 0 items?|ran 0 tests?)\b",
+            r"\b(?:no tests (?:ran|found|collected|were executed)|"
+            r"no test files? (?:found|were found)|collected 0 items?|ran 0 tests?)\b",
             re.I,
         ),
     ),
-    ("a Python module was unavailable", re.compile(r"\bModuleNotFoundError\b", re.I)),
-    ("a package script was missing", re.compile(r"\bmissing script\b", re.I)),
+    (
+        "a Python module was unavailable",
+        re.compile(
+            r"\b(?:ModuleNotFoundError|ImportError)\s*:\s*No module named\b",
+            re.I,
+        ),
+    ),
+    (
+        "a language module was unavailable",
+        re.compile(
+            r"\b(?:(?:error:\s*)?cannot find module|no such module|could not find module|"
+            r"could not load module|missing required module)\b|"
+            r"\bmodule\s+(?:'[^'\r\n]{1,128}'|\"[^\"\r\n]{1,128}\"|"
+            r"`[^`\r\n]{1,128}`)\s+not found\b",
+            re.I,
+        ),
+    ),
+    (
+        "a package script was missing",
+        re.compile(
+            r"\b(?:missing script|error command [\"'][^\r\n\"']{1,128}[\"'] not found)\b",
+            re.I,
+        ),
+    ),
+    (
+        "a runtime dependency was unavailable",
+        re.compile(
+            r"\b(?:ClassNotFoundException|NoClassDefFoundError|"
+            r"LoadError:\s*cannot load such file)\b",
+            re.I,
+        ),
+    ),
+    (
+        "a compiled-language dependency or type environment was unavailable",
+        re.compile(
+            r"\berror\[E0463\]:\s*can't find crate for\b|"
+            r"\berror\s+TS2688:|"
+            r"(?m:^[^\r\n]{0,1000}\berror:\s+package\s+"
+            r"[^\r\n]{1,256}\s+does not exist\b)|"
+            r"\berror\s+CS0246:",
+            re.I,
+        ),
+    ),
+    (
+        "the configured compiler or target toolchain was unavailable",
+        re.compile(
+            r"\btarget may not be installed\b|"
+            r"\binvalid (?:source|target) release\b|"
+            r"\brelease version [^\r\n]{1,64} not supported\b",
+            re.I,
+        ),
+    ),
+    (
+        "sandbox storage was unavailable",
+        re.compile(
+            r"\b(?:no space left on device|disk quota exceeded|read-only file system|ENOSPC)\b",
+            re.I,
+        ),
+    ),
+    (
+        "sandbox memory was exhausted",
+        re.compile(
+            r"\b(?:OutOfMemoryError|out of memory|cannot allocate memory|ENOMEM|OOMKilled)\b",
+            re.I,
+        ),
+    ),
     (
         "the validation command lacked permission",
         re.compile(
@@ -120,7 +189,8 @@ _INVALID_BASELINE_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"\b(?:temporary failure in name resolution|name or service not known|"
             r"could not resolve host(?:name)?|getaddrinfo (?:failed|error)|gaierror|"
-            r"EAI_AGAIN|EAI_NONAME|nodename nor servname provided)\b",
+            r"getaddrinfo ENOTFOUND|ENOTFOUND|EAI_AGAIN|EAI_NONAME|unknown host|"
+            r"UnknownHostException|nodename nor servname provided)\b",
             re.I,
         ),
     ),
@@ -128,10 +198,61 @@ _INVALID_BASELINE_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "the validation command failed because the network was unavailable",
         re.compile(
             r"\b(?:network is unreachable|failed to establish a new connection|"
-            r"connection refused|ENETUNREACH|ECONNREFUSED)\b",
+            r"could not connect to (?:the )?server|connection refused|connection timed out|"
+            r"cannot connect to proxy|ProxyError|tunnel connection failed|"
+            r"ENETUNREACH|ECONNREFUSED|ETIMEDOUT)\b",
             re.I,
         ),
     ),
+    (
+        "the Docker validation service was unavailable",
+        re.compile(
+            r"\b(?:cannot connect to the docker daemon|is the docker daemon running)\b",
+            re.I,
+        ),
+    ),
+)
+_ACTIONABLE_VALIDATION_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "an assertion failed",
+        re.compile(r"\b(?:AssertionError|AssertionFailedError|assertion failed)\b", re.I),
+    ),
+    (
+        "a test runner reported a failing test",
+        re.compile(
+            r"(?m)^(?:FAILED(?:\s|$)|FAIL:\s|--- FAIL:)|"
+            r"\b[1-9][0-9]* failed(?:[,\s]|$)|"
+            r"\btest result:\s*FAILED\b|"
+            r"\bFailures:\s*[1-9][0-9]*\b|"
+            r"\bFAILED \(failures=[1-9][0-9]*",
+            re.I,
+        ),
+    ),
+    (
+        "the changed source has a syntax error",
+        re.compile(r"\b(?:SyntaxError|IndentationError|TabError)\b"),
+    ),
+    (
+        "a compiler or type checker reported a source error",
+        re.compile(
+            r"(?m)^[^:\r\n]{1,500}:\d+(?::\d+)?:\s+(?:fatal\s+)?error:|"
+            r"^[^:\r\n]{1,500}(?::\d+:\d+|\(\d+,\d+\)):\s*"
+            r"error\s+(?:TS|CS)\d+\b|"
+            r"^\[ERROR\]\s+[^:\r\n]{1,500}:\[\d+,\d+\]\s+|"
+            r"^\.?(?:/[^:\r\n]+|[^:\r\n]+):\d+:\d+:\s+"
+            r"(?:undefined|syntax error|cannot use|too many arguments|not enough arguments)\b",
+            re.I,
+        ),
+    ),
+    (
+        "a linter reported a source diagnostic",
+        re.compile(r"(?m)^[^:\r\n]{1,500}:\d+:\d+:\s+[A-Z]{1,5}\d{3,4}\b"),
+    ),
+)
+_RUST_ERROR_LINE = re.compile(r"^\s*error\[E\d+\]:", re.I)
+_RUST_SOURCE_LOCATION_LINE = re.compile(
+    r"^\s*-->\s+[^:\r\n]{1,500}:\d+:\d+\s*$",
+    re.I,
 )
 
 
@@ -424,18 +545,94 @@ def evaluate_quality(
     )
 
 
-def _baseline_failure_rejection(result: CommandResult) -> str | None:
+def infrastructure_failure_reason(result: CommandResult) -> str | None:
+    """Explain why a failed command is not actionable repository-code evidence."""
+
+    if result.passed:
+        return None
     if result.timed_out:
-        return "the baseline command timed out"
+        return "the validation command timed out"
+    if result.exit_code < 0:
+        return "the validation process was terminated by a host signal"
+    if result.exit_code == 125:
+        return "the Docker validation process could not be started"
     if result.exit_code in {126, 127}:
         return (
             f"exit code {result.exit_code} indicates an unavailable command or permission failure"
         )
+    if result.exit_code in {130, 137, 143}:
+        return f"exit code {result.exit_code} indicates external or resource-limit termination"
     output = f"{result.stdout}\n{result.stderr}"
-    for reason, pattern in _INVALID_BASELINE_FAILURE_PATTERNS:
+    if "[output truncated by autocontribute]" in output:
+        return "the validation command output was truncated before it could be classified safely"
+    if _installed_python_package_syntax_failure(output):
+        return "an installed Python package was incompatible with the interpreter"
+    for reason, pattern in _INFRASTRUCTURE_FAILURE_PATTERNS:
         if pattern.search(output):
             return reason
     return None
+
+
+def actionable_validation_failure_reason(result: CommandResult) -> str | None:
+    """Return a bounded positive reason for offering one repository-code repair."""
+
+    if result.passed or infrastructure_failure_reason(result) is not None:
+        return None
+    output = f"{result.stdout}\n{result.stderr}"
+    for reason, pattern in _ACTIONABLE_VALIDATION_FAILURE_PATTERNS:
+        if pattern.search(output):
+            return reason
+    if _rust_source_diagnostic(output):
+        return "a compiler or type checker reported a source error"
+    return None
+
+
+def _installed_python_package_syntax_failure(output: str) -> bool:
+    """Recognize an adjacent package traceback frame and syntax error in linear time."""
+
+    package_frame_line: int | None = None
+    for line_number, line in enumerate(output.splitlines()):
+        folded = line.casefold()
+        normalized = folded.replace("\\", "/")
+        if (
+            line.lstrip().startswith("File ")
+            and ("site-packages/" in normalized or "dist-packages/" in normalized)
+            and ", line " in folded
+        ):
+            package_frame_line = line_number
+        if (
+            package_frame_line is not None
+            and line_number - package_frame_line <= 4
+            and line.lstrip().startswith(("SyntaxError", "IndentationError", "TabError"))
+        ):
+            return True
+        if package_frame_line is not None and line_number - package_frame_line > 4:
+            package_frame_line = None
+    return False
+
+
+def _rust_source_diagnostic(output: str) -> bool:
+    """Require a nearby rustc source location without overlapping cross-output scans."""
+
+    error_line: int | None = None
+    for line_number, line in enumerate(output.splitlines()):
+        if _RUST_ERROR_LINE.match(line):
+            error_line = line_number
+        if (
+            error_line is not None
+            and line_number - error_line <= 8
+            and _RUST_SOURCE_LOCATION_LINE.match(line)
+        ):
+            return True
+        if error_line is not None and line_number - error_line > 8:
+            error_line = None
+    return False
+
+
+def _baseline_failure_rejection(result: CommandResult) -> str | None:
+    if result.timed_out:
+        return "the baseline command timed out"
+    return infrastructure_failure_reason(result)
 
 
 def _parse_git_diff(diff: str) -> list[_DiffFile]:
@@ -575,4 +772,10 @@ def _path_evidence(kind: str, paths: Sequence[str]) -> str:
     return f"{kind}(s) detected: {rendered}{suffix}"
 
 
-__all__ = ["QualityEvaluator", "evaluate_quality", "secret_findings"]
+__all__ = [
+    "QualityEvaluator",
+    "actionable_validation_failure_reason",
+    "evaluate_quality",
+    "infrastructure_failure_reason",
+    "secret_findings",
+]

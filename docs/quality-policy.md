@@ -36,6 +36,21 @@ All gates must pass. A high model score cannot override one.
   networking are infrastructure failures rather than regression evidence.
 - Every operator-owned repository validation command passes in a disposable offline sandbox copy;
   model-suggested commands cannot replace it and command-budget truncation fails closed.
+- A positively recognized assertion, test-runner failure, source-located compiler/type-checker error, or
+  linter diagnostic may consume the run's one repair opportunity before independent review. An
+  unknown nonzero result is not presumed actionable. Timeouts, unavailable commands, missing
+  files/modules/scripts, incompatible dependencies or toolchains, empty test discovery, permission
+  errors, and networking or proxy failures are
+  infrastructure failures and are never offered to the builder. Docker launch failures, host-signal
+  termination, and resource-limit termination are also non-actionable. Output that exceeds either
+  the bounded sandbox capture or the 100,000-character-per-stream model artifact limit is too
+  incomplete to classify and is likewise not repairable, even when the retained prefix contains a
+  diagnostic. Infrastructure classification uses the bounded raw command result before the
+  persisted model evidence is redacted and truncated. The same positive actionable classification
+  must remain in that scrubbed model-visible evidence. The controller preflights the exact optional
+  repair prompt against the builder input limit and skips a repair that cannot fit.
+  Any repair reruns the exact initial validation suite; repair output cannot add, remove, or replace
+  commands. A validation-driven repair and a critic-driven repair can never both occur in one run.
 - Repository guidance is an exhaustive bounded input, never a best-effort sample. Before planning,
   every tracked contribution, policy, AI, security, conduct/legal, and pull-request-template file is
   loaded in full together with root `AGENTS.md` and README guidance. Ancestor `AGENTS.md` and README

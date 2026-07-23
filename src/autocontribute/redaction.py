@@ -6,9 +6,11 @@ import os
 import re
 from collections.abc import Iterable
 from pathlib import PurePosixPath
+from typing import Final
 
 MODEL_INPUT_REDACTION = "[REDACTED:SENSITIVE_MODEL_INPUT]"
 SENSITIVE_FILE_REDACTION = "[REDACTED:SENSITIVE_FILE_CONTENT]"
+MAX_ARTIFACT_CHARACTERS: Final = 100_000
 
 _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
@@ -134,7 +136,7 @@ def is_sensitive_path(path: str) -> bool:
     return PurePosixPath(name).suffix in _SENSITIVE_FILE_SUFFIXES
 
 
-def truncate_artifact(text: str, *, limit: int = 100_000) -> str:
+def truncate_artifact(text: str, *, limit: int = MAX_ARTIFACT_CHARACTERS) -> str:
     if len(text) <= limit:
         return text
     omitted = len(text) - limit
@@ -142,6 +144,7 @@ def truncate_artifact(text: str, *, limit: int = 100_000) -> str:
 
 
 __all__ = [
+    "MAX_ARTIFACT_CHARACTERS",
     "MODEL_INPUT_REDACTION",
     "SENSITIVE_FILE_REDACTION",
     "contains_credential_material",
