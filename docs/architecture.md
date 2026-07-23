@@ -155,10 +155,34 @@ only evaluated eligible candidates consume the configured selection budget.
 
 For a pinned run, an active or suppressed decision is itself persisted as a terminal audited run.
 `candidate.active_deferred` and `candidate.retry_deferred` bind the current revision to the prior run
-ID and status, and no model is called. A manual `--issue ... --retry-unchanged` can bypass only the
-suppressed state; it records `candidate.retry_override` and then follows the normal eligibility and
+ID and status, and no model is called. A manual override must include `--issue`,
+`--retry-unchanged`, `--retry-actor`, and `--retry-reason`; the old bare boolean is not an
+authorization. It can bypass only the suppressed state and then follows the normal eligibility and
 quality pipeline. Scheduled mode rejects both issue pinning and this override before run creation,
 so unattended operation cannot convert a conservative terminal decision into repeated model spend.
+
+The CLI maps each run to a typed `RunInvocationMode`. The orchestration API defaults to `AUTOMATIC`
+for unpinned programmatic discovery, accepts an explicit issue or retry authorization only with an
+actual `MANUAL` enum value, and rejects retry authorization without an explicit issue. `SCHEDULED`
+cannot be confused with manual by a truthy string or boolean. This check is repeated below the CLI so
+an alternate caller cannot bypass the command-line combination rules.
+
+Selection is an atomic candidate claim, not a disposition check followed by an unfenced save. While
+holding one SQLite write transaction, the store validates the run's unchanged `discovering` row,
+recomputes and validates the complete bounded attempt history, and checks the current
+`autocontribute.run` lease owner, fencing generation, durable generation counter, and expiry. It then
+writes repository, issue number, revision, manifest, the applicable selection/override event, and
+artifact-sync intent. A case-insensitive partial unique index over repository/issue enforces at most
+one active run even if two workers raced before the transaction.
+
+For an override claim, that same transaction also creates exactly one durable
+`candidate_retry_authorizations` row and matching `candidate.retry_override` event. Both contain a
+generated authorization ID, operator actor and reason, current issue revision, and exact prior run
+and suppressed status. The run ID is unique in the authorization table. Corpus validation binds the
+authorization to both run manifests and rejects a missing prior run, mismatched revision/status,
+invalid operator evidence, duplicate or mismatched event, and an override event without an
+authorization row. If the candidate is no longer suppressed at claim time, the authorization is not
+repurposed.
 
 Each run has one bounded repair opportunity. A positively recognized assertion, test,
 source-located compiler/type-checker, or linter failure may trigger `validating -> implementing ->
@@ -278,15 +302,17 @@ corpus for ambiguous submitting publications. The v4-to-v5 step adds an explicit
 sync outbox and reconciles materialized reservation/hold rows with their hash-chained evidence. The
 v5-to-v6 step adds `publication_gate_holds.outcome_corpus_cursor`. New automatic holds atomically
 bind that cursor with the evaluation cursor; migrated v2-v5 holds retain a null outcome cursor and
-cannot confer automatic recovery authority. The v6-to-v7 step adds the issue-revision column and
-candidate lookup index. It validates at most the supported bounded run corpus, requires every row's
-status and candidate identity to agree with its manifest, and backfills a revision for each selected
-candidate in one transaction; invalid evidence rolls the whole migration back. Because older
-schemas did not retain every v7 invariant after a clean release, the cutover must be offline and
-one-way: quiesce every older worker before the first v7 open and never let one resume against the
-migrated lineage. A stale restore can omit reservations, gate holds, outcome cursors, issue
-revisions, artifact-sync intent, evaluation anchors, event heads, or lease generations, so SQLite
-integrity alone does not make it a safe autonomous-publication recovery point.
+cannot confer automatic recovery authority. The v6-to-v7 step adds the issue-revision column,
+`candidate_retry_authorizations`, a case-insensitive revision lookup index, and a case-insensitive
+partial unique index over active candidate claims. It validates at most the supported bounded run
+corpus, requires every row's status and candidate identity to agree with its manifest, backfills a
+revision for each selected candidate, and rejects duplicate active claims before installing the
+unique index; invalid evidence rolls the whole migration back. Because older schemas did not retain
+every v7 invariant after a clean release, the cutover must be offline and one-way: quiesce every
+older worker before the first v7 open and never let one resume against the migrated lineage. A stale
+restore can omit reservations, gate holds, outcome cursors, issue revisions, retry authorizations,
+active claims, artifact-sync intent, evaluation anchors, event heads, or lease generations, so
+SQLite integrity alone does not make it a safe autonomous-publication recovery point.
 
 Automatic publication computes exact cursors over the globally ordered, hash-chained evaluation
 anchors and the scoped upstream-outcome evidence. The publication reservation and both cursor holds

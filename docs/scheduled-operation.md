@@ -103,14 +103,31 @@ unchanged revision:
 ```bash
 uv run autocontribute run \
   --issue owner/repository#123 \
-  --retry-unchanged
+  --retry-unchanged \
+  --retry-actor "OPERATOR IDENTITY" \
+  --retry-reason "PRIOR EVIDENCE REVIEWED; CONCRETE REASON FOR RETRY"
 ```
 
-The override is manual-only, records `candidate.retry_override`, and reruns all current eligibility
-and quality gates. It cannot bypass active work or guarantee that the candidate proceeds to a model.
-`--retry-unchanged` is invalid without `--issue`; `run --scheduled` rejects both `--issue` and
-`--retry-unchanged` before creating a run or invoking a model. Scheduled workers must remain
-unpinned so automatic discovery can fall through to another candidate.
+The actor must be a canonical non-empty single-line identity; the reason must be concrete, non-empty,
+and bounded. The override is invalid unless all four options are present. Supplying actor or reason
+without `--retry-unchanged` is also rejected. The authorization row and
+`candidate.retry_override` event persist the actor, reason, generated authorization ID, exact issue
+revision, and exact prior run/status atomically with the new run's candidate claim. Only after that
+claim does the worker rerun all current eligibility and quality gates. Authorization cannot bypass
+active work or guarantee that the candidate proceeds to a model.
+
+`run --scheduled` rejects both `--issue` and `--retry-unchanged` before creating a run or invoking a
+model. Below the CLI, the orchestration boundary requires the typed `RunInvocationMode.MANUAL` value
+for any explicit issue or retry authorization and rejects authorization without an explicit issue;
+the scheduler supplies `SCHEDULED`. Scheduled workers must remain unpinned so automatic discovery
+can fall through to another candidate.
+
+The claim itself is not a read-then-write promise. Inside one SQLite write transaction, the store
+revalidates all candidate history, verifies the current `autocontribute.run` lease owner, fencing
+generation, generation counter, and expiry, then persists the run's repository/issue/revision. A
+case-insensitive partial unique index permits only one non-released run for a repository/issue. A
+stale lease, concurrent winner, changed disposition, or authorization that no longer matches the
+same unchanged suppressed revision fails instead of claiming a different candidate.
 
 ## Lifecycle sync and persistent safety stop
 
@@ -263,12 +280,16 @@ hash-chained events so incomplete state cannot reset capacity or silently remove
 hold. The v5-to-v6 step adds
 `publication_gate_holds.outcome_corpus_cursor`. Every new automatic hold atomically binds it with the
 evaluation cursor; migrated v2-v5 holds retain a null outcome cursor and cannot authorize automatic
-recovery. The v6-to-v7 step adds `runs.issue_revision` and its candidate lookup index, validates the
-bounded run corpus against each saved manifest, and backfills the revision for every historical
-candidate row in the same transaction. A malformed manifest, row/manifest identity mismatch, or
-invalid issue evidence aborts without leaving a partial v7 database. Stop every older worker before
-this offline, one-way cutover and never restart one against the migrated lineage. Preserve a new v7
-snapshot before the next ephemeral job.
+recovery. The v6-to-v7 step adds `runs.issue_revision`, the
+`candidate_retry_authorizations` table, a `NOCASE` candidate-revision lookup index, and a `NOCASE`
+partial unique index over active repository/issue claims. It validates the bounded run corpus against
+each saved manifest, backfills the revision for every historical candidate row, and rejects any
+pre-existing duplicate active candidate before creating the index. A malformed manifest,
+row/manifest identity mismatch, invalid issue evidence, or duplicate active claim aborts without
+leaving a partial v7 database. Current-schema validation also cross-checks each authorization against
+the new and prior run evidence and its unique override event, and rejects an orphan override event.
+Stop every older worker before this offline, one-way cutover and never restart one against the
+migrated lineage. Preserve a new v7 snapshot before the next ephemeral job.
 
 Store schema and lifecycle evidence format are separate lineages. Canonical unversioned lifecycle
 payloads can exist in any restorable store schema from v2 through v7. Restore preserves those rows

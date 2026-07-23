@@ -1155,11 +1155,13 @@ sudo systemctl list-timers 'autocontribute-*'
 After structural validation, credential-free cleanup, and the headroom gate, the scheduled run is
 the worker's first credentialed and potentially billable command. A safe skip is success and
 refreshes the worker stamp. The packaged wrapper always uses `run --scheduled`, so it cannot pin an
-issue or request `--retry-unchanged`. Active and unchanged-suppressed candidates are filtered before
-model work and discovery continues to another candidate; an exhausted search is still a successful
-safe skip. A rejected or failed attempt is a service failure. The complete-backup command verifies
-the SQLite snapshot, event chains, run manifests, evidence, evaluations, file sizes, and SHA-256
-hashes before it publishes the uniquely named bundle. It receives no credentials and has no network.
+issue or request a retry authorization. The typed orchestration boundary also marks that call as
+`SCHEDULED`, which rejects an explicit issue or authorization even below the CLI. Active and
+unchanged-suppressed candidates are filtered before model work and discovery continues to another
+candidate; an exhausted search is still a successful safe skip. A rejected or failed attempt is a
+service failure. The complete-backup command verifies the SQLite snapshot, event chains, run
+manifests, evidence, evaluations, file sizes, and SHA-256 hashes before it publishes the uniquely
+named bundle. It receives no credentials and has no network.
 
 ## Routine operation and monitoring
 
@@ -1251,10 +1253,21 @@ or run only after all Autocontribute services are stopped. Never run `approve`, 
 `state restore`, or a second `run` beside the timer service.
 
 If an operator deliberately retries an unchanged `skipped`, `rejected`, or `cancelled` issue, stop
-the timer/worker, acquire the same operation lock, and use `run --issue ... --retry-unchanged`
-manually. Inspect the prior evidence and the new `candidate.retry_override` ledger event first. This
-escape hatch does not bypass an active run or any eligibility/quality gate and must never be added to
-the unit or timer.
+the timer/worker, acquire the same operation lock, and invoke the manual CLI through the deployment's
+approved credential-loading path with all four options:
+
+```bash
+autocontribute run \
+  --issue owner/repository#123 \
+  --retry-unchanged \
+  --retry-actor "OPERATOR IDENTITY" \
+  --retry-reason "PRIOR EVIDENCE REVIEWED; CONCRETE REASON FOR RETRY"
+```
+
+Inspect the prior evidence and then verify the new durable authorization and
+`candidate.retry_override` ledger event. The authorization binds actor/reason to the exact prior
+run/status/revision atomically with the lease-fenced, unique candidate claim. This escape hatch does
+not bypass an active run or any eligibility/quality gate and must never be added to the unit or timer.
 
 ### Deliberately enabling automatic publication
 

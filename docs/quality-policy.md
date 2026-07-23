@@ -23,9 +23,14 @@ without converting infrastructure failure into a permanent quality judgment.
 Discovery fetches the canonical issue, applies this disposition before eligibility or model work,
 and falls through to later candidates. A pinned deferral writes the current revision, prior run ID,
 and status to the hash-chained event ledger and makes zero model calls. The manual-only
-`--issue ... --retry-unchanged` exception is an operator decision, not a quality waiver: active work
-still blocks, the override is audited, and every deterministic gate is rerun. Scheduled invocations
-cannot pin an issue or request this override.
+exception requires `--issue`, `--retry-unchanged`, `--retry-actor`, and `--retry-reason`; a bare
+boolean is not sufficient authorization. Actor, reason, authorization ID, issue revision, and exact
+prior run/status are persisted with the override event in the same lease-fenced transaction that
+claims the candidate. This is an operator decision, not a quality waiver: active work still blocks,
+the claim remains subject to its case-insensitive unique-active constraint, and every deterministic
+gate is rerun. Scheduled invocations cannot pin an issue or request this override. The typed
+orchestration boundary independently requires manual invocation mode, so non-CLI callers receive the
+same restriction.
 
 The deterministic score is:
 

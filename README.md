@@ -70,10 +70,19 @@ uv run autocontribute publish RUN_ID
 
 A normal pinned run does not repeatedly spend model budget on an unchanged issue that already ended
 as `skipped`, `rejected`, or `cancelled`. After reviewing the prior evidence, an operator can make a
-deliberate manual exception with
-`autocontribute run --issue owner/repository#123 --retry-unchanged`. The retry flag is valid only
-when paired with `--issue`. A scheduled invocation rejects both pinned issues and the retry override,
-and the override never bypasses an active run for the issue.
+deliberate manual exception:
+
+```bash
+uv run autocontribute run \
+  --issue owner/repository#123 \
+  --retry-unchanged \
+  --retry-actor "OPERATOR IDENTITY" \
+  --retry-reason "PRIOR EVIDENCE REVIEWED; CONCRETE REASON FOR RETRY"
+```
+
+The retry flag is valid only when paired with an issue, actor, and reason. A scheduled invocation
+rejects both pinned issues and the retry override, and the override never bypasses an active run for
+the issue.
 
 `doctor` is an active preflight, not a purely static configuration check. It sends one bounded,
 potentially billable strict-schema request per distinct model profile (at most 1,024 output tokens
@@ -164,10 +173,19 @@ first duplicate as the result.
 
 Pinned active and unchanged-suppressed decisions finish as audited skips before eligibility or model
 work, with `candidate.active_deferred` or `candidate.retry_deferred` evidence naming the issue
-revision, prior run, and prior status. A deliberate manual override records
-`candidate.retry_override`, then reruns every normal deterministic gate; it does not force the issue
-to pass. These deferrals make zero model calls. Their run and event records remain part of the state
-lineage so repeated scheduler invocations cannot forget the decision.
+revision, prior run, and prior status. A deliberate manual override additionally requires a
+non-empty operator identity and reason. Its durable authorization row and
+`candidate.retry_override` event bind those fields to the exact prior run, prior status, and issue
+revision in the same fenced transaction that claims the candidate. It then reruns every normal
+deterministic gate; it does not force the issue to pass. These deferrals make zero model calls. Their
+run and event records remain part of the state lineage so repeated scheduler invocations cannot
+forget the decision.
+
+Candidate claims are protected by the generation-fenced run lease and a case-insensitive unique
+active-candidate index, so a stale or concurrent worker cannot turn a read-then-write race into two
+active attempts. The orchestration API also uses a typed invocation mode below the CLI: explicit
+issues and retry authorizations are rejected unless the caller supplies `MANUAL`, so a direct caller
+cannot reproduce the old bare-boolean bypass.
 
 Published pull requests remain part of the safety loop. `autocontribute lifecycle sync` records an
 immutable snapshot of every locally tracked open PR and persistently stops all preparation and
@@ -401,15 +419,17 @@ synchronization and cross-checks reservation/hold rows against their hash-chaine
 Schema v6 adds
 `publication_gate_holds.outcome_corpus_cursor`: every new automatic hold atomically binds both
 evaluation and outcome cursors, while migrated v2-v5 holds retain a null outcome cursor and cannot
-authorize automatic recovery. Schema v7 adds the durable issue-revision column and candidate lookup
-index. Its migration validates every bounded run row against its manifest and transactionally
-backfills revisions for rows that selected a candidate; malformed or mismatched evidence rolls the
-migration back. The upgrade is an offline, one-way cutover: stop all older workers before opening
-restored state with v7, never restart them against the migrated lineage, and take a fresh v7 backup
-before continuing. Never resume
+authorize automatic recovery. Schema v7 adds the durable issue-revision column, the
+`candidate_retry_authorizations` table, a case-insensitive candidate-revision lookup index, and a
+case-insensitive partial unique index for active candidates. Its migration validates every bounded
+run row against its manifest, transactionally backfills revisions for rows that selected a
+candidate, and rejects duplicate active attempts before installing the unique index; malformed or
+mismatched evidence rolls the migration back. The upgrade is an offline, one-way cutover: stop all
+older workers before opening restored state with v7, never restart them against the migrated
+lineage, and take a fresh v7 backup before continuing. Never resume
 automatic publication from a stale or partial restore, because missing reservation, gate-hold,
-outcome-cursor, issue-revision, artifact-sync, evaluation-anchor, or lease-generation history can
-invalidate safety decisions.
+outcome-cursor, issue-revision, retry-authorization, active-claim, artifact-sync, evaluation-anchor,
+or lease-generation history can invalidate safety decisions.
 
 Autocontribute never autonomously creates issues, comments, reactions, reviews, stars, merges, or
 maintainer messages. Follow-up changes require a fresh evidence bundle and approval.
