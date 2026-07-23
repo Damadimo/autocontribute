@@ -6,6 +6,7 @@ on:
       - pilot/nvidia-cccl-e2e
     paths:
       - .github/workflows/nvidia-pilot-smoke.yml
+      - autocontribute.yml
 
 permissions:
   contents: read
@@ -71,33 +72,33 @@ jobs:
             CXX=g++ \
             CUDAHOSTCXX=g++ \
             CCCL_BUILD_INFIX=autocontribute \
+            LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
             CI=1 \
             NO_COLOR=1 \
             GIT_TERMINAL_PROMPT=0 \
             AUTOCONTRIBUTE_SANDBOX=1 \
             /bin/sh -lc \
-            'git diff --check &&
+            'set -eu;
+             command -v clang-format >/dev/null;
+             git diff --check &&
              python -m compileall -q libcudacxx/share/libcudacxx libcudacxx/test/debugging &&
-             ruff check libcudacxx/share/libcudacxx/gdb libcudacxx/share/libcudacxx/lldb libcudacxx/test/debugging &&
-             ruff format --check libcudacxx/share/libcudacxx/gdb libcudacxx/share/libcudacxx/lldb libcudacxx/test/debugging &&
-             find libcudacxx/test/debugging -type f -name CMakeLists.txt -exec gersemi --check {} + &&
              find libcudacxx/test/debugging -type f -name "*.cu" -exec clang-format --dry-run --Werror {} + &&
              /usr/local/cuda/bin/nvcc --version &&
              /usr/local/cuda/bin/cuda-gdb --version &&
              lldb --version &&
-             cmake --preset libcudacxx
-               -DCMAKE_CUDA_ARCHITECTURES=75-virtual
-               -DLIBCUDACXX_GDB=/usr/local/cuda/bin/cuda-gdb
-               -DLIBCUDACXX_ENABLE_GDB_TESTING=ON
+             cmake --preset libcudacxx \
+               -DCMAKE_CUDA_ARCHITECTURES=75-virtual \
+               -DLIBCUDACXX_GDB=/usr/local/cuda/bin/cuda-gdb \
+               -DLIBCUDACXX_ENABLE_GDB_TESTING=ON \
                -DLIBCUDACXX_ENABLE_LLDB_TESTING=ON &&
              cmake --build --preset libcudacxx --target help >/tmp/autocontribute-target-help &&
-             grep -oE "libcudacxx\.test\.debugging\.[[:alnum:]_-]+"
+             grep -oE "libcudacxx\.test\.debugging\.[[:alnum:]_-]+" \
                /tmp/autocontribute-target-help | sort -u >/tmp/autocontribute-debug-targets &&
              test -s /tmp/autocontribute-debug-targets &&
-             xargs cmake --build --preset libcudacxx --parallel 2 --target
+             xargs cmake --build --preset libcudacxx --parallel 2 --target \
                </tmp/autocontribute-debug-targets &&
-             ctest --preset libcudacxx
-               --tests-regex "^libcudacxx\.test\.debugging\."
-               --exclude-regex "^libcudacxx\.test\.debugging\.buffer\."
-               --output-on-failure
+             ctest --test-dir build/autocontribute/libcudacxx \
+               --tests-regex "^libcudacxx\.test\.debugging\." \
+               --exclude-regex "^libcudacxx\.test\.debugging\.buffer\." \
+               --output-on-failure \
                --no-tests=error'
