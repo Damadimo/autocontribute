@@ -2210,6 +2210,47 @@ def test_ineligible_explicit_issue_skips_without_spending_model_tokens(tmp_path:
     assert all(provider.calls == 0 for provider in providers.values())
 
 
+def test_candidate_claim_failure_cannot_attach_candidate_through_failure_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sha = "a" * 40
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    providers = _providers()
+
+    def fail_claim(*_: object, **__: object) -> None:
+        raise StateError("candidate claim failed before durable attachment")
+
+    monkeypatch.setattr(store, "claim_candidate", fail_claim)
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(
+            issue_reference="example/project#42",
+            invocation_mode=RunInvocationMode.MANUAL,
+        )
+
+    durable = store.get(manifest.run_id)
+    assert manifest.status == RunStatus.FAILED
+    assert manifest.candidate is None
+    assert manifest.repository is None
+    assert durable.status == RunStatus.FAILED
+    assert durable.candidate is None
+    assert durable.repository is None
+    assert all(provider.calls == 0 for provider in providers.values())
+
+
 def test_unchanged_explicit_issue_is_deferred_before_eligibility_or_model_work(
     tmp_path: Path,
 ) -> None:
