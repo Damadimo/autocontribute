@@ -3070,6 +3070,8 @@ def test_docs_install_a_noneditable_release_readable_by_the_service_identity(
     assert "sanitized, provenance-attested" in prose
     assert "Never deploy a working checkout" in prose
     assert "complete file inventory" in prose
+    assert "/usr/bin/findmnt --noheadings --raw --output TARGET" in script
+    assert "--list" not in script
     assert 'sudo chown -R -h root:root -- "$release"' not in script
     assert 'sudo chmod -R u=rwX,go=rX -- "$release"' not in script
     assert script.count('release_mount="$(release_mount_at_or_below)"') >= 4

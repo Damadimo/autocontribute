@@ -92,7 +92,7 @@ PY
 mounted_path_at_or_below() {
   local root="$1"
 
-  /usr/bin/findmnt --list --noheadings --raw --output TARGET | \
+  /usr/bin/findmnt --noheadings --raw --output TARGET | \
     /usr/bin/awk -v root="$root" \
       '$0 == root || index($0, root "/") == 1 { print }'
 }

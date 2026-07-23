@@ -130,6 +130,10 @@ def test_acceptance_hardens_only_opt_and_restores_its_exact_identity_bound_mode(
 
 def test_acceptance_normalizes_and_probes_the_release_as_the_service_identity() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
+    mounted_path_check = _shell_function("mounted_path_at_or_below")
+
+    assert "/usr/bin/findmnt --noheadings --raw --output TARGET" in mounted_path_check
+    assert "--list" not in mounted_path_check
 
     source_types = script.index("immutable release source contains an unsafe entry")
     source_links = script.index(

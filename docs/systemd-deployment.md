@@ -476,7 +476,7 @@ release_identity="$(sudo stat --format='%d:%i' -- "$release")" || exit 1
 [[ "$release_identity" =~ ^[0-9]+:[0-9]+$ ]]
 
 release_mount_at_or_below() {
-  /usr/bin/findmnt --list --noheadings --raw --output TARGET | \
+  /usr/bin/findmnt --noheadings --raw --output TARGET | \
     /usr/bin/awk -v root="$release" \
       '$0 == root || index($0, root "/") == 1 { print }'
 }
