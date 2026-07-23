@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -145,9 +145,21 @@ def _sealed_manifest() -> RunManifest:
 def test_preparation_fingerprint_survives_store_persistence(tmp_path) -> None:  # type: ignore[no-untyped-def]
     store = RunStore(tmp_path / "state")
     created = store.create_run()
+    store.transition(created, RunStatus.DISCOVERING, reason="fixture started")
     manifest = _ready_manifest(run_id=created.run_id)
+    manifest.status = RunStatus.DISCOVERING
     manifest.updated_at = created.updated_at
     manifest.preparation_fingerprint = compute_preparation_fingerprint(manifest, diff=PATCH)
+    lease_owner = f"preparation-fixture-{manifest.run_id}"
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        lease_owner,
+        ttl=timedelta(minutes=1),
+    )
+    assert lease is not None
+    store.claim_candidate(manifest, lease=lease)
+    assert store.release_lease("autocontribute.run", lease_owner, lease.generation)
+    manifest.status = RunStatus.READY_FOR_APPROVAL
     store.save(manifest, event="fixture.ready", details={})
 
     persisted = store.get(manifest.run_id)

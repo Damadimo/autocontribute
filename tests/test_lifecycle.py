@@ -350,7 +350,7 @@ def _published_run(
     publishing_api_origin: str = "https://api.github.com",
 ) -> RunManifest:
     run = store.create_run()
-    run.status = RunStatus.PR_OPEN
+    store.transition(run, RunStatus.DISCOVERING, reason="fixture started")
     run.candidate = IssueCandidate(
         repository=repository,
         number=42,
@@ -380,6 +380,16 @@ def _published_run(
     run.commit_sha = commit_sha
     run.pull_request_url = pull_request_url or f"https://github.com/{repository}/pull/{number}"
     run.publishing_api_origin = publishing_api_origin
+    lease_owner = f"lifecycle-fixture-{run.run_id}"
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        lease_owner,
+        ttl=timedelta(minutes=1),
+    )
+    assert lease is not None
+    store.claim_candidate(run, lease=lease)
+    assert store.release_lease("autocontribute.run", lease_owner, lease.generation)
+    run.status = RunStatus.PR_OPEN
     store.save(run, event="test.published", details={})
     return run
 

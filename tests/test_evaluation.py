@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -51,13 +52,15 @@ def _summary(evaluations: EvaluationStore) -> EvaluationSummary:
 
 def _ready_run(store: RunStore) -> RunManifest:
     run = _new_run(store)
+    store.transition(run, RunStatus.DISCOVERING, reason="fixture started")
     now = run.created_at
+    issue_number = int(run.run_id[:8], 16) + 1
     run.candidate = IssueCandidate(
         repository="example/project",
-        number=42,
+        number=issue_number,
         title="Correct the boundary",
         body="The current boundary result is incorrect.",
-        html_url="https://github.com/example/project/issues/42",
+        html_url=f"https://github.com/example/project/issues/{issue_number}",
         state="open",
         author="maintainer",
         labels=["bug"],
@@ -134,6 +137,15 @@ def _ready_run(store: RunStore) -> RunManifest:
     ]
     store.write_artifact(run.run_id, "contribution.patch", _PATCH.decode("utf-8"))
     run.preparation_fingerprint = compute_preparation_fingerprint(run, diff=_PATCH)
+    lease_owner = f"evaluation-fixture-{run.run_id}"
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        lease_owner,
+        ttl=timedelta(minutes=1),
+    )
+    assert lease is not None
+    store.claim_candidate(run, lease=lease)
+    assert store.release_lease("autocontribute.run", lease_owner, lease.generation)
     run.status = RunStatus.READY_FOR_APPROVAL
     store.save(run, event="fixture.ready", details={})
     return run

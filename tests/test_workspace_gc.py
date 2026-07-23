@@ -54,6 +54,7 @@ def _prepared_run(
     deployment_fingerprint: str | None = None,
 ) -> RunManifest:
     run = store.create_run(deployment_fingerprint=deployment_fingerprint)
+    store.transition(run, RunStatus.DISCOVERING, reason="fixture started")
     now = run.created_at
     run.candidate = IssueCandidate(
         repository="example/project",
@@ -139,6 +140,15 @@ def _prepared_run(
     store.write_artifact(run.run_id, "contribution.patch", PATCH.decode())
     store.write_artifact(run.run_id, "validation.json", render_validation_artifact(run))
     run.preparation_fingerprint = compute_preparation_fingerprint(run, diff=PATCH)
+    lease_owner = f"workspace-gc-fixture-{run.run_id}"
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        lease_owner,
+        ttl=timedelta(minutes=1),
+    )
+    assert lease is not None
+    store.claim_candidate(run, lease=lease)
+    assert store.release_lease("autocontribute.run", lease_owner, lease.generation)
     run.status = RunStatus.READY_FOR_APPROVAL
     store.save(run, event="fixture.prepared", details={"status": run.status.value})
     workspace = store.workspace_dir(run.run_id)

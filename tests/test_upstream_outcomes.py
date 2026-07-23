@@ -1473,6 +1473,7 @@ def test_github_time_regression_is_unknown_and_blocks() -> None:
 def test_classifier_consumes_real_store_ledger_and_lifecycle_apis(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     manifest = store.create_run(deployment_fingerprint=DEPLOYMENT)
+    store.transition(manifest, RunStatus.DISCOVERING, reason="fixture started")
     manifest.candidate = IssueCandidate(
         repository=REPOSITORY,
         number=1,
@@ -1500,6 +1501,15 @@ def test_classifier_consumes_real_store_ledger_and_lifecycle_apis(tmp_path: Path
         license_spdx="MIT",
     )
     manifest.base_sha = "b" * 40
+    lease_owner = f"upstream-outcome-fixture-{manifest.run_id}"
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        lease_owner,
+        ttl=timedelta(minutes=1),
+    )
+    assert lease is not None
+    store.claim_candidate(manifest, lease=lease)
+    assert store.release_lease("autocontribute.run", lease_owner, lease.generation)
     manifest.status = RunStatus.READY_FOR_APPROVAL
     manifest.approval = Approval(
         actor=LOGIN,

@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import zipfile
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,7 @@ def _prepared_run(
     status: RunStatus = RunStatus.READY_FOR_APPROVAL,
 ) -> RunManifest:
     run = store.create_run()
+    store.transition(run, RunStatus.DISCOVERING, reason="fixture started")
     now = run.created_at
     run.candidate = IssueCandidate(
         repository="example/project",
@@ -122,6 +124,15 @@ def _prepared_run(
     store.write_artifact(run.run_id, "contribution.patch", _PATCH.decode())
     store.write_artifact(run.run_id, "validation.json", render_validation_artifact(run))
     run.preparation_fingerprint = compute_preparation_fingerprint(run, diff=_PATCH)
+    lease_owner = f"backup-fixture-{run.run_id}"
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        lease_owner,
+        ttl=timedelta(minutes=1),
+    )
+    assert lease is not None
+    store.claim_candidate(run, lease=lease)
+    assert store.release_lease("autocontribute.run", lease_owner, lease.generation)
     run.status = status
     store.save(run, event="fixture.prepared", details={"status": status.value})
     return run

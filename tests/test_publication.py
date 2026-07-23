@@ -226,6 +226,7 @@ def _ready_run(
         config = AutocontributeConfig.model_validate(config.model_dump(mode="python"))
         store = RunStore(config.storage.path)
     run = store.create_run(deployment_fingerprint=compute_deployment_fingerprint(config))
+    store.transition(run, RunStatus.DISCOVERING, reason="fixture started")
     workspace = RepositoryWorkspace.clone(
         str(source),
         sha,
@@ -311,6 +312,15 @@ def _ready_run(
         repository=issue.repository,
     )
     run.preparation_fingerprint = compute_preparation_fingerprint(run, diff=patch)
+    lease_owner = f"publication-fixture-{run.run_id}"
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        lease_owner,
+        ttl=timedelta(minutes=1),
+    )
+    assert lease is not None
+    store.claim_candidate(run, lease=lease)
+    assert store.release_lease("autocontribute.run", lease_owner, lease.generation)
     run.status = RunStatus.READY_FOR_APPROVAL
     store.save(run, event="fixture.ready", details={})
     approval_review = build_approval_review(config, store, run.run_id, actor="octocat")
