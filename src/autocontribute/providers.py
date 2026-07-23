@@ -17,7 +17,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Generic, Literal, Protocol, TypeVar, cast
 
-from openai import OpenAI
+from openai import APIStatusError, OpenAI
 from openai.types.shared_params import Reasoning
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -178,19 +178,29 @@ def _request_error(
     profile: ModelProfile,
     configured_api_key: str,
 ) -> ModelError:
-    """Create a useful error without echoing provider bodies, prompts, or credentials."""
+    """Create a useful error without echoing provider bodies, prompts, or credentials.
+
+    Preserve only a numeric status from a genuine OpenAI SDK HTTP exception. All response-body
+    fields remain intentionally unavailable because a compatible endpoint can place arbitrary
+    prompt or credential material in otherwise token-shaped error metadata.
+    """
+
+    details: list[str] = []
+    if isinstance(exc, APIStatusError):
+        status_code = getattr(exc, "status_code", None)
+        if type(status_code) is int and 400 <= status_code <= 599:
+            details.append(f"HTTP {status_code}")
 
     request_id = getattr(exc, "request_id", None)
-    safe_request_id: str | None = None
     if isinstance(request_id, str) and _SAFE_REQUEST_ID.fullmatch(request_id):
         try:
             _assert_secret_free_model_output(profile, configured_api_key, request_id)
         except ModelError:
             pass
         else:
-            safe_request_id = request_id
-    request_suffix = f" (request ID: {safe_request_id})" if safe_request_id is not None else ""
-    return ModelError(f"{provider} request failed{request_suffix}")
+            details.append(f"request ID: {request_id}")
+    detail_suffix = f" ({'; '.join(details)})" if details else ""
+    return ModelError(f"{provider} request failed{detail_suffix}")
 
 
 def _model_output_strings(value: object) -> Iterator[str]:

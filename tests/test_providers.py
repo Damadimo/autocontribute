@@ -4,7 +4,9 @@ import json
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
 import pytest
+from openai import BadRequestError
 from pydantic import BaseModel
 
 import autocontribute.providers as providers
@@ -50,6 +52,36 @@ def _responses_usage() -> SimpleNamespace:
         output_tokens=45,
         output_tokens_details=SimpleNamespace(reasoning_tokens=30),
         total_tokens=165,
+    )
+
+
+def _bad_request_error(
+    *,
+    api_key: str = _API_KEY,
+    error_type: object = "invalid_request_error",
+    code: object = "invalid_json_schema",
+    param: object = "text.format.schema.properties[0]",
+) -> BadRequestError:
+    request = httpx.Request(
+        "POST",
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {api_key}"},
+        content=f"private request containing {api_key}".encode(),
+    )
+    response = httpx.Response(
+        400,
+        request=request,
+        headers={"x-request-id": "req_safe_to_log"},
+    )
+    return BadRequestError(
+        f"provider message echoed {api_key} and private prompt",
+        response=response,
+        body={
+            "type": error_type,
+            "code": code,
+            "param": param,
+            "message": f"provider body echoed {api_key} and private prompt",
+        },
     )
 
 
@@ -352,6 +384,10 @@ def test_provider_request_error_does_not_echo_sensitive_provider_body(
     )
     provider, client, _ = _responses_provider(monkeypatch, response)
     failure = RuntimeError(f"request body contained {_API_KEY} and private prompt")
+    failure.status_code = 400  # type: ignore[attr-defined]
+    failure.type = "invalid_request_error"  # type: ignore[attr-defined]
+    failure.code = "invalid_json_schema"  # type: ignore[attr-defined]
+    failure.param = "text.format.schema"  # type: ignore[attr-defined]
     failure.request_id = "req_safe_to_log"  # type: ignore[attr-defined]
     client.responses.parse.side_effect = failure
 
@@ -363,6 +399,85 @@ def test_provider_request_error_does_not_echo_sensitive_provider_body(
     assert "private prompt" not in str(raised.value)
     assert raised.value.__cause__ is None
     assert raised.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("compatible", [False, True])
+def test_provider_request_error_preserves_only_safe_bounded_http_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    compatible: bool,
+) -> None:
+    failure = _bad_request_error()
+    if compatible:
+        provider, client, _ = _compatible_provider(monkeypatch, _chat_response())
+        client.chat.completions.create.side_effect = failure
+        provider_label = "OpenAI-compatible"
+    else:
+        response = _responses_response(
+            SimpleNamespace(
+                type="output_text",
+                parsed=Verdict(accepted=True, summary="not reached"),
+            )
+        )
+        provider, client, _ = _responses_provider(monkeypatch, response)
+        client.responses.parse.side_effect = failure
+        provider_label = "OpenAI Responses"
+
+    with pytest.raises(ModelError) as raised:
+        provider.generate(instructions="Private.", prompt="Secret.", output_type=Verdict)
+
+    assert str(raised.value) == (
+        f"{provider_label} request failed (HTTP 400; request ID: req_safe_to_log)"
+    )
+    assert _API_KEY not in str(raised.value)
+    assert "private prompt" not in str(raised.value)
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize("attribute", ["type", "code", "param"])
+def test_provider_request_error_never_renders_provider_controlled_error_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+) -> None:
+    response = _responses_response(
+        SimpleNamespace(type="output_text", parsed=Verdict(accepted=True, summary="not reached"))
+    )
+    provider, client, _ = _responses_provider(monkeypatch, response)
+    failure = _bad_request_error()
+    private_sentinel = "confidentialmergercodename"
+    setattr(
+        failure,
+        attribute,
+        f"input.{private_sentinel}" if attribute == "param" else private_sentinel,
+    )
+    client.responses.parse.side_effect = failure
+
+    with pytest.raises(ModelError) as raised:
+        provider.generate(instructions="Private.", prompt="Secret.", output_type=Verdict)
+
+    assert str(raised.value) == (
+        "OpenAI Responses request failed (HTTP 400; request ID: req_safe_to_log)"
+    )
+    assert private_sentinel not in str(raised.value)
+
+
+@pytest.mark.parametrize("status_code", [True, "401", 399, 600])
+def test_provider_request_error_omits_invalid_http_status_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: object,
+) -> None:
+    response = _responses_response(
+        SimpleNamespace(type="output_text", parsed=Verdict(accepted=True, summary="not reached"))
+    )
+    provider, client, _ = _responses_provider(monkeypatch, response)
+    failure = _bad_request_error()
+    failure.status_code = status_code  # type: ignore[assignment]
+    client.responses.parse.side_effect = failure
+
+    with pytest.raises(ModelError) as raised:
+        provider.generate(instructions="Private.", prompt="Secret.", output_type=Verdict)
+
+    assert str(raised.value) == "OpenAI Responses request failed (request ID: req_safe_to_log)"
 
 
 @pytest.mark.parametrize("compatible", [False, True])
