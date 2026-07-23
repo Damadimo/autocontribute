@@ -206,6 +206,23 @@ def test_responses_provider_parses_one_output_and_maps_detailed_usage(
     )
 
 
+def test_responses_provider_omits_reasoning_mode_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = Verdict(accepted=True, summary="well scoped")
+    response = _responses_response(SimpleNamespace(type="output_text", parsed=expected))
+    provider, client, _ = _responses_provider(monkeypatch, response)
+    provider.profile.reasoning_mode = None
+
+    provider.generate(
+        instructions="Return a strict verdict.",
+        prompt="Review the patch.",
+        output_type=Verdict,
+    )
+
+    assert client.responses.parse.call_args.kwargs["reasoning"] == {"effort": "high"}
+
+
 def test_provider_rejects_model_snapshot_outside_calibrated_deployment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

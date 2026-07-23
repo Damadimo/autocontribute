@@ -123,6 +123,12 @@ def test_checked_in_staging_config_is_safe_for_the_operator_fixture() -> None:
     assert settings.sandbox.network == "none"
     assert settings.sandbox.max_commands == 11
     assert settings.storage.path == ROOT / ".autocontribute-staging"
+    assert settings.models.scout.model == "gpt-5.5"
+    assert settings.models.builder.model == "gpt-5.5"
+    assert settings.models.critic.model == "gpt-5.5-pro"
+    assert settings.models.scout.reasoning_mode is None
+    assert settings.models.builder.reasoning_mode is None
+    assert settings.models.critic.reasoning_mode is None
 
 
 @pytest.mark.parametrize(
