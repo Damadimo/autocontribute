@@ -127,8 +127,21 @@ jobs:
              test -s /tmp/autocontribute-debug-targets &&
              xargs cmake --build --preset libcudacxx --parallel 2 --target \
                </tmp/autocontribute-debug-targets &&
-             ctest --test-dir build/autocontribute/libcudacxx \
+             if ctest --test-dir build/autocontribute/libcudacxx \
                --tests-regex "^libcudacxx\.test\.debugging\." \
                --exclude-regex "^libcudacxx\.test\.debugging\.buffer\." \
                --output-on-failure \
-               --no-tests=error'
+               --no-tests=error; then
+               :;
+             else
+               ctest_status=$?;
+               for artifact in \
+                 build/autocontribute/libcudacxx/libcudacxx/test/debugging/memory_resource/*.commands \
+                 build/autocontribute/libcudacxx/libcudacxx/test/debugging/memory_resource/*.log; do
+                 if [ -f "$artifact" ]; then
+                   printf "\n===== %s =====\n" "$artifact";
+                   cat "$artifact";
+                 fi;
+               done;
+               exit "$ctest_status";
+             fi'
