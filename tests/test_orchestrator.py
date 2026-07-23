@@ -1649,6 +1649,131 @@ def test_repository_pull_request_template_is_a_hard_pre_review_gate(
     assert providers["critic"].calls == 0
 
 
+def test_required_template_tasks_are_completed_only_after_validation(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    source, _ = _source_repository(tmp_path)
+    template_dir = source / ".github"
+    template_dir.mkdir()
+    (template_dir / "pull_request_template.md").write_text(
+        "## Summary\n\n## Testing\n\n- [ ] Tests pass\n",
+        encoding="utf-8",
+    )
+    _git(source, "add", ".")
+    _git(source, "commit", "--quiet", "-m", "add pull request template")
+    sha = _git(source, "rev-parse", "HEAD")
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    proposal = providers["builder"].output
+    assert isinstance(proposal, PatchProposal)
+    providers["builder"].output = proposal.model_copy(
+        update={
+            "pull_request_body": (
+                "## Summary\n\nFixes #42. Corrects the boundary return value.\n\n"
+                "## Testing\n\n- [ ] Tests pass\n"
+            )
+        }
+    )
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
+
+    assert manifest.status == RunStatus.READY_FOR_APPROVAL
+    assert manifest.proposal is not None
+    assert "- [x] Tests pass" in manifest.proposal.pull_request_body
+    critic_prompt = str(providers["critic"].requests[0]["prompt"])
+    assert "- [x] Tests pass" in critic_prompt
+    assert "validation_results" in critic_prompt
+
+
+def test_failed_validation_never_completes_template_tasks(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    source, _ = _source_repository(tmp_path)
+    template_dir = source / ".github"
+    template_dir.mkdir()
+    (template_dir / "pull_request_template.md").write_text(
+        "## Summary\n\n## Testing\n\n- [ ] Tests pass\n",
+        encoding="utf-8",
+    )
+    _git(source, "add", ".")
+    _git(source, "commit", "--quiet", "-m", "add pull request template")
+    sha = _git(source, "rev-parse", "HEAD")
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "budget": {"max_model_calls_per_run": 3},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    providers = _providers()
+    proposal = providers["builder"].output
+    assert isinstance(proposal, PatchProposal)
+    providers["builder"].output = proposal.model_copy(
+        update={
+            "pull_request_body": (
+                "## Summary\n\nFixes #42. Corrects the boundary return value.\n\n"
+                "## Testing\n\n- [ ] Tests pass\n"
+            )
+        }
+    )
+
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=SequenceSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
+
+    assert manifest.status == RunStatus.REJECTED
+    assert manifest.proposal is not None
+    assert "- [ ] Tests pass" in manifest.proposal.pull_request_body
+    critic_prompt = str(providers["critic"].requests[0]["prompt"])
+    assert "- [ ] Tests pass" in critic_prompt
+    assert "- [x] Tests pass" not in critic_prompt
+
+
 def test_organization_default_pull_request_template_is_a_hard_gate(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]

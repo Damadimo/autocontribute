@@ -13,6 +13,7 @@ from autocontribute.domain import (
     RepositoryInfo,
 )
 from autocontribute.prompts import (
+    BUILDER_INSTRUCTIONS,
     implementation_prompt,
     planning_prompt,
     repair_prompt,
@@ -124,6 +125,13 @@ def test_derived_plan_and_file_metadata_never_become_trusted_markup() -> None:
     assert files[0]["path"] == malicious_path
     assert files[0]["content"] == "def value() -> int:\n    return 1 < 2\n"
     assert files[1]["content"] == SENSITIVE_FILE_REDACTION
+
+
+def test_builder_preserves_template_tasks_for_evidence_backed_completion() -> None:
+    instructions = " ".join(BUILDER_INSTRUCTIONS.split())
+    assert "Reproduce every heading and safe checklist item" in instructions
+    assert "Leave automated claims that depend on commands unchecked" in instructions
+    assert "Do not introduce any other unchecked item" in instructions
 
 
 def test_review_and_repair_keep_all_derived_evidence_untrusted() -> None:
