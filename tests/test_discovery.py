@@ -517,12 +517,22 @@ def _comment(*, body: str, author: str = "contributor", association: str = "NONE
     )
 
 
-def test_claimed_work_in_discussion_fails_closed(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "claim",
+    [
+        "I'm working on this and will open a PR shortly.",
+        "I would like to work on this.",
+        "I'd like to work on this as a follow up.",
+        "I'd loke to worn on this as a follow up.",
+        "I want to take this.",
+    ],
+)
+def test_claimed_work_in_discussion_fails_closed(tmp_path, claim: str) -> None:
     config = AutocontributeConfig()
     service = DiscoveryService(config, FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
     issue = _issue(
         comments=1,
-        discussion=[_comment(body="I'm working on this and will open a PR shortly.")],
+        discussion=[_comment(body=claim)],
     )
 
     result = service.evaluate(issue, _repository())

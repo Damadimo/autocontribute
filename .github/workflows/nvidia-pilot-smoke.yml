@@ -1,0 +1,103 @@
+name: NVIDIA pilot sandbox smoke
+
+on:
+  push:
+    branches:
+      - pilot/nvidia-cccl-e2e
+    paths:
+      - .github/workflows/nvidia-pilot-smoke.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nvidia-pilot-sandbox-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check runner capacity
+        run: |
+          df -h /
+          docker info --format '{{json .SecurityOptions}}'
+      - name: Check out pinned CCCL baseline
+        env:
+          CCCL_SHA: 74750558d6a6f409666d0db667708f455f24714f
+        run: |
+          git init cccl
+          git -C cccl remote add origin https://github.com/NVIDIA/cccl.git
+          git -C cccl fetch --depth=1 --filter=blob:none origin "$CCCL_SHA"
+          git -C cccl checkout --detach FETCH_HEAD
+      - name: Preload immutable CCCL sandbox
+        env:
+          SANDBOX_IMAGE: >-
+            rapidsai/devcontainers@sha256:dea01ef9fe0f500a50aa4eb3645979d73661de4e6d813ea0c82bc1171234fb9e
+        run: docker pull "$SANDBOX_IMAGE"
+      - name: Run baseline debugger checks inside the production sandbox boundary
+        env:
+          SANDBOX_IMAGE: >-
+            rapidsai/devcontainers@sha256:dea01ef9fe0f500a50aa4eb3645979d73661de4e6d813ea0c82bc1171234fb9e
+        run: |
+          timeout --signal=TERM --kill-after=5s 600s docker run --rm \
+            --pull=never \
+            --network=none \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --ipc=none \
+            --user="$(id -u):$(id -g)" \
+            --memory=8g \
+            --memory-swap=8g \
+            --cpus=4 \
+            --pids-limit=512 \
+            --ulimit=nofile=1024:1024 \
+            --ulimit=core=0:0 \
+            --stop-timeout=2 \
+            --init \
+            --entrypoint=/usr/bin/env \
+            --workdir=/workspace \
+            --tmpfs=/tmp:rw,nosuid,nodev,size=512m \
+            --mount="type=bind,src=$PWD/cccl,dst=/workspace" \
+            --mount="type=bind,src=$PWD/cccl/.git,dst=/workspace/.git,readonly" \
+            "$SANDBOX_IMAGE" \
+            -i \
+            HOME=/tmp \
+            TMPDIR=/tmp \
+            PATH=/usr/local/cuda/bin:/usr/local/python/current/bin:/usr/local/py-utils/bin:/usr/local/jupyter:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            CC=gcc \
+            CXX=g++ \
+            CUDAHOSTCXX=g++ \
+            CCCL_BUILD_INFIX=autocontribute \
+            CI=1 \
+            NO_COLOR=1 \
+            GIT_TERMINAL_PROMPT=0 \
+            AUTOCONTRIBUTE_SANDBOX=1 \
+            /bin/sh -lc \
+            'git diff --check &&
+             python -m compileall -q libcudacxx/share/libcudacxx libcudacxx/test/debugging &&
+             ruff check libcudacxx/share/libcudacxx/gdb libcudacxx/share/libcudacxx/lldb libcudacxx/test/debugging &&
+             ruff format --check libcudacxx/share/libcudacxx/gdb libcudacxx/share/libcudacxx/lldb libcudacxx/test/debugging &&
+             find libcudacxx/test/debugging -type f -name CMakeLists.txt -exec gersemi --check {} + &&
+             find libcudacxx/test/debugging -type f -name "*.cu" -exec clang-format --dry-run --Werror {} + &&
+             /usr/local/cuda/bin/nvcc --version &&
+             /usr/local/cuda/bin/cuda-gdb --version &&
+             lldb --version &&
+             cmake --preset libcudacxx
+               -DCMAKE_CUDA_ARCHITECTURES=75-virtual
+               -DLIBCUDACXX_GDB=/usr/local/cuda/bin/cuda-gdb
+               -DLIBCUDACXX_ENABLE_GDB_TESTING=ON
+               -DLIBCUDACXX_ENABLE_LLDB_TESTING=ON &&
+             cmake --build --preset libcudacxx --target help >/tmp/autocontribute-target-help &&
+             grep -oE "libcudacxx\.test\.debugging\.[[:alnum:]_-]+"
+               /tmp/autocontribute-target-help | sort -u >/tmp/autocontribute-debug-targets &&
+             test -s /tmp/autocontribute-debug-targets &&
+             xargs cmake --build --preset libcudacxx --parallel 2 --target
+               </tmp/autocontribute-debug-targets &&
+             ctest --preset libcudacxx
+               --tests-regex "^libcudacxx\.test\.debugging\."
+               --exclude-regex "^libcudacxx\.test\.debugging\.buffer\."
+               --output-on-failure
+               --no-tests=error'

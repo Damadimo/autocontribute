@@ -104,6 +104,9 @@ _WORK_CLAIM = re.compile(
     r"\b(?:(?:i(?:'m| am|\u2019m)|we(?:'re| are|\u2019re))\s+"
     r"(?:(?:already|currently)\s+)?working on (?:this|it)|"
     r"i(?:'ll| will) (?:take|work on) (?:this|it)|"
+    r"i(?:'d|\u2019d| would) (?:like|loke) to "
+    r"(?:take (?:on )?|(?:work|worn) on )(?:this|it)|"
+    r"i (?:want|plan) to (?:take (?:on )?|work on )(?:this|it)|"
     r"working on (?:a |the )?(?:fix|pull request|pr)|"
     r"please assign (?:this|it) to me)\b",
     re.I,

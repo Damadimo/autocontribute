@@ -1,0 +1,120 @@
+# Production-equivalent, review-gated pilot for one explicitly approved NVIDIA repository.
+# Credentials are injected through environment variables; never add them to this file.
+identity:
+  name: "Damadimo"
+  email: "70027166+Damadimo@users.noreply.github.com"
+
+github:
+  auth: token
+  token_env: AUTOCONTRIBUTE_GITHUB_TOKEN
+  repositories:
+    - NVIDIA/cccl
+  owners: []
+  include_labels: ["good first issue", "help wanted"]
+  exclude_labels: ["security", "breaking change", "needs design", "blocked", "discussion"]
+  min_stars: 1000
+  repository_limit_per_owner: 1
+  issue_limit_per_repository: 10
+  require_unassigned: true
+  max_issue_age_days: 365
+  max_repository_inactivity_days: 90
+
+models:
+  scout: &production_model
+    provider: openai
+    model: gpt-5.5
+    api_key_env: OPENAI_API_KEY
+    reasoning_effort: high
+    reasoning_mode: null
+    max_input_tokens: 500000
+    max_output_tokens: 40000
+    timeout_seconds: 900
+    # Conservative operator ceilings, not a bundled price table.
+    pricing:
+      input_usd_per_million_tokens: 10
+      cached_input_usd_per_million_tokens: 10
+      cache_write_usd_per_million_tokens: 10
+      output_usd_per_million_tokens: 45
+  builder: *production_model
+  critic: *production_model
+
+sandbox:
+  backend: docker
+  image: >-
+    rapidsai/devcontainers@sha256:dea01ef9fe0f500a50aa4eb3645979d73661de4e6d813ea0c82bc1171234fb9e
+  network: none
+  command_timeout_seconds: 600
+  memory: 8g
+  cpus: 4
+  pids_limit: 512
+  max_commands: 12
+
+validation:
+  required_commands:
+    NVIDIA/cccl:
+      - >-
+        export PATH=/usr/local/cuda/bin:/usr/local/python/current/bin:/usr/local/py-utils/bin:/usr/local/jupyter:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin;
+        export CC=gcc CXX=g++ CUDAHOSTCXX=g++ CCCL_BUILD_INFIX=autocontribute;
+        git diff --check &&
+        python -m compileall -q libcudacxx/share/libcudacxx libcudacxx/test/debugging &&
+        /usr/local/cuda/bin/nvcc --version >/dev/null &&
+        cmake --preset libcudacxx
+        -DCMAKE_CUDA_ARCHITECTURES=75-virtual
+        -DLIBCUDACXX_GDB=/usr/local/cuda/bin/cuda-gdb
+        -DLIBCUDACXX_ENABLE_GDB_TESTING=ON
+        -DLIBCUDACXX_ENABLE_LLDB_TESTING=ON &&
+        cmake --build --preset libcudacxx --target help >/tmp/autocontribute-target-help &&
+        grep -oE 'libcudacxx\.test\.debugging\.[[:alnum:]_-]+'
+        /tmp/autocontribute-target-help | sort -u >/tmp/autocontribute-debug-targets &&
+        test -s /tmp/autocontribute-debug-targets &&
+        xargs cmake --build --preset libcudacxx --parallel 2 --target
+        </tmp/autocontribute-debug-targets &&
+        ctest --preset libcudacxx --tests-regex '^libcudacxx\.test\.debugging\.'
+        --exclude-regex '^libcudacxx\.test\.debugging\.buffer\.'
+        --output-on-failure --no-tests=error
+
+policy:
+  require_maintainer_signal: true
+  require_contribution_guidelines: true
+  allow_assigned_issues: false
+  allow_security_issues: false
+  allow_dependency_changes: false
+  allow_workflow_changes: false
+  legal_attestations: {}
+  ai_disclosure: >-
+    This contribution was prepared autonomously by an AI agent. Its validation evidence comes from
+    Autocontribute's configured automated checks; no human review is implied.
+
+quality:
+  min_candidate_score: 85
+  min_readiness_score: 90
+  min_dimension_score: 80
+  max_files_changed: 12
+  max_changed_lines: 600
+  max_context_files: 24
+  max_context_characters: 200000
+  require_validation_commands: true
+  require_regression_evidence_for_bugfix: true
+
+publishing:
+  mode: review_required
+  approval_expires_hours: 12
+  branch_prefix: autocontribute
+  draft: true
+  ready_for_review: false
+  max_new_pull_requests_per_day: 1
+  # The authenticated account currently has eight unrelated open PRs; retain headroom for this pilot.
+  max_open_pull_requests: 10
+  repository_cooldown_days: 30
+  auto_publish_env: AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH
+
+budget:
+  max_model_calls_per_run: 6
+  max_candidates_per_run: 10
+  max_input_tokens_per_run: 3000000
+  max_output_tokens_per_run: 240000
+  max_model_seconds_per_run: 3600
+  max_model_cost_usd_per_run: 50
+
+storage:
+  path: .autocontribute
