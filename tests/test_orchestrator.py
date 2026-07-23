@@ -129,6 +129,33 @@ class FakeGitHub:
         return "b" * 40
 
 
+class CountingGitHub(FakeGitHub):
+    def __init__(self, issue: IssueCandidate, repository: RepositoryInfo, sha: str) -> None:
+        super().__init__(issue, repository, sha)
+        self.default_branch_calls = 0
+
+    def default_branch_sha(self, repository: str, branch: str) -> str:
+        self.default_branch_calls += 1
+        return super().default_branch_sha(repository, branch)
+
+
+class DiscoveryGitHub(CountingGitHub):
+    def __init__(self, issue: IssueCandidate, repository: RepositoryInfo, sha: str) -> None:
+        super().__init__(issue, repository, sha)
+        self.search_calls = 0
+
+    def search_issues(
+        self,
+        repository: str,
+        *,
+        labels: list[str],
+        limit: int,
+    ) -> list[IssueCandidate]:
+        del repository, labels, limit
+        self.search_calls += 1
+        return [self.issue]
+
+
 class FixedProvider:
     def __init__(self, output: Any, model: str, *, usage: ModelUsage | None = None) -> None:
         self.output = output
@@ -2043,6 +2070,147 @@ def test_ineligible_explicit_issue_skips_without_spending_model_tokens(tmp_path:
     assert all(provider.calls == 0 for provider in providers.values())
 
 
+def test_unchanged_explicit_issue_is_deferred_before_eligibility_or_model_work(
+    tmp_path: Path,
+) -> None:
+    sha = "a" * 40
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    providers = _providers()
+    github = CountingGitHub(_issue(assigned=True), _repository(sha), sha)
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=github,  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        first = orchestrator.run(issue_reference="example/project#42")
+        second = orchestrator.run(issue_reference="example/project#42")
+
+    assert first.status == RunStatus.SKIPPED
+    assert second.status == RunStatus.SKIPPED
+    assert second.candidate is None
+    assert "unchanged since prior skipped run" in (second.skip_reason or "")
+    assert "--retry-unchanged" in (second.skip_reason or "")
+    assert github.default_branch_calls == 1
+    assert all(provider.calls == 0 for provider in providers.values())
+    events = store.events(second.run_id)
+    assert "candidate.retry_deferred" in [event["event_type"] for event in events]
+    details = json.loads(
+        next(
+            event["details"]
+            for event in events
+            if event["event_type"] == "candidate.retry_deferred"
+        )
+    )
+    first_selection = json.loads(
+        next(
+            event["details"]
+            for event in store.events(first.run_id)
+            if event["event_type"] == "candidate.selected"
+        )
+    )
+    assert details == {
+        "issue": "example/project#42",
+        "issue_revision": first_selection["issue_revision"],
+        "prior_run_id": first.run_id,
+        "prior_status": "skipped",
+    }
+
+
+def test_unpinned_discovery_exhausts_suppressed_revision_without_model_work(
+    tmp_path: Path,
+) -> None:
+    sha = "a" * 40
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    providers = _providers()
+    github = DiscoveryGitHub(_issue(assigned=True), _repository(sha), sha)
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=github,  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        prior = orchestrator.run(issue_reference="example/project#42")
+        discovered = orchestrator.run()
+
+    assert prior.status == RunStatus.SKIPPED
+    assert discovered.status == RunStatus.SKIPPED
+    assert discovered.candidate is None
+    assert discovered.skip_reason == (
+        "No candidate is currently available: 1 unchanged issue revision was deferred after a "
+        "prior skipped, rejected, or cancelled run."
+    )
+    assert github.search_calls == 1
+    assert all(provider.calls == 0 for provider in providers.values())
+    exhaustion = next(
+        event
+        for event in store.events(discovered.run_id)
+        if event["event_type"] == "candidate.discovery_exhausted"
+    )
+    assert json.loads(exhaustion["details"]) == {
+        "active_candidates": "0",
+        "ineligible_candidates": "0",
+        "suppressed_candidates": "1",
+    }
+
+
+def test_retry_unchanged_explicit_issue_records_override_and_rechecks_eligibility(
+    tmp_path: Path,
+) -> None:
+    sha = "a" * 40
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    providers = _providers()
+    github = CountingGitHub(_issue(assigned=True), _repository(sha), sha)
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=github,  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        first = orchestrator.run(issue_reference="example/project#42")
+        retried = orchestrator.run(
+            issue_reference="example/project#42",
+            retry_unchanged=True,
+        )
+
+    assert first.status == RunStatus.SKIPPED
+    assert retried.status == RunStatus.SKIPPED
+    assert retried.candidate is not None
+    assert "already assigned" in (retried.skip_reason or "")
+    assert github.default_branch_calls == 2
+    assert all(provider.calls == 0 for provider in providers.values())
+    events = store.events(retried.run_id)
+    override = next(event for event in events if event["event_type"] == "candidate.retry_override")
+    assert json.loads(override["details"])["prior_run_id"] == first.run_id
+
+
 def test_explicit_issue_cannot_bypass_repository_allowlist(tmp_path: Path) -> None:
     sha = "a" * 40
     config = AutocontributeConfig.model_validate(
@@ -2319,16 +2487,34 @@ def test_reused_orchestrator_resets_per_run_model_call_artifact(
     )
     store = RunStore(config.storage.path)
     providers = _providers()
+    github = FakeGitHub(_issue(), _repository(sha), sha)
     orchestrator = Orchestrator(
         config,
         store=store,
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        github=github,  # type: ignore[arg-type]
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     )
 
     first = orchestrator.run(issue_reference="example/project#42")
-    second = orchestrator.run(issue_reference="example/project#42")
+    blocked = orchestrator.run(
+        issue_reference="example/project#42",
+        retry_unchanged=True,
+    )
+    assert blocked.status == RunStatus.SKIPPED
+    assert blocked.candidate is None
+    assert "already has active run" in (blocked.skip_reason or "")
+    assert all(provider.calls == 1 for provider in providers.values())
+    assert "candidate.active_deferred" in [
+        event["event_type"] for event in store.events(blocked.run_id)
+    ]
+    github.issue = _issue().model_copy(
+        update={
+            "number": 43,
+            "html_url": "https://github.com/example/project/issues/43",
+        }
+    )
+    second = orchestrator.run(issue_reference="example/project#43")
 
     assert first.status == RunStatus.READY_FOR_APPROVAL
     assert second.status == RunStatus.READY_FOR_APPROVAL

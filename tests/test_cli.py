@@ -984,6 +984,96 @@ def test_safety_stop_while_stopped_records_new_evidence_and_validates_input(
     assert status.reason == "second reason"
 
 
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--retry-unchanged"], "--retry-unchanged requires --issue"),
+        (
+            ["--scheduled", "--issue", "example/project#42"],
+            "--scheduled cannot be combined with --issue",
+        ),
+        (
+            [
+                "--scheduled",
+                "--issue",
+                "example/project#42",
+                "--retry-unchanged",
+            ],
+            "--retry-unchanged cannot be used by a scheduled invocation",
+        ),
+    ],
+)
+def test_retry_unchanged_cli_combinations_fail_before_configuration_or_github(
+    arguments: list[str],
+    message: str,
+) -> None:
+    result = runner.invoke(app, ["run", *arguments])
+
+    assert result.exit_code == 1, result.output
+    assert message in result.output
+
+
+def test_manual_retry_unchanged_is_forwarded_to_orchestrator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+    calls: list[str] = []
+
+    class FakeGitHub:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def close(self) -> None:
+            calls.append("close")
+
+    class FakeOrchestrator:
+        def __init__(self, _: object, *, store: RunStore, github: object) -> None:
+            del github
+            self.store = store
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def run(  # type: ignore[no-untyped-def]
+            self,
+            *,
+            issue_reference: str | None = None,
+            retry_unchanged: bool = False,
+        ):
+            assert issue_reference == "example/project#42"
+            assert retry_unchanged
+            calls.append("run:retry")
+            manifest = self.store.create_run()
+            manifest.status = RunStatus.SKIPPED
+            manifest.skip_reason = "fixture"
+            self.store.save(manifest, event="test.skipped", details={})
+            return manifest
+
+    monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
+    monkeypatch.setattr(cli, "Orchestrator", FakeOrchestrator)
+
+    result = runner.invoke(
+        app,
+        [
+            "run",
+            "--issue",
+            "example/project#42",
+            "--retry-unchanged",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["run:retry", "close"]
+
+
 def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     config = tmp_path / "autocontribute.yml"
     state = tmp_path / "state"
@@ -1007,7 +1097,13 @@ def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monk
         def __exit__(self, *_: object) -> None:
             pass
 
-        def run(self, *, issue_reference: str | None = None):  # type: ignore[no-untyped-def]
+        def run(  # type: ignore[no-untyped-def]
+            self,
+            *,
+            issue_reference: str | None = None,
+            retry_unchanged: bool = False,
+        ):
+            assert not retry_unchanged
             calls.append("run")
             manifest = self.store.create_run()
             manifest.status = RunStatus.SKIPPED
@@ -1061,7 +1157,13 @@ def test_auto_path_resyncs_lifecycle_immediately_before_publisher(
         def __exit__(self, *_: object) -> None:
             pass
 
-        def run(self, *, issue_reference: str | None = None):  # type: ignore[no-untyped-def]
+        def run(  # type: ignore[no-untyped-def]
+            self,
+            *,
+            issue_reference: str | None = None,
+            retry_unchanged: bool = False,
+        ):
+            assert not retry_unchanged
             calls.append("run")
             manifest = self.store.create_run()
             manifest.status = RunStatus.READY_FOR_APPROVAL

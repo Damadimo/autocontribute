@@ -14,15 +14,26 @@ from autocontribute.discovery import (
     MAX_POLICY_FILES_PER_REPOSITORY,
     MAX_POLICY_TOTAL_BYTES,
     POLICY_SOURCES_EVIDENCE_KEY,
+    DiscoveryOutcome,
     DiscoveryService,
     PolicySnapshot,
     apply_legal_commit_message,
     parse_issue_reference,
     validate_legal_publication,
 )
-from autocontribute.domain import IssueCandidate, IssueComment, RepositoryInfo
+from autocontribute.domain import (
+    EligibilityResult,
+    IssueCandidate,
+    IssueComment,
+    RepositoryInfo,
+    RunStatus,
+)
 from autocontribute.exceptions import GitHubError, PolicyError, StateError
-from autocontribute.store import RunStore
+from autocontribute.store import (
+    CandidateAttemptDisposition,
+    CandidateAttemptState,
+    RunStore,
+)
 
 REPOSITORY_REF = "a" * 40
 ORGANIZATION_REF = "b" * 40
@@ -66,6 +77,55 @@ class PolicyGitHub(FakeGitHub):
     ) -> str | None:
         del ref, max_bytes
         return self.files.get((repository, path))
+
+
+class CandidateDiscoveryGitHub(FakeGitHub):
+    def __init__(self, issues: list[IssueCandidate]) -> None:
+        self.issues = {issue.number: issue for issue in issues}
+        self.fetched: list[int] = []
+
+    def get_repository(self, full_name: str) -> RepositoryInfo:
+        del full_name
+        return _repository()
+
+    def search_issues(
+        self,
+        repository: str,
+        *,
+        labels: list[str],
+        limit: int,
+    ) -> list[IssueCandidate]:
+        del repository, labels
+        return list(self.issues.values())[:limit]
+
+    def get_issue(self, repository: str, number: int) -> IssueCandidate:
+        del repository
+        self.fetched.append(number)
+        return self.issues[number]
+
+
+class DispositionStore:
+    def __init__(self, states: dict[int, CandidateAttemptState]) -> None:
+        self.states = states
+
+    def candidate_attempt_disposition(
+        self,
+        issue: IssueCandidate,
+    ) -> CandidateAttemptDisposition:
+        state = self.states.get(issue.number, CandidateAttemptState.AVAILABLE)
+        prior = state != CandidateAttemptState.AVAILABLE
+        return CandidateAttemptDisposition(
+            state=state,
+            issue_revision="a" * 64,
+            prior_run_id="prior-run" if prior else None,
+            prior_status=(
+                RunStatus.REJECTED
+                if state == CandidateAttemptState.SUPPRESSED
+                else RunStatus.READY_FOR_APPROVAL
+                if state == CandidateAttemptState.ACTIVE
+                else None
+            ),
+        )
 
 
 def _repository() -> RepositoryInfo:
@@ -357,6 +417,92 @@ def test_inactive_repository_fails_before_model_selection(tmp_path) -> None:
 
 def test_issue_reference_parser_is_unambiguous() -> None:
     assert parse_issue_reference("owner/repo#123") == ("owner/repo", 123)
+
+
+def test_discovery_continues_past_suppressed_revision_without_spending_candidate_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _issue(number=41, title="Previously rejected candidate")
+    second = _issue(number=42, title="Fresh candidate")
+    third = _issue(number=43, title="Candidate beyond the configured evaluation budget")
+    github = CandidateDiscoveryGitHub([first, second, third])
+    store = DispositionStore({41: CandidateAttemptState.SUPPRESSED})
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "budget": {"max_candidates_per_run": 1},
+            "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
+        }
+    )
+    service = DiscoveryService(config, github, store)  # type: ignore[arg-type]
+    evaluated: list[int] = []
+
+    def eligible(
+        issue: IssueCandidate,
+        repository: RepositoryInfo,
+        **_: object,
+    ) -> EligibilityResult:
+        del repository
+        evaluated.append(issue.number)
+        return EligibilityResult(eligible=True, score=90, evidence={}, blockers=[])
+
+    monkeypatch.setattr(service, "evaluate", eligible)
+
+    outcome = service.discover()
+
+    assert outcome.selection is not None
+    assert outcome.selection[0].number == 42
+    assert outcome.suppressed_candidates == 1
+    assert evaluated == [42]
+    assert github.fetched == [41, 42]
+
+
+def test_discovery_exhaustion_distinguishes_suppressed_active_and_ineligible_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    issues = [_issue(number=number) for number in (41, 42, 43)]
+    github = CandidateDiscoveryGitHub(issues)
+    store = DispositionStore(
+        {
+            41: CandidateAttemptState.SUPPRESSED,
+            42: CandidateAttemptState.ACTIVE,
+        }
+    )
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
+        }
+    )
+    service = DiscoveryService(config, github, store)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        service,
+        "evaluate",
+        lambda *_args, **_kwargs: EligibilityResult(
+            eligible=False,
+            score=20,
+            evidence={},
+            blockers=["fixture"],
+        ),
+    )
+
+    outcome = service.discover()
+
+    assert outcome.selection is None
+    assert outcome.active_candidates == 1
+    assert outcome.suppressed_candidates == 1
+    assert outcome.ineligible_candidates == 1
+    assert outcome.no_candidate_reason == (
+        "No candidate is currently available: 1 unchanged issue revision was deferred after a "
+        "prior skipped, rejected, or cancelled run; 1 candidate already has an active run; "
+        "1 candidate failed deterministic discovery gates."
+    )
+
+
+def test_empty_discovery_preserves_generic_no_candidate_reason() -> None:
+    outcome = DiscoveryOutcome(selection=None)
+
+    assert outcome.no_candidate_reason == "No candidate passed deterministic discovery gates."
 
 
 def _comment(*, body: str, author: str = "contributor", association: str = "NONE") -> IssueComment:

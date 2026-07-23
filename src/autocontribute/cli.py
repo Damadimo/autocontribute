@@ -205,13 +205,13 @@ def discover(config: ConfigOption = DEFAULT_CONFIG) -> None:
     store = RunStore(settings.storage.path)
     try:
         with _github_client(settings, store) as github:
-            selection = DiscoveryService(settings, github, store).discover()
+            outcome = DiscoveryService(settings, github, store).discover()
     except AutocontributeError as exc:
         _fail(str(exc))
-    if selection is None:
-        console.print("[yellow]No candidate passed every deterministic discovery gate.[/yellow]")
+    if outcome.selection is None:
+        console.print(f"[yellow]{outcome.no_candidate_reason}[/yellow]")
         return
-    issue, repository, eligibility = selection
+    issue, repository, eligibility = outcome.selection
     console.print(f"[bold green]{issue.reference}[/bold green] — {issue.title}")
     console.print(issue.html_url)
     console.print(f"Repository: {repository.full_name} ({repository.stars:,} stars)")
@@ -227,6 +227,12 @@ def run_once(
         str | None,
         typer.Option(help="Pin the attempt to owner/repository#number."),
     ] = None,
+    retry_unchanged: Annotated[
+        bool,
+        typer.Option(
+            help="Deliberately retry an unchanged skipped, rejected, or cancelled --issue."
+        ),
+    ] = False,
     scheduled: Annotated[
         bool,
         typer.Option(
@@ -236,6 +242,12 @@ def run_once(
 ) -> None:
     """Prepare one candidate, or skip safely when evidence is insufficient."""
 
+    if scheduled and retry_unchanged:
+        _fail("--retry-unchanged cannot be used by a scheduled invocation")
+    if scheduled and issue is not None:
+        _fail("--scheduled cannot be combined with --issue; pinned retries must be manual")
+    if retry_unchanged and issue is None:
+        _fail("--retry-unchanged requires --issue owner/repository#number")
     settings = _config(config)
     store = RunStore(settings.storage.path)
     github: GitHubClient | None = None
@@ -256,7 +268,10 @@ def run_once(
             if not _scheduled_auto_preflight(settings, store, github):
                 return
         with Orchestrator(settings, store=store, github=github) as orchestrator:
-            manifest = orchestrator.run(issue_reference=issue)
+            manifest = orchestrator.run(
+                issue_reference=issue,
+                retry_unchanged=retry_unchanged,
+            )
         if manifest.status == RunStatus.READY_FOR_APPROVAL and settings.publishing.mode == "auto":
             _sync_lifecycle(settings, store, github)
             manifest = Publisher(settings, store, github).publish(manifest.run_id)

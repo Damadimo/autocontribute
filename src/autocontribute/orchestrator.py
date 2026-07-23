@@ -82,7 +82,7 @@ from autocontribute.redaction import (
 from autocontribute.reporting import render_run_report
 from autocontribute.repository import ContextEntry, RepositoryWorkspace, TextMatch
 from autocontribute.sandbox import SandboxRunner
-from autocontribute.store import RunStore
+from autocontribute.store import CandidateAttemptDisposition, CandidateAttemptState, RunStore
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 ProviderFactory = Callable[[object], ModelProvider]
@@ -180,7 +180,14 @@ class Orchestrator:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def run(self, *, issue_reference: str | None = None) -> RunManifest:
+    def run(
+        self,
+        *,
+        issue_reference: str | None = None,
+        retry_unchanged: bool = False,
+    ) -> RunManifest:
+        if retry_unchanged and issue_reference is None:
+            raise ValueError("retry_unchanged requires an explicit issue reference")
         self._model_events = []
         self.store.assert_circuit_breaker_clear()
         with LeaseHeartbeatGuard(
@@ -205,6 +212,7 @@ class Orchestrator:
                     manifest = self._prepare(
                         manifest,
                         issue_reference=issue_reference,
+                        retry_unchanged=retry_unchanged,
                         commands=commands,
                     )
                 except Exception as exc:
@@ -231,11 +239,13 @@ class Orchestrator:
         manifest: RunManifest,
         *,
         issue_reference: str | None,
+        retry_unchanged: bool,
         commands: list[CommandResult],
     ) -> RunManifest:
         self._assert_operational()
         self.store.transition(manifest, RunStatus.DISCOVERING, reason="starting candidate search")
         discovery = DiscoveryService(self.config, self.github, self.store)
+        retry_override: CandidateAttemptDisposition | None = None
 
         if issue_reference:
             repository_name, issue_number = parse_issue_reference(issue_reference)
@@ -245,6 +255,67 @@ class Orchestrator:
             issue = self.github.get_issue(repository.full_name, issue_number)
             if issue.repository.casefold() != repository.full_name.casefold():
                 raise PolicyError("Pinned issue resolved outside its configured repository")
+            retry_override = self.store.candidate_attempt_disposition(issue)
+            if retry_override.state == CandidateAttemptState.ACTIVE:
+                if retry_override.prior_run_id is None or retry_override.prior_status is None:
+                    raise StateError("Active candidate disposition lacks prior-run evidence")
+                manifest.skip_reason = (
+                    f"{issue.reference} already has active run {retry_override.prior_run_id} "
+                    f"in status {retry_override.prior_status.value}; explicit retry was not "
+                    "started."
+                )
+                self._assert_operational()
+                self.store.save(
+                    manifest,
+                    event="candidate.active_deferred",
+                    details={
+                        "issue": issue.reference,
+                        "issue_revision": retry_override.issue_revision,
+                        "prior_run_id": retry_override.prior_run_id,
+                        "prior_status": retry_override.prior_status.value,
+                    },
+                )
+                self._assert_operational()
+                self.store.transition(manifest, RunStatus.SKIPPED, reason=manifest.skip_reason)
+                return manifest
+            if retry_override.state == CandidateAttemptState.SUPPRESSED and not retry_unchanged:
+                if retry_override.prior_run_id is None or retry_override.prior_status is None:
+                    raise StateError("Suppressed candidate disposition lacks prior-run evidence")
+                manifest.skip_reason = (
+                    f"{issue.reference} is unchanged since prior "
+                    f"{retry_override.prior_status.value} run {retry_override.prior_run_id}; "
+                    "pass --retry-unchanged with --issue to retry it deliberately."
+                )
+                self._assert_operational()
+                self.store.save(
+                    manifest,
+                    event="candidate.retry_deferred",
+                    details={
+                        "issue": issue.reference,
+                        "issue_revision": retry_override.issue_revision,
+                        "prior_run_id": retry_override.prior_run_id,
+                        "prior_status": retry_override.prior_status.value,
+                    },
+                )
+                self._assert_operational()
+                self.store.transition(manifest, RunStatus.SKIPPED, reason=manifest.skip_reason)
+                return manifest
+            if retry_override.state == CandidateAttemptState.SUPPRESSED:
+                if retry_override.prior_run_id is None or retry_override.prior_status is None:
+                    raise StateError("Suppressed candidate disposition lacks prior-run evidence")
+                manifest.candidate = issue
+                manifest.repository = repository
+                self._assert_operational()
+                self.store.save(
+                    manifest,
+                    event="candidate.retry_override",
+                    details={
+                        "issue": issue.reference,
+                        "issue_revision": retry_override.issue_revision,
+                        "prior_run_id": retry_override.prior_run_id,
+                        "prior_status": retry_override.prior_status.value,
+                    },
+                )
             base_sha = self.github.default_branch_sha(
                 repository.full_name,
                 repository.default_branch,
@@ -255,13 +326,23 @@ class Orchestrator:
                 repository_ref=base_sha,
             )
         else:
-            selection = discovery.discover()
-            if selection is None:
-                manifest.skip_reason = "No candidate passed deterministic discovery gates."
+            outcome = discovery.discover()
+            if outcome.selection is None:
+                manifest.skip_reason = outcome.no_candidate_reason
+                self._assert_operational()
+                self.store.save(
+                    manifest,
+                    event="candidate.discovery_exhausted",
+                    details={
+                        "active_candidates": str(outcome.active_candidates),
+                        "ineligible_candidates": str(outcome.ineligible_candidates),
+                        "suppressed_candidates": str(outcome.suppressed_candidates),
+                    },
+                )
                 self._assert_operational()
                 self.store.transition(manifest, RunStatus.SKIPPED, reason=manifest.skip_reason)
                 return manifest
-            issue, repository, eligibility = selection
+            issue, repository, eligibility = outcome.selection
             base_sha = discovery.pinned_repository_ref(repository.full_name)
 
         self._assert_operational()

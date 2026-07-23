@@ -15,7 +15,7 @@ from autocontribute.config import AutocontributeConfig, LegalAttestation
 from autocontribute.domain import EligibilityResult, IssueCandidate, RepositoryInfo
 from autocontribute.exceptions import CircuitBreakerTrigger, GitHubError, PolicyError, StateError
 from autocontribute.github import GitHubClient
-from autocontribute.store import RunStore
+from autocontribute.store import CandidateAttemptState, RunStore
 
 _CLARITY_TERMS = re.compile(
     r"\b(expected|actual|acceptance|should|reproduce|steps|behavior|documentation)\b", re.I
@@ -348,6 +348,61 @@ class PolicySnapshot:
         return self.organization_ref or "absent"
 
 
+DiscoverySelection = tuple[IssueCandidate, RepositoryInfo, EligibilityResult]
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryOutcome:
+    """A selection or a bounded explanation of why discovery exhausted its search."""
+
+    selection: DiscoverySelection | None
+    active_candidates: int = 0
+    suppressed_candidates: int = 0
+    ineligible_candidates: int = 0
+
+    @property
+    def no_candidate_reason(self) -> str:
+        if self.selection is not None:
+            raise ValueError("A successful discovery outcome has no exhaustion reason")
+        if not any(
+            (self.active_candidates, self.suppressed_candidates, self.ineligible_candidates)
+        ):
+            return "No candidate passed deterministic discovery gates."
+
+        explanations: list[str] = []
+        if self.suppressed_candidates:
+            explanations.append(
+                _counted_reason(
+                    self.suppressed_candidates,
+                    singular=(
+                        "unchanged issue revision was deferred after a prior skipped, "
+                        "rejected, or cancelled run"
+                    ),
+                    plural=(
+                        "unchanged issue revisions were deferred after prior skipped, "
+                        "rejected, or cancelled runs"
+                    ),
+                )
+            )
+        if self.active_candidates:
+            explanations.append(
+                _counted_reason(
+                    self.active_candidates,
+                    singular="candidate already has an active run",
+                    plural="candidates already have active runs",
+                )
+            )
+        if self.ineligible_candidates:
+            explanations.append(
+                _counted_reason(
+                    self.ineligible_candidates,
+                    singular="candidate failed deterministic discovery gates",
+                    plural="candidates failed deterministic discovery gates",
+                )
+            )
+        return "No candidate is currently available: " + "; ".join(explanations) + "."
+
+
 class DiscoveryService:
     def __init__(
         self,
@@ -378,8 +433,11 @@ class DiscoveryService:
                 by_name[repository.full_name] = repository
         return sorted(by_name.values(), key=lambda repo: repo.stars, reverse=True)
 
-    def discover(self) -> tuple[IssueCandidate, RepositoryInfo, EligibilityResult] | None:
-        ranked: list[tuple[IssueCandidate, RepositoryInfo, EligibilityResult]] = []
+    def discover(self) -> DiscoveryOutcome:
+        ranked: list[DiscoverySelection] = []
+        active_candidates = 0
+        suppressed_candidates = 0
+        ineligible_candidates = 0
         for repository in self.repositories():
             if not self._repository_baseline(repository):
                 continue
@@ -393,7 +451,12 @@ class DiscoveryService:
                 # Search results omit the discussion and may contain a shortened body. Fetch the
                 # canonical issue before spending model budget or deciding that work is unclaimed.
                 issue = self.github.get_issue(repository.full_name, issue.number)
-                if self.store.has_active_candidate(issue.repository, issue.number):
+                disposition = self.store.candidate_attempt_disposition(issue)
+                if disposition.state == CandidateAttemptState.ACTIVE:
+                    active_candidates += 1
+                    continue
+                if disposition.state == CandidateAttemptState.SUPPRESSED:
+                    suppressed_candidates += 1
                     continue
                 eligibility = self.evaluate(
                     issue,
@@ -404,14 +467,26 @@ class DiscoveryService:
                 issue.score_evidence = eligibility.evidence
                 if eligibility.eligible:
                     ranked.append((issue, repository, eligibility))
+                else:
+                    ineligible_candidates += 1
                 if len(ranked) >= self.config.budget.max_candidates_per_run:
                     break
             if len(ranked) >= self.config.budget.max_candidates_per_run:
                 break
         if not ranked:
-            return None
+            return DiscoveryOutcome(
+                selection=None,
+                active_candidates=active_candidates,
+                suppressed_candidates=suppressed_candidates,
+                ineligible_candidates=ineligible_candidates,
+            )
         ranked.sort(key=lambda item: (item[2].score, item[0].updated_at), reverse=True)
-        return ranked[0]
+        return DiscoveryOutcome(
+            selection=ranked[0],
+            active_candidates=active_candidates,
+            suppressed_candidates=suppressed_candidates,
+            ineligible_candidates=ineligible_candidates,
+        )
 
     def evaluate(
         self,
@@ -1278,6 +1353,10 @@ def parse_issue_reference(value: str) -> tuple[str, int]:
     return match.group(1), int(match.group(2))
 
 
+def _counted_reason(count: int, *, singular: str, plural: str) -> str:
+    return f"{count} {singular if count == 1 else plural}"
+
+
 __all__ = [
     "LEGAL_ATTESTATION_EVIDENCE_KEY",
     "LEGAL_POLICY_EVIDENCE_KEY",
@@ -1289,6 +1368,8 @@ __all__ = [
     "POLICY_ORGANIZATION_REF_EVIDENCE_KEY",
     "POLICY_REPOSITORY_REF_EVIDENCE_KEY",
     "POLICY_SOURCES_EVIDENCE_KEY",
+    "DiscoveryOutcome",
+    "DiscoverySelection",
     "DiscoveryService",
     "PolicySnapshot",
     "apply_legal_commit_message",
