@@ -696,6 +696,9 @@ def test_security_integration_exercises_rootful_and_rootless_resource_boundaries
     assert 'daemon_pid_before="$("${user_systemctl[@]}" show "$user_unit"' in script
     assert '"/proc/${daemon_pid_before}/status"' in script
     assert 'test "$daemon_no_new_privileges" = 0' in script
+    assert "Rootless Docker socket owner and group" in script
+    assert 'test "$docker_socket_owner_group" = \\' in script
+    assert '"${service_uid}:${service_gid}"' in script
     reload_command = 'sudo systemctl reload "$system_unit"'
     docker_probe = '"${service_env[@]}" docker info >/dev/null'
     assert script.count(reload_command) == 1

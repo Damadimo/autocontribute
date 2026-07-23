@@ -678,8 +678,12 @@ jobs:
             "${service_uid}:${service_gid}:700"
           sudo test -S "$docker_socket"
           sudo test ! -L "$docker_socket"
-          test "$(sudo stat --format=%u:%g "$docker_socket")" = \
+          docker_socket_owner_group="$(sudo stat --format=%u:%g "$docker_socket")"
+          printf 'Rootless Docker socket owner and group: %s\n' \
+            "$docker_socket_owner_group"
+          test "$docker_socket_owner_group" = \
             "${service_uid}:${service_gid}"
+          unset docker_socket_owner_group
           sudo test ! -e "/run/user/${service_uid}/docker.sock"
           sudo -u "$account" env \
             HOME="$service_home" \

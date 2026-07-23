@@ -351,7 +351,8 @@ The release therefore supplies two distinct root-owned units:
   exits.
 - `/etc/systemd/user/autocontribute-rootless-docker-daemon.service` is the static user unit beneath
   the delegated manager. It is deliberately not enabled and is started only by the system proxy.
-  Its launcher pins the config, data root, cgroup driver, and sole Unix socket on the command line.
+  Its launcher pins the config, data root, cgroup driver, sole Unix socket, and namespace-side
+  socket group on the command line.
 
 The proxy gives the user manager one aggregate 120-second readiness window; an individual probe
 cannot multiply that deadline. It waits up to 120 seconds for a daemon stop and 150 seconds for a
@@ -371,8 +372,10 @@ they cannot reach the user bus below `/run/user`.
 
 Create the root-owned daemon configuration at its dedicated system path before the first start. The
 reference configuration pins the storage driver exercised by the production-topology integration;
-the launcher supplies every security-critical location explicitly. Any additional daemon option is
-an operator-owned policy change and must be reviewed offline; never add a TCP listener.
+the launcher supplies every security-critical location explicitly and fixes the Unix socket group
+to namespace GID 0. That GID maps back to the dedicated account's private primary group on the host
+instead of Docker's default group mapping into the subordinate-GID range. Any additional daemon
+option is an operator-owned policy change and must be reviewed offline; never add a TCP listener.
 
 ```bash
 sudo install -d -o root -g autocontribute -m 0750 /etc/autocontribute
@@ -391,6 +394,9 @@ Use this initial content:
   "storage-driver": "fuse-overlayfs"
 }
 ```
+
+Do not add `group` to this file. The launcher already supplies `--group=0`, and Docker rejects an
+option supplied in both its configuration file and on the command line.
 
 Do not start the user manager or daemon yet. The release installation below first installs and
 attests the root-owned user unit and the exact

@@ -3377,6 +3377,7 @@ def test_rootless_dockerd_launcher_keeps_socket_outside_user_runtime() -> None:
     assert '--config-file="$daemon_config"' in launcher
     assert '--data-root="$data_root"' in launcher
     assert "--exec-opt=native.cgroupdriver=systemd" in launcher
+    assert launcher.count("--group=0") == 1
     assert '--host="$docker_host"' in launcher
     assert "/run/user/${service_uid}/docker.sock" not in launcher
     assert "dockerd-rootless-setuptool.sh" not in launcher

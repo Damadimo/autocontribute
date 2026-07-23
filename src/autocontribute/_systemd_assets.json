@@ -131,7 +131,7 @@
     {
       "source_path": "deploy/systemd/libexec/autocontribute-rootless-dockerd",
       "installed_path": "/usr/local/libexec/autocontribute-rootless-dockerd",
-      "sha256": "d7b0694c22572fd375e03580844d56a2c7906202634b2ab7e53dd2888d3b2777",
+      "sha256": "25441ad61380a81a2659a429ff81071ec69022ce43d0125754edc1af48b9a89e",
       "mode": "0755",
       "required": true
     },

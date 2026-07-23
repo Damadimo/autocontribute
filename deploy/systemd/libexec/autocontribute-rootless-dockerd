@@ -146,4 +146,5 @@ exec "$daemon" \
   --config-file="$daemon_config" \
   --data-root="$data_root" \
   --exec-opt=native.cgroupdriver=systemd \
+  --group=0 \
   --host="$docker_host"
