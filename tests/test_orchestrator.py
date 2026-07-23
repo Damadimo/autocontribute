@@ -22,13 +22,13 @@ from autocontribute.domain import (
     RunStatus,
 )
 from autocontribute.exceptions import PolicyError, StateError
-from autocontribute.orchestrator import Orchestrator
+from autocontribute.orchestrator import Orchestrator, RunInvocationMode
 from autocontribute.preparation import validate_preparation_fingerprint
 from autocontribute.providers import ModelResult, ModelUsage
 from autocontribute.redaction import MAX_ARTIFACT_CHARACTERS, MODEL_INPUT_REDACTION
 from autocontribute.repository import RepositoryWorkspace
 from autocontribute.sandbox import SandboxRunner
-from autocontribute.store import Lease, RunStore
+from autocontribute.store import CandidateRetryAuthorization, Lease, RunStore
 
 REPRODUCTION_COMMAND = "python -c 'from app import value; assert value() == 2'"
 TRUSTED_COMMAND = "python -m pytest"
@@ -380,7 +380,9 @@ def test_full_prepare_pipeline_reaches_exact_approval_boundary(tmp_path: Path, m
         providers=_providers(),  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.READY_FOR_APPROVAL
     assert manifest.deployment_fingerprint == compute_deployment_fingerprint(config)
@@ -464,7 +466,9 @@ def test_actionable_validation_failure_uses_the_single_repair_opportunity(
         providers=providers,  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     expected_suite = [TRUSTED_COMMAND, REPRODUCTION_COMMAND]
     assert manifest.status == RunStatus.READY_FOR_APPROVAL
@@ -533,7 +537,9 @@ def test_actionable_validation_failure_skips_repair_when_suite_exceeds_remaining
         providers=providers,  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.REJECTED
     assert manifest.error is None
@@ -581,7 +587,9 @@ def test_actionable_validation_failure_skips_repair_when_prompt_exceeds_model_pr
         providers=providers,  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.REJECTED
     assert manifest.error is None
@@ -643,7 +651,9 @@ def test_failed_validation_repair_is_not_retried(
         providers=providers,  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     expected_suite = [TRUSTED_COMMAND, REPRODUCTION_COMMAND]
     assert manifest.status == RunStatus.REJECTED
@@ -717,7 +727,9 @@ def test_validation_repair_consumes_the_only_repair_opportunity_before_critic(
         providers=providers,  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     expected_suite = [TRUSTED_COMMAND, REPRODUCTION_COMMAND]
     assert manifest.status == RunStatus.REJECTED
@@ -769,7 +781,9 @@ def test_infrastructure_validation_failure_is_not_sent_to_builder_for_repair(
         providers=providers,  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.REJECTED
     assert manifest.error is None
@@ -815,7 +829,9 @@ def test_truncated_model_visible_failure_is_not_sent_to_builder_for_repair(
         providers=providers,  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.REJECTED
     assert manifest.error is None
@@ -863,7 +879,9 @@ def test_redaction_created_failure_signature_cannot_authorize_repair(
         providers=providers,  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.REJECTED
     assert manifest.error is None
@@ -921,7 +939,9 @@ def test_critic_repair_is_skipped_when_exact_validation_suite_exceeds_remaining_
         providers=providers,  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.REJECTED
     assert manifest.error is None
@@ -1006,7 +1026,9 @@ def test_critic_repair_reuses_exact_validation_suite_when_it_fits_remaining_budg
         providers=providers,  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.READY_FOR_APPROVAL
     assert manifest.model_calls == 5
@@ -1076,7 +1098,9 @@ def test_clone_uses_the_exact_sha_used_for_repository_policy_reads(
         providers=_providers(),  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     repository_policy_refs = {
         ref for repository, ref in policy_reads if repository == "example/project"
@@ -1137,7 +1161,9 @@ def test_secret_finding_trips_global_breaker_without_retaining_value(
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.FAILED
     assert manifest.proposal is None
@@ -1157,7 +1183,7 @@ def test_secret_finding_trips_global_breaker_without_retaining_value(
             github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
             providers=_providers(),  # type: ignore[arg-type]
             sandbox=PassingSandbox(),  # type: ignore[arg-type]
-        ).run(issue_reference="example/project#42")
+        ).run(issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL)
 
 
 def test_breaker_blocks_before_github_or_model_work(tmp_path: Path) -> None:
@@ -1190,7 +1216,87 @@ def test_breaker_blocks_before_github_or_model_work(tmp_path: Path) -> None:
         ) as orchestrator,
         pytest.raises(StateError, match="Circuit breaker is tripped"),
     ):
-        orchestrator.run(issue_reference="example/project#42")
+        orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
+
+    assert store.list() == []
+    assert all(provider.calls == 0 for provider in providers.values())
+
+
+@pytest.mark.parametrize(
+    "invocation_mode", [RunInvocationMode.AUTOMATIC, RunInvocationMode.SCHEDULED]
+)
+@pytest.mark.parametrize("with_retry_authorization", [False, True])
+def test_nonmanual_invocation_cannot_pin_or_authorize_an_issue_before_external_work(
+    tmp_path: Path,
+    invocation_mode: RunInvocationMode,
+    with_retry_authorization: bool,
+) -> None:
+    config = AutocontributeConfig.model_validate({"storage": {"path": tmp_path / "state"}})
+    store = RunStore(config.storage.path)
+    providers = _providers()
+
+    class NoGitHubWork:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"unexpected GitHub access: {name}")
+
+    authorization = (
+        CandidateRetryAuthorization(
+            actor="release-operator",
+            reason="Reviewed the prior terminal outcome.",
+        )
+        if with_retry_authorization
+        else None
+    )
+    with (
+        Orchestrator(
+            config,
+            store=store,
+            github=NoGitHubWork(),  # type: ignore[arg-type]
+            providers=providers,  # type: ignore[arg-type]
+            sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        ) as orchestrator,
+        pytest.raises(ValueError, match="explicit issue references require manual invocation mode"),
+    ):
+        orchestrator.run(
+            issue_reference="example/project#42",
+            invocation_mode=invocation_mode,
+            retry_authorization=authorization,
+        )
+
+    assert store.list() == []
+    assert all(provider.calls == 0 for provider in providers.values())
+
+
+@pytest.mark.parametrize(
+    "invocation_mode", [RunInvocationMode.AUTOMATIC, RunInvocationMode.SCHEDULED]
+)
+def test_nonmanual_invocation_cannot_supply_retry_authorization_without_an_issue(
+    tmp_path: Path,
+    invocation_mode: RunInvocationMode,
+) -> None:
+    config = AutocontributeConfig.model_validate({"storage": {"path": tmp_path / "state"}})
+    store = RunStore(config.storage.path)
+    providers = _providers()
+
+    with (
+        Orchestrator(
+            config,
+            store=store,
+            github=object(),  # type: ignore[arg-type]
+            providers=providers,  # type: ignore[arg-type]
+            sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        ) as orchestrator,
+        pytest.raises(ValueError, match="retry authorization requires an explicit issue reference"),
+    ):
+        orchestrator.run(
+            invocation_mode=invocation_mode,
+            retry_authorization=CandidateRetryAuthorization(
+                actor="release-operator",
+                reason="Reviewed the prior terminal outcome.",
+            ),
+        )
 
     assert store.list() == []
     assert all(provider.calls == 0 for provider in providers.values())
@@ -1219,7 +1325,9 @@ def test_run_recovers_stale_work_and_releases_singleton_lease(tmp_path: Path, mo
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        current = orchestrator.run(issue_reference="example/project#42")
+        current = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     recovered = store.get(abandoned.run_id)
     assert recovered.status == RunStatus.FAILED
@@ -1283,7 +1391,9 @@ def test_run_lease_takeover_during_model_outcome_preserves_ambiguous_reservation
     ) as orchestrator:
         provider.orchestrator = orchestrator
         with pytest.raises(StateError, match="ownership was lost"):
-            orchestrator.run(issue_reference="example/project#42")
+            orchestrator.run(
+                issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+            )
 
     assert provider.takeover is not None
     assert store.release_lease(
@@ -1341,7 +1451,9 @@ def test_run_lease_takeover_during_github_read_stops_before_workspace_or_failure
     ) as orchestrator:
         github.orchestrator = orchestrator
         with pytest.raises(StateError, match="ownership was lost"):
-            orchestrator.run(issue_reference="example/project#42")
+            orchestrator.run(
+                issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+            )
 
     assert github.takeover is not None
     assert store.release_lease(
@@ -1405,7 +1517,9 @@ def test_breaker_trip_during_model_failure_still_records_safe_failure_bookkeepin
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.FAILED
     assert manifest.model_reservation is not None
@@ -1465,7 +1579,9 @@ def test_planner_and_critic_receive_callers_tests_and_exact_publication_text(
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.READY_FOR_APPROVAL
     planner_prompt = str(providers["scout"].requests[0]["prompt"])
@@ -1523,7 +1639,9 @@ def test_repository_pull_request_template_is_a_hard_pre_review_gate(
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.FAILED
     assert "missing template heading" in (manifest.error or "")
@@ -1575,7 +1693,9 @@ def test_organization_default_pull_request_template_is_a_hard_gate(
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.FAILED
     assert "organization verification" in (manifest.error or "")
@@ -1650,7 +1770,9 @@ def test_planner_selected_new_scope_triggers_one_instruction_aware_replan(
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.READY_FOR_APPROVAL
     assert providers["scout"].calls == 2
@@ -1719,7 +1841,9 @@ def test_replan_cannot_expand_into_a_second_unseen_guidance_scope(
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.FAILED
     assert "second/AGENTS.md" in (manifest.error or "")
@@ -1784,7 +1908,9 @@ def test_builder_edit_entering_unseen_agents_scope_fails_before_workspace_mutati
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.FAILED
     assert "repository-guidance scope" in (manifest.error or "")
@@ -1835,7 +1961,9 @@ def test_excess_global_guidance_fails_before_any_model_call(
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.FAILED
     assert "above the configured limit of 30" in (manifest.error or "")
@@ -1884,7 +2012,9 @@ def test_excess_scoped_guidance_fails_after_planning_but_before_builder(
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.FAILED
     assert "Applicable repository guidance exceeds" in (manifest.error or "")
@@ -1923,7 +2053,9 @@ def test_operator_required_commands_run_when_models_omit_them(tmp_path: Path, mo
         providers=_providers(validation_commands=[]),  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.READY_FOR_APPROVAL
     assert sandbox.validation_batches == [["trusted-project-check", REPRODUCTION_COMMAND]]
@@ -1949,7 +2081,9 @@ def test_missing_dynamic_repository_validation_fails_before_model_work(tmp_path:
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.FAILED
     assert "no operator-owned validation.required_commands" in (manifest.error or "")
@@ -1991,7 +2125,9 @@ def test_insufficient_command_budget_fails_without_truncating_required_checks(
         providers=_providers(validation_commands=[]),  # type: ignore[arg-type]
         sandbox=sandbox,  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.FAILED
     assert "refusing to truncate validation" in (manifest.error or "")
@@ -2035,7 +2171,9 @@ def test_isolated_validation_files_never_enter_the_contribution_patch(
         providers=_providers(validation_commands=[], reproduction_command=mutating_reproduction),  # type: ignore[arg-type]
         sandbox=SandboxRunner(config.sandbox),
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.READY_FOR_APPROVAL
     patch = (store.artifact_dir(manifest.run_id) / "contribution.patch").read_text()
@@ -2063,7 +2201,9 @@ def test_ineligible_explicit_issue_skips_without_spending_model_tokens(tmp_path:
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.SKIPPED
     assert "already assigned" in (manifest.skip_reason or "")
@@ -2092,8 +2232,12 @@ def test_unchanged_explicit_issue_is_deferred_before_eligibility_or_model_work(
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        first = orchestrator.run(issue_reference="example/project#42")
-        second = orchestrator.run(issue_reference="example/project#42")
+        first = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
+        second = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert first.status == RunStatus.SKIPPED
     assert second.status == RunStatus.SKIPPED
@@ -2148,7 +2292,9 @@ def test_unpinned_discovery_exhausts_suppressed_revision_without_model_work(
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        prior = orchestrator.run(issue_reference="example/project#42")
+        prior = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
         discovered = orchestrator.run()
 
     assert prior.status == RunStatus.SKIPPED
@@ -2194,10 +2340,16 @@ def test_retry_unchanged_explicit_issue_records_override_and_rechecks_eligibilit
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        first = orchestrator.run(issue_reference="example/project#42")
+        first = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
         retried = orchestrator.run(
             issue_reference="example/project#42",
-            retry_unchanged=True,
+            invocation_mode=RunInvocationMode.MANUAL,
+            retry_authorization=CandidateRetryAuthorization(
+                actor="release-operator",
+                reason="Reviewed the prior skip after updating the model instructions.",
+            ),
         )
 
     assert first.status == RunStatus.SKIPPED
@@ -2208,7 +2360,12 @@ def test_retry_unchanged_explicit_issue_records_override_and_rechecks_eligibilit
     assert all(provider.calls == 0 for provider in providers.values())
     events = store.events(retried.run_id)
     override = next(event for event in events if event["event_type"] == "candidate.retry_override")
-    assert json.loads(override["details"])["prior_run_id"] == first.run_id
+    details = json.loads(override["details"])
+    assert details["prior_run_id"] == first.run_id
+    assert details["actor"] == "release-operator"
+    assert details["reason"] == "Reviewed the prior skip after updating the model instructions."
+    assert len(details["authorization_id"]) == 32
+    assert set(details["authorization_id"]) <= set("0123456789abcdef")
 
 
 def test_explicit_issue_cannot_bypass_repository_allowlist(tmp_path: Path) -> None:
@@ -2229,7 +2386,9 @@ def test_explicit_issue_cannot_bypass_repository_allowlist(tmp_path: Path) -> No
         providers=providers,  # type: ignore[arg-type]
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     ) as orchestrator:
-        manifest = orchestrator.run(issue_reference="example/project#42")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
 
     assert manifest.status == RunStatus.FAILED
     assert "not in github.repositories" in (manifest.error or "")
@@ -2496,10 +2655,16 @@ def test_reused_orchestrator_resets_per_run_model_call_artifact(
         sandbox=PassingSandbox(),  # type: ignore[arg-type]
     )
 
-    first = orchestrator.run(issue_reference="example/project#42")
+    first = orchestrator.run(
+        issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+    )
     blocked = orchestrator.run(
         issue_reference="example/project#42",
-        retry_unchanged=True,
+        invocation_mode=RunInvocationMode.MANUAL,
+        retry_authorization=CandidateRetryAuthorization(
+            actor="release-operator",
+            reason="Attempted explicit retry while prior work remains active.",
+        ),
     )
     assert blocked.status == RunStatus.SKIPPED
     assert blocked.candidate is None
@@ -2514,7 +2679,9 @@ def test_reused_orchestrator_resets_per_run_model_call_artifact(
             "html_url": "https://github.com/example/project/issues/43",
         }
     )
-    second = orchestrator.run(issue_reference="example/project#43")
+    second = orchestrator.run(
+        issue_reference="example/project#43", invocation_mode=RunInvocationMode.MANUAL
+    )
 
     assert first.status == RunStatus.READY_FOR_APPROVAL
     assert second.status == RunStatus.READY_FOR_APPROVAL

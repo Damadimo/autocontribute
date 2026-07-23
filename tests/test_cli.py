@@ -31,12 +31,13 @@ from autocontribute.domain import (
 from autocontribute.evaluation import EvaluationStore, EvaluationVerdict
 from autocontribute.exceptions import PublicationResumeRequired, StateError
 from autocontribute.lifecycle import LifecycleSyncResult
+from autocontribute.orchestrator import RunInvocationMode
 from autocontribute.preparation import (
     compute_preparation_config_fingerprint,
     compute_preparation_fingerprint,
     render_validation_artifact,
 )
-from autocontribute.store import RunStore
+from autocontribute.store import CandidateRetryAuthorization, RunStore
 
 runner = CliRunner()
 
@@ -160,6 +161,7 @@ def _ready_review_run(tmp_path: Path) -> tuple[Path, RunStore, str]:
     settings = load_config(config_path)
     store = RunStore(state)
     manifest = store.create_run()
+    store.transition(manifest, RunStatus.DISCOVERING, reason="fixture started")
     now = datetime.now(UTC)
     manifest.candidate = IssueCandidate(
         repository="example/project",
@@ -270,6 +272,15 @@ def _ready_review_run(tmp_path: Path) -> tuple[Path, RunStore, str]:
         manifest,
         diff=_REVIEW_PATCH,
     )
+    lease_owner = f"review-fixture-{manifest.run_id}"
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        lease_owner,
+        ttl=timedelta(minutes=1),
+    )
+    assert lease is not None
+    store.claim_candidate(manifest, lease=lease)
+    assert store.release_lease("autocontribute.run", lease_owner, lease.generation)
     manifest.status = RunStatus.READY_FOR_APPROVAL
     store.save(manifest, event="fixture.ready_for_review", details={})
     return config_path, store, manifest.run_id
@@ -989,6 +1000,38 @@ def test_safety_stop_while_stopped_records_new_evidence_and_validates_input(
     [
         (["--retry-unchanged"], "--retry-unchanged requires --issue"),
         (
+            ["--issue", "example/project#42", "--retry-unchanged"],
+            "--retry-unchanged requires both --retry-actor and --retry-reason",
+        ),
+        (
+            [
+                "--issue",
+                "example/project#42",
+                "--retry-unchanged",
+                "--retry-actor",
+                "release-operator",
+            ],
+            "--retry-unchanged requires both --retry-actor and --retry-reason",
+        ),
+        (
+            [
+                "--issue",
+                "example/project#42",
+                "--retry-unchanged",
+                "--retry-reason",
+                "Reviewed prior result",
+            ],
+            "--retry-unchanged requires both --retry-actor and --retry-reason",
+        ),
+        (
+            ["--retry-actor", "release-operator"],
+            "--retry-actor and --retry-reason require --retry-unchanged",
+        ),
+        (
+            ["--retry-reason", "Reviewed prior result"],
+            "--retry-actor and --retry-reason require --retry-unchanged",
+        ),
+        (
             ["--scheduled", "--issue", "example/project#42"],
             "--scheduled cannot be combined with --issue",
         ),
@@ -998,6 +1041,10 @@ def test_safety_stop_while_stopped_records_new_evidence_and_validates_input(
                 "--issue",
                 "example/project#42",
                 "--retry-unchanged",
+                "--retry-actor",
+                "release-operator",
+                "--retry-reason",
+                "Reviewed prior result",
             ],
             "--retry-unchanged cannot be used by a scheduled invocation",
         ),
@@ -1011,6 +1058,62 @@ def test_retry_unchanged_cli_combinations_fail_before_configuration_or_github(
 
     assert result.exit_code == 1, result.output
     assert message in result.output
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("--retry-actor", " ", "candidate retry actor must be 1-255 non-NUL characters"),
+        (
+            "--retry-actor",
+            "release\noperator",
+            "candidate retry actor must be a canonical single-line value",
+        ),
+        (
+            "--retry-actor",
+            "a" * 256,
+            "candidate retry actor must be 1-255 non-NUL characters",
+        ),
+        ("--retry-reason", " ", "candidate retry reason must be 1-2000 non-NUL characters"),
+        (
+            "--retry-reason",
+            "reviewed\nprior result",
+            "candidate retry reason must be canonical single-line text",
+        ),
+        (
+            "--retry-reason",
+            "r" * 2_001,
+            "candidate retry reason must be 1-2000 non-NUL characters",
+        ),
+    ],
+)
+def test_malformed_retry_provenance_fails_before_configuration_or_github(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+    message: str,
+) -> None:
+    def unexpected_config(*_: object, **__: object) -> None:
+        raise AssertionError("configuration should not be loaded")
+
+    monkeypatch.setattr(cli, "_config", unexpected_config)
+    arguments = [
+        "run",
+        "--issue",
+        "example/project#42",
+        "--retry-unchanged",
+        "--retry-actor",
+        "release-operator",
+        "--retry-reason",
+        "Reviewed the prior result.",
+    ]
+    index = arguments.index(field)
+    arguments[index + 1] = value
+
+    result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 1
+    assert message in f"{result.output}\n{result.exception}"
 
 
 def test_manual_retry_unchanged_is_forwarded_to_orchestrator(
@@ -1044,10 +1147,15 @@ def test_manual_retry_unchanged_is_forwarded_to_orchestrator(
             self,
             *,
             issue_reference: str | None = None,
-            retry_unchanged: bool = False,
+            invocation_mode: RunInvocationMode = RunInvocationMode.AUTOMATIC,
+            retry_authorization: CandidateRetryAuthorization | None = None,
         ):
             assert issue_reference == "example/project#42"
-            assert retry_unchanged
+            assert invocation_mode == RunInvocationMode.MANUAL
+            assert retry_authorization == CandidateRetryAuthorization(
+                actor="release-operator",
+                reason="Reviewed the prior result after a model upgrade.",
+            )
             calls.append("run:retry")
             manifest = self.store.create_run()
             manifest.status = RunStatus.SKIPPED
@@ -1065,6 +1173,10 @@ def test_manual_retry_unchanged_is_forwarded_to_orchestrator(
             "--issue",
             "example/project#42",
             "--retry-unchanged",
+            "--retry-actor",
+            "release-operator",
+            "--retry-reason",
+            "Reviewed the prior result after a model upgrade.",
             "--config",
             str(config),
         ],
@@ -1101,9 +1213,12 @@ def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monk
             self,
             *,
             issue_reference: str | None = None,
-            retry_unchanged: bool = False,
+            invocation_mode: RunInvocationMode = RunInvocationMode.AUTOMATIC,
+            retry_authorization: CandidateRetryAuthorization | None = None,
         ):
-            assert not retry_unchanged
+            assert issue_reference is None
+            assert invocation_mode == RunInvocationMode.SCHEDULED
+            assert retry_authorization is None
             calls.append("run")
             manifest = self.store.create_run()
             manifest.status = RunStatus.SKIPPED
@@ -1161,9 +1276,12 @@ def test_auto_path_resyncs_lifecycle_immediately_before_publisher(
             self,
             *,
             issue_reference: str | None = None,
-            retry_unchanged: bool = False,
+            invocation_mode: RunInvocationMode = RunInvocationMode.AUTOMATIC,
+            retry_authorization: CandidateRetryAuthorization | None = None,
         ):
-            assert not retry_unchanged
+            assert issue_reference is None
+            assert invocation_mode == RunInvocationMode.SCHEDULED
+            assert retry_authorization is None
             calls.append("run")
             manifest = self.store.create_run()
             manifest.status = RunStatus.READY_FOR_APPROVAL
