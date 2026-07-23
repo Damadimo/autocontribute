@@ -125,9 +125,12 @@ can fall through to another candidate.
 The claim itself is not a read-then-write promise. Inside one SQLite write transaction, the store
 revalidates all candidate history, verifies the current `autocontribute.run` lease owner, fencing
 generation, generation counter, and expiry, then persists the run's repository/issue/revision. A
-case-insensitive partial unique index permits only one non-released run for a repository/issue. A
-stale lease, concurrent winner, changed disposition, or authorization that no longer matches the
-same unchanged suppressed revision fails instead of claiming a different candidate.
+case-insensitive partial unique index permits only one non-released run for a repository/issue.
+Candidate identities must be ASCII `owner/name`; each component may use only letters, digits, `_`,
+`.`, or `-`, and `.` and `..` are not components. This makes the store's normalization agree with
+SQLite `NOCASE`. A stale lease, concurrent winner, changed disposition, or authorization that no
+longer matches the same unchanged suppressed revision fails instead of claiming a different
+candidate.
 
 ## Lifecycle sync and persistent safety stop
 
@@ -284,13 +287,18 @@ recovery. The v6-to-v7 step adds `runs.issue_revision` and the original
 `runs_candidate_revision_idx`. It validates the bounded run corpus against each saved manifest and
 backfills the revision for every historical candidate row; a malformed manifest, row/manifest
 identity mismatch, or invalid issue evidence leaves the v6 source unchanged. The validated v7-to-v8
-step creates `candidate_retry_authorizations`, rebuilds `runs_candidate_revision_idx` with `NOCASE`,
-and adds the `NOCASE` partial unique `runs_active_candidate_idx` over active repository/issue claims.
-It rejects any pre-existing duplicate active candidate before creating the unique index, and any
-failure rolls the complete migration back to v7. Current-schema validation also cross-checks each
-authorization against the new and prior run evidence and its unique override event, and rejects an
-orphan override event. Stop every older worker before this offline, one-way cutover and never restart
-one against the migrated lineage. Preserve a new v8 snapshot before the next ephemeral job.
+step creates `candidate_retry_authorizations` and the migration-only
+`legacy_candidate_retry_overrides` marker table, rebuilds `runs_candidate_revision_idx` with
+`NOCASE`, and adds the `NOCASE` partial unique `runs_active_candidate_idx` over active
+repository/issue claims. It rejects any pre-existing duplicate active candidate before creating the
+unique index. A historical v7 four-field retry event is accepted only when its exact event ID/hash,
+current and prior run, issue revision, and suppressed prior status validate; migration records that
+binding in the marker table without inventing operator authorization. A fresh v8 schema has the same
+table empty. Every new seven-field retry event must instead match exactly one
+`candidate_retry_authorizations` row; an orphan or mismatched modern event, or an unmarked legacy
+event, fails validation. Any failure rolls the complete migration back to v7. Stop every older worker
+before this offline, one-way cutover and never restart one against the migrated lineage. Preserve a
+new v8 snapshot before the next ephemeral job.
 
 Store schema and lifecycle evidence format are separate lineages. Canonical unversioned lifecycle
 payloads can exist in any restorable store schema from v2 through v8. Restore preserves those rows

@@ -8,6 +8,9 @@ import yaml
 from autocontribute.config import load_config
 
 ROOT = Path(__file__).resolve().parents[1]
+HOSTED_SCHEMA_VERSION = 8
+HOSTED_PARENT_SCHEMA_VERSIONS = tuple(range(3, HOSTED_SCHEMA_VERSION + 1))
+RECOVERY_CANDIDATE_SCHEMA_VERSIONS = (5, 6, 7, 8)
 
 
 def _security_workflow() -> dict[str, object]:
@@ -235,17 +238,19 @@ def test_scheduler_cache_uses_externally_committed_exact_lineage(
     assert 'current" != "$RESOLVED_LINEAGE' in claim["run"]
     assert 'echo "claim=$claim"' in claim["run"]
     lineage_suffix = "${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
-    for version in (3, 4, 5, 6):
+    for version in HOSTED_PARENT_SCHEMA_VERSIONS:
         assert (
             f'v{version}_lineage_pattern="^committed:{key_stem}v{version}-{lineage_suffix}"'
         ) in resolve["run"]
         assert f'[[ "$current" =~ $v{version}_lineage_pattern ]]' in resolve["run"]
         assert f'parent_schema="v{version}"' in resolve["run"]
     assert "v2_lineage_pattern" not in resolve["run"]
+    assert "v9_lineage_pattern" not in resolve["run"]
     assert "== committed:" not in resolve["run"]
     assert 'echo "parent_schema=$parent_schema"' in resolve["run"]
     assert (
-        f'new_key="{key_stem}v6-$RUNNER_OS-$REPOSITORY_ID-$RUN_ID-$RUN_ATTEMPT"' in resolve["run"]
+        f'new_key="{key_stem}v{HOSTED_SCHEMA_VERSION}-'
+        '$RUNNER_OS-$REPOSITORY_ID-$RUN_ID-$RUN_ATTEMPT"' in resolve["run"]
     )
     assert restore["with"]["key"] == "${{ steps.state_lineage.outputs.parent_key }}"
     assert "restore-keys" not in restore["with"]
@@ -261,7 +266,9 @@ def test_scheduler_cache_uses_externally_committed_exact_lineage(
     assert "CURRENT_SCHEMA_VERSION" in confirm["run"]
     assert "RunStore" in confirm["run"]
     assert confirm["env"]["PARENT_SCHEMA"] == "${{ steps.state_lineage.outputs.parent_schema }}"
-    assert '"bootstrap": 6, "v3": 3, "v4": 4, "v5": 5, "v6": 6' in confirm["run"]
+    assert f'"bootstrap": {HOSTED_SCHEMA_VERSION}' in confirm["run"]
+    for version in HOSTED_PARENT_SCHEMA_VERSIONS:
+        assert f'"v{version}": {version}' in confirm["run"]
     assert "cache schema does not match its committed lineage" in confirm["run"]
     assert steps.index(confirm) < steps.index(claim)
     assert "${{ github.token }}" not in (ROOT / ".github" / "workflows" / workflow).read_text()
@@ -493,12 +500,17 @@ def test_hosted_lineage_recovery_requires_exact_claim_and_exact_retained_evidenc
     assert '"${#claim_parts[@]}" -eq 7' in resolve["run"]
     assert '"${claim_parts[1]}" == "v2"' in resolve["run"]
     assert 'candidate_key="${claim_parts[6]}"' in resolve["run"]
-    assert 'candidate_key="${KEY_PREFIX}v5-' in resolve["run"]
-    assert 'candidate_pattern="^${KEY_PREFIX}v(5|6)-' in resolve["run"]
+    assert (
+        'candidate_key="${KEY_PREFIX}v5-${RUNNER_OS}-${REPOSITORY_ID}-'
+        '${claim_run_id}-${claim_run_attempt}"' in resolve["run"]
+    )
+    candidate_versions = "|".join(str(version) for version in RECOVERY_CANDIDATE_SCHEMA_VERSIONS)
+    assert f'candidate_pattern="^${{KEY_PREFIX}}v({candidate_versions})-' in resolve["run"]
     assert '[[ ! "$candidate_key" =~ $candidate_pattern ]]' in resolve["run"]
     assert 'candidate_schema="v${BASH_REMATCH[1]}"' in resolve["run"]
-    assert "^${KEY_PREFIX}v(3|4|5|6)-" in resolve["run"]
-    assert 'recovery_key="${KEY_PREFIX}v6-' in resolve["run"]
+    parent_versions = "|".join(str(version) for version in HOSTED_PARENT_SCHEMA_VERSIONS)
+    assert f"^${{KEY_PREFIX}}v({parent_versions})-" in resolve["run"]
+    assert f'recovery_key="${{KEY_PREFIX}}v{HOSTED_SCHEMA_VERSION}-' in resolve["run"]
     assert 'echo "candidate_schema=$candidate_schema"' in resolve["run"]
     assert "requires an explicit committed or handoff intent" in resolve["run"]
     assert claimant_probe["with"]["key"] == "${{ steps.recovery_lineage.outputs.candidate_key }}"
@@ -519,7 +531,8 @@ def test_hosted_lineage_recovery_requires_exact_claim_and_exact_retained_evidenc
     assert schema_validation["env"]["CANDIDATE_SCHEMA"] == (
         "${{ steps.recovery_lineage.outputs.candidate_schema }}"
     )
-    assert '"v3": 3, "v4": 4, "v5": 5, "v6": 6' in schema_validation["run"]
+    for version in HOSTED_PARENT_SCHEMA_VERSIONS:
+        assert f'"v{version}": {version}' in schema_validation["run"]
     assert "Recovery lineage did not declare a supported source schema" in schema_validation["run"]
 
 

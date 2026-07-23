@@ -187,6 +187,7 @@ def _downgrade_current_database_to_v7(database: Path) -> None:
         connection.execute("PRAGMA journal_mode = DELETE")
         connection.executescript(
             """
+            DROP TABLE legacy_candidate_retry_overrides;
             DROP TABLE candidate_retry_authorizations;
             DROP INDEX runs_active_candidate_idx;
             DROP INDEX runs_candidate_revision_idx;
@@ -484,6 +485,64 @@ def _delete_tail_event(
         """,
         (row[1], run_id),
     )
+
+
+def _historical_v7_candidate_retry_database(
+    root: Path,
+) -> tuple[RunManifest, RunManifest, int, str]:
+    """Create canonical v7 state containing its historical four-field retry event."""
+
+    store = RunStore(root)
+    candidate = _issue_candidate()
+    prior = _candidate_run(store, candidate=candidate, status=RunStatus.REJECTED)
+    retry = store.create_run()
+    _set_status(store, retry, RunStatus.DISCOVERING)
+    retry.candidate = candidate.model_copy(deep=True)
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        f"legacy-retry-fixture-{retry.run_id}",
+        ttl=timedelta(minutes=5),
+    )
+    assert lease is not None
+    try:
+        store.claim_candidate(
+            retry,
+            lease=lease,
+            retry_authorization=CandidateRetryAuthorization(
+                actor="historical-operator",
+                reason="Authorization was not durably structured before schema v8.",
+            ),
+        )
+    finally:
+        assert store.release_lease(lease.name, lease.owner, lease.generation)
+
+    revision = compute_issue_revision(candidate)
+    with closing(sqlite3.connect(store.database_path)) as connection:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        _rewrite_tail_event_details(
+            connection,
+            run_id=retry.run_id,
+            event_type="candidate.retry_override",
+            details={
+                "issue": candidate.reference,
+                "issue_revision": revision,
+                "prior_run_id": prior.run_id,
+                "prior_status": prior.status.value,
+            },
+        )
+        event = connection.execute(
+            """
+            SELECT id, event_hash FROM events
+            WHERE run_id = ? AND event_type = 'candidate.retry_override'
+            """,
+            (retry.run_id,),
+        ).fetchone()
+        assert event is not None
+        event_id, event_hash = event
+        connection.commit()
+
+    _downgrade_current_database_to_v7(store.database_path)
+    return prior, retry, event_id, event_hash
 
 
 def _reserve_gate(
@@ -943,6 +1002,12 @@ def test_fresh_database_has_current_version_and_all_v8_tables(tmp_path: Path) ->
                 "PRAGMA table_info(candidate_retry_authorizations)"
             ).fetchall()
         ]
+        legacy_override_columns = [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(legacy_candidate_retry_overrides)"
+            ).fetchall()
+        ]
 
     assert store.schema_version == CURRENT_SCHEMA_VERSION == 8
     assert "issue_revision" in run_columns
@@ -975,6 +1040,12 @@ def test_fresh_database_has_current_version_and_all_v8_tables(tmp_path: Path) ->
         "reason",
         "authorized_at",
     ]
+    assert legacy_override_columns == [
+        "event_id",
+        "run_id",
+        "event_hash",
+        "migrated_at",
+    ]
     assert tables == {
         "schema_metadata",
         "runs",
@@ -988,6 +1059,7 @@ def test_fresh_database_has_current_version_and_all_v8_tables(tmp_path: Path) ->
         "publication_gate_holds",
         "manifest_artifact_sync",
         "candidate_retry_authorizations",
+        "legacy_candidate_retry_overrides",
     }
 
 
@@ -1035,7 +1107,11 @@ def test_v7_migration_preserves_rows_and_installs_fenced_candidate_claim_schema(
         assert connection.execute(
             """
             SELECT count(*) FROM sqlite_master
-            WHERE name IN ('candidate_retry_authorizations', 'runs_active_candidate_idx')
+            WHERE name IN (
+                'candidate_retry_authorizations',
+                'legacy_candidate_retry_overrides',
+                'runs_active_candidate_idx'
+            )
             """
         ).fetchone() == (0,)
         assert [
@@ -1085,6 +1161,102 @@ def test_v7_migration_preserves_rows_and_installs_fenced_candidate_claim_schema(
         assert connection.execute(
             "SELECT count(*) FROM candidate_retry_authorizations"
         ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT count(*) FROM legacy_candidate_retry_overrides"
+        ).fetchone() == (0,)
+
+
+def test_v7_migration_marks_historical_retry_override_and_restores_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    prior, retry, event_id, event_hash = _historical_v7_candidate_retry_database(root)
+
+    migrated = RunStore(root)
+
+    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
+    assert migrated.get(prior.run_id) == prior
+    assert migrated.get(retry.run_id) == retry
+    with sqlite3.connect(migrated.database_path) as connection:
+        marker = connection.execute(
+            """
+            SELECT event_id, run_id, event_hash, migrated_at
+            FROM legacy_candidate_retry_overrides
+            """
+        ).fetchone()
+        authorization_count = connection.execute(
+            "SELECT count(*) FROM candidate_retry_authorizations"
+        ).fetchone()
+    assert marker is not None
+    assert marker[:3] == (event_id, retry.run_id, event_hash)
+    assert datetime.fromisoformat(marker[3]).tzinfo is not None
+    assert authorization_count == (0,)
+    migrated.verify_event_chains()
+
+    snapshot = migrated.create_snapshot(tmp_path / "backup" / "state.sqlite3")
+    restored_root = tmp_path / "restored"
+    assert RunStore.restore_snapshot(restored_root, snapshot) == restored_root / "state.sqlite3"
+    restored = RunStore(restored_root)
+
+    assert restored.get(prior.run_id) == prior
+    assert restored.get(retry.run_id) == retry
+    restored.verify_event_chains()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("issue", "revision", "prior_run", "prior_status"),
+)
+def test_v7_migration_rejects_tampered_historical_retry_override_transactionally(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    root = tmp_path / "state"
+    _, retry, _, _ = _historical_v7_candidate_retry_database(root)
+    with closing(sqlite3.connect(root / "state.sqlite3")) as connection:
+        event = connection.execute(
+            """
+            SELECT details_json FROM events
+            WHERE run_id = ? AND event_type = 'candidate.retry_override'
+            """,
+            (retry.run_id,),
+        ).fetchone()
+        assert event is not None
+        details = json.loads(event[0])
+        if tamper == "issue":
+            details["issue"] = "example/other#999"
+        elif tamper == "revision":
+            details["issue_revision"] = "f" * 64
+        elif tamper == "prior_run":
+            details["prior_run_id"] = retry.run_id
+        else:
+            details["prior_status"] = RunStatus.SKIPPED.value
+        _rewrite_tail_event_details(
+            connection,
+            run_id=retry.run_id,
+            event_type="candidate.retry_override",
+            details=details,
+        )
+        connection.commit()
+
+    with pytest.raises(StateError, match="legacy candidate retry override"):
+        RunStore(root)
+
+    with sqlite3.connect(root / "state.sqlite3") as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+        ).fetchone() == (7,)
+        assert connection.execute(
+            """
+            SELECT count(*) FROM sqlite_master
+            WHERE name IN (
+                'candidate_retry_authorizations',
+                'legacy_candidate_retry_overrides',
+                'runs_active_candidate_idx'
+            )
+            """
+        ).fetchone() == (0,)
+        assert RunStore._schema_manifest(connection) == RunStore._expected_schema_manifest(7)
 
 
 def test_v6_migration_backfills_issue_revision_and_accepts_publication_only_identity(
@@ -1233,7 +1405,11 @@ def test_v7_migration_rejects_duplicate_active_candidate_attempts_transactionall
         assert connection.execute(
             """
             SELECT count(*) FROM sqlite_master
-            WHERE name IN ('candidate_retry_authorizations', 'runs_active_candidate_idx')
+            WHERE name IN (
+                'candidate_retry_authorizations',
+                'legacy_candidate_retry_overrides',
+                'runs_active_candidate_idx'
+            )
             """
         ).fetchone() == (0,)
         assert [
@@ -1458,6 +1634,7 @@ def test_restore_snapshot_rejects_issue_revision_tampering(
     (
         ("authorization", "override disagrees with its authorization"),
         ("malformed_authorization", "authorization has an invalid identity"),
+        ("authorization_time", "mismatched authorization time"),
         ("override", "override disagrees with its authorization"),
         ("orphan_authorization", "exactly one candidate retry override event"),
         ("orphan_override", "lacks durable authorization"),
@@ -1512,6 +1689,15 @@ def test_restore_snapshot_rejects_tampered_or_orphaned_candidate_retry_evidence(
                 """,
                 (retry.run_id,),
             )
+        elif tamper == "authorization_time":
+            connection.execute(
+                """
+                UPDATE candidate_retry_authorizations
+                SET authorized_at = '2999-01-01T00:00:00+00:00'
+                WHERE run_id = ?
+                """,
+                (retry.run_id,),
+            )
         elif tamper == "override":
             event = next(
                 event
@@ -1541,6 +1727,158 @@ def test_restore_snapshot_rejects_tampered_or_orphaned_candidate_retry_evidence(
 
     target = tmp_path / f"target-{tamper}"
     with pytest.raises(StateError, match=message):
+        RunStore.restore_snapshot(target, snapshot)
+
+    assert not (target / "state.sqlite3").exists()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "unmarked_event",
+        "orphan_marker",
+        "mismatched_run",
+        "mismatched_event",
+        "mismatched_hash",
+        "migration_time",
+        "pre_event_cutoff",
+        "event_details",
+    ),
+)
+def test_restore_snapshot_rejects_tampered_legacy_candidate_retry_marker(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    source_root = tmp_path / "source"
+    prior, retry, _, _ = _historical_v7_candidate_retry_database(source_root)
+    source = RunStore(source_root)
+    ordinary = source.create_run()
+    snapshot = source.create_snapshot(tmp_path / "backup" / f"{tamper}.sqlite3")
+
+    with closing(sqlite3.connect(snapshot)) as connection:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        marker = connection.execute(
+            """
+            SELECT event_id, run_id, event_hash, migrated_at
+            FROM legacy_candidate_retry_overrides WHERE run_id = ?
+            """,
+            (retry.run_id,),
+        ).fetchone()
+        assert marker is not None
+        if tamper == "unmarked_event":
+            connection.execute(
+                "DELETE FROM legacy_candidate_retry_overrides WHERE run_id = ?",
+                (retry.run_id,),
+            )
+        elif tamper == "orphan_marker":
+            ordinary_event = connection.execute(
+                """
+                SELECT id, event_hash FROM events
+                WHERE run_id = ? AND event_type = 'run.created'
+                """,
+                (ordinary.run_id,),
+            ).fetchone()
+            assert ordinary_event is not None
+            connection.execute(
+                """
+                INSERT INTO legacy_candidate_retry_overrides(
+                    event_id, run_id, event_hash, migrated_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (ordinary_event[0], ordinary.run_id, ordinary_event[1], marker[3]),
+            )
+        elif tamper == "mismatched_run":
+            connection.execute(
+                """
+                UPDATE legacy_candidate_retry_overrides SET run_id = ?
+                WHERE run_id = ?
+                """,
+                (prior.run_id, retry.run_id),
+            )
+        elif tamper == "mismatched_event":
+            creation = connection.execute(
+                """
+                SELECT id, event_hash FROM events
+                WHERE run_id = ? AND event_type = 'run.created'
+                """,
+                (retry.run_id,),
+            ).fetchone()
+            assert creation is not None
+            connection.execute(
+                """
+                UPDATE legacy_candidate_retry_overrides
+                SET event_id = ?, event_hash = ? WHERE run_id = ?
+                """,
+                (creation[0], creation[1], retry.run_id),
+            )
+        elif tamper == "mismatched_hash":
+            connection.execute(
+                """
+                UPDATE legacy_candidate_retry_overrides SET event_hash = ?
+                WHERE run_id = ?
+                """,
+                ("f" * 64, retry.run_id),
+            )
+        elif tamper == "migration_time":
+            connection.execute(
+                """
+                UPDATE legacy_candidate_retry_overrides
+                SET migrated_at = '2999-01-01T00:00:00+00:00'
+                WHERE run_id = ?
+                """,
+                (retry.run_id,),
+            )
+        elif tamper == "pre_event_cutoff":
+            cutoff = "2000-01-01T00:00:00+00:00"
+            connection.execute(
+                """
+                UPDATE legacy_candidate_retry_overrides SET migrated_at = ?
+                WHERE run_id = ?
+                """,
+                (cutoff, retry.run_id),
+            )
+            connection.execute(
+                """
+                UPDATE schema_metadata SET migrated_at = ? WHERE singleton = 1
+                """,
+                (cutoff,),
+            )
+        else:
+            event = connection.execute(
+                """
+                SELECT details_json FROM events
+                WHERE run_id = ? AND event_type = 'candidate.retry_override'
+                """,
+                (retry.run_id,),
+            ).fetchone()
+            assert event is not None
+            details = json.loads(event[0])
+            details["prior_status"] = RunStatus.SKIPPED.value
+            _rewrite_tail_event_details(
+                connection,
+                run_id=retry.run_id,
+                event_type="candidate.retry_override",
+                details=details,
+            )
+            changed_hash = connection.execute(
+                """
+                SELECT event_hash FROM events
+                WHERE run_id = ? AND event_type = 'candidate.retry_override'
+                """,
+                (retry.run_id,),
+            ).fetchone()
+            assert changed_hash is not None
+            connection.execute(
+                """
+                UPDATE legacy_candidate_retry_overrides SET event_hash = ?
+                WHERE run_id = ?
+                """,
+                (changed_hash[0], retry.run_id),
+            )
+        connection.commit()
+
+    target = tmp_path / f"target-{tamper}"
+    with pytest.raises(StateError):
         RunStore.restore_snapshot(target, snapshot)
 
     assert not (target / "state.sqlite3").exists()
@@ -2426,6 +2764,11 @@ def test_candidate_claim_rejects_wrong_and_stale_lease_generations(tmp_path: Pat
     (
         ("repository", " example/project"),
         ("repository", "example /project"),
+        ("repository", "Straße/project"),
+        ("repository", "./project"),
+        ("repository", "../project"),
+        ("repository", "example/."),
+        ("repository", "example/.."),
         ("number", 0),
         ("number", -1),
     ),

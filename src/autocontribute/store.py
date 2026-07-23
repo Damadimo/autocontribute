@@ -35,7 +35,7 @@ from autocontribute.lifecycle import (
     parse_pull_request_url,
 )
 
-CURRENT_SCHEMA_VERSION: Final = 7
+CURRENT_SCHEMA_VERSION: Final = 8
 _MAX_GENERATION: Final = 2**63 - 1
 _MAX_ACTIVE_CIRCUIT_BREAKER_TRIGGERS: Final = 10_000
 _MAX_LIFECYCLE_SNAPSHOT_BYTES: Final = 2_000_000
@@ -44,6 +44,7 @@ _MAX_RUN_CORPUS: Final = 10_000
 _MAX_EVALUATION_EVENT_CORPUS: Final = 10_000
 _UPSTREAM_OUTCOME_CURSOR_DOMAIN: Final = b"autocontribute.upstream-outcome-corpus.v1\x00"
 _GITHUB_LOGIN: Final = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+_CANDIDATE_REPOSITORY: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _REQUIRED_STORAGE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT"
 _REQUIRED_WORKSPACE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT"
@@ -134,6 +135,24 @@ _MANIFEST_ARTIFACT_SYNC_COLUMNS: Final = {
     "updated_at",
     "manifest_sha256",
 }
+_CANDIDATE_RETRY_AUTHORIZATION_COLUMNS: Final = {
+    "authorization_id",
+    "run_id",
+    "repository",
+    "issue_number",
+    "issue_revision",
+    "prior_run_id",
+    "prior_status",
+    "actor",
+    "reason",
+    "authorized_at",
+}
+_LEGACY_CANDIDATE_RETRY_OVERRIDE_COLUMNS: Final = {
+    "event_id",
+    "run_id",
+    "event_hash",
+    "migrated_at",
+}
 _PUBLICATION_EVIDENCE_EVENT_TYPES: Final = (
     "publication.reserved",
     "publication.reservation.legacy",
@@ -158,10 +177,16 @@ _V6_REQUIRED_INDEXES: Final = {
     "publication_reservations_reserved_at_idx",
     "publication_reservations_repository_idx",
 }
-_REQUIRED_INDEXES: Final = {
+_V7_REQUIRED_INDEXES: Final = {
     *_V6_REQUIRED_INDEXES,
     "runs_candidate_revision_idx",
 }
+_REQUIRED_INDEXES: Final = {
+    *_V7_REQUIRED_INDEXES,
+    "runs_active_candidate_idx",
+}
+
+_CANDIDATE_CLAIM_LEASE_NAME: Final = "autocontribute.run"
 
 # A completed local run can still represent an active upstream contribution. In particular, an
 # open pull request must continue blocking duplicate work for the same issue.
@@ -767,6 +792,17 @@ class CandidateAttemptDisposition:
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateRetryAuthorization:
+    actor: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        """Reject non-canonical provenance before any run or remote work begins."""
+
+        _candidate_retry_authorization(self)
+
+
+@dataclass(frozen=True, slots=True)
 class Lease:
     name: str
     owner: str
@@ -1003,7 +1039,7 @@ class RunStore:
                 )
             if version == 1 and "schema_metadata" not in self._table_names(connection):
                 self._adopt_legacy_schema(connection)
-            if version in {2, 3, 4, 5, 6}:
+            if version in {2, 3, 4, 5, 6, 7}:
                 # Validate the complete source schema before executing migration SQL. This
                 # prevents unexpected views or triggers from participating in the migration,
                 # even though a later validation would ultimately roll the transaction back.
@@ -1023,6 +1059,8 @@ class RunStore:
                     self._migrate_5_to_6(connection)
                 elif version == 6:
                     self._migrate_6_to_7(connection)
+                elif version == 7:
+                    self._migrate_7_to_8(connection)
                 else:  # pragma: no cover - guarded by the supported-version checks
                     raise StateError(f"No state migration is available from schema {version}")
                 version += 1
@@ -1060,6 +1098,8 @@ class RunStore:
             "publication_reservations",
             "publication_gate_holds",
             "manifest_artifact_sync",
+            "candidate_retry_authorizations",
+            "legacy_candidate_retry_overrides",
         }:
             raise StateError(f"Refusing to inspect unexpected state table: {table}")
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -1553,6 +1593,140 @@ class RunStore:
             raise StateError("State schema changed while migration was in progress")
 
     @staticmethod
+    def _migrate_7_to_8(connection: sqlite3.Connection) -> None:
+        """Fence active claims and persist exact operator retry authorization."""
+
+        duplicate = connection.execute(
+            """
+            SELECT lower(repository) AS repository_key, issue_number
+            FROM runs
+            WHERE issue_number IS NOT NULL
+                AND status NOT IN (?, ?, ?, ?)
+            GROUP BY lower(repository), issue_number
+            HAVING count(*) > 1
+            LIMIT 1
+            """,
+            tuple(sorted(status.value for status in _CANDIDATE_RELEASED_STATUSES)),
+        ).fetchone()
+        if duplicate is not None:
+            raise StateError(
+                "State migration found duplicate active attempts for one candidate issue"
+            )
+        connection.execute("DROP INDEX runs_candidate_revision_idx")
+        connection.execute(
+            """
+            CREATE INDEX runs_candidate_revision_idx
+            ON runs(repository COLLATE NOCASE, issue_number, issue_revision, status)
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX runs_active_candidate_idx
+            ON runs(repository COLLATE NOCASE, issue_number)
+            WHERE issue_number IS NOT NULL
+                AND status NOT IN ('cancelled', 'failed', 'rejected', 'skipped')
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE candidate_retry_authorizations (
+                authorization_id TEXT PRIMARY KEY CHECK(
+                    length(authorization_id) = 32
+                    AND authorization_id NOT GLOB '*[^0-9a-f]*'
+                ),
+                run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+                repository TEXT NOT NULL,
+                issue_number INTEGER NOT NULL CHECK(issue_number >= 1),
+                issue_revision TEXT NOT NULL CHECK(
+                    length(issue_revision) = 64
+                    AND issue_revision NOT GLOB '*[^0-9a-f]*'
+                ),
+                prior_run_id TEXT NOT NULL REFERENCES runs(run_id),
+                prior_status TEXT NOT NULL CHECK(
+                    prior_status IN ('cancelled', 'rejected', 'skipped')
+                ),
+                actor TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                authorized_at TEXT NOT NULL,
+                CHECK(run_id <> prior_run_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE legacy_candidate_retry_overrides (
+                event_id INTEGER PRIMARY KEY REFERENCES events(id),
+                run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+                event_hash TEXT NOT NULL UNIQUE CHECK(
+                    length(event_hash) = 64
+                    AND event_hash NOT GLOB '*[^0-9a-f]*'
+                ),
+                migrated_at TEXT NOT NULL
+            )
+            """
+        )
+        legacy_events = connection.execute(
+            """
+            SELECT id, run_id, occurred_at, event_hash, details_json
+            FROM events
+            WHERE event_type = 'candidate.retry_override'
+            ORDER BY id LIMIT ?
+            """,
+            (_MAX_RUN_CORPUS + 1,),
+        ).fetchall()
+        if len(legacy_events) > _MAX_RUN_CORPUS:
+            raise StateError("Legacy candidate retry overrides exceed the migration bound")
+        source_metadata = connection.execute(
+            "SELECT migrated_at FROM schema_metadata WHERE singleton = 1"
+        ).fetchone()
+        if source_metadata is None:
+            raise StateError("State schema metadata disappeared during migration")
+        migration_time = max(
+            _aware_utc(utc_now(), field="schema v8 migration time"),
+            _stored_canonical_utc_datetime(
+                source_metadata["migrated_at"],
+                field="schema v7 migration time",
+            ),
+        )
+        validated_legacy_events: list[tuple[int, str, str]] = []
+        for event in legacy_events:
+            event_id, run_id, event_hash = _validated_legacy_candidate_retry_override(
+                connection,
+                event_id=event["id"],
+                run_id=event["run_id"],
+                event_hash=event["event_hash"],
+                details_json=event["details_json"],
+            )
+            migration_time = max(
+                migration_time,
+                _stored_datetime(
+                    event["occurred_at"],
+                    field="legacy candidate retry event time",
+                ),
+            )
+            validated_legacy_events.append((event_id, run_id, event_hash))
+        migrated_at = migration_time.isoformat()
+        for event_id, run_id, event_hash in validated_legacy_events:
+            connection.execute(
+                """
+                INSERT INTO legacy_candidate_retry_overrides(
+                    event_id, run_id, event_hash, migrated_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (event_id, run_id, event_hash, migrated_at),
+            )
+        connection.execute(
+            """
+            UPDATE schema_metadata
+            SET schema_version = 8, migrated_at = ?
+            WHERE singleton = 1 AND schema_version = 7
+            """,
+            (migrated_at,),
+        )
+        if connection.execute("SELECT changes()").fetchone()[0] != 1:
+            raise StateError("State schema changed while migration was in progress")
+
+    @staticmethod
     def _schema_manifest(
         connection: sqlite3.Connection,
     ) -> tuple[tuple[str, str, str, str | None], ...]:
@@ -1584,7 +1758,7 @@ class RunStore:
     def _expected_schema_manifest(
         cls, version: int
     ) -> tuple[tuple[str, str, str, str | None], ...]:
-        if version not in {2, 3, 4, 5, 6, CURRENT_SCHEMA_VERSION}:
+        if version not in {2, 3, 4, 5, 6, 7, CURRENT_SCHEMA_VERSION}:
             raise StateError(f"No canonical schema manifest exists for state version {version}")
         expected = sqlite3.connect(":memory:")
         expected.row_factory = sqlite3.Row
@@ -1602,6 +1776,8 @@ class RunStore:
                 cls._migrate_5_to_6(expected)
             if version >= 7:
                 cls._migrate_6_to_7(expected)
+            if version >= 8:
+                cls._migrate_7_to_8(expected)
             return cls._schema_manifest(expected)
         finally:
             expected.close()
@@ -1630,7 +1806,11 @@ class RunStore:
             expected["publication_reservations"] = _PUBLICATION_RESERVATION_COLUMNS
             required_indexes = _V6_REQUIRED_INDEXES
         if expected_version >= 7:
+            required_indexes = _V7_REQUIRED_INDEXES
+        if expected_version >= 8:
             required_indexes = _REQUIRED_INDEXES
+            expected["candidate_retry_authorizations"] = _CANDIDATE_RETRY_AUTHORIZATION_COLUMNS
+            expected["legacy_candidate_retry_overrides"] = _LEGACY_CANDIDATE_RETRY_OVERRIDE_COLUMNS
         if expected_version >= 4:
             expected["lease_generations"] = _LEASE_GENERATION_COLUMNS
             expected["publication_gate_holds"] = (
@@ -1672,7 +1852,10 @@ class RunStore:
                 require_current_rollout_cursors=False,
             )
         if expected_version >= 7:
-            _verify_issue_revision_evidence(connection)
+            _verify_issue_revision_evidence(
+                connection,
+                require_current_provenance=expected_version >= 8,
+            )
 
     @classmethod
     def _validate_current_schema(cls, connection: sqlite3.Connection) -> None:
@@ -1683,10 +1866,10 @@ class RunStore:
         version = cls._detect_schema_version(connection)
         if version == 0:
             raise StateError("State database contains missing or unsupported tables")
-        if version not in {2, 3, 4, 5, 6, CURRENT_SCHEMA_VERSION}:
+        if version not in {2, 3, 4, 5, 6, 7, CURRENT_SCHEMA_VERSION}:
             raise StateError(
                 f"State snapshot schema {version} cannot be restored; expected version 2, 3, 4, "
-                f"5, 6, or {CURRENT_SCHEMA_VERSION}"
+                f"5, 6, 7, or {CURRENT_SCHEMA_VERSION}"
             )
         cls._validate_schema_version(connection, expected_version=version)
 
@@ -2088,6 +2271,233 @@ class RunStore:
             manifests.append(manifest)
         return manifests
 
+    def claim_candidate(
+        self,
+        manifest: RunManifest,
+        *,
+        lease: Lease,
+        retry_authorization: CandidateRetryAuthorization | None = None,
+    ) -> CandidateAttemptDisposition:
+        """Atomically fence, classify, and bind one active candidate attempt."""
+
+        if manifest.status != RunStatus.DISCOVERING:
+            raise StateError("Candidate claims require a discovering run")
+        candidate = manifest.candidate
+        if candidate is None:
+            raise StateError("Candidate claims require complete issue evidence")
+        try:
+            repository_key, issue_number = _candidate_identity(
+                candidate.repository,
+                candidate.number,
+            )
+            if (
+                manifest.repository is not None
+                and _candidate_identity(
+                    manifest.repository.full_name,
+                    issue_number,
+                )[0]
+                != repository_key
+            ):
+                raise ValueError("candidate repository metadata identifies a different repository")
+        except (TypeError, ValueError) as exc:
+            raise StateError("Candidate claims require a canonical issue identity") from exc
+        if not 0 <= candidate.score <= 100:
+            raise StateError("Candidate claims require a score between 0 and 100")
+        if not isinstance(lease, Lease) or lease.name != _CANDIDATE_CLAIM_LEASE_NAME:
+            raise StateError("Candidate claims require the fenced autocontribute run lease")
+
+        revision = compute_issue_revision(candidate)
+        expected_updated_at = manifest.updated_at
+        manifest.updated_at = _next_run_update_time(expected_updated_at)
+        disposition: CandidateAttemptDisposition
+        try:
+            manifest_json = manifest.model_dump_json()
+            event_occurred_at: str | None = None
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                _assert_candidate_claim_lease(connection, lease, checked_at=utc_now())
+                current = connection.execute(
+                    """
+                    SELECT status, repository, issue_number, issue_revision, manifest_json,
+                           updated_at
+                    FROM runs WHERE run_id = ?
+                    """,
+                    (manifest.run_id,),
+                ).fetchone()
+                if current is None:
+                    raise StateError(f"Unknown run: {manifest.run_id}")
+                try:
+                    stored_manifest = RunManifest.model_validate_json(current["manifest_json"])
+                except (TypeError, ValueError) as exc:
+                    raise StateError(f"Run {manifest.run_id} contains an invalid manifest") from exc
+                if (
+                    current["status"] != RunStatus.DISCOVERING.value
+                    or current["updated_at"] != expected_updated_at.isoformat()
+                    or current["repository"] is not None
+                    or current["issue_number"] is not None
+                    or current["issue_revision"] is not None
+                    or stored_manifest.run_id != manifest.run_id
+                    or stored_manifest.status != RunStatus.DISCOVERING
+                    or stored_manifest.candidate is not None
+                ):
+                    raise StateError(f"Run {manifest.run_id} changed before its candidate claim")
+
+                rows = connection.execute(
+                    """
+                    SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
+                    FROM runs
+                    WHERE run_id <> ? AND repository = ? COLLATE NOCASE
+                        AND issue_number = ?
+                    ORDER BY run_id ASC LIMIT ?
+                    """,
+                    (
+                        manifest.run_id,
+                        repository_key,
+                        issue_number,
+                        _MAX_RUN_CORPUS + 1,
+                    ),
+                ).fetchall()
+                if len(rows) > _MAX_RUN_CORPUS:
+                    raise StateError(
+                        "Candidate attempt history exceeds the supported integrity bound"
+                    )
+                attempts = [_verified_issue_revision_row(row) for row in rows]
+                active = next(
+                    (
+                        (run_id, status)
+                        for run_id, status, _ in attempts
+                        if status not in _CANDIDATE_RELEASED_STATUSES
+                    ),
+                    None,
+                )
+                if active is not None:
+                    raise StateError(
+                        f"Candidate already has active run {active[0]} in status {active[1].value}"
+                    )
+                suppressed = next(
+                    (
+                        (run_id, status)
+                        for run_id, status, stored_revision in attempts
+                        if status in _CANDIDATE_SUPPRESSED_STATUSES and stored_revision == revision
+                    ),
+                    None,
+                )
+                if suppressed is None and retry_authorization is not None:
+                    raise StateError(
+                        "Retry authorization no longer matches an unchanged suppressed candidate"
+                    )
+                if suppressed is not None and retry_authorization is None:
+                    raise StateError(
+                        "Unchanged suppressed candidate requires explicit retry authorization"
+                    )
+
+                if suppressed is None:
+                    disposition = CandidateAttemptDisposition(
+                        state=CandidateAttemptState.AVAILABLE,
+                        issue_revision=revision,
+                    )
+                    event_type = "candidate.selected"
+                    event_details = {
+                        "issue": candidate.reference,
+                        "issue_revision": revision,
+                        "score": str(candidate.score),
+                    }
+                else:
+                    assert retry_authorization is not None
+                    actor, reason = _candidate_retry_authorization(retry_authorization)
+                    authorization_id = uuid.uuid4().hex
+                    authorized_at = utc_now().isoformat()
+                    event_occurred_at = authorized_at
+                    prior_run_id, prior_status = suppressed
+                    disposition = CandidateAttemptDisposition(
+                        state=CandidateAttemptState.SUPPRESSED,
+                        issue_revision=revision,
+                        prior_run_id=prior_run_id,
+                        prior_status=prior_status,
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO candidate_retry_authorizations(
+                            authorization_id, run_id, repository, issue_number,
+                            issue_revision, prior_run_id, prior_status, actor, reason,
+                            authorized_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            authorization_id,
+                            manifest.run_id,
+                            candidate.repository,
+                            issue_number,
+                            revision,
+                            prior_run_id,
+                            prior_status.value,
+                            actor,
+                            reason,
+                            authorized_at,
+                        ),
+                    )
+                    event_type = "candidate.retry_override"
+                    event_details = {
+                        "actor": actor,
+                        "authorization_id": authorization_id,
+                        "issue": candidate.reference,
+                        "issue_revision": revision,
+                        "prior_run_id": prior_run_id,
+                        "prior_status": prior_status.value,
+                        "reason": reason,
+                    }
+
+                result = connection.execute(
+                    """
+                    UPDATE runs
+                    SET repository = ?, issue_number = ?, issue_revision = ?, updated_at = ?,
+                        manifest_json = ?
+                    WHERE run_id = ? AND status = ? AND updated_at = ?
+                        AND repository IS NULL AND issue_number IS NULL
+                        AND issue_revision IS NULL AND manifest_json = ?
+                    """,
+                    (
+                        candidate.repository,
+                        issue_number,
+                        revision,
+                        manifest.updated_at.isoformat(),
+                        manifest_json,
+                        manifest.run_id,
+                        RunStatus.DISCOVERING.value,
+                        expected_updated_at.isoformat(),
+                        current["manifest_json"],
+                    ),
+                )
+                if result.rowcount != 1:
+                    raise StateError(
+                        f"Run {manifest.run_id} changed while its candidate was claimed"
+                    )
+                self._append_event(
+                    connection,
+                    manifest.run_id,
+                    event_type,
+                    event_details,
+                    occurred_at=event_occurred_at,
+                )
+                _mark_manifest_artifact_sync(
+                    connection,
+                    run_id=manifest.run_id,
+                    updated_at=manifest.updated_at.isoformat(),
+                    manifest_json=manifest_json,
+                )
+        except sqlite3.IntegrityError as exc:
+            manifest.updated_at = expected_updated_at
+            raise StateError("Candidate claim violated a durable state constraint") from exc
+        except Exception:
+            manifest.updated_at = expected_updated_at
+            raise
+        self._synchronize_manifest_artifact(
+            manifest.run_id,
+            updated_at=manifest.updated_at.isoformat(),
+            manifest_sha256=_manifest_json_digest(manifest_json),
+        )
+        return disposition
+
     def save(self, manifest: RunManifest, *, event: str, details: dict[str, str]) -> None:
         candidate = manifest.candidate
         issue_revision = compute_issue_revision(candidate) if candidate is not None else None
@@ -2095,10 +2505,18 @@ class RunStore:
         if event == "candidate.selected":
             if candidate is None or issue_revision is None:
                 raise StateError("Candidate selection cannot be saved without issue evidence")
+            if not 0 <= candidate.score <= 100:
+                raise StateError("Candidate selection requires a score between 0 and 100")
             supplied_revision = event_details.get("issue_revision")
             if supplied_revision is not None and supplied_revision != issue_revision:
                 raise StateError("Candidate selection event has a mismatched issue revision")
             event_details["issue_revision"] = issue_revision
+            if event_details != {
+                "issue": candidate.reference,
+                "issue_revision": issue_revision,
+                "score": str(candidate.score),
+            }:
+                raise StateError("Candidate selection event disagrees with its candidate evidence")
         expected_updated_at = manifest.updated_at
         expected_utc = _aware_utc(expected_updated_at, field="manifest updated_at")
         saved_at = _aware_utc(utc_now(), field="run save time")
@@ -2111,6 +2529,17 @@ class RunStore:
         manifest_json = manifest.model_dump_json()
         try:
             with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    """
+                    SELECT issue_revision FROM runs WHERE run_id = ?
+                    """,
+                    (manifest.run_id,),
+                ).fetchone()
+                if current is None:
+                    raise StateError(f"Unknown run: {manifest.run_id}")
+                if candidate is not None and current["issue_revision"] is None:
+                    raise StateError("Candidate evidence must be persisted through claim_candidate")
                 result = connection.execute(
                     """
                     UPDATE runs
@@ -2132,12 +2561,12 @@ class RunStore:
                     ),
                 )
                 if result.rowcount != 1:
-                    current = connection.execute(
+                    changed = connection.execute(
                         "SELECT issue_revision FROM runs WHERE run_id = ?", (manifest.run_id,)
                     ).fetchone()
-                    if current is None:
+                    if changed is None:
                         raise StateError(f"Unknown run: {manifest.run_id}")
-                    if current["issue_revision"] not in {None, issue_revision}:
+                    if changed["issue_revision"] not in {None, issue_revision}:
                         raise StateError(
                             f"Run {manifest.run_id} candidate evidence changed after selection"
                         )
@@ -2201,18 +2630,35 @@ class RunStore:
 
         expected_updated_at = manifest.updated_at
         saved_at = _next_run_update_time(expected_updated_at)
-        manifest.updated_at = saved_at
         candidate = manifest.candidate
+        issue_revision = compute_issue_revision(candidate) if candidate is not None else None
+        manifest.updated_at = saved_at
         manifest_json = manifest.model_dump_json()
         try:
             with self._connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
+                current = connection.execute(
+                    """
+                    SELECT run_id, status, repository, issue_number, issue_revision,
+                           manifest_json
+                    FROM runs WHERE run_id = ?
+                    """,
+                    (manifest.run_id,),
+                ).fetchone()
+                if current is None:
+                    raise StateError(f"Unknown run: {manifest.run_id}")
+                _, stored_status, stored_revision = _verified_issue_revision_row(current)
+                if stored_status != previous or stored_revision != issue_revision:
+                    raise StateError(
+                        f"Run {manifest.run_id} candidate evidence changed after selection"
+                    )
                 result = connection.execute(
                     """
                     UPDATE runs
                     SET status = ?, repository = ?, issue_number = ?, updated_at = ?,
                         manifest_json = ?
                     WHERE run_id = ? AND updated_at = ? AND status = ?
+                        AND issue_revision IS ? AND manifest_json = ?
                     """,
                     (
                         manifest.status.value,
@@ -2223,16 +2669,11 @@ class RunStore:
                         manifest.run_id,
                         expected_updated_at.isoformat(),
                         previous.value,
+                        issue_revision,
+                        current["manifest_json"],
                     ),
                 )
                 if result.rowcount != 1:
-                    if (
-                        connection.execute(
-                            "SELECT 1 FROM runs WHERE run_id = ?", (manifest.run_id,)
-                        ).fetchone()
-                        is None
-                    ):
-                        raise StateError(f"Unknown run: {manifest.run_id}")
                     raise StateError(
                         f"Run {manifest.run_id} changed while this manifest was being saved"
                     )
@@ -2535,14 +2976,18 @@ class RunStore:
         return manifest
 
     def has_active_candidate(self, repository: str, issue_number: int) -> bool:
+        repository_key, normalized_issue_number = _candidate_identity(repository, issue_number)
         released = tuple(sorted(status.value for status in _CANDIDATE_RELEASED_STATUSES))
         placeholders = ",".join("?" for _ in released)
         query = (
-            "SELECT 1 FROM runs WHERE repository = ? AND issue_number = ? "
+            "SELECT 1 FROM runs WHERE repository = ? COLLATE NOCASE AND issue_number = ? "
             f"AND status NOT IN ({placeholders}) LIMIT 1"
         )
         with self._connection() as connection:
-            row = connection.execute(query, (repository, issue_number, *released)).fetchone()
+            row = connection.execute(
+                query,
+                (repository_key, normalized_issue_number, *released),
+            ).fetchone()
         return row is not None
 
     def candidate_attempt_disposition(
@@ -2558,9 +3003,7 @@ class RunStore:
 
         if not isinstance(issue, IssueCandidate):
             raise TypeError("candidate disposition requires an IssueCandidate")
-        repository = _repository_identity(issue.repository)
-        if isinstance(issue.number, bool) or not isinstance(issue.number, int) or issue.number < 1:
-            raise ValueError("candidate issue number must be a positive integer")
+        repository, issue_number = _candidate_identity(issue.repository, issue.number)
         revision = compute_issue_revision(issue)
         with self._connection() as connection:
             connection.execute("BEGIN")
@@ -2571,7 +3014,7 @@ class RunStore:
                 WHERE repository = ? COLLATE NOCASE AND issue_number = ?
                 ORDER BY run_id ASC LIMIT ?
                 """,
-                (repository, issue.number, _MAX_RUN_CORPUS + 1),
+                (repository, issue_number, _MAX_RUN_CORPUS + 1),
             ).fetchall()
             if len(rows) > _MAX_RUN_CORPUS:
                 raise StateError("Candidate attempt history exceeds the supported integrity bound")
@@ -4249,8 +4692,16 @@ class RunStore:
         run_id: str,
         event_type: str,
         details: dict[str, str],
+        *,
+        occurred_at: str | None = None,
     ) -> None:
-        _append_event_to_ledger(connection, run_id, event_type, details)
+        _append_event_to_ledger(
+            connection,
+            run_id,
+            event_type,
+            details,
+            occurred_at=occurred_at,
+        )
 
     def synchronize_manifest_artifacts(self, *, limit: int = _MAX_RUN_CORPUS) -> int:
         """Publish only explicitly pending manifest artifacts and clear their exact markers."""
@@ -4390,6 +4841,8 @@ def _append_event_to_ledger(
     run_id: str,
     event_type: str,
     details: dict[str, str],
+    *,
+    occurred_at: str | None = None,
 ) -> None:
     run_row = connection.execute(
         "SELECT event_count, event_head_hash FROM runs WHERE run_id = ?",
@@ -4422,7 +4875,10 @@ def _append_event_to_ledger(
     if stored_count != actual_count or stored_head != actual_head:
         raise StateError(f"Event ledger anchor mismatch for run {run_id}")
     previous_hash = stored_head
-    occurred_at = utc_now().isoformat()
+    if occurred_at is None:
+        occurred_at = utc_now().isoformat()
+    else:
+        _stored_canonical_utc_datetime(occurred_at, field="event occurrence time")
     details_json = _canonical_json(details)
     payload = _canonical_json(
         {
@@ -4563,6 +5019,10 @@ def _verified_issue_revision_row(
         # having selected an issue, so repository alone deliberately remains valid here.
         return run_id, status, None
 
+    try:
+        _candidate_identity(candidate.repository, candidate.number)
+    except (TypeError, ValueError) as exc:
+        raise StateError(f"Run {run_id} has an invalid candidate identity") from exc
     if row["repository"] != candidate.repository or row["issue_number"] != candidate.number:
         raise StateError(f"Run {run_id} candidate disagrees with its state row")
     try:
@@ -4581,7 +5041,11 @@ def _verified_issue_revision_row(
     return run_id, status, revision
 
 
-def _verify_issue_revision_evidence(connection: sqlite3.Connection) -> None:
+def _verify_issue_revision_evidence(
+    connection: sqlite3.Connection,
+    *,
+    require_current_provenance: bool,
+) -> None:
     rows = connection.execute(
         """
         SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
@@ -4591,8 +5055,387 @@ def _verify_issue_revision_evidence(connection: sqlite3.Connection) -> None:
     ).fetchall()
     if len(rows) > _MAX_RUN_CORPUS:
         raise StateError("Run corpus exceeds the supported issue-revision integrity bound")
+    candidate_runs: set[str] = set()
     for row in rows:
-        _verified_issue_revision_row(row)
+        run_id, _, revision = _verified_issue_revision_row(row)
+        if revision is not None:
+            candidate_runs.add(run_id)
+    if not require_current_provenance:
+        return
+    selected_runs = _verify_candidate_selection_events(connection)
+    authorized_retry_runs = _verify_candidate_retry_authorizations(connection)
+    missing_provenance = candidate_runs - selected_runs - authorized_retry_runs
+    if missing_provenance:
+        raise StateError(
+            f"Run {min(missing_provenance)} has candidate evidence without selection provenance"
+        )
+
+
+def _verify_candidate_selection_events(connection: sqlite3.Connection) -> set[str]:
+    rows = connection.execute(
+        """
+        SELECT events.run_id, events.details_json,
+               runs.status, runs.repository, runs.issue_number,
+               runs.issue_revision, runs.manifest_json
+        FROM events
+        JOIN runs USING(run_id)
+        WHERE events.event_type = 'candidate.selected'
+        ORDER BY events.id LIMIT ?
+        """,
+        (_MAX_RUN_CORPUS + 1,),
+    ).fetchall()
+    if len(rows) > _MAX_RUN_CORPUS:
+        raise StateError("Candidate selection evidence exceeds the supported integrity bound")
+    seen: set[str] = set()
+    for row in rows:
+        run_id, _, revision = _verified_issue_revision_row(row)
+        if run_id in seen:
+            raise StateError(f"Run {run_id} has duplicate candidate selection evidence")
+        seen.add(run_id)
+        if revision is None:
+            raise StateError(f"Run {run_id} selected a candidate without durable issue evidence")
+        manifest = RunManifest.model_validate_json(row["manifest_json"])
+        candidate = manifest.candidate
+        assert candidate is not None
+        details = _stored_event_details(
+            row["details_json"],
+            field=f"run {run_id} candidate selection event",
+        )
+        event_revision = details.get("issue_revision")
+        if event_revision is not None and event_revision != revision:
+            raise StateError(f"Run {run_id} candidate selection has a mismatched issue revision")
+        expected_keys = {"issue", "score"}
+        if event_revision is not None:
+            expected_keys.add("issue_revision")
+        score = details.get("score")
+        try:
+            parsed_score = int(score) if isinstance(score, str) else -1
+        except ValueError:
+            parsed_score = -1
+        if (
+            set(details) != expected_keys
+            or details.get("issue") != candidate.reference
+            or not 0 <= parsed_score <= 100
+            or score != str(parsed_score)
+        ):
+            raise StateError(
+                f"Run {run_id} candidate selection disagrees with its candidate evidence"
+            )
+    return seen
+
+
+def _verify_candidate_retry_authorizations(connection: sqlite3.Connection) -> set[str]:
+    metadata = connection.execute(
+        "SELECT migrated_at FROM schema_metadata WHERE singleton = 1"
+    ).fetchone()
+    if metadata is None:
+        raise StateError("Candidate retry evidence lacks schema migration metadata")
+    schema_migrated_at = _stored_canonical_utc_datetime(
+        metadata["migrated_at"],
+        field="schema migration time",
+    )
+    markers = connection.execute(
+        """
+        SELECT legacy_candidate_retry_overrides.event_id AS marker_event_id,
+               legacy_candidate_retry_overrides.run_id AS marker_run_id,
+               legacy_candidate_retry_overrides.event_hash AS marker_event_hash,
+               legacy_candidate_retry_overrides.migrated_at,
+               events.id AS event_id, events.run_id AS event_run_id,
+               events.event_type, events.occurred_at, events.event_hash,
+               events.details_json
+        FROM legacy_candidate_retry_overrides
+        LEFT JOIN events ON events.id = legacy_candidate_retry_overrides.event_id
+        ORDER BY legacy_candidate_retry_overrides.event_id LIMIT ?
+        """,
+        (_MAX_RUN_CORPUS + 1,),
+    ).fetchall()
+    if len(markers) > _MAX_RUN_CORPUS:
+        raise StateError("Legacy candidate retry markers exceed the supported integrity bound")
+    covered_event_ids: set[int] = set()
+    legacy_runs: set[str] = set()
+    for marker in markers:
+        marker_event_id = marker["marker_event_id"]
+        event_id = marker["event_id"]
+        if (
+            isinstance(marker_event_id, bool)
+            or not isinstance(marker_event_id, int)
+            or marker_event_id < 1
+            or event_id != marker_event_id
+            or marker["event_type"] != "candidate.retry_override"
+            or marker["event_run_id"] != marker["marker_run_id"]
+            or marker["event_hash"] != marker["marker_event_hash"]
+        ):
+            raise StateError("Legacy candidate retry marker disagrees with its exact event")
+        marker_migrated_at = _stored_canonical_utc_datetime(
+            marker["migrated_at"],
+            field="legacy candidate retry migration time",
+        )
+        event_occurred_at = _stored_datetime(
+            marker["occurred_at"],
+            field="legacy candidate retry event time",
+        )
+        if (
+            marker["migrated_at"] != metadata["migrated_at"]
+            or marker_migrated_at != schema_migrated_at
+            or event_occurred_at > marker_migrated_at
+        ):
+            raise StateError("Legacy candidate retry marker has an invalid migration cutoff")
+        validated_event_id, run_id, event_hash = _validated_legacy_candidate_retry_override(
+            connection,
+            event_id=event_id,
+            run_id=marker["event_run_id"],
+            event_hash=marker["event_hash"],
+            details_json=marker["details_json"],
+        )
+        if (
+            validated_event_id in covered_event_ids
+            or run_id in legacy_runs
+            or event_hash != marker["marker_event_hash"]
+        ):
+            raise StateError("Legacy candidate retry marker is duplicated or mismatched")
+        covered_event_ids.add(validated_event_id)
+        legacy_runs.add(run_id)
+
+    authorizations = connection.execute(
+        """
+        SELECT authorization_id, run_id, repository, issue_number, issue_revision,
+               prior_run_id, prior_status, actor, reason, authorized_at
+        FROM candidate_retry_authorizations
+        ORDER BY authorization_id LIMIT ?
+        """,
+        (_MAX_RUN_CORPUS + 1,),
+    ).fetchall()
+    if len(authorizations) > _MAX_RUN_CORPUS:
+        raise StateError("Candidate retry authorizations exceed the supported integrity bound")
+    authorized_runs: set[str] = set()
+    for authorization in authorizations:
+        authorization_id = _stored_authorization_id(authorization["authorization_id"])
+        try:
+            run_id = _lease_identity(authorization["run_id"], field="candidate retry run id")
+            prior_run_id = _lease_identity(
+                authorization["prior_run_id"],
+                field="candidate retry prior run id",
+            )
+            repository, issue_number = _candidate_identity(
+                authorization["repository"],
+                authorization["issue_number"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise StateError("Candidate retry authorization has an invalid identity") from exc
+        try:
+            prior_status = RunStatus(authorization["prior_status"])
+        except (TypeError, ValueError) as exc:
+            raise StateError("Candidate retry authorization has an invalid prior status") from exc
+        if prior_status not in _CANDIDATE_SUPPRESSED_STATUSES:
+            raise StateError("Candidate retry authorization references a non-suppressed status")
+        try:
+            actor, reason = _candidate_retry_authorization(
+                CandidateRetryAuthorization(
+                    actor=authorization["actor"],
+                    reason=authorization["reason"],
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise StateError("Candidate retry authorization has invalid operator evidence") from exc
+        _stored_canonical_utc_datetime(
+            authorization["authorized_at"],
+            field="candidate retry authorization time",
+        )
+        revision = _stored_event_hash(
+            authorization["issue_revision"],
+            field="candidate retry issue revision",
+        )
+
+        run_row = connection.execute(
+            """
+            SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
+            FROM runs WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        prior_row = connection.execute(
+            """
+            SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
+            FROM runs WHERE run_id = ?
+            """,
+            (prior_run_id,),
+        ).fetchone()
+        if run_row is None or prior_row is None:
+            raise StateError("Candidate retry authorization references a missing run")
+        _, _, run_revision = _verified_issue_revision_row(run_row)
+        _, stored_prior_status, prior_revision = _verified_issue_revision_row(prior_row)
+        try:
+            run_manifest = RunManifest.model_validate_json(run_row["manifest_json"])
+        except (TypeError, ValueError) as exc:
+            raise StateError("Candidate retry authorization references an invalid run") from exc
+        candidate = run_manifest.candidate
+        candidate_repository = (
+            _candidate_identity(candidate.repository, candidate.number)[0]
+            if candidate is not None
+            else None
+        )
+        if (
+            candidate is None
+            or run_revision != revision
+            or prior_revision != revision
+            or stored_prior_status != prior_status
+            or authorization["repository"] != candidate.repository
+            or repository != candidate_repository
+            or issue_number != candidate.number
+        ):
+            raise StateError("Candidate retry authorization disagrees with its run evidence")
+
+        events = connection.execute(
+            """
+            SELECT id, occurred_at, details_json FROM events
+            WHERE run_id = ? AND event_type = 'candidate.retry_override'
+            ORDER BY id LIMIT 2
+            """,
+            (run_id,),
+        ).fetchall()
+        if len(events) != 1:
+            raise StateError(f"Run {run_id} must have exactly one candidate retry override event")
+        if events[0]["occurred_at"] != authorization["authorized_at"]:
+            raise StateError(
+                f"Run {run_id} candidate retry override has a mismatched authorization time"
+            )
+        details = _stored_event_details(
+            events[0]["details_json"],
+            field=f"run {run_id} candidate retry override event",
+        )
+        expected_details = {
+            "actor": actor,
+            "authorization_id": authorization_id,
+            "issue": candidate.reference,
+            "issue_revision": revision,
+            "prior_run_id": prior_run_id,
+            "prior_status": prior_status.value,
+            "reason": reason,
+        }
+        if details != expected_details:
+            raise StateError(
+                f"Run {run_id} candidate retry override disagrees with its authorization"
+            )
+        event_id = events[0]["id"]
+        if (
+            isinstance(event_id, bool)
+            or not isinstance(event_id, int)
+            or event_id < 1
+            or event_id in covered_event_ids
+        ):
+            raise StateError(f"Run {run_id} candidate retry override event is invalid")
+        covered_event_ids.add(event_id)
+        authorized_runs.add(run_id)
+
+    if legacy_runs & authorized_runs:
+        raise StateError("Candidate retry evidence mixes legacy and authorized provenance")
+
+    retry_events = connection.execute(
+        """
+        SELECT id FROM events
+        WHERE event_type = 'candidate.retry_override'
+        ORDER BY id LIMIT ?
+        """,
+        (_MAX_RUN_CORPUS + 1,),
+    ).fetchall()
+    if len(retry_events) > _MAX_RUN_CORPUS:
+        raise StateError("Candidate retry overrides exceed the supported integrity bound")
+    retry_event_ids = {row["id"] for row in retry_events}
+    if retry_event_ids != covered_event_ids:
+        raise StateError(
+            "Candidate retry override event lacks durable authorization or migration provenance"
+        )
+    return authorized_runs | legacy_runs
+
+
+def _validated_legacy_candidate_retry_override(
+    connection: sqlite3.Connection,
+    *,
+    event_id: object,
+    run_id: object,
+    event_hash: object,
+    details_json: object,
+) -> tuple[int, str, str]:
+    """Bind one schema-v7 retry event to its exact current and prior run evidence."""
+
+    if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 1:
+        raise StateError("Legacy candidate retry override has an invalid event ID")
+    try:
+        if not isinstance(run_id, str):
+            raise TypeError("legacy candidate retry run ID must be a string")
+        normalized_run_id = _lease_identity(run_id, field="legacy candidate retry run id")
+    except (TypeError, ValueError) as exc:
+        raise StateError("Legacy candidate retry override has an invalid run ID") from exc
+    normalized_event_hash = _stored_event_hash(
+        event_hash,
+        field="legacy candidate retry event hash",
+    )
+    details = _stored_event_details(
+        details_json,
+        field=f"run {normalized_run_id} legacy candidate retry override",
+    )
+    expected_keys = {"issue", "issue_revision", "prior_run_id", "prior_status"}
+    if set(details) != expected_keys:
+        raise StateError(
+            f"Run {normalized_run_id} legacy candidate retry override has unsupported details"
+        )
+    try:
+        prior_run_id = _lease_identity(
+            details["prior_run_id"],
+            field="legacy candidate retry prior run id",
+        )
+        prior_status = RunStatus(details["prior_status"])
+    except (TypeError, ValueError) as exc:
+        raise StateError(
+            f"Run {normalized_run_id} legacy candidate retry override has invalid prior evidence"
+        ) from exc
+    if prior_run_id == normalized_run_id or prior_status not in _CANDIDATE_SUPPRESSED_STATUSES:
+        raise StateError(
+            f"Run {normalized_run_id} legacy candidate retry override has invalid prior evidence"
+        )
+    revision = _stored_event_hash(
+        details["issue_revision"],
+        field="legacy candidate retry issue revision",
+    )
+    run_row = connection.execute(
+        """
+        SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
+        FROM runs WHERE run_id = ?
+        """,
+        (normalized_run_id,),
+    ).fetchone()
+    prior_row = connection.execute(
+        """
+        SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
+        FROM runs WHERE run_id = ?
+        """,
+        (prior_run_id,),
+    ).fetchone()
+    if run_row is None or prior_row is None:
+        raise StateError(
+            f"Run {normalized_run_id} legacy candidate retry override references a missing run"
+        )
+    _, _, run_revision = _verified_issue_revision_row(run_row)
+    _, stored_prior_status, prior_revision = _verified_issue_revision_row(prior_row)
+    manifest = RunManifest.model_validate_json(run_row["manifest_json"])
+    candidate = manifest.candidate
+    expected_details = {
+        "issue": candidate.reference if candidate is not None else "",
+        "issue_revision": revision,
+        "prior_run_id": prior_run_id,
+        "prior_status": prior_status.value,
+    }
+    if (
+        candidate is None
+        or run_revision != revision
+        or prior_revision != revision
+        or stored_prior_status != prior_status
+        or details != expected_details
+    ):
+        raise StateError(
+            f"Run {normalized_run_id} legacy candidate retry override disagrees with run evidence"
+        )
+    return event_id, normalized_run_id, normalized_event_hash
 
 
 def _verified_event_heads(
@@ -5897,6 +6740,82 @@ def _stored_event_hash(value: object, *, field: str) -> str:
     return value
 
 
+def _stored_authorization_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 32
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise StateError("Candidate retry authorization ID is invalid")
+    return value
+
+
+def _candidate_retry_authorization(
+    authorization: CandidateRetryAuthorization,
+) -> tuple[str, str]:
+    if not isinstance(authorization, CandidateRetryAuthorization):
+        raise TypeError("candidate retry authorization has an unsupported type")
+    actor = _bounded_text(
+        authorization.actor,
+        field="candidate retry actor",
+        maximum=255,
+    )
+    reason = _bounded_text(
+        authorization.reason,
+        field="candidate retry reason",
+        maximum=2_000,
+    )
+    if actor != authorization.actor or any(character in actor for character in ("\r", "\n")):
+        raise ValueError("candidate retry actor must be a canonical single-line value")
+    if reason != authorization.reason or any(character in reason for character in ("\r", "\n")):
+        raise ValueError("candidate retry reason must be canonical single-line text")
+    return actor, reason
+
+
+def _assert_candidate_claim_lease(
+    connection: sqlite3.Connection,
+    lease: Lease,
+    *,
+    checked_at: datetime,
+) -> None:
+    """Fence a candidate claim inside the same write transaction as its row update."""
+
+    if lease.name != _CANDIDATE_CLAIM_LEASE_NAME:
+        raise StateError("Candidate claim uses the wrong lease")
+    checked = _aware_utc(checked_at, field="candidate claim lease check time")
+    row = connection.execute(
+        """
+        SELECT leases.owner, leases.generation, leases.expires_at,
+               lease_generations.generation AS counter_generation
+        FROM leases
+        LEFT JOIN lease_generations USING(lease_name)
+        WHERE leases.lease_name = ?
+        """,
+        (lease.name,),
+    ).fetchone()
+    if row is None:
+        raise StateError("Candidate claim lease is no longer active")
+    stored_generation = _stored_generation(
+        row["generation"],
+        field="candidate claim lease generation",
+    )
+    counter_generation = _stored_generation(
+        row["counter_generation"],
+        field="candidate claim lease generation counter",
+    )
+    expires_at = _stored_datetime(
+        row["expires_at"],
+        field="candidate claim lease expiry",
+    )
+    if (
+        row["owner"] != lease.owner
+        or stored_generation != lease.generation
+        or counter_generation != lease.generation
+        or expires_at <= checked
+    ):
+        raise StateError("Candidate claim lease ownership was lost")
+
+
 def _sha256_identity(value: str, *, field: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field} must be a string")
@@ -6116,6 +7035,22 @@ def _repository_identity(value: str) -> str:
     return normalized
 
 
+def _candidate_identity(repository: str, issue_number: int) -> tuple[str, int]:
+    normalized_repository = _repository_identity(repository)
+    if repository != repository.strip() or any(
+        character.isspace() or not character.isprintable() for character in repository
+    ):
+        raise ValueError("candidate repository must be a canonical owner/name value")
+    if _CANDIDATE_REPOSITORY.fullmatch(repository) is None:
+        raise ValueError("candidate repository must use the GitHub ASCII owner/name syntax")
+    owner, name = repository.split("/", 1)
+    if owner in {".", ".."} or name in {".", ".."}:
+        raise ValueError("candidate repository components cannot be dot paths")
+    if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number < 1:
+        raise ValueError("candidate issue number must be a positive integer")
+    return normalized_repository, issue_number
+
+
 def _lease_expiry(now: datetime, ttl: timedelta) -> datetime:
     if not isinstance(ttl, timedelta):
         raise TypeError("lease ttl must be a timedelta")
@@ -6145,6 +7080,7 @@ __all__ = [
     "RECOVERABLE_IN_FLIGHT_STATUSES",
     "CandidateAttemptDisposition",
     "CandidateAttemptState",
+    "CandidateRetryAuthorization",
     "CircuitBreakerStatus",
     "Lease",
     "LifecycleSnapshot",

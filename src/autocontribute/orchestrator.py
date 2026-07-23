@@ -11,6 +11,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from decimal import ROUND_FLOOR, Decimal
+from enum import StrEnum
 from typing import Literal, TypeVar, cast
 
 from pydantic import BaseModel
@@ -82,7 +83,13 @@ from autocontribute.redaction import (
 from autocontribute.reporting import render_run_report
 from autocontribute.repository import ContextEntry, RepositoryWorkspace, TextMatch
 from autocontribute.sandbox import SandboxRunner
-from autocontribute.store import CandidateAttemptDisposition, CandidateAttemptState, RunStore
+from autocontribute.store import (
+    CandidateAttemptDisposition,
+    CandidateAttemptState,
+    CandidateRetryAuthorization,
+    Lease,
+    RunStore,
+)
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 ProviderFactory = Callable[[object], ModelProvider]
@@ -93,6 +100,12 @@ _RUN_HEARTBEAT_INTERVAL = timedelta(minutes=1)
 _STALE_RUN_AGE = timedelta(hours=2)
 _MAX_GUIDANCE_FILES = 30
 _MAX_GUIDANCE_CHARACTERS = 80_000
+
+
+class RunInvocationMode(StrEnum):
+    AUTOMATIC = "automatic"
+    MANUAL = "manual"
+    SCHEDULED = "scheduled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,10 +197,21 @@ class Orchestrator:
         self,
         *,
         issue_reference: str | None = None,
-        retry_unchanged: bool = False,
+        invocation_mode: RunInvocationMode = RunInvocationMode.AUTOMATIC,
+        retry_authorization: CandidateRetryAuthorization | None = None,
     ) -> RunManifest:
-        if retry_unchanged and issue_reference is None:
-            raise ValueError("retry_unchanged requires an explicit issue reference")
+        if not isinstance(invocation_mode, RunInvocationMode):
+            raise TypeError("invocation_mode must be a RunInvocationMode")
+        if retry_authorization is not None and not isinstance(
+            retry_authorization, CandidateRetryAuthorization
+        ):
+            raise TypeError("retry_authorization must be a CandidateRetryAuthorization")
+        if issue_reference is not None and invocation_mode != RunInvocationMode.MANUAL:
+            raise ValueError("explicit issue references require manual invocation mode")
+        if retry_authorization is not None and issue_reference is None:
+            raise ValueError("retry authorization requires an explicit issue reference")
+        if retry_authorization is not None and invocation_mode != RunInvocationMode.MANUAL:
+            raise ValueError("retry authorization is forbidden outside manual invocation mode")
         self._model_events = []
         self.store.assert_circuit_breaker_clear()
         with LeaseHeartbeatGuard(
@@ -212,11 +236,17 @@ class Orchestrator:
                     manifest = self._prepare(
                         manifest,
                         issue_reference=issue_reference,
-                        retry_unchanged=retry_unchanged,
+                        retry_authorization=retry_authorization,
                         commands=commands,
                     )
                 except Exception as exc:
                     self._assert_run_lease_owned()
+                    durable_manifest = self.store.get(manifest.run_id)
+                    if durable_manifest.candidate is None and manifest.candidate is not None:
+                        # A failed atomic claim must not attach candidate evidence through the
+                        # generic failure path. Keep the durable pre-claim identity authoritative.
+                        manifest.candidate = None
+                        manifest.repository = durable_manifest.repository
                     safe_error = self._safe_error(exc)
                     manifest.error = safe_error
                     allowed = RunStatus.FAILED in self._allowed_targets(manifest)
@@ -239,7 +269,7 @@ class Orchestrator:
         manifest: RunManifest,
         *,
         issue_reference: str | None,
-        retry_unchanged: bool,
+        retry_authorization: CandidateRetryAuthorization | None,
         commands: list[CommandResult],
     ) -> RunManifest:
         self._assert_operational()
@@ -278,7 +308,10 @@ class Orchestrator:
                 self._assert_operational()
                 self.store.transition(manifest, RunStatus.SKIPPED, reason=manifest.skip_reason)
                 return manifest
-            if retry_override.state == CandidateAttemptState.SUPPRESSED and not retry_unchanged:
+            if (
+                retry_override.state == CandidateAttemptState.SUPPRESSED
+                and retry_authorization is None
+            ):
                 if retry_override.prior_run_id is None or retry_override.prior_status is None:
                     raise StateError("Suppressed candidate disposition lacks prior-run evidence")
                 manifest.skip_reason = (
@@ -303,18 +336,17 @@ class Orchestrator:
             if retry_override.state == CandidateAttemptState.SUPPRESSED:
                 if retry_override.prior_run_id is None or retry_override.prior_status is None:
                     raise StateError("Suppressed candidate disposition lacks prior-run evidence")
+                assert retry_authorization is not None
                 manifest.candidate = issue
                 manifest.repository = repository
-                self._assert_operational()
-                self.store.save(
+                self.store.claim_candidate(
                     manifest,
-                    event="candidate.retry_override",
-                    details={
-                        "issue": issue.reference,
-                        "issue_revision": retry_override.issue_revision,
-                        "prior_run_id": retry_override.prior_run_id,
-                        "prior_status": retry_override.prior_status.value,
-                    },
+                    lease=self._candidate_claim_lease(),
+                    retry_authorization=retry_authorization,
+                )
+            elif retry_authorization is not None:
+                raise StateError(
+                    "Retry authorization no longer matches an unchanged suppressed candidate"
                 )
             base_sha = self.github.default_branch_sha(
                 repository.full_name,
@@ -350,12 +382,18 @@ class Orchestrator:
         issue.score_evidence = eligibility.evidence
         manifest.candidate = issue
         manifest.repository = repository
-        self._assert_operational()
-        self.store.save(
-            manifest,
-            event="candidate.selected",
-            details={"issue": issue.reference, "score": str(eligibility.score)},
-        )
+        if retry_override is not None and retry_override.state == CandidateAttemptState.SUPPRESSED:
+            self._assert_operational()
+            self.store.save(
+                manifest,
+                event="candidate.selected",
+                details={"issue": issue.reference, "score": str(eligibility.score)},
+            )
+        else:
+            self.store.claim_candidate(
+                manifest,
+                lease=self._candidate_claim_lease(),
+            )
         self._assert_operational()
         self.store.transition(
             manifest,
@@ -1452,6 +1490,11 @@ class Orchestrator:
         if self._lease_guard is not None:
             self._lease_guard.assert_owned()
 
+    def _candidate_claim_lease(self) -> Lease:
+        if self._lease_guard is None:
+            raise StateError("Autocontribute run lease is not active")
+        return self._lease_guard.assert_owned()
+
     def _render_index(self, entries: list[ContextEntry], *, issue_text: str) -> str:
         incomplete = [entry.path for entry in entries if not entry.content_inspected]
         if incomplete:
@@ -1585,4 +1628,4 @@ class Orchestrator:
         return ALLOWED_TRANSITIONS.get(manifest.status, set())
 
 
-__all__ = ["Orchestrator"]
+__all__ = ["Orchestrator", "RunInvocationMode"]

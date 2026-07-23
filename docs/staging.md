@@ -112,10 +112,12 @@ uv run autocontribute run \
 Confirm the authorization table row and `candidate.retry_override` event contain the actor, reason,
 authorization ID, exact issue revision, and exact prior run/status, then confirm fresh deterministic
 eligibility evidence. The authorization, event, and candidate claim must be one atomic operation;
-there must never be an authorization detached from its run or two active claims for the same fixture
-issue. Never add the override to a schedule: scheduled mode rejects both pinned issues and retry
-overrides, and an override cannot bypass active work. Do not merge a locally advanced fixture lineage
-back into the hosted lineage or resume the hosted workflow from its older parent.
+the seven-field event and authorization row must exist one-to-one, and there must never be an
+authorization detached from its run or two active claims for the same fixture issue. A migrated
+legacy-event marker is historical provenance, not an authorization for this drill. Never add the
+override to a schedule: scheduled mode rejects both pinned issues and retry overrides, and an
+override cannot bypass active work. Do not merge a locally advanced fixture lineage back into the
+hosted lineage or resume the hosted workflow from its older parent.
 
 Staging state uses the same three-part persistence contract as production review runs: a verified
 SQLite snapshot, run bundles under `.autocontribute-staging/runs/`, and separate immutable expert
@@ -136,13 +138,16 @@ already committed in that variable are one-way legacy inputs: the workflow check
 matches its declared schema, migrates it, and saves the replacement under a v8 key. The v6-to-v7
 migration transactionally verifies historical candidate rows against their manifests, backfills
 durable issue revisions, and creates the original revision lookup index. The validated v7-to-v8
-migration creates the durable retry-authorization table, rebuilds that lookup with `NOCASE`, and adds
-the case-insensitive unique-active-candidate index after rejecting any duplicate active claim. A
-mismatch or duplicate leaves the source schema unchanged. The workflow never falls back to a stale
-prefix or accepts arbitrary legacy keys. Never use `bootstrap_state=true` or edit the variable to
-bypass a failed save, migration, or missing lineage. Although the shadow workflow never publishes,
-preserve the matching snapshot, run bundles, and evaluation records together for any later
-operator-reviewed fixture publication.
+migration creates the durable retry-authorization and legacy-event-marker tables, rebuilds that
+lookup with `NOCASE`, and adds the case-insensitive unique-active-candidate index after rejecting any
+duplicate active claim. It validates each historical four-field retry event against its exact event
+hash and current/prior run evidence before writing a migration-only marker; it does not fabricate an
+operator authorization. Fresh v8 state contains the marker table empty, and new seven-field events
+require one matching authorization row. A mismatch or duplicate leaves the source schema unchanged.
+The workflow never falls back to a stale prefix or accepts arbitrary legacy keys. Never use
+`bootstrap_state=true` or edit the variable to bypass a failed save, migration, or missing lineage.
+Although the shadow workflow never publishes, preserve the matching snapshot, run bundles, and
+evaluation records together for any later operator-reviewed fixture publication.
 
 If staging is left at an `in-progress` claim, set `AUTOCONTRIBUTE_STAGING_ENABLED=false` and use
 **Recover staging hosted state** from the default branch; never rewrite

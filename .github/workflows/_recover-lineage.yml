@@ -170,7 +170,7 @@ jobs:
             echo "Hosted-state claim has an invalid run identity" >&2
             exit 1
           fi
-          candidate_pattern="^${KEY_PREFIX}v(5|6)-${RUNNER_OS}-${REPOSITORY_ID}-${claim_run_id}-${claim_run_attempt}$"
+          candidate_pattern="^${KEY_PREFIX}v(5|6|7|8)-${RUNNER_OS}-${REPOSITORY_ID}-${claim_run_id}-${claim_run_attempt}$"
           if [[ ! "$candidate_key" =~ $candidate_pattern ]]; then
             echo "Hosted-state claim destination is not the exact claimant generation" >&2
             exit 1
@@ -179,7 +179,7 @@ jobs:
 
           if [[ "$parent_key" == "bootstrap" ]]; then
             parent_schema="bootstrap"
-          elif [[ "$parent_key" =~ ^${KEY_PREFIX}v(3|4|5|6)-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$ ]]; then
+          elif [[ "$parent_key" =~ ^${KEY_PREFIX}v(3|4|5|6|7|8)-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$ ]]; then
             parent_schema="v${BASH_REMATCH[1]}"
           else
             echo "Hosted-state claim has an unsupported parent generation" >&2
@@ -200,7 +200,7 @@ jobs:
             fi
           fi
 
-          recovery_key="${KEY_PREFIX}v6-${RUNNER_OS}-${REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          recovery_key="${KEY_PREFIX}v8-${RUNNER_OS}-${REPOSITORY_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           source_artifact="${SOURCE_ARTIFACT_PREFIX}-${claim_run_id}-${claim_run_attempt}"
           {
             echo "candidate_key=$candidate_key"
@@ -399,9 +399,14 @@ jobs:
           )
           if source_schema == "bootstrap":
               raise SystemExit(0)
-          expected_schema = {"v3": 3, "v4": 4, "v5": 5, "v6": 6}.get(
-              source_schema
-          )
+          expected_schema = {
+              "v3": 3,
+              "v4": 4,
+              "v5": 5,
+              "v6": 6,
+              "v7": 7,
+              "v8": 8,
+          }.get(source_schema)
           if expected_schema is None:
               raise SystemExit("Recovery lineage did not declare a supported source schema")
           database = storage / "snapshots" / "state.sqlite3"

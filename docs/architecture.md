@@ -144,6 +144,10 @@ to both the run row and `candidate.selected` event. Repository/name, issue numbe
 title, body, author, labels, assignees, created/updated timestamps, and every structured discussion
 entry participate; derived score and score evidence do not. Subsequent saves must reproduce the
 same digest, and retry lookup validates each historical row against its manifest before trusting it.
+The repository identity accepted by candidate disposition and claim operations is ASCII-only
+`owner/name`: both components are non-empty, use only letters, digits, `_`, `.`, or `-`, and cannot
+be `.` or `..`. Restricting this boundary to ASCII makes Python normalization and SQLite `NOCASE`
+identity semantics agree.
 
 Retry classification is ordered. Any status other than the released side exits above is active and
 blocks another attempt for that issue, regardless of a newer revision or a requested override. If
@@ -178,11 +182,22 @@ one active run even if two workers raced before the transaction.
 For an override claim, that same transaction also creates exactly one durable
 `candidate_retry_authorizations` row and matching `candidate.retry_override` event. Both contain a
 generated authorization ID, operator actor and reason, current issue revision, and exact prior run
-and suppressed status. The run ID is unique in the authorization table. Corpus validation binds the
-authorization to both run manifests and rejects a missing prior run, mismatched revision/status,
-invalid operator evidence, duplicate or mismatched event, and an override event without an
-authorization row. If the candidate is no longer suppressed at claim time, the authorization is not
-repurposed.
+and suppressed status. The run ID is unique in the authorization table. Every override created by
+v8 therefore has one seven-field event bound one-to-one to one authorization row, and the row's
+authorization time is the same timestamp committed into the hash-chained event. Corpus validation
+binds that pair to both run manifests and rejects a missing prior run, mismatched revision/status,
+invalid operator evidence, duplicate or mismatched event, an authorization without its exact event,
+or a modern event without its authorization row. If the candidate is no longer suppressed at claim
+time, the authorization is not repurposed.
+
+Schema v7 could already contain a four-field `candidate.retry_override` event with issue, revision,
+prior run ID, and prior status, but it had no authorization table. The v7-to-v8 migration validates
+that exact event and both run identities, then records its event ID, event hash, run ID, and migration
+time in `legacy_candidate_retry_overrides`. The marker time is bound to the schema-v8 migration
+cutoff and cannot precede its event. This marker preserves only historical candidate-selection
+provenance; it neither fabricates operator authorization nor permits another retry. An unmarked or
+mismatched four-field event fails v8 validation, while a seven-field event can never use a legacy
+marker in place of its authorization row.
 
 Each run has one bounded repair opportunity. A positively recognized assertion, test,
 source-located compiler/type-checker, or linter failure may trigger `validating -> implementing ->
@@ -306,9 +321,14 @@ cannot confer automatic recovery authority. The v6-to-v7 step adds the issue-rev
 `runs_candidate_revision_idx`. It validates at most the supported bounded run corpus, requires every
 row's status and candidate identity to agree with its manifest, and backfills a revision for each
 selected candidate; invalid evidence rolls the whole migration back. The validated v7-to-v8 step
-creates `candidate_retry_authorizations`, rebuilds `runs_candidate_revision_idx` with `NOCASE`, and
-adds the case-insensitive partial unique `runs_active_candidate_idx` after rejecting duplicate active
-attempts. Because older schemas do not retain every v8 invariant, the cutover must be offline and
+creates `candidate_retry_authorizations` and `legacy_candidate_retry_overrides`, rebuilds
+`runs_candidate_revision_idx` with `NOCASE`, and adds the case-insensitive partial unique
+`runs_active_candidate_idx` after rejecting duplicate active attempts. A fresh v8 schema contains an
+empty legacy-marker table. Migration accepts a historical four-field retry event only after binding a
+marker to its exact event ID/hash and validated current/prior-run evidence; it never synthesizes a
+modern authorization. Current-schema validation requires each seven-field retry event and
+authorization row to match one-to-one and treats marked legacy events only as historical selection
+provenance. Because older schemas do not retain every v8 invariant, the cutover must be offline and
 one-way: quiesce every older worker before the first v8 open and never let one resume against the
 migrated lineage. A stale
 restore can omit reservations, gate holds, outcome cursors, issue revisions, retry authorizations,

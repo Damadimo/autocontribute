@@ -32,6 +32,14 @@ gate is rerun. Scheduled invocations cannot pin an issue or request this overrid
 orchestration boundary independently requires manual invocation mode, so non-CLI callers receive the
 same restriction.
 
+Candidate claim identity is intentionally narrower than arbitrary Unicode text: repository names
+must be ASCII `owner/name`, with non-empty components containing only letters, digits, `_`, `.`, or
+`-`; `.` and `..` are forbidden components. This makes the case-insensitive application and SQLite
+identity checks agree. Every retry created under schema v8 also requires one seven-field override
+event bound one-to-one to its durable authorization row. A migration marker for a validated
+four-field v7 event preserves historical selection provenance only; it cannot authorize a new
+override or satisfy the modern event shape.
+
 The deterministic score is:
 
 | Dimension | Weight |

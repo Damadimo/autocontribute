@@ -1266,8 +1266,10 @@ autocontribute run \
 
 Inspect the prior evidence and then verify the new durable authorization and
 `candidate.retry_override` ledger event. The authorization binds actor/reason to the exact prior
-run/status/revision atomically with the lease-fenced, unique candidate claim. This escape hatch does
-not bypass an active run or any eligibility/quality gate and must never be added to the unit or timer.
+run/status/revision atomically with the lease-fenced, unique candidate claim. The new seven-field
+event and authorization row must form a one-to-one pair; a migration-only marker for a historical v7
+event is not retry authority. This escape hatch does not bypass an active run or any
+eligibility/quality gate and must never be added to the unit or timer.
 
 ### Deliberately enabling automatic publication
 

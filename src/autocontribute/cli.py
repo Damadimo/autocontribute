@@ -56,11 +56,11 @@ from autocontribute.exceptions import (
 from autocontribute.github import GitHubClient
 from autocontribute.github_origin import web_origin_for_api
 from autocontribute.lifecycle import LifecycleSyncResult, sync_open_pull_requests
-from autocontribute.orchestrator import Orchestrator
+from autocontribute.orchestrator import Orchestrator, RunInvocationMode
 from autocontribute.publication import Publisher, approve_run, build_approval_review
 from autocontribute.reporting import render_approval_review, render_run_report
 from autocontribute.rollout import RolloutGate, RolloutSummary
-from autocontribute.store import RunStore
+from autocontribute.store import CandidateRetryAuthorization, RunStore
 from autocontribute.systemd_assets import (
     verify_installed_systemd_assets,
     verify_source_systemd_assets,
@@ -233,6 +233,14 @@ def run_once(
             help="Deliberately retry an unchanged skipped, rejected, or cancelled --issue."
         ),
     ] = False,
+    retry_actor: Annotated[
+        str | None,
+        typer.Option(help="Human/operator identity authorizing --retry-unchanged."),
+    ] = None,
+    retry_reason: Annotated[
+        str | None,
+        typer.Option(help="Auditable reason for --retry-unchanged."),
+    ] = None,
     scheduled: Annotated[
         bool,
         typer.Option(
@@ -248,6 +256,18 @@ def run_once(
         _fail("--scheduled cannot be combined with --issue; pinned retries must be manual")
     if retry_unchanged and issue is None:
         _fail("--retry-unchanged requires --issue owner/repository#number")
+    if retry_unchanged and (retry_actor is None or retry_reason is None):
+        _fail("--retry-unchanged requires both --retry-actor and --retry-reason")
+    if not retry_unchanged and (retry_actor is not None or retry_reason is not None):
+        _fail("--retry-actor and --retry-reason require --retry-unchanged")
+    try:
+        retry_authorization = (
+            CandidateRetryAuthorization(actor=retry_actor, reason=retry_reason)
+            if retry_actor is not None and retry_reason is not None
+            else None
+        )
+    except (TypeError, ValueError) as exc:
+        _fail(str(exc))
     settings = _config(config)
     store = RunStore(settings.storage.path)
     github: GitHubClient | None = None
@@ -270,7 +290,10 @@ def run_once(
         with Orchestrator(settings, store=store, github=github) as orchestrator:
             manifest = orchestrator.run(
                 issue_reference=issue,
-                retry_unchanged=retry_unchanged,
+                invocation_mode=(
+                    RunInvocationMode.SCHEDULED if scheduled else RunInvocationMode.MANUAL
+                ),
+                retry_authorization=retry_authorization,
             )
         if manifest.status == RunStatus.READY_FOR_APPROVAL and settings.publishing.mode == "auto":
             _sync_lifecycle(settings, store, github)

@@ -183,9 +183,12 @@ forget the decision.
 
 Candidate claims are protected by the generation-fenced run lease and a case-insensitive unique
 active-candidate index, so a stale or concurrent worker cannot turn a read-then-write race into two
-active attempts. The orchestration API also uses a typed invocation mode below the CLI: explicit
-issues and retry authorizations are rejected unless the caller supplies `MANUAL`, so a direct caller
-cannot reproduce the old bare-boolean bypass.
+active attempts. Candidate repository identities are restricted to one ASCII `owner/name`: each
+component may contain only letters, digits, `_`, `.`, or `-`, and neither component may be `.` or
+`..`. This keeps application identity normalization and SQLite `NOCASE` comparisons equivalent. The
+orchestration API also uses a typed invocation mode below the CLI: explicit issues and retry
+authorizations are rejected unless the caller supplies `MANUAL`, so a direct caller cannot reproduce
+the old bare-boolean bypass.
 
 Published pull requests remain part of the safety loop. `autocontribute lifecycle sync` records an
 immutable snapshot of every locally tracked open PR and persistently stops all preparation and
@@ -421,13 +424,19 @@ Schema v6 adds
 evaluation and outcome cursors, while migrated v2-v5 holds retain a null outcome cursor and cannot
 authorize automatic recovery. Schema v7 adds the durable issue-revision column and the original
 `runs_candidate_revision_idx`. Its migration validates every bounded run row against its manifest and
-transactionally backfills revisions for rows that selected a candidate. Schema v8 adds the
-`candidate_retry_authorizations` table and case-insensitive partial unique
-`runs_active_candidate_idx`, and rebuilds `runs_candidate_revision_idx` with `NOCASE`. The validated
-v7-to-v8 migration rejects duplicate active attempts before installing the unique index; malformed
-or mismatched evidence rolls the migration back. The upgrade is an offline, one-way cutover: stop
-all older workers before opening restored state with v8, never restart them against the migrated
-lineage, and take a fresh v8 backup before continuing. Never resume
+transactionally backfills revisions for rows that selected a candidate. Schema v8 adds
+`candidate_retry_authorizations`, the migration-provenance-only
+`legacy_candidate_retry_overrides` table, and the case-insensitive partial unique
+`runs_active_candidate_idx`; it also rebuilds `runs_candidate_revision_idx` with `NOCASE`. A fresh v8
+lineage contains an empty legacy-marker table. During v7 migration, an old four-field
+`candidate.retry_override` event is marked only after its exact event ID/hash, run and prior run,
+issue revision, and suppressed prior status validate. The migration does not invent an operator or
+authorization. Every seven-field v8 override instead requires exactly one matching
+`candidate_retry_authorizations` row; an orphan or mismatched modern override, or an unmarked legacy
+override, fails validation. The validated migration also rejects duplicate active attempts before
+installing the unique index; malformed or mismatched evidence rolls the migration back. The upgrade
+is an offline, one-way cutover: stop all older workers before opening restored state with v8, never
+restart them against the migrated lineage, and take a fresh v8 backup before continuing. Never resume
 automatic publication from a stale or partial restore, because missing reservation, gate-hold,
 outcome-cursor, issue-revision, retry-authorization, active-claim, artifact-sync, evaluation-anchor,
 or lease-generation history can invalidate safety decisions.
