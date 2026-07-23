@@ -510,7 +510,8 @@ verify_legacy_socket_absent() {
   fi
 }
 
-verify_daemon_running() {
+verify_daemon_state() {
+  local expected_active_state="$1" expected_sub_state="$2" failure_message="$3"
   local active_state='' sub_state=''
   local unit_properties property_name property_value seen_properties='' property_count=0
   unit_properties="$(
@@ -536,10 +537,25 @@ verify_daemon_running() {
   if [[ "$property_count" -ne 2 ]]; then
     fail 'Autocontribute rootless Docker user unit has an ambiguous property'
   fi
-  if [[ "$active_state" != active || "$sub_state" != running ]]; then
-    fail 'Autocontribute rootless Docker user unit is not running'
+  if [[
+    "$active_state" != "$expected_active_state" ||
+    "$sub_state" != "$expected_sub_state"
+  ]]; then
+    fail "$failure_message"
   fi
+}
+
+verify_daemon_running() {
+  verify_daemon_state \
+    active running \
+    'Autocontribute rootless Docker user unit is not running'
   verify_legacy_socket_absent
+}
+
+verify_daemon_inactive() {
+  verify_daemon_state \
+    inactive dead \
+    'Autocontribute rootless Docker user unit is not safely inactive'
 }
 
 verify_user_manager
@@ -572,10 +588,14 @@ trap 'exit 0' TERM INT
 timeout --kill-after=10s "${daemon_stop_client_timeout_seconds}s" \
   systemctl --user stop "$daemon_unit" || \
   fail 'Autocontribute could not quiesce the rootless Docker user unit'
-timeout --kill-after=5s 30s systemctl --user reset-failed "$daemon_unit" || \
-  fail 'Autocontribute could not reset the rootless Docker user unit'
+if ! timeout --kill-after=5s 30s systemctl --user reset-failed "$daemon_unit"; then
+  # systemd can garbage-collect an inactive static unit between stop and reset-failed.
+  # The complete attestations below distinguish that benign race from an unsafe state.
+  :
+fi
 verify_user_manager
 verify_user_unit
+verify_daemon_inactive
 verify_legacy_socket_absent
 timeout --kill-after=10s "${daemon_start_client_timeout_seconds}s" \
   systemctl --user start "$daemon_unit" || \

@@ -285,6 +285,7 @@ exit "$TEST_DOCKER_EXIT"
 def _run_rootless_supervisor_reload(
     case_directory: Path,
     *,
+    operation: str = "--reload",
     home_owner: int = 0,
     home_group: int | None = None,
     home_mode: str = "750",
@@ -324,6 +325,7 @@ def _run_rootless_supervisor_reload(
     bus_first_response: str = "u 4242",
     bus_first_exit: int = 0,
     bus_exit: int = 0,
+    bus_exit_after_reset: int | None = None,
     process_uid: int | None = None,
     process_gid: int | None = None,
     process_cgroup: str | None = None,
@@ -333,13 +335,18 @@ def _run_rootless_supervisor_reload(
     executable_mode: str = "755",
     controller_values: str = "cpu cpuset io memory pids\n",
     user_load_state: str = "loaded",
+    user_load_state_after_reset: str | None = None,
     user_need_daemon_reload: str = "no",
     user_fragment_path: str | None = None,
     user_dropin_paths: str = "",
     user_active_state: str = "active",
     user_sub_state: str = "running",
+    user_stopped_active_state: str = "inactive",
+    user_stopped_sub_state: str = "dead",
     user_transient: str = "no",
     user_failure_property: str = "",
+    reset_failed_exit: int = 0,
+    start_exit: int = 0,
     fragment_owner: int = 0,
     fragment_group: int = 0,
     fragment_mode: str = "644",
@@ -574,6 +581,9 @@ printf 'busctl %s\n' "$*" >> "$TEST_SYSTEMCTL_CALLS"
 [ "$7" = 'GetConnectionUnixProcessID' ]
 [ "$8" = 's' ]
 [ "$9" = 'org.freedesktop.systemd1' ]
+if [ -e "$TEST_RESET_CALLED_MARKER" ] && [ -n "$TEST_BUS_EXIT_AFTER_RESET" ]; then
+  exit "$TEST_BUS_EXIT_AFTER_RESET"
+fi
 if [ ! -e "$TEST_BUS_FIRST_CALL_MARKER" ]; then
   : > "$TEST_BUS_FIRST_CALL_MARKER"
   printf '%s\n' "$TEST_BUS_FIRST_RESPONSE"
@@ -676,12 +686,35 @@ case "$2" in
             exit 100
           fi
           case "$property" in
-            LoadState) value=$TEST_USER_LOAD_STATE ;;
+            LoadState)
+              if [ -e "$TEST_RESET_CALLED_MARKER" ] && \
+                 [ -n "$TEST_USER_LOAD_STATE_AFTER_RESET" ]; then
+                value=$TEST_USER_LOAD_STATE_AFTER_RESET
+              else
+                value=$TEST_USER_LOAD_STATE
+              fi
+              ;;
             NeedDaemonReload) value=$TEST_USER_NEED_DAEMON_RELOAD ;;
             FragmentPath) value=$TEST_USER_FRAGMENT_PATH ;;
             DropInPaths) value=$TEST_USER_DROPIN_PATHS ;;
-            ActiveState) value=$TEST_USER_ACTIVE_STATE ;;
-            SubState) value=$TEST_USER_SUB_STATE ;;
+            ActiveState)
+              if [ -e "$TEST_USER_STARTED_MARKER" ]; then
+                value=$TEST_USER_ACTIVE_STATE
+              elif [ -e "$TEST_USER_STOPPED_MARKER" ]; then
+                value=$TEST_USER_STOPPED_ACTIVE_STATE
+              else
+                value=$TEST_USER_ACTIVE_STATE
+              fi
+              ;;
+            SubState)
+              if [ -e "$TEST_USER_STARTED_MARKER" ]; then
+                value=$TEST_USER_SUB_STATE
+              elif [ -e "$TEST_USER_STOPPED_MARKER" ]; then
+                value=$TEST_USER_STOPPED_SUB_STATE
+              else
+                value=$TEST_USER_SUB_STATE
+              fi
+              ;;
             Transient) value=$TEST_USER_TRANSIENT ;;
             *) exit 101 ;;
           esac
@@ -695,14 +728,48 @@ case "$2" in
   reload)
     [ "$3" = 'autocontribute-rootless-docker-daemon.service' ]
     ;;
+  stop)
+    [ "$3" = 'autocontribute-rootless-docker-daemon.service' ]
+    : > "$TEST_USER_STOPPED_MARKER"
+    ;;
+  reset-failed)
+    [ "$3" = 'autocontribute-rootless-docker-daemon.service' ]
+    : > "$TEST_RESET_CALLED_MARKER"
+    exit "$TEST_RESET_FAILED_EXIT"
+    ;;
+  start)
+    [ "$3" = 'autocontribute-rootless-docker-daemon.service' ]
+    [ "$TEST_USER_START_EXIT" -eq 0 ] || exit "$TEST_USER_START_EXIT"
+    : > "$TEST_USER_STARTED_MARKER"
+    ;;
   *) exit 102 ;;
 esac
+""",
+    )
+    _write_executable(
+        fake_bin / "systemd-notify",
+        """#!/bin/sh
+set -eu
+printf 'systemd-notify %s\n' "$*" >> "$TEST_SYSTEMCTL_CALLS"
+""",
+    )
+    _write_executable(
+        fake_bin / "sleep",
+        """#!/bin/sh
+set -eu
+if [ "$1" = 30 ]; then
+  exit 1
+fi
+exec /bin/sleep "$@"
 """,
     )
     environment = {
         **os.environ,
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "TEST_BUS_EXIT": str(bus_exit),
+        "TEST_BUS_EXIT_AFTER_RESET": (
+            "" if bus_exit_after_reset is None else str(bus_exit_after_reset)
+        ),
         "TEST_BUS_FIRST_CALL_MARKER": os.fspath(case_directory / "bus-first-call"),
         "TEST_BUS_FIRST_EXIT": str(bus_first_exit),
         "TEST_BUS_FIRST_RESPONSE": bus_first_response,
@@ -765,6 +832,8 @@ esac
         "TEST_RUNTIME_GROUP": str(gid if runtime_group is None else runtime_group),
         "TEST_RUNTIME_MODE": runtime_mode,
         "TEST_RUNTIME_OWNER": str(uid if runtime_owner is None else runtime_owner),
+        "TEST_RESET_CALLED_MARKER": os.fspath(case_directory / "reset-called"),
+        "TEST_RESET_FAILED_EXIT": str(reset_failed_exit),
         "TEST_SERVICE_HOME": os.fspath(service_home),
         "TEST_SYSTEMCTL_CALLS": os.fspath(calls),
         "TEST_UID": str(uid),
@@ -777,8 +846,16 @@ esac
             os.fspath(user_fragment) if user_fragment_path is None else user_fragment_path
         ),
         "TEST_USER_LOAD_STATE": user_load_state,
+        "TEST_USER_LOAD_STATE_AFTER_RESET": (
+            "" if user_load_state_after_reset is None else user_load_state_after_reset
+        ),
         "TEST_USER_NEED_DAEMON_RELOAD": user_need_daemon_reload,
         "TEST_USER_RUNTIME": os.fspath(user_runtime),
+        "TEST_USER_START_EXIT": str(start_exit),
+        "TEST_USER_STARTED_MARKER": os.fspath(case_directory / "user-started"),
+        "TEST_USER_STOPPED_MARKER": os.fspath(case_directory / "user-stopped"),
+        "TEST_USER_STOPPED_ACTIVE_STATE": user_stopped_active_state,
+        "TEST_USER_STOPPED_SUB_STATE": user_stopped_sub_state,
         "TEST_USER_SUB_STATE": user_sub_state,
         "TEST_USER_TRANSIENT": user_transient,
         "TEST_VENDOR_DROPIN_GROUP": str(vendor_dropin_group),
@@ -800,7 +877,7 @@ esac
         bus_listener.bind(os.fspath(user_bus))
         try:
             result = subprocess.run(
-                ["bash", os.fspath(supervisor), "--reload"],
+                ["bash", os.fspath(supervisor), *([operation] if operation else [])],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -2292,6 +2369,100 @@ def test_rootless_docker_supervisor_reload_accepts_exact_delegated_policy(
     assert calls.count("--property=MainPID") == 6
     assert calls.count("--property=Transient") == 4
     assert calls.count("--property=ActiveState") == 3
+
+
+def test_rootless_docker_supervisor_start_resets_and_starts_attested_user_unit(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_rootless_supervisor_reload(
+        tmp_path / "successful-reset",
+        operation="",
+    )
+
+    reset_call = "--user reset-failed autocontribute-rootless-docker-daemon.service"
+    start_call = "--user start autocontribute-rootless-docker-daemon.service"
+    assert result.returncode == 0, result.stderr
+    assert calls.count(reset_call) == 1
+    assert calls.count(start_call) == 1
+    assert calls.index(reset_call) < calls.index(start_call)
+    assert "systemd-notify --ready --pid=parent" in calls
+
+
+def test_rootless_docker_supervisor_start_tolerates_garbage_collected_unit_reset(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_rootless_supervisor_reload(
+        tmp_path / "garbage-collected-reset",
+        operation="",
+        reset_failed_exit=5,
+    )
+
+    reset_call = "--user reset-failed autocontribute-rootless-docker-daemon.service"
+    start_call = "--user start autocontribute-rootless-docker-daemon.service"
+    assert result.returncode == 0, result.stderr
+    after_failed_reset = calls[calls.index(reset_call) + len(reset_call) : calls.index(start_call)]
+    assert "show user@" in after_failed_reset
+    assert "--user show autocontribute-rootless-docker-daemon.service" in after_failed_reset
+    assert "--property=LoadState" in after_failed_reset
+    assert "--property=ActiveState --property=SubState" in after_failed_reset
+
+
+def test_rootless_docker_supervisor_start_remains_fatal_after_failed_reset(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_rootless_supervisor_reload(
+        tmp_path / "failed-start-after-reset",
+        operation="",
+        reset_failed_exit=5,
+        start_exit=7,
+    )
+
+    assert result.returncode != 0
+    assert "could not start the rootless Docker user unit" in result.stderr
+    assert calls.count("--user start autocontribute-rootless-docker-daemon.service") == 1
+    assert "systemd-notify --ready" not in calls
+
+
+@pytest.mark.parametrize(
+    ("name", "overrides", "message"),
+    [
+        (
+            "manager-unavailable-after-reset",
+            {"bus_exit_after_reset": 1},
+            "could not bind the Docker user-manager bus",
+        ),
+        (
+            "unsafe-unit-after-reset",
+            {"user_load_state_after_reset": "not-found"},
+            "user unit is not safely loaded",
+        ),
+        (
+            "unsafe-unit-state-after-reset",
+            {
+                "user_stopped_active_state": "failed",
+                "user_stopped_sub_state": "failed",
+            },
+            "user unit is not safely inactive",
+        ),
+    ],
+)
+def test_rootless_docker_supervisor_start_rejects_unsafe_reset_recovery(
+    tmp_path: Path,
+    name: str,
+    overrides: dict[str, object],
+    message: str,
+) -> None:
+    result, calls = _run_rootless_supervisor_reload(
+        tmp_path / name,
+        operation="",
+        reset_failed_exit=5,
+        **overrides,  # type: ignore[arg-type]
+    )
+
+    assert result.returncode != 0
+    assert message in result.stderr
+    assert "--user reset-failed autocontribute-rootless-docker-daemon.service" in calls
+    assert "--user start autocontribute-rootless-docker-daemon.service" not in calls
 
 
 def test_rootless_docker_supervisor_retries_transient_bus_readiness_failure(

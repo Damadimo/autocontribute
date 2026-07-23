@@ -117,7 +117,7 @@
     {
       "source_path": "deploy/systemd/libexec/autocontribute-rootless-docker",
       "installed_path": "/usr/local/libexec/autocontribute-rootless-docker",
-      "sha256": "96e318ff468e6ca870bb96e8f74be06c206599d0900967360fbe2295e725693a",
+      "sha256": "38c9b1fe2ed8c5c399966971d4b0b9b9d104f40c7bbbf3d96ba7df50fdd1d7bc",
       "mode": "0755",
       "required": true
     },
