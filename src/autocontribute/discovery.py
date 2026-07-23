@@ -24,15 +24,40 @@ _REPRODUCTION_TERMS = re.compile(
     r"\b(repro(?:duce|duction)?|traceback|error|fails?|incorrect|bug|typo|broken)\b", re.I
 )
 _DANGEROUS_TERMS = re.compile(
-    r"\b(?:CVE-\d{4}-\d+|vulnerabilit(?:y|ies)|"
-    r"remote code execution|arbitrary code execution|"
-    r"authentication bypass|authorization bypass|privilege escalation|"
+    r"\b(?:CVE-\d{4}-\d+|CWE-\d+|vulnerabilit(?:y|ies)|"
+    r"(?:potential\s+)?security (?:issue|bug|impact)|timing attack|"
+    r"remote (?:code|command) exec(?:ution)?|arbitrary (?:code|command) execution|RCE|"
+    r"(?:authentication|auth) bypass|authorization bypass|privilege escalation|"
+    r"bypass(?:es|ed|ing)? (?:an? |the )?"
+    r"(?:permission|authorization|authentication|access[ -]control)(?: check)?|"
+    r"(?:permission|access[ -]control)(?: check)? bypass|"
     r"server[ -]side request forgery|SSRF|"
+    r"server[ -]side template injection|SSTI|"
+    r"insecure direct object reference|IDOR|"
+    r"(?:local|remote) file inclusion|LFI|RFI|LPE|"
     r"(?:path|directory) traversal|use[ -]after[ -]free|"
-    r"arbitrary file (?:read|write)|credential (?:exposure|leak)|secret exposure|"
+    r"arbitrary file (?:read|write)|credentials? (?:exposure|leak(?:age)?)|"
+    r"secrets? (?:exposure|leak(?:age)?)|hard[ -]coded credentials?|"
     r"SQL injection|command injection|code injection|"
-    r"cross[ -]site scripting|XSS|cross[ -]site request forgery|CSRF|"
-    r"XML external entity|XXE|buffer overflow|memory corruption)\b",
+    r"cross[ -]site scripting|XSS|cross[ -]site request forgery|CSRF|XSRF|"
+    r"XML external entity|XXE|buffer overflow|memory corruption|"
+    r"CRLF injection|HTTP response splitting|cache poisoning|host header injection|"
+    r"double free|integer overflow|data exfiltration|"
+    r"denial[ -]of[ -]service|(?-i:DDoS|DDOS|DoS|DOS|ReDoS|ReDOS|REDOS)|"
+    r"information (?:disclosure|leak(?:age)?)|"
+    r"account takeover|SQLi|"
+    r"out[ -]of[ -]bounds (?:memory )?(?:read|write|access)|"
+    r"OOB (?:memory )?(?:read|write|access)|"
+    r"sensitive (?:data|information) (?:exposure|leak)|open redirect|"
+    r"security advisory|zero[ -]day|sandbox escape|request smuggling|"
+    r"prototype pollution|insecure deserialization)\b",
+    re.I,
+)
+_SECURITY_WORD_SEPARATOR = re.compile(r"(?<=\w)[_/\-\u2010-\u2015]+(?=\w)")
+_SECURITY_MARKUP_SEPARATOR = re.compile(r"[*_`~]+")
+_DANGEROUS_LABEL = re.compile(
+    r"(?:^|[\s/:_-])(?:security|sec|vuln(?:erabilit(?:y|ies))?|CVE|CWE(?:-\d+)?)"
+    r"(?:$|[\s/:_-])",
     re.I,
 )
 _AI_PROHIBITION = re.compile(
@@ -76,19 +101,133 @@ _LEGAL_NEGATED_SUFFIX = re.compile(
     re.I,
 )
 _WORK_CLAIM = re.compile(
-    r"\b(?:i(?:'m| am|\u2019m) working on (?:this|it)|"
+    r"\b(?:(?:i(?:'m| am|\u2019m)|we(?:'re| are|\u2019re))\s+"
+    r"(?:(?:already|currently)\s+)?working on (?:this|it)|"
     r"i(?:'ll| will) (?:take|work on) (?:this|it)|"
     r"working on (?:a |the )?(?:fix|pull request|pr)|"
     r"please assign (?:this|it) to me)\b",
     re.I,
 )
+_STOP_TARGET = (
+    r"(?:(?:(?:ai|llm)[ -]generated|ai[ -]assisted|automated|bot[ -]authored|"
+    r"community|external|outside|unsolicited)\s+)?"
+    r"(?:pull\s+requests?|prs?|contributions?|submissions?|patch(?:es)?)"
+)
+_STOP_TEMPORAL = r"(?:currently|temporarily)"
+_STOP_SCOPE_TAIL = (
+    r"(?:for|on)\s+(?:(?:this|the)\s+)?(?:issue|fix|change)"
+    r"(?:\s+(?:right\s+now|currently|at\s+this\s+time|for\s+now|anymore|here)"
+    r"|\s+(?:until|pending)\b[^\n.!?;]*)?"
+)
+_STOP_CURRENT_TAIL = (
+    rf"(?:\s*$"
+    rf"|\s+(?:right\s+now|currently|at\s+this\s+time|for\s+now|anymore|here|yet)\s*$"
+    rf"|\s+(?:until|pending)\b[^\n.!?;]*$"
+    rf"|\s+{_STOP_SCOPE_TAIL}\s*$)"
+)
+_STOP_POLICY_TAIL = (
+    r"(?:\s*$"
+    r"|\s+(?:right\s+now|currently|at\s+this\s+time|for\s+now|anymore|here)\s*$"
+    r"|\s+(?:until|pending|because|since|as)\b[^\n.!?;]*$"
+    r"|\s*[\u2013\u2014]\s*[^\n.!?;]+$)"
+)
 _MAINTAINER_STOP = re.compile(
-    r"\b(?:do not|don't|please (?:do not|don't)|stop|hold off|not accepting|"
-    r"already (?:being )?worked on|no (?:pull request|pr)s? needed)\b",
+    rf"(?:"
+    rf"\b(?:do\s+not|don't|never)\s+"
+    rf"(?:open|submit|send|create|prepare)\s+(?:an?\s+|any\s+)?{_STOP_TARGET}\b"
+    rf"{_STOP_CURRENT_TAIL}"
+    rf"|\b(?:do\s+not|don't|never)\s+"
+    rf"(?:work\s+on|implement)\s+(?:this|it|the\s+issue|this\s+issue|this\s+fix)\b"
+    rf"{_STOP_CURRENT_TAIL}"
+    rf"|\b(?:you\s+should|let's)\s+not\s+"
+    rf"(?:open|submit|send|create|prepare)\s+(?:an?\s+|any\s+)?{_STOP_TARGET}\b"
+    rf"{_STOP_CURRENT_TAIL}"
+    rf"|\b(?:avoid|refrain\s+from)\s+"
+    rf"(?:opening|submitting|sending|creating|preparing)\s+(?:an?\s+|any\s+)?"
+    rf"{_STOP_TARGET}\b{_STOP_CURRENT_TAIL}"
+    rf"|\bno\s+need\s+to\s+(?:open|submit|send|create|prepare)\s+"
+    rf"(?:an?\s+|any\s+)?{_STOP_TARGET}\b{_STOP_CURRENT_TAIL}"
+    rf"|\b(?:please\s+)?(?:hold\s+off|pause|wait)\s+"
+    rf"(?:"
+    rf"(?:(?:on|before|to)\s+)?"
+    rf"(?:open(?:ing)?|submit(?:ting)?|send(?:ing)?|creat(?:e|ing)|prepar(?:e|ing))"
+    rf"\s+(?:an?\s+|any\s+)?{_STOP_TARGET}\b{_STOP_CURRENT_TAIL}"
+    rf"|(?:on\s+)?(?:working|implementing)\s+(?:on\s+)?(?:this|it|the\s+issue)\b"
+    rf"{_STOP_CURRENT_TAIL}"
+    rf"|(?:on\s+)?(?:work\s+on|implementation\s+of)\s+(?:this|it|the\s+issue)\b"
+    rf"{_STOP_CURRENT_TAIL}"
+    rf"|on\s+(?:an?\s+|any\s+)?{_STOP_TARGET}\b{_STOP_CURRENT_TAIL}"
+    rf"|(?:on\s+)?(?:this\s+issue|the\s+issue|this|it)\b{_STOP_CURRENT_TAIL}"
+    rf"|(?:for\s+now|right\s+now|until\s+further\s+notice)\s*$"
+    rf"|until\s+(?:next\s+\w+|tomorrow|later)\b[^\n.!?;]*$"
+    rf"|until\s+(?:the\s+)?(?:design|approach|plan|direction|decision)\b"
+    rf"[^\n.!?;]*$"
+    rf"|(?:for|until)\s+(?:the\s+)?maintainers?\s+"
+    rf"(?:direction|guidance|approval|decision)\s+before\s+"
+    rf"(?:starting|working|implementing|opening|submitting)\b[^\n.!?;]*$"
+    rf")"
+    rf"|\b(?:please\s+)?(?:stop|cease)\s+(?:working\s+on|work\s+on|"
+    rf"implementing)\s+(?:this|it|the\s+issue)\b"
+    rf"|\b(?:we(?:'re)?|maintainers?|(?:this|the)\s+(?:project|repository|repo))\s+"
+    rf"(?:"
+    rf"(?:(?:are|is)\s+)?(?:{_STOP_TEMPORAL}\s+)?(?:not|no\s+longer)\s+"
+    rf"(?:{_STOP_TEMPORAL}\s+)?accepting"
+    rf"|(?:aren't|isn't)\s+(?:{_STOP_TEMPORAL}\s+)?accepting"
+    rf"|(?:{_STOP_TEMPORAL}\s+)?"
+    rf"(?:(?:will|do(?:es)?|can)\s+not|cannot|won't|don't|doesn't|can't)\s+"
+    rf"(?:{_STOP_TEMPORAL}\s+)?accept"
+    rf"|no\s+longer\s+accepts"
+    rf"|(?:have|has)\s+(?:stopped|paused)\s+accepting"
+    rf")\s+(?:any\s+)?{_STOP_TARGET}\b{_STOP_POLICY_TAIL}"
+    rf"|\b{_STOP_TARGET}\s+"
+    rf"(?:"
+    rf"(?:are|is)\s+(?:{_STOP_TEMPORAL}\s+)?(?:not|no\s+longer)\s+"
+    rf"(?:{_STOP_TEMPORAL}\s+)?(?:accepted|allowed|welcome)"
+    rf"|(?:are|is)\s+not\s+being\s+(?:accepted|allowed)"
+    rf"|(?:aren't|isn't)\s+(?:{_STOP_TEMPORAL}\s+)?(?:accepted|allowed|welcome)"
+    rf"|(?:are|is)\s+(?:{_STOP_TEMPORAL}\s+)?(?:closed|on\s+hold|paused)"
+    rf"){_STOP_POLICY_TAIL}"
+    rf"|\b{_STOP_TARGET}\s+will\s+be\s+closed\b"
+    rf"(?:\s+without\s+(?:human\s+)?review)?{_STOP_POLICY_TAIL}"
+    rf"|\bno\s+(?:(?:more|new)\s+)?{_STOP_TARGET}\s*"
+    rf"(?:(?:are|is)\s+(?:needed|required))?(?:,\s*)?(?:please)?{_STOP_CURRENT_TAIL}"
+    rf"|\b(?:an?\s+)?(?:pull\s+request|pr|contribution)\s+is\s+not\s+"
+    rf"(?:needed|required)\b{_STOP_CURRENT_TAIL}"
+    rf"|\b(?:please\s+)?(?:close|withdraw)\s+(?:this\s+)?{_STOP_TARGET}\b"
+    rf"{_STOP_CURRENT_TAIL}"
+    rf"|\b(?:i(?:'m|\s+am)|we(?:'re|\s+are)|maintainers?\s+(?:is|are))\s+"
+    rf"(?:(?:already|currently)\s+)?(?:working\s+on|implementing)\s+"
+    rf"(?:this|it|(?:this|the)\s+(?:issue|fix|change))\b{_STOP_CURRENT_TAIL}"
+    rf"|\balready\s+being\s+worked\s+on\b"
+    rf")",
     re.I,
 )
-_NEGATED_STOP_DIRECTIVE = re.compile(
-    r"\b(?:do\s+not|don't|never)\s+(?:stop|cease|pause|hold\s+off)\b",
+_NON_STOP_DIRECTIVE = re.compile(
+    r"\b(?:do\s+not|don't|never)\s+(?:(?:hesitate|wait|forget)\s+to|"
+    r"(?:stop|cease|pause|hold\s+off|close|withdraw)\b)",
+    re.I,
+)
+_NON_ACTIVE_WORK = re.compile(
+    r"\b(?:not|never|was|were)\s+already\s+being\s+worked\s+on\b",
+    re.I,
+)
+_ALREADY_WORKED_ON = re.compile(r"\balready\s+being\s+worked\s+on\b", re.I)
+_CONDITIONAL_CLAIM = re.compile(r"\b(?:if|unless|whether)\b", re.I)
+_RETIRED_STOP_PREFIX = re.compile(
+    r"(?:"
+    r"\b(?:(?:the|our|this)\s+)?(?:old|former|previous|prior|retired|removed|"
+    r"obsolete|outdated|superseded)\s+"
+    r"(?:policy|guidance|rule|wording|documentation|docs?|message|notice)\s+"
+    r"(?:said|stated|read|required|was|used\s+to\s+say)"
+    r"|\b(?:(?:the|our|this)\s+)?"
+    r"(?:policy|guidance|rule|wording|documentation|docs?|message|notice)\s+"
+    r"(?:(?:no\s+longer\s+(?:says?|states?|reads?|requires?)|"
+    r"does(?:n't|\s+not)\s+(?:say|state|read|require))|"
+    r"(?:was|has\s+been)\s+(?:removed|retired|superseded))"
+    r"|\bwe\s+(?:removed|retired|superseded)\s+(?:(?:the|our)\s+)?"
+    r"(?:(?:old|previous|prior)\s+)?"
+    r"(?:policy|guidance|rule|wording|documentation|docs?|message|notice)"
+    r")\s*(?:[:,\-\u2013\u2014]\s*)?[\"'\u201c\u201d]?\s*$",
     re.I,
 )
 _BOT_LOGIN = re.compile(r"\[bot\]$", re.I)
@@ -280,6 +419,7 @@ class DiscoveryService:
         repository: RepositoryInfo,
         *,
         check_remote_policy: bool = True,
+        check_competing_pull_requests: bool = True,
         repository_ref: str | None = None,
     ) -> EligibilityResult:
         blockers: list[str] = []
@@ -305,10 +445,18 @@ class DiscoveryService:
         age = (datetime.now(UTC) - issue.updated_at).days
         if age > self.config.github.max_issue_age_days:
             blockers.append(f"issue has not been updated for {age} days")
-        if _DANGEROUS_TERMS.search(f"{issue.title}\n{issue.body}") and not (
-            self.config.policy.allow_security_issues
-        ):
+        issue_discussion_text = (
+            issue.title,
+            issue.body,
+            *(comment.body for comment in issue.discussion),
+        )
+        security_sensitive = any(
+            _is_security_sensitive(text) for text in issue_discussion_text
+        ) or any(_DANGEROUS_LABEL.search(label) for label in issue.labels)
+        if not self.config.policy.allow_security_issues and security_sensitive:
             blockers.append("issue may concern a vulnerability and requires private handling")
+        if _is_maintainer_stop(f"{issue.title}\n{issue.body}"):
+            blockers.append("issue description asks contributors not to open a pull request")
 
         claimed_by = sorted(
             {comment.author for comment in issue.discussion if _WORK_CLAIM.search(comment.body)}
@@ -459,12 +607,16 @@ class DiscoveryService:
             else:
                 evidence[LEGAL_REQUIREMENTS_EVIDENCE_KEY] = "none"
 
-        competing = self.github.search_competing_pull_requests(repository.full_name, issue.number)
-        if competing:
-            blockers.append(f"possible competing pull request already exists: {competing[0]}")
-            evidence["no_duplicate"] = f"0/required: {len(competing)} possible duplicate(s)"
-        else:
-            evidence["no_duplicate"] = "passed: no open PR references the issue"
+        if check_competing_pull_requests:
+            competing = self.github.search_competing_pull_requests(
+                repository.full_name,
+                issue.number,
+            )
+            if competing:
+                blockers.append(f"possible competing pull request already exists: {competing[0]}")
+                evidence["no_duplicate"] = f"0/required: {len(competing)} possible duplicate(s)"
+            else:
+                evidence["no_duplicate"] = "passed: no open PR references the issue"
 
         score = signal + clarity + reproducibility + scope + activity + policy_fit
         threshold = self.config.quality.min_candidate_score
@@ -1045,9 +1197,33 @@ def _bounded_policy_source_size(
     return size
 
 
+def _is_security_sensitive(text: str) -> bool:
+    normalized = _SECURITY_MARKUP_SEPARATOR.sub(" ", text)
+    normalized = _SECURITY_WORD_SEPARATOR.sub(" ", normalized)
+    normalized = " ".join(normalized.split())
+    return (
+        _DANGEROUS_TERMS.search(text) is not None or _DANGEROUS_TERMS.search(normalized) is not None
+    )
+
+
 def _is_maintainer_stop(body: str) -> bool:
-    without_negated_directives = _NEGATED_STOP_DIRECTIVE.sub("", body)
-    return _MAINTAINER_STOP.search(without_negated_directives) is not None
+    normalized = body.replace("\u2018", "'").replace("\u2019", "'")
+    without_invitations = _NON_STOP_DIRECTIVE.sub("", normalized)
+    without_invitations = _NON_ACTIVE_WORK.sub("", without_invitations)
+    for raw_segment in re.split(r"(?<=[.!?])|[;\n]", without_invitations):
+        is_question = "?" in raw_segment
+        segment = raw_segment.strip(" \t\r\n.!?\"'\u201c\u201d")
+        if not segment:
+            continue
+        if _ALREADY_WORKED_ON.search(segment) and (
+            is_question or _CONDITIONAL_CLAIM.search(segment)
+        ):
+            segment = _ALREADY_WORKED_ON.sub("", segment)
+        for match in _MAINTAINER_STOP.finditer(segment):
+            if _RETIRED_STOP_PREFIX.search(segment[: match.start()]):
+                continue
+            return True
+    return False
 
 
 def _is_pull_request_template(path: str) -> bool:

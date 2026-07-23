@@ -35,11 +35,12 @@ from autocontribute.discovery import (
     LEGAL_ATTESTATION_EVIDENCE_KEY,
     LEGAL_POLICY_EVIDENCE_KEY,
     LEGAL_REQUIREMENTS_EVIDENCE_KEY,
+    POLICY_ORGANIZATION_REF_EVIDENCE_KEY,
     POLICY_SOURCES_EVIDENCE_KEY,
     DiscoveryService,
     validate_legal_publication,
 )
-from autocontribute.domain import EligibilityResult, RunManifest, RunStatus
+from autocontribute.domain import EligibilityResult, IssueCandidate, RunManifest, RunStatus
 from autocontribute.exceptions import (
     AutomaticRolloutBlocked,
     GitHubError,
@@ -820,9 +821,97 @@ class Publisher:
             fork=fork,
             lease_guard=lease_guard,
         )
+        assert manifest.candidate is not None
+        assert manifest.upstream_repository_id is not None
+        assert manifest.upstream_repository_node_id is not None
+        assert manifest.fork_repository_id is not None
+        assert manifest.fork_repository_node_id is not None
+        lease_guard.assert_owned()
+        observed_fork = self.github.get_fork_identity(fork)
+        lease_guard.assert_owned()
+        if (
+            observed_fork.repository.full_name.casefold() != fork.casefold()
+            or observed_fork.repository.database_id != manifest.fork_repository_id
+            or observed_fork.repository.node_id != manifest.fork_repository_node_id
+            or observed_fork.parent.full_name.casefold() != manifest.candidate.repository.casefold()
+            or observed_fork.parent.database_id != manifest.upstream_repository_id
+            or observed_fork.parent.node_id != manifest.upstream_repository_node_id
+        ):
+            raise GitHubError(
+                "The publication fork no longer has its durable immutable upstream parent"
+            )
         self._assert_constructive_mutation_authorized(
             manifest,
             lease_guard=lease_guard,
+        )
+
+    def _ensure_durable_existing_branch_evidence(
+        self,
+        manifest: RunManifest,
+        *,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> None:
+        """Adopt one exact existing publication head without inventing a push event."""
+
+        if (
+            manifest.upstream_repository_id is None
+            or manifest.upstream_repository_node_id is None
+            or manifest.fork_repository_id is None
+            or manifest.fork_repository_node_id is None
+        ):
+            raise StateError("Existing branch evidence lacks immutable repository identity")
+        expected = {
+            "fork": fork,
+            "fork_repository_id": str(manifest.fork_repository_id),
+            "fork_repository_node_id": manifest.fork_repository_node_id,
+            "upstream_repository_id": str(manifest.upstream_repository_id),
+            "upstream_repository_node_id": manifest.upstream_repository_node_id,
+            "branch": branch,
+            "commit_sha": commit_sha,
+        }
+        lease_guard.assert_owned()
+        self.store.verify_event_chains(run_id=manifest.run_id)
+        branch_events = tuple(
+            event
+            for event in self.store.events(manifest.run_id)
+            if event["event_type"] in {"branch.pushed", "branch.reconciled"}
+        )
+        lease_guard.assert_owned()
+        if len(branch_events) > 1:
+            raise StateError("Publication has conflicting durable branch evidence")
+        if branch_events:
+            try:
+                recorded = json.loads(branch_events[0]["details"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise StateError("Publication branch evidence is malformed") from exc
+            if recorded != expected:
+                raise StateError("Publication branch evidence differs from immutable intent")
+            return
+
+        self._assert_constructive_remote_identities(
+            manifest,
+            fork=fork,
+            lease_guard=lease_guard,
+        )
+        lease_guard.assert_owned()
+        confirmed_sha = self.github.ref_sha(fork, f"heads/{branch}")
+        lease_guard.assert_owned()
+        if confirmed_sha is None or confirmed_sha.casefold() != commit_sha.casefold():
+            raise PublicationResumeRequired(
+                "GitHub did not preserve the exact existing contribution branch while its "
+                "recovery evidence was recorded"
+            )
+        self._assert_constructive_mutation_authorized(
+            manifest,
+            lease_guard=lease_guard,
+        )
+        self.store.save(
+            manifest,
+            event="branch.reconciled",
+            details=expected,
         )
 
     def publish(self, run_id: str) -> RunManifest:
@@ -1337,6 +1426,14 @@ class Publisher:
                 "GitHub did not confirm the exact contribution branch after push; "
                 "the durable publication intent requires reconciliation"
             )
+        if remote_sha is not None:
+            self._ensure_durable_existing_branch_evidence(
+                manifest,
+                fork=fork,
+                branch=branch,
+                commit_sha=commit_sha,
+                lease_guard=lease_guard,
+            )
 
         self.store.assert_circuit_breaker_clear()
         lease_guard.assert_owned()
@@ -1373,30 +1470,17 @@ class Publisher:
         try:
             self._check_pre_pull_request_policy_freshness(manifest)
         except PolicyError as exc:
-            self.store.assert_circuit_breaker_clear()
-            lease_guard.assert_owned()
-            manifest.publication_compensation_reason = "pre_pr_policy_stale"
-            self.store.save(
+            self._compensate_stale_pre_pull_request_branch(
                 manifest,
-                event="publication.policy_stale_before_pull_request",
-                details={
-                    "repository": manifest.candidate.repository,
-                    "fork": fork,
-                    "fork_repository_id": str(manifest.fork_repository_id),
-                    "fork_repository_node_id": str(manifest.fork_repository_node_id),
-                    "upstream_repository_id": str(manifest.upstream_repository_id),
-                    "upstream_repository_node_id": str(manifest.upstream_repository_node_id),
-                    "branch": branch,
-                    "commit_sha": commit_sha,
-                },
-            )
-            self._resume_started_compensation(
-                manifest,
+                fork=fork,
+                branch=branch,
+                commit_sha=commit_sha,
                 lease_guard=lease_guard,
             )
             raise PolicyError(
-                "Repository policy changed after the contribution branch was pushed; the exact "
-                "remote branch was removed and preparation must be rerun"
+                "Issue or repository freshness evidence changed after the contribution branch "
+                "was pushed; the exact remote branch was removed and the candidate must be "
+                "reevaluated"
             ) from exc
 
         proposal = manifest.proposal
@@ -1417,23 +1501,80 @@ class Publisher:
             "base": base_branch,
             "base_sha": approved_base_sha,
         }
+        callback_failure: Exception | None = None
+        mutation_boundary_failure: Exception | None = None
+        pull_request_callback_completed = False
 
         def begin_pull_request_creation() -> None:
-            self._assert_constructive_mutation_authorized(
-                manifest,
-                lease_guard=lease_guard,
-            )
-            manifest.pull_request_creation_started = True
-            self.store.save(
-                manifest,
-                event="pull_request.creation.started",
-                details=creation_details,
-            )
-            self._assert_constructive_remote_identities(
-                manifest,
-                fork=fork,
-                lease_guard=lease_guard,
-            )
+            nonlocal mutation_boundary_failure
+            nonlocal callback_failure
+            nonlocal pull_request_callback_completed
+            try:
+                self._assert_constructive_remote_identities(
+                    manifest,
+                    fork=fork,
+                    lease_guard=lease_guard,
+                )
+                try:
+                    self._check_mutation_boundary_freshness(manifest)
+                except (GitHubError, PolicyError, StateError) as exc:
+                    mutation_boundary_failure = exc
+                    raise
+                self._assert_constructive_remote_identities(
+                    manifest,
+                    fork=fork,
+                    lease_guard=lease_guard,
+                )
+                try:
+                    lease_guard.assert_owned()
+                    boundary_head_sha = self.github.ref_sha(
+                        fork,
+                        f"heads/{branch}",
+                    )
+                    lease_guard.assert_owned()
+                    if (
+                        boundary_head_sha is None
+                        or boundary_head_sha.casefold() != commit_sha.casefold()
+                    ):
+                        raise PolicyError(
+                            "The exact contribution branch changed at the pull-request "
+                            "mutation boundary"
+                        )
+                except (GitHubError, PolicyError, StateError) as exc:
+                    mutation_boundary_failure = exc
+                    raise
+                self._assert_constructive_mutation_authorized(
+                    manifest,
+                    lease_guard=lease_guard,
+                )
+                manifest.pull_request_creation_started = True
+                try:
+                    self.store.save(
+                        manifest,
+                        event="pull_request.creation.started",
+                        details=creation_details,
+                    )
+                except Exception:
+                    try:
+                        marker_is_durable = self.store.get(
+                            manifest.run_id
+                        ).pull_request_creation_started
+                    except Exception:
+                        # The durable state is unknown, so retain the conservative in-memory
+                        # marker. A fresh process will reload the authoritative state.
+                        pass
+                    else:
+                        if not marker_is_durable:
+                            manifest.pull_request_creation_started = False
+                    raise
+                self._assert_constructive_mutation_authorized(
+                    manifest,
+                    lease_guard=lease_guard,
+                )
+            except Exception as exc:
+                callback_failure = exc
+                raise
+            pull_request_callback_completed = True
 
         try:
             created_pull_request = self.github.create_pull_request(
@@ -1448,9 +1589,24 @@ class Publisher:
                 draft=_required_publication_draft(manifest),
                 before_mutation=begin_pull_request_creation,
             )
-        except (AutomaticRolloutBlocked, StateError):
-            raise
         except Exception as exc:
+            if mutation_boundary_failure is not None:
+                self._compensate_stale_pre_pull_request_branch(
+                    manifest,
+                    fork=fork,
+                    branch=branch,
+                    commit_sha=commit_sha,
+                    lease_guard=lease_guard,
+                )
+                raise PolicyError(
+                    "Issue or repository freshness evidence changed at the pull-request "
+                    "mutation boundary; the exact remote branch was removed and the candidate "
+                    "must be reevaluated"
+                ) from mutation_boundary_failure
+            if not pull_request_callback_completed:
+                if callback_failure is None or callback_failure is exc:
+                    raise
+                raise callback_failure from exc
             self._trip_ambiguous_pull_request_creation(
                 manifest,
                 error_type=type(exc).__name__,
@@ -2242,7 +2398,8 @@ class Publisher:
                 "Absent publication compensation has a commit without immutable fork identity"
             )
         if not fork_identity_bound and any(
-            event["event_type"] == "branch.pushed" for event in self.store.events(manifest.run_id)
+            event["event_type"] in {"branch.pushed", "branch.reconciled"}
+            for event in self.store.events(manifest.run_id)
         ):
             raise StateError(
                 "Absent publication compensation has remote branch evidence without immutable "
@@ -2445,10 +2602,13 @@ class Publisher:
                 raise StateError("Created-PR compensation marker lacks an exact base race")
 
         event_types = tuple(event["event_type"] for event in events[:marker_index])
-        if "publication.intent.begun" not in event_types or "branch.pushed" not in event_types:
+        branch_evidence_types = {"branch.pushed", "branch.reconciled"}
+        if "publication.intent.begun" not in event_types or not branch_evidence_types.intersection(
+            event_types
+        ):
             raise StateError("Publication compensation marker precedes durable remote intent")
         branch_events = tuple(
-            event for event in events[:marker_index] if event["event_type"] == "branch.pushed"
+            event for event in events[:marker_index] if event["event_type"] in branch_evidence_types
         )
         if len(branch_events) != 1:
             raise StateError("Publication compensation lacks one exact branch event")
@@ -3192,6 +3352,115 @@ class Publisher:
         )
         return manifest
 
+    def _compensate_stale_pre_pull_request_branch(
+        self,
+        manifest: RunManifest,
+        *,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> None:
+        """Durably remove the exact pushed branch after a proven pre-POST stale read."""
+
+        assert manifest.candidate is not None
+        lease_guard.assert_owned()
+        manifest.publication_compensation_reason = "pre_pr_policy_stale"
+        self.store.save(
+            manifest,
+            event="publication.policy_stale_before_pull_request",
+            details={
+                "repository": manifest.candidate.repository,
+                "fork": fork,
+                "fork_repository_id": str(manifest.fork_repository_id),
+                "fork_repository_node_id": str(manifest.fork_repository_node_id),
+                "upstream_repository_id": str(manifest.upstream_repository_id),
+                "upstream_repository_node_id": str(manifest.upstream_repository_node_id),
+                "branch": branch,
+                "commit_sha": commit_sha,
+            },
+        )
+        self._resume_started_compensation(
+            manifest,
+            lease_guard=lease_guard,
+        )
+
+    def _check_mutation_boundary_freshness(self, manifest: RunManifest) -> None:
+        """Minimize, but cannot eliminate, GitHub's unavoidable pre-POST state race.
+
+        GitHub offers no conditional multi-resource pull-request creation. Keep the issue read
+        last within this policy snapshot. The caller then revalidates immutable repository
+        identities and the exact contribution head before its local durable creation marker.
+        """
+
+        assert manifest.candidate and manifest.repository and manifest.base_sha
+        if manifest.eligibility is None:
+            raise PolicyError("Run is missing durable eligibility evidence")
+
+        competing = self.github.search_competing_pull_requests(
+            manifest.candidate.repository,
+            manifest.candidate.number,
+        )
+        if competing:
+            raise PolicyError(
+                "A competing pull request appeared at the publication mutation boundary: "
+                + competing[0]
+            )
+
+        repository = self.github.get_repository(manifest.repository.full_name)
+        if (
+            repository.full_name.casefold() != manifest.repository.full_name.casefold()
+            or repository.default_branch != manifest.repository.default_branch
+        ):
+            raise PolicyError(
+                "The upstream repository identity or default branch changed at the publication "
+                "mutation boundary"
+            )
+
+        owner_policy_repository = f"{repository.full_name.split('/', 1)[0]}/.github"
+        organization_ref = self.github.default_branch_sha_if_exists(owner_policy_repository)
+        observed_organization_ref = organization_ref or "absent"
+        expected_organization_ref = manifest.eligibility.evidence.get(
+            POLICY_ORGANIZATION_REF_EVIDENCE_KEY
+        )
+        if (
+            not expected_organization_ref
+            or observed_organization_ref.casefold() != expected_organization_ref.casefold()
+        ):
+            raise PolicyError(
+                "The organization policy repository moved at the publication mutation boundary"
+            )
+
+        current_base_sha = self.github.default_branch_sha(
+            repository.full_name,
+            repository.default_branch,
+        )
+        if current_base_sha.casefold() != manifest.base_sha.casefold():
+            raise PolicyError("The upstream base branch moved at the publication mutation boundary")
+
+        issue = self.github.get_issue(
+            manifest.candidate.repository,
+            manifest.candidate.number,
+        )
+        eligibility = DiscoveryService(self.config, self.github, self.store).evaluate(
+            issue,
+            repository,
+            check_remote_policy=False,
+            check_competing_pull_requests=False,
+        )
+        if not eligibility.eligible:
+            reasons = "; ".join(eligibility.blockers)
+            raise PolicyError(
+                "Candidate no longer passes mutation-boundary eligibility: " + reasons
+            )
+        changed_issue_evidence = self._changed_issue_evidence(manifest.candidate, issue)
+        if changed_issue_evidence:
+            raise PolicyError(
+                "Issue evidence changed at the publication mutation boundary ("
+                + ", ".join(changed_issue_evidence)
+                + "); approval is stale"
+            )
+
     def _check_freshness(self, manifest: RunManifest) -> None:
         assert manifest.candidate and manifest.repository and manifest.base_sha
         issue = self.github.get_issue(manifest.candidate.repository, manifest.candidate.number)
@@ -3214,21 +3483,7 @@ class Publisher:
         )
         self._assert_current_eligibility_evidence(manifest, eligibility)
 
-        changed_issue_evidence: list[str] = []
-        if issue.title != manifest.candidate.title:
-            changed_issue_evidence.append("title")
-        if issue.body != manifest.candidate.body:
-            changed_issue_evidence.append("body")
-        if {label.casefold() for label in issue.labels} != {
-            label.casefold() for label in manifest.candidate.labels
-        }:
-            changed_issue_evidence.append("labels")
-        if issue.comments != manifest.candidate.comments or issue.discussion != (
-            manifest.candidate.discussion
-        ):
-            changed_issue_evidence.append("discussion")
-        if issue.updated_at != manifest.candidate.updated_at:
-            changed_issue_evidence.append("updated timestamp")
+        changed_issue_evidence = self._changed_issue_evidence(manifest.candidate, issue)
         if changed_issue_evidence:
             raise PolicyError(
                 "Issue evidence changed after preparation ("
@@ -3236,29 +3491,144 @@ class Publisher:
                 + "); approval is stale"
             )
 
-        confirmed_sha = self.github.default_branch_sha(
-            repository.full_name, repository.default_branch
+        closing_repository = self.github.get_repository(manifest.repository.full_name)
+        if (
+            closing_repository.full_name.casefold() != manifest.repository.full_name.casefold()
+            or closing_repository.default_branch != manifest.repository.default_branch
+        ):
+            raise PolicyError(
+                "The upstream repository identity or default branch changed during freshness "
+                "verification"
+            )
+        closing_issue = self.github.get_issue(
+            manifest.candidate.repository,
+            manifest.candidate.number,
         )
-        if confirmed_sha.casefold() != current_sha.casefold():
+        closing_eligibility = DiscoveryService(self.config, self.github, self.store).evaluate(
+            closing_issue,
+            closing_repository,
+            check_remote_policy=False,
+        )
+        if not closing_eligibility.eligible:
+            reasons = "; ".join(closing_eligibility.blockers)
+            raise PolicyError(
+                "Candidate changed during publication freshness verification: " + reasons
+            )
+        closing_issue_changes = self._changed_issue_evidence(
+            manifest.candidate,
+            closing_issue,
+        )
+        if closing_issue_changes:
+            raise PolicyError(
+                "Issue evidence changed during publication freshness verification ("
+                + ", ".join(closing_issue_changes)
+                + "); approval is stale"
+            )
+
+        owner_policy_repository = f"{repository.full_name.split('/', 1)[0]}/.github"
+        final_organization_ref = self.github.default_branch_sha_if_exists(
+            owner_policy_repository,
+        )
+        observed_organization_ref = final_organization_ref or "absent"
+        evaluated_organization_ref = eligibility.evidence.get(POLICY_ORGANIZATION_REF_EVIDENCE_KEY)
+        if (
+            not evaluated_organization_ref
+            or observed_organization_ref.casefold() != evaluated_organization_ref.casefold()
+        ):
+            raise PolicyError(
+                "The organization policy repository moved while policy evidence was fetched; "
+                "retry publication"
+            )
+
+        final_repository = self.github.get_repository(manifest.repository.full_name)
+        if (
+            final_repository.full_name.casefold() != manifest.repository.full_name.casefold()
+            or final_repository.default_branch != manifest.repository.default_branch
+        ):
+            raise PolicyError(
+                "The upstream repository identity or default branch changed during final "
+                "freshness verification"
+            )
+        final_issue = self.github.get_issue(
+            manifest.candidate.repository,
+            manifest.candidate.number,
+        )
+        final_eligibility = DiscoveryService(self.config, self.github, self.store).evaluate(
+            final_issue,
+            final_repository,
+            check_remote_policy=False,
+            check_competing_pull_requests=False,
+        )
+        if not final_eligibility.eligible:
+            reasons = "; ".join(final_eligibility.blockers)
+            raise PolicyError(
+                "Candidate changed during final publication freshness verification: " + reasons
+            )
+        final_issue_changes = self._changed_issue_evidence(
+            manifest.candidate,
+            final_issue,
+        )
+        if final_issue_changes:
+            raise PolicyError(
+                "Issue evidence changed during final publication freshness verification ("
+                + ", ".join(final_issue_changes)
+                + "); approval is stale"
+            )
+
+        final_sha = self.github.default_branch_sha(
+            final_repository.full_name,
+            final_repository.default_branch,
+        )
+        if final_sha.casefold() != current_sha.casefold():
             raise PolicyError(
                 "The upstream base branch moved while policy evidence was fetched; "
                 "retry publication"
             )
 
     def _check_pre_pull_request_policy_freshness(self, manifest: RunManifest) -> None:
-        """Re-read policy after branch push and before the pull-request mutation."""
+        """Re-read canonical issue, repository, and policy evidence before opening a PR."""
 
-        assert manifest.candidate and manifest.repository and manifest.base_sha
-        eligibility = DiscoveryService(self.config, self.github, self.store).evaluate(
-            manifest.candidate,
-            manifest.repository,
-            repository_ref=manifest.base_sha,
-        )
-        self._assert_current_eligibility_evidence(
-            manifest,
-            eligibility,
-            require_eligible=False,
-        )
+        try:
+            self._check_freshness(manifest)
+        except GitHubError as exc:
+            raise PolicyError(
+                "GitHub did not provide a complete stable final freshness snapshot"
+            ) from exc
+        except StateError as exc:
+            assert manifest.candidate is not None
+            expected_source = f"github_issue_discussion:{manifest.candidate.reference}"
+            breaker = self.store.circuit_breaker_status()
+            if not any(trigger.source == expected_source for trigger in breaker.active_triggers):
+                raise
+            raise PolicyError(
+                "A trusted maintainer stop was observed in the final issue discussion"
+            ) from exc
+
+    @staticmethod
+    def _changed_issue_evidence(
+        recorded: IssueCandidate,
+        current: IssueCandidate,
+    ) -> list[str]:
+        changed: list[str] = []
+        if current.state.casefold() != recorded.state.casefold():
+            changed.append("state")
+        if current.title != recorded.title:
+            changed.append("title")
+        if current.body != recorded.body:
+            changed.append("body")
+        if {label.casefold() for label in current.labels} != {
+            label.casefold() for label in recorded.labels
+        }:
+            changed.append("labels")
+        if current.comments != recorded.comments or current.discussion != recorded.discussion:
+            changed.append("discussion")
+        if {assignee.casefold() for assignee in current.assignees} != {
+            assignee.casefold() for assignee in recorded.assignees
+        }:
+            changed.append("assignment")
+        if current.updated_at != recorded.updated_at:
+            changed.append("updated timestamp")
+        return changed
 
     @staticmethod
     def _assert_current_eligibility_evidence(

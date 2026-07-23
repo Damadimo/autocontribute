@@ -1345,6 +1345,46 @@ def test_base_movement_during_policy_fetch_stops_before_remote_mutation(
     assert all(event["event_type"] != "publication.reserved" for event in store.events(run_id))
 
 
+def test_organization_policy_ref_movement_during_fetch_stops_before_remote_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    original_get_file = github.get_file
+    live_organization_ref = "b" * 40
+
+    def moving_organization_ref(repository: str) -> str | None:
+        github.calls.append("default_branch_sha_if_exists")
+        assert repository == "example/.github"
+        return live_organization_ref
+
+    def get_file_then_move_organization_ref(
+        repository: str,
+        path: str,
+        *,
+        ref: str,
+        max_bytes: int = 1_000_000,
+    ) -> str | None:
+        nonlocal live_organization_ref
+        result = original_get_file(repository, path, ref=ref, max_bytes=max_bytes)
+        if repository == "example/.github":
+            live_organization_ref = "c" * 40
+        return result
+
+    monkeypatch.setattr(github, "default_branch_sha_if_exists", moving_organization_ref)
+    monkeypatch.setattr(github, "get_file", get_file_then_move_organization_ref)
+
+    with pytest.raises(PolicyError, match="organization policy repository moved"):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert github.calls.count("default_branch_sha_if_exists") == 2
+    assert "ensure_fork" not in github.calls
+    assert not github.mutated
+    assert all(event["event_type"] != "publication.reserved" for event in store.events(run_id))
+
+
 def test_base_moves_after_push_deletes_exact_branch_without_post(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1467,10 +1507,20 @@ def test_post_race_persists_url_then_closes_pr_and_deletes_exact_branch(
     assert store.circuit_breaker_status().is_tripped
 
 
-@pytest.mark.parametrize("changed_field", ["body", "labels", "discussion"])
+@pytest.mark.parametrize(
+    ("changed_field", "expected_error"),
+    [
+        ("body", r"Issue evidence changed.*body"),
+        ("labels", r"Issue evidence changed.*labels"),
+        ("discussion", r"Issue evidence changed.*discussion"),
+        ("state", r"no longer passes deterministic eligibility.*issue is not open"),
+        ("assignment", r"no longer passes deterministic eligibility.*already assigned"),
+    ],
+)
 def test_issue_evidence_drift_stops_before_any_github_mutation(
     tmp_path: Path,
     changed_field: str,
+    expected_error: str,
 ) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
     manifest = store.get(run_id)
@@ -1478,7 +1528,7 @@ def test_issue_evidence_drift_stops_before_any_github_mutation(
         issue = issue.model_copy(update={"body": issue.body + "\nA new acceptance requirement."})
     elif changed_field == "labels":
         issue = issue.model_copy(update={"labels": [*issue.labels, "triaged"]})
-    else:
+    elif changed_field == "discussion":
         now = datetime.now(UTC)
         comment = IssueComment(
             author="maintainer",
@@ -1489,13 +1539,629 @@ def test_issue_evidence_drift_stops_before_any_github_mutation(
             updated_at=now,
         )
         issue = issue.model_copy(update={"comments": issue.comments + 1, "discussion": [comment]})
+    elif changed_field == "state":
+        issue = issue.model_copy(update={"state": "closed"})
+    else:
+        issue = issue.model_copy(update={"assignees": ["another-contributor"]})
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
 
-    with pytest.raises(PolicyError, match=f"Issue evidence changed.*{changed_field}"):
+    with pytest.raises(PolicyError, match=expected_error):
         Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
 
     assert not github.mutated
     assert all(event["event_type"] != "publication.reserved" for event in store.events(run_id))
+
+
+@pytest.mark.parametrize(
+    ("drift", "timing"),
+    [
+        ("state", "after_push"),
+        ("labels", "after_push"),
+        ("assignment", "after_push"),
+        ("discussion", "after_push"),
+        ("security_discussion", "after_push"),
+        ("archived", "after_push"),
+        ("maintainer_stop", "after_push"),
+        ("state", "during_policy"),
+        ("security_discussion", "during_policy"),
+        ("archived", "during_policy"),
+        ("maintainer_stop", "during_policy"),
+        ("state", "during_closing_duplicate_search"),
+        ("archived", "during_closing_duplicate_search"),
+    ],
+)
+def test_issue_or_repository_drift_after_push_compensates_before_pull_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+    timing: str,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_get_repository = github.get_repository
+    original_get_file = github.get_file
+    original_search_competing_pull_requests = github.search_competing_pull_requests
+    repository_archived = False
+    after_push = False
+    drift_applied = False
+    post_push_duplicate_searches = 0
+    deleted: list[tuple[str, str, str]] = []
+
+    def apply_drift() -> None:
+        nonlocal drift_applied, repository_archived
+        assert not drift_applied
+        drift_applied = True
+        if drift == "state":
+            github.issue = issue.model_copy(update={"state": "closed"})
+        elif drift == "labels":
+            github.issue = issue.model_copy(update={"labels": ["bug", "good first issue"]})
+        elif drift == "assignment":
+            github.issue = issue.model_copy(update={"assignees": ["another-contributor"]})
+        elif drift in {"discussion", "security_discussion", "maintainer_stop"}:
+            now = datetime.now(UTC)
+            bodies = {
+                "discussion": "The expected output now includes an additional field.",
+                "security_discussion": ("A private report confirms an authentication bypass."),
+                "maintainer_stop": (
+                    "Please hold off; no pull request is needed until the design is settled."
+                ),
+            }
+            comment = IssueComment(
+                author="maintainer",
+                author_association="MEMBER",
+                body=bodies[drift],
+                html_url="https://github.com/example/project/issues/42#issuecomment-late",
+                created_at=now,
+                updated_at=now,
+            )
+            github.issue = issue.model_copy(
+                update={"comments": issue.comments + 1, "discussion": [comment]}
+            )
+        else:
+            repository_archived = True
+
+    def get_repository(full_name: str) -> RepositoryInfo:
+        repository = original_get_repository(full_name)
+        if repository_archived:
+            return repository.model_copy(update={"archived": True})
+        return repository
+
+    def get_file(
+        repository: str,
+        path: str,
+        *,
+        ref: str,
+        max_bytes: int = 1_000_000,
+    ) -> str | None:
+        if after_push and timing == "during_policy" and not drift_applied:
+            apply_drift()
+        return original_get_file(repository, path, ref=ref, max_bytes=max_bytes)
+
+    def search_competing_pull_requests(repository: str, issue_number: int) -> list[str]:
+        nonlocal post_push_duplicate_searches
+        result = original_search_competing_pull_requests(repository, issue_number)
+        if after_push:
+            post_push_duplicate_searches += 1
+            if (
+                timing == "during_closing_duplicate_search"
+                and post_push_duplicate_searches == 2
+                and not drift_applied
+            ):
+                apply_drift()
+        return result
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        nonlocal after_push
+        before_mutation()
+        del workspace, fork, branch
+        github.branch_sha = commit_sha
+        after_push = True
+        if timing == "after_push":
+            apply_drift()
+
+    def delete(
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        expected_repository_id: int,
+        expected_repository_node_id: str,
+        lease_guard: LeaseHeartbeatGuard,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        assert expected_repository_id == github.fork_repository_id
+        assert expected_repository_node_id == github.fork_repository_node_id
+        lease_guard.assert_owned()
+        before_mutation()
+        assert github.branch_sha == commit_sha
+        deleted.append((fork, branch, commit_sha))
+        github.branch_sha = None
+
+    monkeypatch.setattr(github, "get_repository", get_repository)
+    monkeypatch.setattr(github, "get_file", get_file)
+    monkeypatch.setattr(
+        github,
+        "search_competing_pull_requests",
+        search_competing_pull_requests,
+    )
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+    monkeypatch.setattr(publisher, "_delete_remote_branch", delete)
+
+    with pytest.raises(
+        PolicyError,
+        match=r"Issue or repository freshness evidence changed after.*branch was pushed",
+    ):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert durable.status == RunStatus.FAILED
+    assert deleted == [("octocat/project", durable.branch_name, durable.commit_sha)]
+    assert github.branch_sha is None
+    assert github.calls.count("get_issue") >= 2
+    assert github.calls.count("get_repository") >= 2
+    assert "create_pull_request" not in github.calls
+    assert "publication.policy_stale_before_pull_request" in event_types
+    assert "publication.compensation.verified" in event_types
+    assert store.circuit_breaker_status().is_tripped is (drift == "maintainer_stop")
+
+
+@pytest.mark.parametrize("drift", ["organization_ref", "maintainer_stop"])
+def test_mutation_boundary_guard_compensates_drift_after_full_freshness_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_policy_freshness = publisher._check_pre_pull_request_policy_freshness
+    original_remote_identities = publisher._assert_constructive_remote_identities
+    live_organization_ref = "b" * 40
+    drift_applied = False
+    deleted: list[tuple[str, str, str]] = []
+
+    def default_branch_sha_if_exists(repository: str) -> str | None:
+        github.calls.append("default_branch_sha_if_exists")
+        assert repository == "example/.github"
+        return live_organization_ref
+
+    def check_policy_then_drift(current: RunManifest) -> None:
+        nonlocal drift_applied, live_organization_ref
+        original_policy_freshness(current)
+        if drift == "organization_ref":
+            assert not drift_applied
+            live_organization_ref = "c" * 40
+            drift_applied = True
+
+    def identities_then_drift(
+        current: RunManifest,
+        *,
+        fork: str,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> None:
+        nonlocal drift_applied
+        original_remote_identities(
+            current,
+            fork=fork,
+            lease_guard=lease_guard,
+        )
+        if drift == "maintainer_stop" and github.branch_sha is not None and not drift_applied:
+            now = datetime.now(UTC)
+            stop = IssueComment(
+                author="maintainer",
+                author_association="MEMBER",
+                body="Please do not open a pull request until the design is approved.",
+                html_url="https://github.com/example/project/issues/42#issuecomment-stop",
+                created_at=now,
+                updated_at=now,
+            )
+            github.issue = issue.model_copy(
+                update={"comments": issue.comments + 1, "discussion": [stop]}
+            )
+            drift_applied = True
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        before_mutation()
+        del workspace, fork, branch
+        github.branch_sha = commit_sha
+
+    def delete(
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        expected_repository_id: int,
+        expected_repository_node_id: str,
+        lease_guard: LeaseHeartbeatGuard,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        assert expected_repository_id == github.fork_repository_id
+        assert expected_repository_node_id == github.fork_repository_node_id
+        lease_guard.assert_owned()
+        before_mutation()
+        assert github.branch_sha == commit_sha
+        deleted.append((fork, branch, commit_sha))
+        github.branch_sha = None
+
+    monkeypatch.setattr(github, "default_branch_sha_if_exists", default_branch_sha_if_exists)
+    monkeypatch.setattr(
+        publisher,
+        "_check_pre_pull_request_policy_freshness",
+        check_policy_then_drift,
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_assert_constructive_remote_identities",
+        identities_then_drift,
+    )
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+    monkeypatch.setattr(publisher, "_delete_remote_branch", delete)
+
+    with pytest.raises(PolicyError, match="mutation boundary"):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert drift_applied
+    assert durable.status == RunStatus.FAILED
+    assert deleted == [("octocat/project", durable.branch_name, durable.commit_sha)]
+    assert github.branch_sha is None
+    assert "create_pull_request" not in github.calls
+    assert "pull_request.creation.started" not in event_types
+    assert "publication.policy_stale_before_pull_request" in event_types
+    assert "publication.compensation.verified" in event_types
+    assert store.circuit_breaker_status().is_tripped is (drift == "maintainer_stop")
+
+
+@pytest.mark.parametrize(
+    "replacement_sha",
+    [None, "d" * 40],
+    ids=["missing", "foreign-sha"],
+)
+def test_mutation_boundary_guard_requires_exact_contribution_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_sha: str | None,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_remote_identities = publisher._assert_constructive_remote_identities
+    pull_request_preflight_checks = 0
+    deleted: list[tuple[str, str, str]] = []
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        before_mutation()
+        del workspace, fork, branch
+        github.branch_sha = commit_sha
+
+    def replace_head_after_second_identity_check(
+        current: RunManifest,
+        *,
+        fork: str,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> None:
+        nonlocal pull_request_preflight_checks
+        original_remote_identities(
+            current,
+            fork=fork,
+            lease_guard=lease_guard,
+        )
+        if github.branch_sha is not None:
+            pull_request_preflight_checks += 1
+            if pull_request_preflight_checks == 2:
+                github.branch_sha = replacement_sha
+
+    def delete(
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        expected_repository_id: int,
+        expected_repository_node_id: str,
+        lease_guard: LeaseHeartbeatGuard,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        assert expected_repository_id == github.fork_repository_id
+        assert expected_repository_node_id == github.fork_repository_node_id
+        lease_guard.assert_owned()
+        before_mutation()
+        assert github.branch_sha == commit_sha
+        deleted.append((fork, branch, commit_sha))
+        github.branch_sha = None
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+    monkeypatch.setattr(
+        publisher,
+        "_assert_constructive_remote_identities",
+        replace_head_after_second_identity_check,
+    )
+    monkeypatch.setattr(publisher, "_delete_remote_branch", delete)
+
+    if replacement_sha is None:
+        expected_error: type[Exception] = PolicyError
+        expected_match = "mutation boundary"
+    else:
+        expected_error = PublicationResumeRequired
+        expected_match = "no longer matches exact publication intent"
+    with pytest.raises(expected_error, match=expected_match):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert pull_request_preflight_checks == 2
+    assert durable.status == (RunStatus.FAILED if replacement_sha is None else RunStatus.SUBMITTING)
+    assert durable.pull_request_creation_started is False
+    assert github.branch_sha == replacement_sha
+    assert deleted == []
+    assert "create_pull_request" not in github.calls
+    assert "pull_request.creation.started" not in event_types
+    assert "publication.policy_stale_before_pull_request" in event_types
+    assert ("publication.compensation.verified" in event_types) is (replacement_sha is None)
+    assert store.circuit_breaker_status().is_tripped is (replacement_sha is not None)
+
+
+@pytest.mark.parametrize("failure", ["identity_replacement", "transient_identity_read"])
+def test_pull_request_preflight_identity_failure_is_known_not_to_have_posted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_remote_identities = publisher._assert_constructive_remote_identities
+    pull_request_preflight_checks = 0
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        before_mutation()
+        del workspace, fork, branch
+        github.branch_sha = commit_sha
+
+    def check_remote_identities(
+        current: RunManifest,
+        *,
+        fork: str,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> None:
+        nonlocal pull_request_preflight_checks
+        if github.branch_sha is not None:
+            pull_request_preflight_checks += 1
+            if failure == "transient_identity_read" and pull_request_preflight_checks == 1:
+                raise GitHubError("transient repository identity read failure")
+        original_remote_identities(
+            current,
+            fork=fork,
+            lease_guard=lease_guard,
+        )
+        if (
+            failure == "identity_replacement"
+            and github.branch_sha is not None
+            and pull_request_preflight_checks == 1
+        ):
+            github.upstream_repository_id += 1
+            github.upstream_repository_node_id = "R_replacement_upstream"
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+    monkeypatch.setattr(
+        publisher,
+        "_assert_constructive_remote_identities",
+        check_remote_identities,
+    )
+
+    with pytest.raises(GitHubError, match=r"repository .*identity|transient"):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert durable.status == RunStatus.SUBMITTING
+    assert durable.pull_request_creation_started is False
+    assert github.branch_sha == durable.commit_sha
+    assert "create_pull_request" not in github.calls
+    assert "pull_request.creation.started" not in event_types
+    assert "publication.policy_stale_before_pull_request" not in event_types
+    assert not store.circuit_breaker_status().is_tripped
+    assert pull_request_preflight_checks == (2 if failure == "identity_replacement" else 1)
+
+
+def test_pull_request_client_validation_failure_before_callback_is_not_ambiguous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    validation_attempted = False
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        before_mutation()
+        del workspace, fork, branch
+        github.branch_sha = commit_sha
+
+    def fail_local_validation(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal validation_attempted
+        del args
+        validation_attempted = True
+        assert callable(kwargs["before_mutation"])
+        raise ValueError("local pull-request input validation failed")
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+    monkeypatch.setattr(github, "create_pull_request", fail_local_validation)
+
+    with pytest.raises(ValueError, match="local pull-request input validation failed"):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert validation_attempted
+    assert durable.status == RunStatus.SUBMITTING
+    assert durable.pull_request_creation_started is False
+    assert github.branch_sha == durable.commit_sha
+    assert "create_pull_request" not in github.calls
+    assert "pull_request.creation.started" not in event_types
+    assert not store.circuit_breaker_status().is_tripped
+
+
+@pytest.mark.parametrize("persist_before_failure", [False, True], ids=["not-durable", "durable"])
+def test_pull_request_creation_marker_save_failure_before_callback_return_is_not_ambiguous(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persist_before_failure: bool,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_save = store.save
+    marker_manifest: RunManifest | None = None
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        before_mutation()
+        del workspace, fork, branch
+        github.branch_sha = commit_sha
+
+    def fail_marker_save(
+        current: RunManifest,
+        *,
+        event: str,
+        details: dict[str, str],
+    ) -> None:
+        nonlocal marker_manifest
+        if event != "pull_request.creation.started":
+            original_save(current, event=event, details=details)
+            return
+        marker_manifest = current
+        if persist_before_failure:
+            original_save(current, event=event, details=details)
+        raise OSError("creation marker save failed")
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+    monkeypatch.setattr(store, "save", fail_marker_save)
+
+    with pytest.raises(OSError, match="creation marker save failed"):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert marker_manifest is not None
+    assert marker_manifest.pull_request_creation_started is persist_before_failure
+    assert durable.status == RunStatus.SUBMITTING
+    assert durable.pull_request_creation_started is persist_before_failure
+    assert github.branch_sha == durable.commit_sha
+    assert "create_pull_request" not in github.calls
+    assert ("pull_request.creation.started" in event_types) is persist_before_failure
+    assert not store.circuit_breaker_status().is_tripped
+
+
+def test_pull_request_preflight_rejects_fork_parent_drift_after_push(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_get_fork_identity = github.get_fork_identity
+    parent_drifted = False
+
+    def get_fork_identity(full_name: str) -> ForkIdentity:
+        observed = original_get_fork_identity(full_name)
+        if not parent_drifted:
+            return observed
+        return ForkIdentity(
+            repository=observed.repository,
+            parent=RepositoryIdentity(
+                full_name="different/project",
+                database_id=9001,
+                node_id="R_different_upstream",
+            ),
+        )
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        nonlocal parent_drifted
+        before_mutation()
+        del workspace, fork, branch
+        github.branch_sha = commit_sha
+        parent_drifted = True
+
+    monkeypatch.setattr(github, "get_fork_identity", get_fork_identity)
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+
+    with pytest.raises(GitHubError, match="durable immutable upstream parent"):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert parent_drifted
+    assert durable.status == RunStatus.SUBMITTING
+    assert github.branch_sha == durable.commit_sha
+    assert durable.pull_request_creation_started is False
+    assert "create_pull_request" not in github.calls
+    assert "pull_request.creation.started" not in event_types
+    assert not store.circuit_breaker_status().is_tripped
 
 
 def test_benign_policy_source_drift_stops_before_any_github_mutation(
@@ -3054,6 +3720,108 @@ def test_retry_recovers_exact_remote_push_without_ephemeral_workspace(
     assert "create_pull_request" in github.calls
 
 
+@pytest.mark.parametrize("drift", ["base", "issue"])
+def test_retry_compensates_reconciled_branch_after_push_event_save_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_save = store.save
+    branch_save_crashed = False
+    deleted: list[tuple[str, str, str]] = []
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        before_mutation()
+        del workspace, fork, branch
+        github.branch_sha = commit_sha
+
+    def save_then_crash(
+        saved_manifest: RunManifest,
+        *,
+        event: str,
+        details: dict[str, str],
+    ) -> None:
+        nonlocal branch_save_crashed
+        if event == "branch.pushed" and not branch_save_crashed:
+            branch_save_crashed = True
+            raise RuntimeError("simulated crash before branch push evidence persistence")
+        original_save(saved_manifest, event=event, details=details)
+
+    def delete(
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        expected_repository_id: int,
+        expected_repository_node_id: str,
+        lease_guard: LeaseHeartbeatGuard,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        assert expected_repository_id == github.fork_repository_id
+        assert expected_repository_node_id == github.fork_repository_node_id
+        lease_guard.assert_owned()
+        before_mutation()
+        assert github.branch_sha == commit_sha
+        deleted.append((fork, branch, commit_sha))
+        github.branch_sha = None
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+    monkeypatch.setattr(publisher, "_delete_remote_branch", delete)
+    monkeypatch.setattr(store, "save", save_then_crash)
+
+    with pytest.raises(RuntimeError, match="branch push evidence persistence"):
+        publisher.publish(run_id)
+
+    stranded = store.get(run_id)
+    stranded_events = [event["event_type"] for event in store.events(run_id)]
+    assert branch_save_crashed
+    assert stranded.status == RunStatus.SUBMITTING
+    assert stranded.commit_sha is not None
+    assert github.branch_sha == stranded.commit_sha
+    assert "branch.pushed" not in stranded_events
+    assert "branch.reconciled" not in stranded_events
+    assert "create_pull_request" not in github.calls
+
+    monkeypatch.setattr(store, "save", original_save)
+    if drift == "base":
+        github.sha = "d" * 40
+        expected_error = "upstream base branch moved after"
+    else:
+        github.issue = issue.model_copy(
+            update={"body": issue.body + "\nA new acceptance requirement."}
+        )
+        expected_error = "Issue or repository freshness evidence changed after"
+
+    with pytest.raises(PolicyError, match=expected_error):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert durable.status == RunStatus.FAILED
+    assert github.branch_sha is None
+    assert deleted == [("octocat/project", durable.branch_name, durable.commit_sha)]
+    assert event_types.count("branch.reconciled") == 1
+    assert "branch.pushed" not in event_types
+    assert (
+        "publication.base_moved_before_pull_request" in event_types
+        if drift == "base"
+        else "publication.policy_stale_before_pull_request" in event_types
+    )
+    assert "publication.compensation.verified" in event_types
+
+
 def test_existing_pr_without_stored_commit_is_not_reconciled(tmp_path: Path) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
     manifest = store.get(run_id)
@@ -4459,6 +5227,7 @@ def test_cursor_drift_during_creation_marker_save_blocks_pull_request_post(
     assert stranded.pull_request_url is None
     assert github.branch_sha == stranded.commit_sha
     assert "create_pull_request" not in github.calls
+    assert not store.circuit_breaker_status().is_tripped
 
 
 def test_manual_created_pr_compensation_adopts_exact_merged_pr_without_gate_hold(

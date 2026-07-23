@@ -271,6 +271,56 @@ def _comment_payload(identifier: int = 11) -> dict[str, object]:
     }
 
 
+def _candidate_issue_payload(
+    *,
+    repository: str = "example/project",
+    number: int = 42,
+    comments: int = 1,
+    api_url: str = "https://api.github.com",
+    web_origin: str = "https://github.com",
+) -> dict[str, object]:
+    api_url = api_url.rstrip("/")
+    web_origin = web_origin.rstrip("/")
+    return {
+        "number": number,
+        "url": f"{api_url}/repos/{repository}/issues/{number}",
+        "repository_url": f"{api_url}/repos/{repository}",
+        "title": "Fix parser",
+        "body": "Reproduction steps and expected behavior",
+        "html_url": f"{web_origin}/{repository}/issues/{number}",
+        "state": "open",
+        "user": {"login": "reporter"},
+        "labels": [{"name": "help wanted"}],
+        "assignees": [],
+        "comments": comments,
+        "created_at": "2026-07-19T12:00:00Z",
+        "updated_at": "2026-07-20T12:00:00Z",
+    }
+
+
+def _issue_discussion_comment_payload(
+    *,
+    identifier: int = 1,
+    repository: str = "example/project",
+    number: int = 42,
+    api_url: str = "https://api.github.com",
+    web_origin: str = "https://github.com",
+) -> dict[str, object]:
+    api_url = api_url.rstrip("/")
+    web_origin = web_origin.rstrip("/")
+    return {
+        "id": identifier,
+        "url": f"{api_url}/repos/{repository}/issues/comments/{identifier}",
+        "issue_url": f"{api_url}/repos/{repository}/issues/{number}",
+        "user": {"login": "maintainer"},
+        "author_association": "MEMBER",
+        "body": "Please include the parser regression test.",
+        "html_url": (f"{web_origin}/{repository}/issues/{number}#issuecomment-{identifier}"),
+        "created_at": "2026-07-20T12:00:00Z",
+        "updated_at": "2026-07-20T12:00:00Z",
+    }
+
+
 def _pull_request_search_item(
     number: int,
     *,
@@ -848,10 +898,13 @@ def test_get_issue_fetches_complete_discussion() -> None:
                 200,
                 json=[
                     {
+                        "id": 1,
+                        "url": ("https://api.github.com/repos/example/project/issues/comments/1"),
                         "user": {"login": "maintainer"},
                         "author_association": "MEMBER",
                         "body": "Please include the parser regression test.",
                         "html_url": "https://github.com/example/project/issues/42#issuecomment-1",
+                        "issue_url": "https://api.github.com/repos/example/project/issues/42",
                         "created_at": "2026-07-20T12:00:00Z",
                         "updated_at": "2026-07-20T12:00:00Z",
                     }
@@ -861,6 +914,8 @@ def test_get_issue_fetches_complete_discussion() -> None:
             200,
             json={
                 "number": 42,
+                "url": "https://api.github.com/repos/example/project/issues/42",
+                "repository_url": "https://api.github.com/repos/example/project",
                 "title": "Fix parser",
                 "body": "Reproduction steps and expected behavior",
                 "html_url": "https://github.com/example/project/issues/42",
@@ -880,9 +935,463 @@ def test_get_issue_fetches_complete_discussion() -> None:
     assert paths == [
         "/repos/example/project/issues/42",
         "/repos/example/project/issues/42/comments",
+        "/repos/example/project/issues/42",
+        "/repos/example/project/issues/42/comments",
+        "/repos/example/project/issues/42",
     ]
     assert issue.discussion[0].author == "maintainer"
     assert issue.discussion[0].author_association == "MEMBER"
+
+
+def test_get_issue_rejects_metadata_change_during_discussion_fetch() -> None:
+    issue_reads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal issue_reads
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 1,
+                        "url": ("https://api.github.com/repos/example/project/issues/comments/1"),
+                        "user": {"login": "maintainer"},
+                        "author_association": "MEMBER",
+                        "body": "Please include the parser regression test.",
+                        "html_url": "https://github.com/example/project/issues/42#issuecomment-1",
+                        "issue_url": "https://api.github.com/repos/example/project/issues/42",
+                        "created_at": "2026-07-20T12:00:00Z",
+                        "updated_at": "2026-07-20T12:00:00Z",
+                    }
+                ],
+            )
+        issue_reads += 1
+        return httpx.Response(
+            200,
+            json={
+                "number": 42,
+                "url": "https://api.github.com/repos/example/project/issues/42",
+                "repository_url": "https://api.github.com/repos/example/project",
+                "title": "Fix parser",
+                "body": "Reproduction steps and expected behavior",
+                "html_url": "https://github.com/example/project/issues/42",
+                "state": "open" if issue_reads == 1 else "closed",
+                "user": {"login": "reporter"},
+                "labels": [{"name": "help wanted"}],
+                "assignees": [],
+                "comments": 1,
+                "created_at": "2026-07-19T12:00:00Z",
+                "updated_at": "2026-07-20T12:00:00Z",
+            },
+        )
+
+    with (
+        _client(handler) as github,
+        pytest.raises(
+            GitHubError,
+            match="Issue changed while its complete discussion was fetched",
+        ),
+    ):
+        github.get_issue("example/project", 42)
+
+    assert issue_reads == 2
+
+
+def test_get_issue_rejects_comment_content_change_with_stable_metadata() -> None:
+    paths: list[str] = []
+    comment_reads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal comment_reads
+        paths.append(request.url.path)
+        if request.url.path.endswith("/comments"):
+            comment_reads += 1
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 1,
+                        "url": ("https://api.github.com/repos/example/project/issues/comments/1"),
+                        "user": {"login": "maintainer"},
+                        "author_association": "MEMBER",
+                        "body": (
+                            "Please include the parser regression test."
+                            if comment_reads == 1
+                            else "Please include parser and serializer regression tests."
+                        ),
+                        "html_url": "https://github.com/example/project/issues/42#issuecomment-1",
+                        "issue_url": "https://api.github.com/repos/example/project/issues/42",
+                        "created_at": "2026-07-20T12:00:00Z",
+                        "updated_at": "2026-07-20T12:00:00Z",
+                    }
+                ],
+            )
+        return httpx.Response(
+            200,
+            json={
+                "number": 42,
+                "url": "https://api.github.com/repos/example/project/issues/42",
+                "repository_url": "https://api.github.com/repos/example/project",
+                "title": "Fix parser",
+                "body": "Reproduction steps and expected behavior",
+                "html_url": "https://github.com/example/project/issues/42",
+                "state": "open",
+                "user": {"login": "reporter"},
+                "labels": [{"name": "help wanted"}],
+                "assignees": [],
+                "comments": 1,
+                "created_at": "2026-07-19T12:00:00Z",
+                "updated_at": "2026-07-20T12:00:00Z",
+            },
+        )
+
+    with (
+        _client(handler) as github,
+        pytest.raises(GitHubError, match="Issue discussion changed while it was fetched"),
+    ):
+        github.get_issue("example/project", 42)
+
+    assert paths == [
+        "/repos/example/project/issues/42",
+        "/repos/example/project/issues/42/comments",
+        "/repos/example/project/issues/42",
+        "/repos/example/project/issues/42/comments",
+        "/repos/example/project/issues/42",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repository_url", None),
+        ("repository_url", "https://api.github.com/repos/other/project"),
+        ("url", None),
+        ("url", "https://api.github.com/repos/other/project/issues/42"),
+    ],
+)
+def test_get_issue_rejects_unbound_metadata_identity(
+    field: str,
+    value: str | None,
+) -> None:
+    payload: dict[str, object] = {
+        "number": 42,
+        "url": "https://api.github.com/repos/example/project/issues/42",
+        "repository_url": "https://api.github.com/repos/example/project",
+        "title": "Fix parser",
+        "body": "Reproduction steps and expected behavior",
+        "html_url": "https://github.com/example/project/issues/42",
+        "state": "open",
+        "user": {"login": "reporter"},
+        "labels": [{"name": "help wanted"}],
+        "assignees": [],
+        "comments": 0,
+        "created_at": "2026-07-19T12:00:00Z",
+        "updated_at": "2026-07-20T12:00:00Z",
+    }
+    if value is None:
+        payload.pop(field)
+    else:
+        payload[field] = value
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with (
+        _client(handler) as github,
+        pytest.raises(GitHubError, match=r"noncanonical issue .*API URL"),
+    ):
+        github.get_issue("example/project", 42)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,
+        "https://attacker.example/example/project/issues/42",
+        "https://github.com/other/project/issues/42",
+        "https://github.com/example/project/issues/99",
+        "https://github.com/example/project/issues/42?view=full",
+        "https://github.com/example/project/issues/42#fragment",
+        "https://github.com/example/project/issues/42/",
+    ],
+)
+def test_get_issue_rejects_unbound_html_identity(value: str | None) -> None:
+    payload = _candidate_issue_payload(comments=0)
+    if value is None:
+        payload.pop("html_url")
+    else:
+        payload["html_url"] = value
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    with (
+        _client(handler) as github,
+        pytest.raises(GitHubError, match="noncanonical issue HTML URL"),
+    ):
+        github.get_issue("example/project", 42)
+
+
+def test_get_issue_rejects_comment_bound_to_another_issue() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 1,
+                        "url": ("https://api.github.com/repos/example/project/issues/comments/1"),
+                        "user": {"login": "maintainer"},
+                        "author_association": "MEMBER",
+                        "body": "Comment from a different issue.",
+                        "html_url": "https://github.com/other/project/issues/99#issuecomment-1",
+                        "issue_url": "https://api.github.com/repos/other/project/issues/99",
+                        "created_at": "2026-07-20T12:00:00Z",
+                        "updated_at": "2026-07-20T12:00:00Z",
+                    }
+                ],
+            )
+        return httpx.Response(
+            200,
+            json={
+                "number": 42,
+                "url": "https://api.github.com/repos/example/project/issues/42",
+                "repository_url": "https://api.github.com/repos/example/project",
+                "title": "Fix parser",
+                "body": "Reproduction steps and expected behavior",
+                "html_url": "https://github.com/example/project/issues/42",
+                "state": "open",
+                "user": {"login": "reporter"},
+                "labels": [{"name": "help wanted"}],
+                "assignees": [],
+                "comments": 1,
+                "created_at": "2026-07-19T12:00:00Z",
+                "updated_at": "2026-07-20T12:00:00Z",
+            },
+        )
+
+    with (
+        _client(handler) as github,
+        pytest.raises(GitHubError, match="noncanonical issue comment parent API URL"),
+    ):
+        github.get_issue("example/project", 42)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("id", None, "invalid issue comment identifier"),
+        ("id", 0, "invalid issue comment identifier"),
+        ("id", -1, "invalid issue comment identifier"),
+        ("id", True, "invalid issue comment identifier"),
+        ("id", "1", "invalid issue comment identifier"),
+        ("url", None, "noncanonical issue comment API URL"),
+        (
+            "url",
+            "https://api.github.com/repos/other/project/issues/comments/1",
+            "noncanonical issue comment API URL",
+        ),
+        (
+            "url",
+            "https://api.github.com/repos/example/project/issues/comments/2",
+            "noncanonical issue comment API URL",
+        ),
+        (
+            "url",
+            "https://api.github.com/repos/example/project/issues/comments/1?view=full",
+            "noncanonical issue comment API URL",
+        ),
+        (
+            "url",
+            "https://api.github.com/repos/example/project/issues/comments/1#fragment",
+            "noncanonical issue comment API URL",
+        ),
+        (
+            "url",
+            "https://api.github.com/repos/example/project/issues/comments/1/",
+            "noncanonical issue comment API URL",
+        ),
+        ("issue_url", None, "noncanonical issue comment parent API URL"),
+        (
+            "issue_url",
+            "https://api.github.com/repos/other/project/issues/42",
+            "noncanonical issue comment parent API URL",
+        ),
+        (
+            "issue_url",
+            "https://api.github.com/repos/example/project/issues/99",
+            "noncanonical issue comment parent API URL",
+        ),
+        (
+            "issue_url",
+            "https://api.github.com/repos/example/project/issues/42?view=full",
+            "noncanonical issue comment parent API URL",
+        ),
+        (
+            "issue_url",
+            "https://api.github.com/repos/example/project/issues/42#fragment",
+            "noncanonical issue comment parent API URL",
+        ),
+        (
+            "issue_url",
+            "https://api.github.com/repos/example/project/issues/42/",
+            "noncanonical issue comment parent API URL",
+        ),
+        ("html_url", None, "noncanonical issue comment HTML URL"),
+        (
+            "html_url",
+            "https://github.com/other/project/issues/42#issuecomment-1",
+            "noncanonical issue comment HTML URL",
+        ),
+        (
+            "html_url",
+            "https://github.com/example/project/issues/99#issuecomment-1",
+            "noncanonical issue comment HTML URL",
+        ),
+        (
+            "html_url",
+            "https://github.com/example/project/issues/42#issuecomment-2",
+            "noncanonical issue comment HTML URL",
+        ),
+        (
+            "html_url",
+            "https://github.com/example/project/issues/42?view=full#issuecomment-1",
+            "noncanonical issue comment HTML URL",
+        ),
+        (
+            "html_url",
+            "https://github.com/example/project/issues/42/#issuecomment-1",
+            "noncanonical issue comment HTML URL",
+        ),
+    ],
+)
+def test_get_issue_comments_rejects_unbound_comment_identity(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    comment = _issue_discussion_comment_payload()
+    if value is None:
+        comment.pop(field)
+    else:
+        comment[field] = value
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[comment])
+
+    with _client(handler) as github, pytest.raises(GitHubError, match=message):
+        github.get_issue_comments("example/project", 42, expected_count=1)
+
+
+def test_get_issue_comments_rejects_duplicate_comment_identities() -> None:
+    comment = _issue_discussion_comment_payload()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[comment, comment])
+
+    with (
+        _client(handler) as github,
+        pytest.raises(GitHubError, match="duplicate issue comment identities"),
+    ):
+        github.get_issue_comments("example/project", 42, expected_count=2)
+
+
+def test_get_issue_accepts_canonical_ghes_comment_identity() -> None:
+    api_url = "https://git.example.com/api/v3"
+    web_origin = "https://git.example.com"
+    issue_payload = _candidate_issue_payload(api_url=api_url, web_origin=web_origin)
+    comment_payload = _issue_discussion_comment_payload(
+        api_url=api_url,
+        web_origin=web_origin,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[comment_payload])
+        return httpx.Response(200, json=issue_payload)
+
+    with _client(handler, api_url=api_url) as github:
+        issue = github.get_issue("example/project", 42)
+
+    assert issue.discussion[0].html_url == (
+        "https://git.example.com/example/project/issues/42#issuecomment-1"
+    )
+    assert issue.html_url == "https://git.example.com/example/project/issues/42"
+
+
+def test_get_issue_proves_a_stable_empty_discussion() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(
+            200,
+            json={
+                "number": 42,
+                "url": "https://api.github.com/repos/example/project/issues/42",
+                "repository_url": "https://api.github.com/repos/example/project",
+                "title": "Fix parser",
+                "body": "Reproduction steps and expected behavior",
+                "html_url": "https://github.com/example/project/issues/42",
+                "state": "open",
+                "user": {"login": "reporter"},
+                "labels": [{"name": "help wanted"}],
+                "assignees": [],
+                "comments": 0,
+                "created_at": "2026-07-19T12:00:00Z",
+                "updated_at": "2026-07-20T12:00:00Z",
+            },
+        )
+
+    with _client(handler) as github:
+        issue = github.get_issue("example/project", 42)
+
+    assert issue.discussion == []
+    assert paths == [
+        "/repos/example/project/issues/42",
+        "/repos/example/project/issues/42/comments",
+        "/repos/example/project/issues/42",
+        "/repos/example/project/issues/42/comments",
+        "/repos/example/project/issues/42",
+    ]
+
+
+def test_get_issue_rejects_third_metadata_read_drift() -> None:
+    issue_reads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal issue_reads
+        if request.url.path.endswith("/comments"):
+            return httpx.Response(200, json=[])
+        issue_reads += 1
+        return httpx.Response(
+            200,
+            json={
+                "number": 42,
+                "url": "https://api.github.com/repos/example/project/issues/42",
+                "repository_url": "https://api.github.com/repos/example/project",
+                "title": "Fix parser",
+                "body": "Reproduction steps and expected behavior",
+                "html_url": "https://github.com/example/project/issues/42",
+                "state": "open" if issue_reads < 3 else "closed",
+                "user": {"login": "reporter"},
+                "labels": [{"name": "help wanted"}],
+                "assignees": [],
+                "comments": 0,
+                "created_at": "2026-07-19T12:00:00Z",
+                "updated_at": "2026-07-20T12:00:00Z",
+            },
+        )
+
+    with (
+        _client(handler) as github,
+        pytest.raises(GitHubError, match="Issue changed while its complete discussion was fetched"),
+    ):
+        github.get_issue("example/project", 42)
+
+    assert issue_reads == 3
 
 
 def test_issue_discussion_above_bound_fails_closed() -> None:
@@ -891,6 +1400,8 @@ def test_issue_discussion_above_bound_fails_closed() -> None:
             200,
             json={
                 "number": 42,
+                "url": "https://api.github.com/repos/example/project/issues/42",
+                "repository_url": "https://api.github.com/repos/example/project",
                 "title": "Busy issue",
                 "body": "body",
                 "html_url": "https://github.com/example/project/issues/42",
@@ -913,10 +1424,13 @@ def test_exact_hundred_issue_comment_count_detects_new_overflow_comment() -> Non
 
     def comment(identifier: int) -> dict[str, object]:
         return {
+            "id": identifier,
+            "url": (f"https://api.github.com/repos/example/project/issues/comments/{identifier}"),
             "user": {"login": "maintainer"},
             "author_association": "MEMBER",
             "body": f"Comment {identifier}",
             "html_url": (f"https://github.com/example/project/issues/42#issuecomment-{identifier}"),
+            "issue_url": "https://api.github.com/repos/example/project/issues/42",
             "created_at": "2026-07-20T12:00:00Z",
             "updated_at": "2026-07-20T12:00:00Z",
         }

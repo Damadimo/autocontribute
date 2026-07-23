@@ -517,20 +517,58 @@ class GitHubClient:
         return repositories
 
     def get_issue(self, repository: str, number: int) -> IssueCandidate:
-        data = cast(
-            "dict[str, Any]",
-            self._request("GET", f"/repos/{quote(repository, safe='/')}/issues/{number}"),
-        )
-        if "pull_request" in data:
-            raise GitHubError(f"{repository}#{number} is a pull request, not an issue")
-        issue = _parse_issue(data, repository)
-        if issue.comments:
-            issue.discussion = self.get_issue_comments(
-                issue.repository,
-                issue.number,
-                expected_count=issue.comments,
+        issue_path = f"/repos/{quote(repository, safe='/')}/issues/{number}"
+
+        def read_metadata() -> IssueCandidate:
+            data = cast("dict[str, Any]", self._request("GET", issue_path))
+            if "pull_request" in data:
+                raise GitHubError(f"{repository}#{number} is a pull request, not an issue")
+            self._require_canonical_api_url(
+                data.get("repository_url"),
+                path=f"/repos/{repository}",
+                field="issue repository API URL",
             )
-        return issue
+            self._require_canonical_api_url(
+                data.get("url"),
+                path=issue_path,
+                field="issue API URL",
+            )
+            _exact_repository_url(
+                data.get("html_url"),
+                expected=f"{web_origin_for_api(self.config.api_url)}/{repository}/issues/{number}",
+                field="issue HTML URL",
+            )
+            issue = _parse_issue(data, repository)
+            if issue.repository.casefold() != repository.casefold() or issue.number != number:
+                raise GitHubError("GitHub returned a different issue identity")
+            return issue
+
+        initial_issue = read_metadata()
+        initial_discussion = self.get_issue_comments(
+            repository,
+            number,
+            expected_count=initial_issue.comments,
+        )
+        middle_issue = read_metadata()
+        if middle_issue != initial_issue:
+            raise GitHubError(
+                "Issue changed while its complete discussion was fetched; retry with fresh evidence"
+            )
+        confirmed_discussion = self.get_issue_comments(
+            repository,
+            number,
+            expected_count=middle_issue.comments,
+        )
+        confirmed_issue = read_metadata()
+        if confirmed_issue != middle_issue:
+            raise GitHubError(
+                "Issue changed while its complete discussion was fetched; retry with fresh evidence"
+            )
+        if confirmed_discussion != initial_discussion:
+            raise GitHubError(
+                "Issue discussion changed while it was fetched; retry with fresh evidence"
+            )
+        return confirmed_issue.model_copy(update={"discussion": confirmed_discussion})
 
     def get_issue_comments(
         self,
@@ -553,6 +591,7 @@ class GitHubClient:
                 )
 
         comments: list[IssueComment] = []
+        comment_ids: set[int] = set()
         # Always request an overflow page after a full page. Otherwise an advertised count of
         # exactly 100 can race with comment 101 and silently accept incomplete evidence.
         pages = max_comments // 100 + 1
@@ -567,7 +606,33 @@ class GitHubClient:
             )
             if len(data) > 100:
                 raise GitHubError("GitHub returned an oversized issue comments page")
-            comments.extend(_parse_issue_comment(item) for item in data)
+            for item in data:
+                identifier = _identifier(item.get("id"), resource="issue comment")
+                if identifier in comment_ids:
+                    raise GitHubError(
+                        "GitHub returned duplicate issue comment identities; "
+                        "discussion evidence may be incomplete"
+                    )
+                comment_ids.add(identifier)
+                self._require_canonical_api_url(
+                    item.get("url"),
+                    path=f"/repos/{repository}/issues/comments/{identifier}",
+                    field="issue comment API URL",
+                )
+                self._require_canonical_api_url(
+                    item.get("issue_url"),
+                    path=f"/repos/{repository}/issues/{number}",
+                    field="issue comment parent API URL",
+                )
+                _exact_repository_url(
+                    item.get("html_url"),
+                    expected=(
+                        f"{web_origin_for_api(self.config.api_url)}/{repository}/issues/{number}"
+                        f"#issuecomment-{identifier}"
+                    ),
+                    field="issue comment HTML URL",
+                )
+                comments.append(_parse_issue_comment(item))
             if len(comments) > max_comments:
                 raise GitHubError("Issue discussion exceeded the safe comment limit")
             if len(data) < 100:

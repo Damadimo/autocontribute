@@ -185,6 +185,53 @@ def test_possible_security_issue_is_never_publicly_selected(tmp_path) -> None:
         "Use-after-free in the stream parser",
         "Arbitrary file write via crafted output path",
         "Arbitrary file read in template loader",
+        "Denial of service in the parser",
+        "Information disclosure in diagnostic logs",
+        "Remote account takeover through password reset",
+        "RCE via a crafted request",
+        "Remote command execution through the helper",
+        "ReDoS in the route matcher",
+        "Out-of-bounds write in the decoder",
+        "Sensitive data leak in debug output",
+        "Open redirect in the login callback",
+        "Remote-code-execution through the helper",
+        "Open-redirect in the login callback",
+        "Sandbox-escape from the worker",
+        "HTTP request-smuggling in the proxy",
+        "Prototype-pollution in object merging",
+        "Insecure-deserialization in session loading",
+        "Account-takeover through password reset",
+        "Out-of-bounds memory read in the decoder",
+        "OOB-read in the native parser",
+        "Information leak from diagnostic logs",
+        "SQLi in the query builder",
+        "Auth bypass in the login handler",
+        "IDOR in the account endpoint",
+        "LFI through the template name",
+        "SSTI in notification rendering",
+        "LPE through the helper binary",
+        "Remote code exec through the worker",
+        "Arbitrary command execution in the task runner",
+        "Remote file inclusion in template loading",
+        "RFI through the locale parameter",
+        "CRLF injection in response headers",
+        "HTTP response splitting in the proxy",
+        "Cache poisoning through an unkeyed header",
+        "Host header injection in password-reset links",
+        "Double free in the native decoder",
+        "Integer overflow in length calculation",
+        "Data exfiltration through diagnostic output",
+        "Security issue in token validation",
+        "Security bug in token validation",
+        "Potential security impact in token validation",
+        "A timing attack can reveal the secret",
+        "A race condition bypasses the permission check",
+        "Fix DOS in the request parser",
+        "Prevent DDoS through expensive requests",
+        "Secret leak in debug logs",
+        "Hard-coded credentials in the sample app",
+        "CWE-798 in the default config",
+        "XSRF in the callback flow",
     ],
 )
 def test_security_issue_synonyms_fail_closed(tmp_path, title: str) -> None:  # type: ignore[no-untyped-def]
@@ -206,6 +253,93 @@ def test_security_issue_term_in_body_fails_closed(tmp_path) -> None:
 
     assert not result.eligible
     assert "private handling" in " ".join(result.blockers)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "A crafted request permits remote\ncode execution in the worker.",
+        "A crafted request permits remote  code execution in the worker.",
+        "A crafted request permits remote **code** execution in the worker.",
+    ],
+)
+def test_security_issue_markup_and_whitespace_normalization_fails_closed(
+    tmp_path,
+    body: str,
+) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+
+    result = service.evaluate(_issue(body=body), _repository())
+
+    assert not result.eligible
+    assert "private handling" in " ".join(result.blockers)
+
+
+def test_lowercase_non_security_word_dos_is_not_treated_as_denial_of_service(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+
+    result = service.evaluate(
+        _issue(title="Hay dos errores en el analizador"),
+        _repository(),
+    )
+
+    assert result.eligible
+    assert "private handling" not in " ".join(result.blockers)
+
+
+def test_security_issue_term_in_later_discussion_comment_fails_closed(tmp_path) -> None:
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    issue = _issue(
+        comments=2,
+        discussion=[
+            _comment(body="The public symptoms look like an ordinary parsing bug."),
+            _comment(body="A private reproducer confirms an authentication bypass."),
+        ],
+    )
+
+    result = service.evaluate(issue, _repository())
+
+    assert not result.eligible
+    assert "private handling" in " ".join(result.blockers)
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "vulnerability",
+        "CVE",
+        "type: security advisory",
+        "CWE-79",
+        "sec:high",
+        "kind/vuln",
+    ],
+)
+def test_security_issue_labels_fail_closed(tmp_path, label: str) -> None:
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    issue = _issue(labels=["help wanted", "bug", "good first issue", label])
+
+    result = service.evaluate(issue, _repository())
+
+    assert not result.eligible
+    assert "private handling" in " ".join(result.blockers)
+
+
+def test_explicit_security_issue_override_applies_to_text_and_labels(tmp_path) -> None:
+    config = AutocontributeConfig.model_validate({"policy": {"allow_security_issues": True}})
+    service = DiscoveryService(config, FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    issue = _issue(
+        title="Denial of service in the parser",
+        labels=["help wanted", "bug", "good first issue", "vulnerability"],
+        comments=1,
+        discussion=[_comment(body="A private report confirms an authentication bypass.")],
+    )
+
+    result = service.evaluate(issue, _repository())
+
+    assert result.eligible
+    assert "private handling" not in " ".join(result.blockers)
 
 
 def test_inactive_repository_fails_before_model_selection(tmp_path) -> None:
@@ -251,14 +385,79 @@ def test_claimed_work_in_discussion_fails_closed(tmp_path) -> None:
     assert "claimed work" in " ".join(result.blockers)
 
 
-def test_maintainer_stop_request_in_discussion_fails_closed(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Please hold off; no PR is needed until the design is settled.",
+        "Please wait before opening a PR.",
+        "Please pause work on this until the design is approved.",
+        "We will not accept automated submissions.",
+        "AI-generated PRs will be closed.",
+        "No PR please.",
+        "Contributions are on hold.",
+        "Please avoid opening a PR.",
+        "Please refrain from opening a PR.",
+        "Hold off on implementing this.",
+        "We aren't accepting PRs right now.",
+        "We won't accept PRs right now.",
+        "No need to open a PR.",
+        "A PR is not needed.",
+        "No PRs at this time.",
+        "Contributions are no longer accepted.",
+        "LLM-generated PRs will be closed.",
+        "PRs will be closed.",
+        "Please don\u2019t open a PR.",
+        "We're not accepting PRs right now.",
+        "Contributions are no longer accepted because the project is archived.",
+        "We won\u2019t accept PRs.",
+        "This project is not accepting contributions.",
+        "We cannot accept PRs.",
+        "Please hold off for now.",
+        "Please wait until the design is approved.",
+        "Please wait to open a PR.",
+        "No more PRs.",
+        "No PRs, please.",
+        "PRs will be closed without review.",
+        "Please do not work on this issue.",
+        "You should not open a PR.",
+        "Please hold off until next week.",
+        "PRs will be closed \u2014 please use Discussions.",
+        "Don't implement this.",
+        "Let's not open a PR.",
+        "No new PRs.",
+        "PRs are not being accepted.",
+        "The project is not accepting PRs.",
+        "We have stopped accepting contributions.",
+        "We are currently not accepting PRs.",
+        "We are not currently accepting PRs.",
+        "We do not currently accept pull requests.",
+        "We are not accepting community contributions.",
+        "Please hold off on this issue for now.",
+        "Please hold off on a PR.",
+        "Hold off on PRs.",
+        "Do not open a PR yet.",
+        "PRs are temporarily on hold.",
+        "Do not open a PR for this issue.",
+        "No PR is needed for this issue.",
+        "Please do not submit patches for this issue.",
+        "We are already working on this.",
+        "External PRs are paused.",
+        "Please wait for maintainer direction before starting work.",
+        "The current policy says: \u201cDo not open a PR.\u201d",
+        (
+            "The old policy said: \u201cDo not open a PR.\u201d That was retired. "
+            "The current policy says: \u201cDo not submit patches for this issue.\u201d"
+        ),
+    ],
+)
+def test_maintainer_stop_request_in_discussion_fails_closed(tmp_path, body: str) -> None:
     config = AutocontributeConfig()
     service = DiscoveryService(config, FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
     issue = _issue(
         comments=1,
         discussion=[
             _comment(
-                body="Please hold off; no PR is needed until the design is settled.",
+                body=body,
                 author="maintainer",
                 association="MEMBER",
             )
@@ -274,10 +473,129 @@ def test_maintainer_stop_request_in_discussion_fails_closed(tmp_path) -> None:
     assert status.trigger_hash is not None
 
 
+def test_issue_description_stop_request_fails_closed_without_tripping_global_breaker(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    issue = _issue(
+        body=(
+            "This is a tracking issue with reproduction details and expected behavior. "
+            "Do not open a pull request until the design is approved."
+        )
+    )
+
+    result = service.evaluate(issue, _repository())
+
+    assert not result.eligible
+    assert "description asks contributors" in " ".join(result.blockers)
+    assert not service.store.circuit_breaker_status().is_tripped
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        (
+            "The old policy said: \u201cDo not open a PR.\u201d That policy has been removed "
+            "and pull requests are welcome."
+        ),
+        (
+            "Our documentation no longer says: \u201cNo PR is needed for this issue.\u201d "
+            "Contributions are welcome."
+        ),
+    ],
+)
+def test_retired_quoted_stop_policy_does_not_trip_global_breaker(
+    tmp_path,
+    body: str,
+) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    issue = _issue(
+        comments=1,
+        discussion=[_comment(body=body, author="maintainer", association="MEMBER")],
+    )
+
+    result = service.evaluate(issue, _repository())
+
+    assert result.eligible
+    assert not service.store.circuit_breaker_status().is_tripped
+
+
 @pytest.mark.parametrize(
     ("body", "author", "association"),
     [
         ("Please do not stop working on this fix.", "maintainer", "MEMBER"),
+        ("This change should stop the parser from crashing.", "maintainer", "MEMBER"),
+        ("Is this already being worked on?", "maintainer", "MEMBER"),
+        (
+            "Unless this is already being worked on, feel free to open a PR.",
+            "maintainer",
+            "MEMBER",
+        ),
+        (
+            "This should stop automated retries from exhausting the rate limit.",
+            "maintainer",
+            "MEMBER",
+        ),
+        (
+            "Automated inputs are not allowed to exceed 10 KiB.",
+            "maintainer",
+            "MEMBER",
+        ),
+        ("PRs are not accepted by this test helper.", "maintainer", "MEMBER"),
+        ("Do not hesitate to open a PR.", "maintainer", "MEMBER"),
+        ("Do not wait to open a PR.", "maintainer", "MEMBER"),
+        ("Don't forget to submit a PR.", "maintainer", "MEMBER"),
+        ("Do not close this PR.", "maintainer", "MEMBER"),
+        ("Do not block pull requests from forks.", "maintainer", "MEMBER"),
+        (
+            "Wait for pull requests to finish CI before merging.",
+            "maintainer",
+            "MEMBER",
+        ),
+        ("Pull requests without tests are not accepted.", "maintainer", "MEMBER"),
+        (
+            "Contributions are not allowed to modify generated files.",
+            "maintainer",
+            "MEMBER",
+        ),
+        ("Wait before opening the output file.", "maintainer", "MEMBER"),
+        ("Do not open a PR without tests.", "maintainer", "MEMBER"),
+        (
+            "Hold off on submitting the form until validation finishes.",
+            "maintainer",
+            "MEMBER",
+        ),
+        ("Please hold off on PRs without tests.", "maintainer", "MEMBER"),
+        ("Do not submit PRs that lack a regression test.", "maintainer", "MEMBER"),
+        ("Never open a PR against main; use develop.", "maintainer", "MEMBER"),
+        (
+            "Do not send automated PRs more than once a day.",
+            "maintainer",
+            "MEMBER",
+        ),
+        (
+            "We are not currently accepting PRs that lack tests.",
+            "maintainer",
+            "MEMBER",
+        ),
+        (
+            "PRs are temporarily on hold while this test fixture runs.",
+            "maintainer",
+            "MEMBER",
+        ),
+        ("This is not already being worked on.", "maintainer", "MEMBER"),
+        (
+            "This was already worked on in v1, but the regression is back and a new PR is welcome.",
+            "maintainer",
+            "MEMBER",
+        ),
+        ("Do not open a PR before running the tests.", "maintainer", "MEMBER"),
+        ("Never submit a PR before filing an issue.", "maintainer", "MEMBER"),
+        (
+            "Do not create a PR because the test fixture already does so.",
+            "maintainer",
+            "MEMBER",
+        ),
         ("Please hold off; no PR is needed.", "helper[bot]", "MEMBER"),
         ("Please hold off; no PR is needed.", "drive-by", "CONTRIBUTOR"),
     ],
