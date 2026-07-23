@@ -360,11 +360,14 @@ daemon start, leaving 30 seconds beyond the user unit's respective 90- and 120-s
 attestations, and the release preflights with several minutes of margin. Its three-minute stop
 ceiling likewise exceeds the cleanup client's 120-second wait plus ten-second kill grace.
 
-The user unit intentionally avoids systemd filesystem and namespace sandbox directives. In a user
-manager those directives introduce an outer user namespace that prevents `newuidmap` from mapping
-the account's subordinate IDs. The daemon remains unprivileged; the root-owned system proxy and
-unit/config paths provide the control boundary. Worker and doctor retain their stricter system-unit
-sandboxes and `ProtectHome=yes`, so they cannot reach the user bus below `/run/user`.
+The user unit intentionally avoids systemd filesystem, namespace, capability, security-label, and
+seccomp sandbox directives. In a user manager the filesystem and namespace directives introduce an
+outer user namespace, while seccomp directives such as `SystemCallArchitectures=` implicitly set
+`NoNewPrivileges`. Capability, secure-bit, and security-label controls can likewise remove or
+confine the privilege transition required by the setuid `newuidmap` and `newgidmap` helpers. The
+daemon remains unprivileged; the root-owned system proxy and unit/config paths provide the control
+boundary. Worker and doctor retain their stricter system-unit sandboxes and `ProtectHome=yes`, so
+they cannot reach the user bus below `/run/user`.
 
 Create the root-owned daemon configuration at its dedicated system path before the first start. The
 reference configuration pins the storage driver exercised by the production-topology integration;
@@ -867,9 +870,10 @@ CI also parses all nine system units and the protected user unit with systemd 25
 and fails on parser warnings. It performs an offline security assessment of the six system services,
 with an exposure ceiling of 4.0 for the networked worker and doctor and 3.0 for the private-network
 backup, health, failure, and rootless-Docker proxy units. The user daemon is deliberately assessed
-separately because namespace-style sandbox directives would break subordinate-ID mapping. These are
-regression ceilings, not a substitute for reviewing the full report or validating the installed
-units against the target host's systemd version.
+separately because filesystem/mount, namespace, capability, security-label, and seccomp sandbox
+directives can break subordinate-ID mapping. These are regression ceilings, not a substitute for
+reviewing the full report or validating the installed units against the target host's systemd
+version.
 
 ```bash
 sudo systemd-analyze verify \

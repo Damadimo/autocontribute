@@ -159,7 +159,7 @@
     {
       "source_path": "deploy/systemd/user/autocontribute-rootless-docker-daemon.service",
       "installed_path": "/etc/systemd/user/autocontribute-rootless-docker-daemon.service",
-      "sha256": "3bd3bb29cf75b1668aeb12bc864ae39494aa2c6ae6449986b41c72e9c6532b47",
+      "sha256": "4e9224da85eca9662f2dfa1a0a265cc70af03321ff773c34e9ddedbc80728605",
       "mode": "0644",
       "required": true
     }

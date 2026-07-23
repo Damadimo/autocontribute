@@ -703,6 +703,11 @@ jobs:
             --property=MainPID --value)"
           [[ "$proxy_pid_before" =~ ^[1-9][0-9]*$ ]]
           [[ "$daemon_pid_before" =~ ^[1-9][0-9]*$ ]]
+          daemon_no_new_privileges="$(sudo sed -n \
+            's/^NoNewPrivs:[[:space:]]*//p' \
+            "/proc/${daemon_pid_before}/status")"
+          test "$daemon_no_new_privileges" = 0
+          unset daemon_no_new_privileges
           sudo systemctl reload "$system_unit"
           sudo systemctl is-active --quiet "$system_unit"
           test "$(sudo systemctl show "$system_unit" \

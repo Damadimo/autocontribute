@@ -3252,22 +3252,45 @@ def test_rootless_docker_system_service_supervises_attested_user_daemon() -> Non
         .read_text(encoding="utf-8")
         .splitlines()
     )
-    namespace_directive_prefixes = (
-        "PrivateTmp=",
-        "PrivateDevices=",
+    incompatible_sandbox_directive_prefixes = (
+        "AmbientCapabilities=",
+        "CapabilityBoundingSet=",
+        "DynamicUser=",
+        "NoNewPrivileges=",
+        "SecureBits=",
+        "LockPersonality=",
+        "MemoryDenyWriteExecute=",
+        "Private",
+        "ProcSubset=",
         "Protect",
+        "Restrict",
+        "SystemCall",
+        "NetworkNamespacePath=",
+        "IPCNamespacePath=",
+        "JoinsNamespaceOf=",
+        "LogNamespace=",
         "ReadOnlyPaths=",
         "ReadWritePaths=",
         "InaccessiblePaths=",
+        "ReadOnlyDirectories=",
+        "ReadWriteDirectories=",
+        "InaccessibleDirectories=",
         "ExecPaths=",
         "NoExecPaths=",
         "BindPaths=",
         "BindReadOnlyPaths=",
         "TemporaryFileSystem=",
-        "RootDirectory=",
-        "RootImage=",
+        "Root",
+        "Mount",
+        "Extension",
+        "AppArmorProfile=",
+        "SELinuxContext=",
+        "SmackProcessLabel=",
     )
-    assert not any(line.startswith(namespace_directive_prefixes) for line in user_unit_lines)
+    assert not any(
+        line.lstrip().startswith(incompatible_sandbox_directive_prefixes)
+        for line in user_unit_lines
+    )
 
 
 def test_rootless_docker_user_manager_policy_is_fixed_and_delegated() -> None:

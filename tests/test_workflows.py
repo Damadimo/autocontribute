@@ -694,6 +694,8 @@ def test_security_integration_exercises_rootful_and_rootless_resource_boundaries
     assert '"${user_systemctl[@]}" is-active --quiet "$user_unit"' in script
     assert 'proxy_pid_before="$(sudo systemctl show "$system_unit"' in script
     assert 'daemon_pid_before="$("${user_systemctl[@]}" show "$user_unit"' in script
+    assert '"/proc/${daemon_pid_before}/status"' in script
+    assert 'test "$daemon_no_new_privileges" = 0' in script
     reload_command = 'sudo systemctl reload "$system_unit"'
     docker_probe = '"${service_env[@]}" docker info >/dev/null'
     assert script.count(reload_command) == 1

@@ -29,7 +29,6 @@ TasksMax=infinity
 LimitNOFILE=infinity
 LimitNPROC=infinity
 LimitCORE=infinity
-SystemCallArchitectures=native
 
 StandardOutput=journal
 StandardError=journal
