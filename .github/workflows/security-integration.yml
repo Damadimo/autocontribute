@@ -95,6 +95,11 @@ jobs:
                 DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${service_uid}/bus" \
                 journalctl --user --no-pager -n 200 -u "$user_unit" \
                 2>/dev/null || true
+              sudo journalctl --no-pager --full -n 200 \
+                "_SYSTEMD_USER_UNIT=$user_unit" 2>/dev/null || true
+              sudo journalctl --no-pager --full -n 200 \
+                SYSLOG_IDENTIFIER=autocontribute-rootless-dockerd \
+                2>/dev/null || true
             fi
           }
 

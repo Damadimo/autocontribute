@@ -714,6 +714,8 @@ def test_security_integration_exercises_rootful_and_rootless_resource_boundaries
     assert 'test "$cgroup_driver" != none' in script
     assert "cleanup_rootless_job" in script
     assert "--signal=KILL" in script
+    assert '"_SYSTEMD_USER_UNIT=$user_unit"' in script
+    assert "SYSLOG_IDENTIFIER=autocontribute-rootless-dockerd" in script
     assert "fixture_preflight_complete=0" in script
     assert "manager_drop_in_preflight_complete=0" in script
     assert "service_home_created=0" in script
