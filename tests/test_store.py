@@ -21,7 +21,13 @@ from autocontribute.lifecycle import (
     PullRequestLifecycleSnapshot,
     parse_lifecycle_snapshot_json,
 )
-from autocontribute.store import CURRENT_SCHEMA_VERSION, CandidateAttemptState, RunStore
+from autocontribute.store import (
+    CURRENT_SCHEMA_VERSION,
+    CandidateAttemptDisposition,
+    CandidateAttemptState,
+    CandidateRetryAuthorization,
+    RunStore,
+)
 
 
 def test_required_storage_root_binds_store_to_verified_mount(
@@ -181,6 +187,8 @@ def _downgrade_current_database_to_v6(database: Path) -> None:
         connection.execute("PRAGMA journal_mode = DELETE")
         connection.executescript(
             """
+            DROP TABLE candidate_retry_authorizations;
+            DROP INDEX runs_active_candidate_idx;
             DROP INDEX runs_candidate_revision_idx;
             ALTER TABLE runs DROP COLUMN issue_revision;
             UPDATE schema_metadata SET schema_version = 6 WHERE singleton = 1;
@@ -382,6 +390,82 @@ def _append_lifecycle_snapshot_event(
     )
 
 
+def _rewrite_tail_event_details(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    event_type: str,
+    details: dict[str, str],
+) -> None:
+    """Tamper with a tail event while preserving a structurally valid hash chain."""
+
+    row = connection.execute(
+        """
+        SELECT id, occurred_at, previous_hash FROM events
+        WHERE run_id = ? AND event_type = ? ORDER BY id DESC LIMIT 1
+        """,
+        (run_id, event_type),
+    ).fetchone()
+    assert row is not None
+    tail = connection.execute(
+        "SELECT id FROM events WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    assert tail == (row[0],)
+    details_json = json.dumps(details, sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(
+        {
+            "run_id": run_id,
+            "occurred_at": row[1],
+            "event_type": event_type,
+            "details": details_json,
+            "previous_hash": row[2],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    event_hash = hashlib.sha256(payload.encode()).hexdigest()
+    connection.execute(
+        "UPDATE events SET details_json = ?, event_hash = ? WHERE id = ?",
+        (details_json, event_hash, row[0]),
+    )
+    connection.execute(
+        "UPDATE runs SET event_head_hash = ? WHERE run_id = ?",
+        (event_hash, run_id),
+    )
+
+
+def _delete_tail_event(
+    connection: sqlite3.Connection,
+    *,
+    run_id: str,
+    event_type: str,
+) -> None:
+    """Remove a tail event while preserving the run's structural ledger anchor."""
+
+    row = connection.execute(
+        """
+        SELECT id, previous_hash FROM events
+        WHERE run_id = ? AND event_type = ? ORDER BY id DESC LIMIT 1
+        """,
+        (run_id, event_type),
+    ).fetchone()
+    assert row is not None
+    tail = connection.execute(
+        "SELECT id FROM events WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    assert tail == (row[0],)
+    connection.execute("DELETE FROM events WHERE id = ?", (row[0],))
+    connection.execute(
+        """
+        UPDATE runs SET event_count = event_count - 1, event_head_hash = ?
+        WHERE run_id = ?
+        """,
+        (row[1], run_id),
+    )
+
+
 def _reserve_gate(
     store: RunStore,
     run: RunManifest,
@@ -441,9 +525,20 @@ def _candidate_run(
     status: RunStatus = RunStatus.QUEUED,
 ) -> RunManifest:
     run = store.create_run()
+    _set_status(store, run, RunStatus.DISCOVERING)
     run.candidate = candidate or _issue_candidate()
-    run.status = status
-    store.save(run, event="test.candidate.persisted", details={"status": status.value})
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        f"candidate-fixture-{run.run_id}",
+        ttl=timedelta(minutes=5),
+    )
+    assert lease is not None
+    try:
+        store.claim_candidate(run, lease=lease)
+    finally:
+        assert store.release_lease(lease.name, lease.owner, lease.generation)
+    if status is not RunStatus.DISCOVERING:
+        _set_status(store, run, status)
     return run
 
 
@@ -452,11 +547,23 @@ def _publication_run(
     *,
     status: RunStatus = RunStatus.APPROVED,
     repository: str = "example/project",
+    number: int = 42,
 ) -> RunManifest:
     run = store.create_run(deployment_fingerprint="d" * 64)
-    run.candidate = _issue_candidate(repository=repository)
-    run.status = status
-    store.save(run, event="test.publication_ready", details={"status": status.value})
+    _set_status(store, run, RunStatus.DISCOVERING)
+    run.candidate = _issue_candidate(repository=repository, number=number)
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        f"publication-fixture-{run.run_id}",
+        ttl=timedelta(minutes=5),
+    )
+    assert lease is not None
+    try:
+        store.claim_candidate(run, lease=lease)
+    finally:
+        assert store.release_lease(lease.name, lease.owner, lease.generation)
+    if status is not RunStatus.DISCOVERING:
+        _set_status(store, run, status)
     return run
 
 
@@ -794,6 +901,28 @@ def test_fresh_database_has_current_version_and_all_v7_tables(tmp_path: Path) ->
         revision_index = connection.execute(
             "PRAGMA index_info(runs_candidate_revision_idx)"
         ).fetchall()
+        revision_index_xinfo = connection.execute(
+            "PRAGMA index_xinfo(runs_candidate_revision_idx)"
+        ).fetchall()
+        run_indexes = {
+            row[1]: row for row in connection.execute("PRAGMA index_list(runs)").fetchall()
+        }
+        index_sql = {
+            row[0]: row[1]
+            for row in connection.execute(
+                """
+                SELECT name, sql FROM sqlite_master
+                WHERE type = 'index'
+                    AND name IN ('runs_candidate_revision_idx', 'runs_active_candidate_idx')
+                """
+            )
+        }
+        authorization_columns = [
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(candidate_retry_authorizations)"
+            ).fetchall()
+        ]
 
     assert store.schema_version == CURRENT_SCHEMA_VERSION == 7
     assert "issue_revision" in run_columns
@@ -802,6 +931,29 @@ def test_fresh_database_has_current_version_and_all_v7_tables(tmp_path: Path) ->
         "issue_number",
         "issue_revision",
         "status",
+    ]
+    assert [row[4] for row in revision_index_xinfo if row[5]] == [
+        "NOCASE",
+        "BINARY",
+        "BINARY",
+        "BINARY",
+    ]
+    assert run_indexes["runs_active_candidate_idx"][2] == 1
+    assert run_indexes["runs_active_candidate_idx"][4] == 1
+    assert "repository COLLATE NOCASE" in index_sql["runs_candidate_revision_idx"]
+    assert "repository COLLATE NOCASE" in index_sql["runs_active_candidate_idx"]
+    assert "WHERE issue_number IS NOT NULL" in index_sql["runs_active_candidate_idx"]
+    assert authorization_columns == [
+        "authorization_id",
+        "run_id",
+        "repository",
+        "issue_number",
+        "issue_revision",
+        "prior_run_id",
+        "prior_status",
+        "actor",
+        "reason",
+        "authorized_at",
     ]
     assert tables == {
         "schema_metadata",
@@ -815,6 +967,7 @@ def test_fresh_database_has_current_version_and_all_v7_tables(tmp_path: Path) ->
         "publication_reservations",
         "publication_gate_holds",
         "manifest_artifact_sync",
+        "candidate_retry_authorizations",
     }
 
 
@@ -930,6 +1083,87 @@ def test_v6_migration_rejects_candidate_row_identity_tampering(
         }
 
 
+def test_v6_migration_rejects_duplicate_active_candidate_attempts_transactionally(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = RunStore(root)
+    first = _candidate_run(
+        store,
+        candidate=_issue_candidate(number=41),
+        status=RunStatus.QUEUED,
+    )
+    second = _candidate_run(
+        store,
+        candidate=_issue_candidate(number=42),
+        status=RunStatus.QUEUED,
+    )
+    assert first.candidate is not None
+    _downgrade_current_database_to_v6(store.database_path)
+    second.candidate = first.candidate.model_copy(deep=True)
+    with closing(sqlite3.connect(store.database_path)) as connection:
+        connection.execute(
+            """
+            UPDATE runs SET repository = ?, issue_number = ?, manifest_json = ?
+            WHERE run_id = ?
+            """,
+            (
+                second.candidate.repository,
+                second.candidate.number,
+                second.model_dump_json(),
+                second.run_id,
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(StateError, match="duplicate active attempts"):
+        RunStore(root)
+
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
+        ).fetchone() == (6,)
+        assert "issue_revision" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(runs)")
+        }
+        assert connection.execute(
+            """
+            SELECT count(*) FROM sqlite_master
+            WHERE name IN (
+                'candidate_retry_authorizations',
+                'runs_candidate_revision_idx',
+                'runs_active_candidate_idx'
+            )
+            """
+        ).fetchone() == (0,)
+
+
+def test_candidate_history_lookup_uses_nocase_revision_index(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    run = _candidate_run(store, status=RunStatus.SKIPPED)
+    assert run.candidate is not None
+
+    with sqlite3.connect(store.database_path) as connection:
+        plan = connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
+            FROM runs
+            WHERE run_id <> ? AND repository = ? COLLATE NOCASE
+                AND issue_number = ?
+            ORDER BY run_id ASC LIMIT ?
+            """,
+            ("other-run", run.candidate.repository.upper(), run.candidate.number, 10_001),
+        ).fetchall()
+
+    assert any("USING INDEX runs_candidate_revision_idx" in row[3] for row in plan)
+    disposition = store.candidate_attempt_disposition(
+        run.candidate.model_copy(update={"repository": run.candidate.repository.upper()})
+    )
+    assert disposition.state is CandidateAttemptState.SUPPRESSED
+    assert disposition.prior_run_id == run.run_id
+
+
 def test_save_persists_issue_revision_and_rejects_candidate_evidence_replacement(
     tmp_path: Path,
 ) -> None:
@@ -957,6 +1191,11 @@ def test_save_persists_issue_revision_and_rejects_candidate_evidence_replacement
             "SELECT issue_revision FROM runs WHERE run_id = ?",
             (run.run_id,),
         ).fetchone() == (first_revision,)
+    reopened_after_reranking = RunStore(store.root)
+    reranked = reopened_after_reranking.get(run.run_id)
+    assert reranked.candidate is not None
+    assert reranked.candidate.score == 99
+    assert reranked.candidate.score_evidence == {"ranking": "refreshed"}
 
     run.candidate = run.candidate.model_copy(update={"title": "Fix the exact parser bug"})
     replacement_revision = compute_issue_revision(run.candidate)
@@ -973,6 +1212,102 @@ def test_save_persists_issue_revision_and_rejects_candidate_evidence_replacement
     assert persisted.candidate is not None
     assert persisted.candidate.title == "Fix the exact bug"
     assert persisted.candidate.score == 99
+
+
+@pytest.mark.parametrize(
+    "status",
+    (
+        RunStatus.FAILED,
+        RunStatus.SKIPPED,
+        RunStatus.REJECTED,
+        RunStatus.CANCELLED,
+    ),
+)
+def test_save_cannot_attach_first_candidate_in_released_status(
+    tmp_path: Path,
+    status: RunStatus,
+) -> None:
+    store = RunStore(tmp_path / status.value)
+    run = store.create_run()
+    original_updated_at = run.updated_at
+    original_events = store.events(run.run_id)
+    run.candidate = _issue_candidate()
+    run.status = status
+
+    with pytest.raises(StateError, match="must be persisted through claim_candidate"):
+        store.save(
+            run,
+            event="test.direct_candidate_attachment",
+            details={"status": status.value},
+        )
+
+    assert run.updated_at == original_updated_at
+    persisted = store.get(run.run_id)
+    assert persisted.status is RunStatus.QUEUED
+    assert persisted.candidate is None
+    assert store.events(run.run_id) == original_events
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute(
+            """
+            SELECT repository, issue_number, issue_revision, updated_at
+            FROM runs WHERE run_id = ?
+            """,
+            (run.run_id,),
+        ).fetchone() == (None, None, None, original_updated_at.isoformat())
+        assert connection.execute(
+            """
+            SELECT count(*) FROM events
+            WHERE run_id = ? AND event_type = 'test.direct_candidate_attachment'
+            """,
+            (run.run_id,),
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT count(*) FROM manifest_artifact_sync WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone() == (0,)
+
+
+def test_pr_open_transition_and_save_reject_semantic_candidate_mutation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = RunStore(root)
+    run = _publication_run(store)
+    _begin_publication(store, run)
+    original_candidate = run.candidate
+    assert original_candidate is not None
+    original_updated_at = run.updated_at
+    run.candidate = original_candidate.model_copy(
+        update={"title": "Semantically tampered issue title"}
+    )
+
+    with pytest.raises(StateError, match="candidate evidence changed after selection"):
+        store.transition(run, RunStatus.PR_OPEN, reason="pull request created")
+
+    assert run.status is RunStatus.SUBMITTING
+    assert run.updated_at == original_updated_at
+    assert store.get(run.run_id).candidate == original_candidate
+    assert store.publication_gate_hold(run.run_id) is not None
+
+    run.candidate = original_candidate
+    store.transition(run, RunStatus.PR_OPEN, reason="pull request created")
+    pr_open_updated_at = run.updated_at
+    run.candidate = original_candidate.model_copy(
+        update={"body": "Semantically tampered issue body"}
+    )
+    with pytest.raises(StateError, match="candidate evidence changed after selection"):
+        store.save(run, event="test.pr_open.candidate_tampered", details={})
+
+    assert run.status is RunStatus.PR_OPEN
+    assert run.updated_at == pr_open_updated_at
+    run.candidate = original_candidate
+    store.save(run, event="test.pr_open.candidate_unchanged", details={})
+
+    reopened = RunStore(root)
+    persisted = reopened.get(run.run_id)
+    assert persisted.status is RunStatus.PR_OPEN
+    assert persisted.candidate == original_candidate
+    reopened.verify_event_chains(run_id=run.run_id)
 
 
 @pytest.mark.parametrize("tamper", ("revision", "manifest"))
@@ -1005,6 +1340,149 @@ def test_restore_snapshot_rejects_issue_revision_tampering(
     target = tmp_path / "target"
 
     with pytest.raises(StateError, match="issue revision"):
+        RunStore.restore_snapshot(target, snapshot)
+
+    assert not (target / "state.sqlite3").exists()
+
+
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    (
+        ("authorization", "override disagrees with its authorization"),
+        ("malformed_authorization", "authorization has an invalid identity"),
+        ("override", "override disagrees with its authorization"),
+        ("orphan_authorization", "exactly one candidate retry override event"),
+        ("orphan_override", "lacks durable authorization"),
+    ),
+)
+def test_restore_snapshot_rejects_tampered_or_orphaned_candidate_retry_evidence(
+    tmp_path: Path,
+    tamper: str,
+    message: str,
+) -> None:
+    source = RunStore(tmp_path / "source")
+    candidate = _issue_candidate()
+    _candidate_run(source, candidate=candidate, status=RunStatus.REJECTED)
+    retry = source.create_run()
+    _set_status(source, retry, RunStatus.DISCOVERING)
+    retry.candidate = candidate.model_copy(deep=True)
+    lease = source.acquire_lease(
+        "autocontribute.run",
+        "snapshot-retry-worker",
+        ttl=timedelta(minutes=5),
+    )
+    assert lease is not None
+    try:
+        source.claim_candidate(
+            retry,
+            lease=lease,
+            retry_authorization=CandidateRetryAuthorization(
+                actor="octocat",
+                reason="Retry authorized for integrity testing.",
+            ),
+        )
+    finally:
+        assert source.release_lease(lease.name, lease.owner, lease.generation)
+    snapshot = source.create_snapshot(tmp_path / "backup" / f"{tamper}.sqlite3")
+
+    with closing(sqlite3.connect(snapshot)) as connection:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        if tamper == "authorization":
+            connection.execute(
+                """
+                UPDATE candidate_retry_authorizations SET actor = 'mallory'
+                WHERE run_id = ?
+                """,
+                (retry.run_id,),
+            )
+        elif tamper == "malformed_authorization":
+            connection.execute(
+                """
+                UPDATE candidate_retry_authorizations
+                SET repository = 'invalid-without-slash'
+                WHERE run_id = ?
+                """,
+                (retry.run_id,),
+            )
+        elif tamper == "override":
+            event = next(
+                event
+                for event in source.events(retry.run_id)
+                if event["event_type"] == "candidate.retry_override"
+            )
+            details = json.loads(event["details"])
+            details["reason"] = "Tampered override reason."
+            _rewrite_tail_event_details(
+                connection,
+                run_id=retry.run_id,
+                event_type="candidate.retry_override",
+                details=details,
+            )
+        elif tamper == "orphan_authorization":
+            _delete_tail_event(
+                connection,
+                run_id=retry.run_id,
+                event_type="candidate.retry_override",
+            )
+        else:
+            connection.execute(
+                "DELETE FROM candidate_retry_authorizations WHERE run_id = ?",
+                (retry.run_id,),
+            )
+        connection.commit()
+
+    target = tmp_path / f"target-{tamper}"
+    with pytest.raises(StateError, match=message):
+        RunStore.restore_snapshot(target, snapshot)
+
+    assert not (target / "state.sqlite3").exists()
+
+
+def test_restore_snapshot_rejects_semantically_tampered_candidate_selection(
+    tmp_path: Path,
+) -> None:
+    source = RunStore(tmp_path / "source")
+    run = _candidate_run(source, status=RunStatus.DISCOVERING)
+    snapshot = source.create_snapshot(tmp_path / "backup" / "selection.sqlite3")
+    event = next(
+        event for event in source.events(run.run_id) if event["event_type"] == "candidate.selected"
+    )
+    details = json.loads(event["details"])
+    details["issue"] = "example/other#999"
+    with closing(sqlite3.connect(snapshot)) as connection:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        _rewrite_tail_event_details(
+            connection,
+            run_id=run.run_id,
+            event_type="candidate.selected",
+            details=details,
+        )
+        connection.commit()
+    target = tmp_path / "target"
+
+    with pytest.raises(StateError, match="candidate selection disagrees"):
+        RunStore.restore_snapshot(target, snapshot)
+
+    assert not (target / "state.sqlite3").exists()
+
+
+def test_restore_snapshot_rejects_candidate_without_selection_provenance(
+    tmp_path: Path,
+) -> None:
+    source = RunStore(tmp_path / "source")
+    run = _candidate_run(source, status=RunStatus.DISCOVERING)
+    snapshot = source.create_snapshot(tmp_path / "backup" / "missing-selection.sqlite3")
+    with closing(sqlite3.connect(snapshot)) as connection:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        _delete_tail_event(
+            connection,
+            run_id=run.run_id,
+            event_type="candidate.selected",
+        )
+        connection.commit()
+    target = tmp_path / "target"
+
+    with pytest.raises(StateError, match="candidate evidence without selection provenance"):
         RunStore.restore_snapshot(target, snapshot)
 
     assert not (target / "state.sqlite3").exists()
@@ -1719,6 +2197,229 @@ def test_open_pull_request_remains_an_active_candidate(tmp_path: Path) -> None:
     assert store.has_active_candidate("example/project", 7) is False
 
 
+def test_concurrent_candidate_claims_have_exactly_one_active_winner(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    candidate = _issue_candidate()
+    runs = [store.create_run(), store.create_run()]
+    for run in runs:
+        _set_status(store, run, RunStatus.DISCOVERING)
+        run.candidate = candidate.model_copy(deep=True)
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        "concurrent-claim-worker",
+        ttl=timedelta(minutes=5),
+    )
+    assert lease is not None
+    barrier = threading.Barrier(2)
+
+    def claim(run: RunManifest) -> CandidateAttemptDisposition | StateError:
+        barrier.wait()
+        try:
+            return store.claim_candidate(run, lease=lease)
+        except StateError as exc:
+            return exc
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(claim, runs))
+    finally:
+        assert store.release_lease(lease.name, lease.owner, lease.generation)
+
+    winners = [result for result in results if not isinstance(result, StateError)]
+    losers = [result for result in results if isinstance(result, StateError)]
+    assert len(winners) == len(losers) == 1
+    assert isinstance(winners[0], CandidateAttemptDisposition)
+    assert winners[0].state is CandidateAttemptState.AVAILABLE
+    assert "already has active run" in str(losers[0])
+    with sqlite3.connect(store.database_path) as connection:
+        active = connection.execute(
+            """
+            SELECT run_id FROM runs
+            WHERE repository = ? COLLATE NOCASE AND issue_number = ?
+                AND status NOT IN ('cancelled', 'failed', 'rejected', 'skipped')
+            """,
+            (candidate.repository, candidate.number),
+        ).fetchall()
+        selections = connection.execute(
+            "SELECT count(*) FROM events WHERE event_type = 'candidate.selected'"
+        ).fetchone()
+    assert len(active) == 1
+    assert selections == (1,)
+    persisted = [store.get(run.run_id) for run in runs]
+    assert sum(run.candidate is not None for run in persisted) == 1
+    store.verify_event_chains()
+
+
+def test_candidate_claim_rejects_wrong_and_stale_lease_generations(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    _set_status(store, run, RunStatus.DISCOVERING)
+    run.candidate = _issue_candidate()
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        "first-claim-worker",
+        ttl=timedelta(minutes=5),
+    )
+    assert lease is not None
+    original_updated_at = run.updated_at
+    with sqlite3.connect(store.database_path) as connection:
+        original_row = connection.execute(
+            "SELECT updated_at, manifest_json FROM runs WHERE run_id = ?",
+            (run.run_id,),
+        ).fetchone()
+
+    with pytest.raises(StateError, match="lease ownership was lost"):
+        store.claim_candidate(run, lease=replace(lease, generation=lease.generation + 1))
+    assert run.updated_at == original_updated_at
+    assert store.get(run.run_id).candidate is None
+
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE leases SET expires_at = ? WHERE lease_name = ?",
+            (datetime(2000, 1, 1, tzinfo=UTC).isoformat(), lease.name),
+        )
+    with pytest.raises(StateError, match="lease ownership was lost"):
+        store.claim_candidate(run, lease=lease)
+    assert run.updated_at == original_updated_at
+    assert store.get(run.run_id).candidate is None
+    with sqlite3.connect(store.database_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT updated_at, manifest_json FROM runs WHERE run_id = ?",
+                (run.run_id,),
+            ).fetchone()
+            == original_row
+        )
+
+    assert store.release_lease(lease.name, lease.owner, lease.generation)
+    current = store.acquire_lease(
+        "autocontribute.run",
+        "second-claim-worker",
+        ttl=timedelta(minutes=5),
+    )
+    assert current is not None
+    assert current.generation == lease.generation + 1
+    try:
+        with pytest.raises(StateError, match="lease ownership was lost"):
+            store.claim_candidate(run, lease=lease)
+        assert run.updated_at == original_updated_at
+        assert store.get(run.run_id).candidate is None
+
+        disposition = store.claim_candidate(run, lease=current)
+    finally:
+        assert store.release_lease(current.name, current.owner, current.generation)
+
+    assert disposition.state is CandidateAttemptState.AVAILABLE
+    assert store.get(run.run_id).candidate == run.candidate
+
+
+def test_unchanged_suppressed_candidate_claim_requires_atomic_retry_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    candidate = _issue_candidate()
+    prior = _candidate_run(store, candidate=candidate, status=RunStatus.SKIPPED)
+    retry = store.create_run()
+    _set_status(store, retry, RunStatus.DISCOVERING)
+    retry.candidate = candidate.model_copy(deep=True)
+    lease = store.acquire_lease(
+        "autocontribute.run",
+        "authorized-retry-worker",
+        ttl=timedelta(minutes=5),
+    )
+    assert lease is not None
+    authorization = CandidateRetryAuthorization(
+        actor="octocat",
+        reason="Maintainer supplied explicit retry approval.",
+    )
+    original_append = store._append_event
+    try:
+        with pytest.raises(StateError, match="requires explicit retry authorization"):
+            store.claim_candidate(retry, lease=lease)
+
+        def fail_override_append(*_args: object, **_kwargs: object) -> None:
+            raise StateError("injected retry override append failure")
+
+        monkeypatch.setattr(store, "_append_event", fail_override_append)
+        with pytest.raises(StateError, match="injected retry override append failure"):
+            store.claim_candidate(
+                retry,
+                lease=lease,
+                retry_authorization=authorization,
+            )
+        monkeypatch.setattr(store, "_append_event", original_append)
+        with sqlite3.connect(store.database_path) as connection:
+            assert connection.execute(
+                "SELECT count(*) FROM candidate_retry_authorizations"
+            ).fetchone() == (0,)
+            assert connection.execute(
+                """
+                SELECT repository, issue_number, issue_revision FROM runs
+                WHERE run_id = ?
+                """,
+                (retry.run_id,),
+            ).fetchone() == (None, None, None)
+            assert connection.execute(
+                """
+                SELECT count(*) FROM events
+                WHERE run_id = ? AND event_type = 'candidate.retry_override'
+                """,
+                (retry.run_id,),
+            ).fetchone() == (0,)
+
+        disposition = store.claim_candidate(
+            retry,
+            lease=lease,
+            retry_authorization=authorization,
+        )
+    finally:
+        monkeypatch.setattr(store, "_append_event", original_append)
+        assert store.release_lease(lease.name, lease.owner, lease.generation)
+
+    assert disposition.state is CandidateAttemptState.SUPPRESSED
+    assert disposition.prior_run_id == prior.run_id
+    assert disposition.prior_status is RunStatus.SKIPPED
+    revision = compute_issue_revision(candidate)
+    with sqlite3.connect(store.database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT authorization_id, run_id, repository, issue_number, issue_revision,
+                   prior_run_id, prior_status, actor, reason, authorized_at
+            FROM candidate_retry_authorizations
+            """
+        ).fetchone()
+    assert row is not None
+    assert len(row[0]) == 32 and set(row[0]) <= set("0123456789abcdef")
+    assert row[1:9] == (
+        retry.run_id,
+        candidate.repository,
+        candidate.number,
+        revision,
+        prior.run_id,
+        RunStatus.SKIPPED.value,
+        authorization.actor,
+        authorization.reason,
+    )
+    assert datetime.fromisoformat(row[9]).tzinfo is not None
+    override = next(
+        event
+        for event in store.events(retry.run_id)
+        if event["event_type"] == "candidate.retry_override"
+    )
+    assert json.loads(override["details"]) == {
+        "actor": authorization.actor,
+        "authorization_id": row[0],
+        "issue": candidate.reference,
+        "issue_revision": revision,
+        "prior_run_id": prior.run_id,
+        "prior_status": RunStatus.SKIPPED.value,
+        "reason": authorization.reason,
+    }
+    assert store.get(retry.run_id).candidate == candidate
+    store.verify_event_chains()
+
+
 @pytest.mark.parametrize(
     ("status", "expected_state"),
     (
@@ -1945,7 +2646,7 @@ def test_begin_publication_recovers_complete_legacy_submitting_intent_but_reject
             (incomplete.run_id,),
         ).fetchone() == (0,)
 
-    legacy = _publication_run(store)
+    legacy = _publication_run(store, number=43)
     legacy.branch_name = "autocontribute/fix-exact-bug"
     legacy.publication_draft = True
     legacy.publication_ready_for_review = False
