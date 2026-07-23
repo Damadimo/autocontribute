@@ -57,7 +57,7 @@ def _run_rootless_check(
     runtime_mode: str = "700",
     socket_owner: int | None = None,
     socket_group: int | None = None,
-    socket_mode: str = "660",
+    socket_mode: str = "1660",
     group_names: str = "autocontribute",
     docker_output: str = "name=seccomp\nname=rootless\nname=cgroupns\n",
     docker_exit: int = 0,
@@ -2300,7 +2300,10 @@ def test_rootless_docker_check_rejects_unsafe_metadata_before_probe(tmp_path: Pa
         ("runtime-mode", {"runtime_mode": "750"}),
         ("socket-owner", {"socket_owner": os.getuid() + 1}),
         ("socket-group", {"socket_group": os.getgid() + 1}),
-        ("socket-mode", {"socket_mode": "666"}),
+        ("socket-missing-sticky", {"socket_mode": "660"}),
+        ("socket-owner-only", {"socket_mode": "1600"}),
+        ("socket-other-access", {"socket_mode": "1666"}),
+        ("socket-unexpected-special-bit", {"socket_mode": "5660"}),
     )
     for name, overrides in cases:
         result, observed_environment = _run_rootless_check(

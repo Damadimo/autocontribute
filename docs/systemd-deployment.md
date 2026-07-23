@@ -87,12 +87,14 @@ controlling process.
 The sandbox daemon must be rootless and owned by the dedicated `autocontribute` account. Membership
 in the host `docker` group or use of `/var/run/docker.sock` would give the worker root-equivalent
 control and defeats this deployment boundary. Before either the worker or doctor reads a systemd
-credential, the wrapper verifies that `/run/autocontribute` is an unsymlinked `0700` directory owned by
-the service identity, that its Docker socket is owned by that identity with mode `0600` or `0660`,
-and that the account cannot use the host socket. It then makes bounded daemon probes, requires one
-exact `name=rootless` element in Docker's reported `SecurityOptions`, and verifies the exact bounded
-data root. A failed or ambiguous check stops the service before the wrapper reads or exports any
-credential.
+credential, the wrapper verifies that `/run/autocontribute` is an unsymlinked `0700` directory owned
+by the service identity, that its Docker socket is owned by that identity, and that the account
+cannot use the host socket. The supplied rootless topology requires exact socket mode `1660`: Docker
+creates the group-private `0660` socket and intentionally adds the sticky bit below
+`XDG_RUNTIME_DIR` so system cleanup does not remove it. The wrapper then makes bounded daemon probes,
+requires one exact `name=rootless` element in Docker's reported `SecurityOptions`, and verifies the
+exact bounded data root. A failed or ambiguous check stops the service before the wrapper reads or
+exports any credential.
 
 The Python sandbox repeats a structured daemon check immediately before every container launch and
 also requires cgroup v2, a non-`none` driver, and Docker-reported memory, swap, CPU-quota, and PID

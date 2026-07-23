@@ -132,7 +132,7 @@ readonly docker_socket_owner docker_socket_group docker_socket_mode
 if [[ "$docker_socket_owner" != "$UID" || "$docker_socket_group" != "$service_gid" ]]; then
   fail 'Autocontribute Docker socket is not owned by the service account'
 fi
-if [[ "$docker_socket_mode" != 600 && "$docker_socket_mode" != 660 ]]; then
+if [[ "$docker_socket_mode" != 1660 ]]; then
   fail 'Autocontribute Docker socket has unsafe permissions'
 fi
 
