@@ -66,11 +66,13 @@ validation:
         -exec clang-format --dry-run --Werror {} + &&
         /usr/local/cuda/bin/nvcc --version >/dev/null &&
         real_lldb="$(command -v lldb)" &&
+        mkdir -p build/autocontribute-tools &&
         printf "%s\n"
         "#!/bin/sh"
         "exec \"$real_lldb\" -o \"settings set target.disable-aslr false\" \"\$@\""
-        >/tmp/autocontribute-lldb &&
-        chmod 500 /tmp/autocontribute-lldb &&
+        >build/autocontribute-tools/lldb-no-aslr &&
+        chmod 500 build/autocontribute-tools/lldb-no-aslr &&
+        build/autocontribute-tools/lldb-no-aslr --version >/dev/null &&
         mkdir -p /tmp/autocontribute-catch2 &&
         printf "%s\n"
         "cmake_minimum_required(VERSION 3.21)"
@@ -92,7 +94,7 @@ validation:
         -DFETCHCONTENT_SOURCE_DIR_CATCH2=/tmp/autocontribute-catch2
         -DFETCHCONTENT_SOURCE_DIR_DLPACK=/tmp/autocontribute-dlpack
         -DLIBCUDACXX_GDB=/usr/local/cuda/bin/cuda-gdb
-        -DLIBCUDACXX_LLDB=/tmp/autocontribute-lldb
+        -DLIBCUDACXX_LLDB="$PWD/build/autocontribute-tools/lldb-no-aslr"
         -DLIBCUDACXX_ENABLE_GDB_TESTING=ON
         -DLIBCUDACXX_ENABLE_LLDB_TESTING=ON &&
         cmake --build --preset libcudacxx --target help >/tmp/autocontribute-target-help &&
