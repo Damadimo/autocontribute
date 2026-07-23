@@ -104,6 +104,23 @@ class PullRequestDetails:
 
 
 @dataclass(frozen=True, slots=True)
+class RepositoryIdentity:
+    """GitHub's immutable identity for a repository currently reachable by ``full_name``."""
+
+    full_name: str
+    database_id: int
+    node_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ForkIdentity:
+    """Immutable identities for a fork and the upstream repository GitHub reports as parent."""
+
+    repository: RepositoryIdentity
+    parent: RepositoryIdentity
+
+
+@dataclass(frozen=True, slots=True)
 class PullRequestReview:
     identifier: int
     author: str
@@ -432,6 +449,55 @@ class GitHubClient:
                 else None
             ),
         )
+
+    def get_repository_identity(self, full_name: str) -> RepositoryIdentity:
+        """Resolve an owner/name once to GitHub's immutable database and GraphQL identities."""
+
+        data = _mapping(
+            self._request("GET", f"/repos/{quote(full_name, safe='/')}"),
+            resource="repository identity",
+        )
+        return _parse_repository_identity(data, resource="repository identity")
+
+    def get_fork_identity(self, full_name: str) -> ForkIdentity:
+        """Resolve a fork and its parent to immutable identities in one API observation."""
+
+        data = _mapping(
+            self._request("GET", f"/repos/{quote(full_name, safe='/')}"),
+            resource="fork identity",
+        )
+        if data.get("fork") is not True:
+            raise GitHubError("GitHub repository is not a fork")
+        parent = _mapping(data.get("parent"), resource="fork parent identity")
+        return ForkIdentity(
+            repository=_parse_repository_identity(data, resource="fork identity"),
+            parent=_parse_repository_identity(parent, resource="fork parent identity"),
+        )
+
+    def assert_repository_identity(
+        self,
+        full_name: str,
+        *,
+        expected_database_id: int,
+        expected_node_id: str,
+    ) -> RepositoryIdentity:
+        """Re-read a repository through its immutable database-ID route and match all identity."""
+
+        database_id = _positive_number(expected_database_id)
+        node_id = _graphql_node_id(expected_node_id)
+        expected_name = _canonical_repository_name(full_name)
+        data = _mapping(
+            self._request("GET", f"/repositories/{database_id}"),
+            resource="immutable repository identity",
+        )
+        identity = _parse_repository_identity(data, resource="immutable repository identity")
+        if (
+            identity.database_id != database_id
+            or identity.node_id != node_id
+            or identity.full_name.casefold() != expected_name.casefold()
+        ):
+            raise GitHubError("GitHub repository differs from its durable immutable identity")
+        return identity
 
     def list_owner_repositories(self, owner: str, *, limit: int) -> list[RepositoryInfo]:
         params: dict[str, str | int] = {
@@ -1267,13 +1333,21 @@ class GitHubClient:
             ).references
         )
 
-    def ensure_fork(self, repository: str, login: str) -> str:
+    def ensure_fork(
+        self,
+        repository: str,
+        login: str,
+        *,
+        before_mutation: Callable[[], None] | None = None,
+    ) -> str:
         name = repository.split("/", 1)[1]
         fork_name = f"{login}/{name}"
         existing = self._request(
             "GET", f"/repos/{quote(fork_name, safe='/')}", allow_not_found=True
         )
         if existing is None:
+            if before_mutation is not None:
+                before_mutation()
             self._request("POST", f"/repos/{quote(repository, safe='/')}/forks", json_body={})
         else:
             existing_data = cast("dict[str, Any]", existing)
@@ -1294,6 +1368,7 @@ class GitHubClient:
         base: str,
         expected_base_sha: str,
         draft: bool,
+        before_mutation: Callable[[], None] | None = None,
     ) -> PullRequestDetails:
         """Create a PR and return its canonical response before policy validation.
 
@@ -1343,6 +1418,8 @@ class GitHubClient:
         if not isinstance(draft, bool):
             raise ValueError("pull request draft must be a boolean")
 
+        if before_mutation is not None:
+            before_mutation()
         data = _mapping(
             self._request(
                 "POST",
@@ -1377,16 +1454,24 @@ class GitHubClient:
         number: int,
         *,
         expected_url: str,
+        expected_node_id: str,
         expected_head_repository: str,
         expected_head_ref: str,
         expected_head_sha: str,
+        before_observation: Callable[[], None] | None = None,
+        before_mutation: Callable[[], None] | None = None,
     ) -> PullRequestDetails:
-        """Move one exact open draft PR to ready-for-review and verify the result."""
+        """Move one exact open draft PR to ready-for-review and verify the result.
+
+        ``before_observation`` may perform remote preflight checks. ``before_mutation`` must be a
+        local-only authority check because it runs after the final exact PR observation.
+        """
 
         current = self.get_pull_request(repository, number)
         self._validate_ready_for_review_identity(
             current,
             expected_url=expected_url,
+            expected_node_id=expected_node_id,
             expected_head_repository=expected_head_repository,
             expected_head_ref=expected_head_ref,
             expected_head_sha=expected_head_sha,
@@ -1396,7 +1481,28 @@ class GitHubClient:
         if not current.draft:
             return current
 
-        node_id = _graphql_node_id(current.node_id)
+        node_id = _graphql_node_id(expected_node_id)
+        if before_observation is not None:
+            before_observation()
+        # The preflight can perform remote repository-ID checks. Re-read the immutable PR node
+        # after those checks so only a local authority check remains before the GraphQL mutation.
+        current = self.get_pull_request(repository, number)
+        self._validate_ready_for_review_identity(
+            current,
+            expected_url=expected_url,
+            expected_node_id=node_id,
+            expected_head_repository=expected_head_repository,
+            expected_head_ref=expected_head_ref,
+            expected_head_sha=expected_head_sha,
+        )
+        if current.state != "open" or current.merged:
+            raise GitHubError("Refusing to mark a pull request whose state changed")
+        if not current.draft:
+            return current
+        # Keep the dispatch-boundary callback local-only: another network request here would
+        # reopen a window for head drift after the final exact PR observation.
+        if before_mutation is not None:
+            before_mutation()
         payload = _mapping(
             self._request(
                 "POST",
@@ -1444,6 +1550,7 @@ class GitHubClient:
         self._validate_ready_for_review_identity(
             confirmed,
             expected_url=expected_url,
+            expected_node_id=node_id,
             expected_head_repository=expected_head_repository,
             expected_head_ref=expected_head_ref,
             expected_head_sha=expected_head_sha,
@@ -1457,12 +1564,15 @@ class GitHubClient:
         details: PullRequestDetails,
         *,
         expected_url: str,
+        expected_node_id: str,
         expected_head_repository: str,
         expected_head_ref: str,
         expected_head_sha: str,
     ) -> None:
         if details.html_url != expected_url:
             raise GitHubError("Refusing to update a pull request with a different canonical URL")
+        if details.node_id != _graphql_node_id(expected_node_id):
+            raise GitHubError("Refusing to update a different pull-request node")
         self._validate_compensation_pull_request(
             details,
             expected_head_repository=expected_head_repository,
@@ -1475,15 +1585,21 @@ class GitHubClient:
         repository: str,
         number: int,
         *,
+        expected_node_id: str,
         expected_head_repository: str,
         expected_head_ref: str,
         expected_head_sha: str,
+        before_observation: Callable[[], None] | None = None,
+        before_mutation: Callable[[], None] | None = None,
     ) -> PullRequestDetails:
         """Close only an exact, unmerged PR and verify the resulting remote state.
 
         This is a narrow compensation primitive.  It deliberately re-reads the PR immediately
-        before PATCH and validates the response again so a caller cannot close an object merely
-        because it has the expected PR number.
+        before the immutable-node GraphQL mutation and validates the response again so a caller
+        cannot close an object merely because it has the expected PR number.
+
+        ``before_observation`` may perform remote preflight checks. ``before_mutation`` must be a
+        local-only authority check because it runs after the final exact PR observation.
         """
 
         expected_repository = _input_nonempty(
@@ -1492,6 +1608,7 @@ class GitHubClient:
         )
         if not _REPOSITORY_NAME.fullmatch(expected_repository):
             raise ValueError("compensation head repository must use owner/name syntax")
+        expected_pull_request_node_id = _graphql_node_id(expected_node_id)
         expected_ref = _input_nonempty(expected_head_ref, field="compensation head ref")
         expected_sha = _input_nonempty(
             expected_head_sha,
@@ -1503,6 +1620,7 @@ class GitHubClient:
         current = self.get_pull_request(repository, number)
         self._validate_compensation_pull_request(
             current,
+            expected_node_id=expected_pull_request_node_id,
             expected_head_repository=expected_repository,
             expected_head_ref=expected_ref,
             expected_head_sha=expected_sha,
@@ -1511,22 +1629,79 @@ class GitHubClient:
             raise GitHubError("Refusing to close a pull request that has already been merged")
         if current.state == "closed":
             return current
-
-        data = _mapping(
-            self._request(
-                "PATCH",
-                f"/repos/{quote(repository, safe='/')}/pulls/{_positive_number(number)}",
-                json_body={"state": "closed"},
-            ),
-            resource="closed pull request",
-        )
-        closed = _parse_pull_request(
-            data,
+        expected_url, _ = self._canonical_pull_request_url(
+            current.html_url,
             expected_repository=repository,
             expected_number=number,
         )
+
+        if before_observation is not None:
+            before_observation()
+        # The preflight may perform remote repository-ID checks. Re-read the immutable PR node
+        # after those checks so only a local authority check remains before the mutation.
+        current = self.get_pull_request(repository, number)
+        self._validate_compensation_pull_request(
+            current,
+            expected_node_id=expected_pull_request_node_id,
+            expected_head_repository=expected_repository,
+            expected_head_ref=expected_ref,
+            expected_head_sha=expected_sha,
+        )
+        if current.merged or current.state != "open":
+            raise GitHubError("Refusing to close a pull request whose state changed")
+        if current.html_url != expected_url:
+            raise GitHubError("Refusing to close a pull request whose canonical URL changed")
+        # As with ready-for-review, keep this dispatch-boundary callback local-only.
+        if before_mutation is not None:
+            before_mutation()
+        payload = _mapping(
+            self._request(
+                "POST",
+                _graphql_api_path(self.config.api_url),
+                json_body={
+                    "query": (
+                        "mutation ClosePullRequest($pullRequestId: ID!) { "
+                        "closePullRequest(input: {pullRequestId: $pullRequestId}) { "
+                        "pullRequest { id number url state merged headRefOid } } }"
+                    ),
+                    "variables": {"pullRequestId": expected_pull_request_node_id},
+                },
+            ),
+            resource="close pull-request mutation",
+        )
+        if payload.get("errors") is not None:
+            raise GitHubError("GitHub rejected the close pull-request mutation")
+        mutation_data = _mapping(
+            payload.get("data"),
+            resource="close pull-request mutation data",
+        )
+        result = _mapping(
+            mutation_data.get("closePullRequest"),
+            resource="close pull-request mutation result",
+        )
+        returned = _mapping(
+            result.get("pullRequest"),
+            resource="closed pull request",
+        )
+        returned_number = _identifier(returned.get("number"), resource="closed pull request")
+        returned_sha = _full_git_sha(
+            returned.get("headRefOid"),
+            field="closed pull request head SHA",
+        )
+        if (
+            _graphql_node_id(returned.get("id")) != expected_pull_request_node_id
+            or returned_number != number
+            or _nonempty(returned.get("url"), field="closed pull request URL") != expected_url
+            or returned.get("state") != "CLOSED"
+            or returned.get("merged") is not False
+            or returned_sha.casefold() != expected_sha
+        ):
+            raise GitHubError("GitHub returned a different closed pull request")
+
+        closed = self.get_pull_request(repository, number)
         self._validate_compensation_pull_request(
             closed,
+            expected_node_id=expected_pull_request_node_id,
             expected_head_repository=expected_repository,
             expected_head_ref=expected_ref,
             expected_head_sha=expected_sha,
@@ -1538,16 +1713,21 @@ class GitHubClient:
             expected_repository=repository,
             expected_number=number,
         )
+        if canonical_url != expected_url:
+            raise GitHubError("GitHub confirmed a different canonical pull-request URL")
         return replace(closed, html_url=canonical_url)
 
     def _validate_compensation_pull_request(
         self,
         details: PullRequestDetails,
         *,
+        expected_node_id: str | None = None,
         expected_head_repository: str,
         expected_head_ref: str,
         expected_head_sha: str,
     ) -> None:
+        if expected_node_id is not None and details.node_id != expected_node_id:
+            raise GitHubError("Refusing to close a different pull-request node")
         if details.head_repository.casefold() != expected_head_repository.casefold():
             raise GitHubError("Refusing to close a pull request from a different head repository")
         if details.head_ref != expected_head_ref:
@@ -1877,6 +2057,18 @@ def _parse_pull_request(
     )
 
 
+def _parse_repository_identity(
+    data: dict[str, Any],
+    *,
+    resource: str,
+) -> RepositoryIdentity:
+    return RepositoryIdentity(
+        full_name=_canonical_repository_name(data.get("full_name")),
+        database_id=_identifier(data.get("id"), resource=resource),
+        node_id=_graphql_node_id(data.get("node_id")),
+    )
+
+
 def _graphql_node_id(value: object) -> str:
     if (
         not isinstance(value, str)
@@ -2134,6 +2326,7 @@ def _response_message(response: httpx.Response) -> str:
 __all__ = [
     "CheckRunDetails",
     "CommitStatusDetails",
+    "ForkIdentity",
     "GitHubClient",
     "GitHubComment",
     "PullRequestCommit",
@@ -2142,5 +2335,6 @@ __all__ = [
     "PullRequestReview",
     "PullRequestTimeline",
     "PullRequestTimelineEvent",
+    "RepositoryIdentity",
     "resolve_github_token",
 ]

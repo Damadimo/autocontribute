@@ -459,6 +459,226 @@ def _begin_publication(
     )
 
 
+def _record_absent_compensation_evidence(
+    store: RunStore,
+    run: RunManifest,
+    *,
+    reason: str,
+) -> dict[str, str]:
+    assert run.candidate is not None
+    assert run.branch_name is not None
+    assert run.publishing_login is not None
+    assert run.publishing_api_origin is not None
+    if run.upstream_repository_id is None and run.upstream_repository_node_id is None:
+        run.upstream_repository_id = 1001
+        run.upstream_repository_node_id = "R_upstream_fixture"
+    assert run.upstream_repository_id is not None
+    assert run.upstream_repository_node_id is not None
+    fork = f"{run.publishing_login}/{run.candidate.repository.split('/', 1)[1]}"
+    if run.fork_repository_id is None and run.fork_repository_node_id is None:
+        fork_identity = {"fork_identity_state": "not_bound"}
+    else:
+        assert run.fork_repository_id is not None
+        assert run.fork_repository_node_id is not None
+        fork_identity = {
+            "fork_identity_state": "bound",
+            "fork_repository_id": str(run.fork_repository_id),
+            "fork_repository_node_id": run.fork_repository_node_id,
+        }
+    details = {
+        "repository": run.candidate.repository,
+        "publishing_api_origin": run.publishing_api_origin,
+        "upstream_repository_id": str(run.upstream_repository_id),
+        "upstream_repository_node_id": run.upstream_repository_node_id,
+        "head": f"{run.publishing_login}:{run.branch_name}",
+        "fork": fork,
+        **fork_identity,
+        "branch": run.branch_name,
+        "commit_sha": run.commit_sha or "not_persisted",
+        "reason": reason,
+    }
+    store.save(
+        run,
+        event="publication.absence.verified",
+        details=details,
+    )
+    return {key: value for key, value in details.items() if key != "reason"} | {
+        "pull_request": "absent",
+        "remote_branch": "absent",
+    }
+
+
+def _record_created_pr_base_race_evidence(
+    store: RunStore,
+    run: RunManifest,
+    *,
+    pull_request_url: str = "https://github.com/example/project/pull/7",
+) -> None:
+    assert run.candidate is not None
+    assert run.branch_name is not None
+    run.base_sha = "b" * 40
+    run.commit_sha = "c" * 40
+    run.pull_request_url = pull_request_url
+    run.pull_request_node_id = "PR_fixture_7"
+    run.upstream_repository_id = 1001
+    run.upstream_repository_node_id = "R_upstream_fixture"
+    run.fork_repository_id = 2001
+    run.fork_repository_node_id = "R_fork_fixture"
+    run.publication_compensation_reason = "created_pr_base_moved"
+    returned_base = "e" * 40
+    store.save(
+        run,
+        event="branch.pushed",
+        details={
+            "fork": "octocat/project",
+            "fork_repository_id": str(run.fork_repository_id),
+            "fork_repository_node_id": run.fork_repository_node_id,
+            "upstream_repository_id": str(run.upstream_repository_id),
+            "upstream_repository_node_id": run.upstream_repository_node_id,
+            "branch": run.branch_name,
+            "commit_sha": run.commit_sha,
+        },
+    )
+    store.save(
+        run,
+        event="pull_request.created.response",
+        details={
+            "url": pull_request_url,
+            "repository": run.candidate.repository,
+            "number": "7",
+            "state": "open",
+            "head_sha": run.commit_sha,
+            "base_sha": returned_base,
+            "pull_request_node_id": run.pull_request_node_id,
+            "upstream_repository_id": str(run.upstream_repository_id),
+            "upstream_repository_node_id": run.upstream_repository_node_id,
+            "fork_repository_id": str(run.fork_repository_id),
+            "fork_repository_node_id": run.fork_repository_node_id,
+        },
+    )
+    store.save(
+        run,
+        event="pull_request.created.rejected",
+        details={
+            "url": pull_request_url,
+            "mismatches": "base commit",
+            "expected_base_sha": run.base_sha,
+            "returned_base_sha": returned_base,
+        },
+    )
+    store.save(
+        run,
+        event="publication.compensation.started",
+        details={
+            "reason": "created_pr_base_moved",
+            "url": pull_request_url,
+            "pull_request_node_id": run.pull_request_node_id,
+            "repository": run.candidate.repository,
+            "number": "7",
+            "upstream_repository_id": str(run.upstream_repository_id),
+            "upstream_repository_node_id": run.upstream_repository_node_id,
+            "fork": "octocat/project",
+            "fork_repository_id": str(run.fork_repository_id),
+            "fork_repository_node_id": run.fork_repository_node_id,
+            "branch": run.branch_name,
+            "commit_sha": run.commit_sha,
+            "approved_base_sha": run.base_sha,
+            "returned_base_sha": returned_base,
+        },
+    )
+
+
+def _record_merged_compensation_evidence(
+    store: RunStore,
+    run: RunManifest,
+    *,
+    pull_request_url: str = "https://github.com/example/project/pull/7",
+) -> None:
+    _record_created_pr_base_race_evidence(
+        store,
+        run,
+        pull_request_url=pull_request_url,
+    )
+    assert run.pull_request_node_id is not None
+    assert run.commit_sha is not None
+    assert run.upstream_repository_id is not None
+    assert run.upstream_repository_node_id is not None
+    assert run.fork_repository_id is not None
+    assert run.fork_repository_node_id is not None
+    store.save(
+        run,
+        event="pull_request.compensation.reconciled",
+        details={
+            "url": pull_request_url,
+            "pull_request_node_id": run.pull_request_node_id,
+            "state": "merged",
+            "head_sha": run.commit_sha,
+            "upstream_repository_id": str(run.upstream_repository_id),
+            "upstream_repository_node_id": run.upstream_repository_node_id,
+            "fork_repository_id": str(run.fork_repository_id),
+            "fork_repository_node_id": run.fork_repository_node_id,
+        },
+    )
+
+
+def _record_created_pr_compensation_evidence(
+    store: RunStore,
+    run: RunManifest,
+    *,
+    reason: str,
+    repetitions: int = 1,
+) -> dict[str, str]:
+    _record_created_pr_base_race_evidence(store, run)
+    assert run.candidate is not None
+    assert run.branch_name is not None
+    assert run.commit_sha is not None
+    assert run.pull_request_url is not None
+    assert run.pull_request_node_id is not None
+    assert run.publishing_login is not None
+    assert run.upstream_repository_id is not None
+    assert run.upstream_repository_node_id is not None
+    assert run.fork_repository_id is not None
+    assert run.fork_repository_node_id is not None
+    fork = f"{run.publishing_login}/{run.candidate.repository.split('/', 1)[1]}"
+    close_details = {
+        "url": run.pull_request_url,
+        "state": "closed_unmerged",
+    }
+    branch_details = {
+        "fork": fork,
+        "fork_repository_id": str(run.fork_repository_id),
+        "fork_repository_node_id": run.fork_repository_node_id,
+        "branch": run.branch_name,
+        "commit_sha": run.commit_sha,
+    }
+    for _ in range(repetitions):
+        store.save(
+            run,
+            event="pull_request.compensation.closed",
+            details=close_details,
+        )
+        store.save(
+            run,
+            event="branch.compensated",
+            details=branch_details,
+        )
+    return {
+        "url": run.pull_request_url,
+        "repository": run.candidate.repository,
+        "number": "7",
+        "pull_request_node_id": run.pull_request_node_id,
+        "upstream_repository_id": str(run.upstream_repository_id),
+        "upstream_repository_node_id": run.upstream_repository_node_id,
+        "fork": fork,
+        "fork_repository_id": str(run.fork_repository_id),
+        "fork_repository_node_id": run.fork_repository_node_id,
+        "branch": run.branch_name,
+        "commit_sha": run.commit_sha,
+        "pull_request": "closed_unmerged",
+        "remote_branch": "absent",
+    }
+
+
 def test_store_persists_transitions_and_hash_chains_events(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     run = store.create_run()
@@ -1365,10 +1585,12 @@ def test_begin_publication_review_mode_and_no_hold_compensation_are_durable(
         )
         assert connection.execute("SELECT count(*) FROM publication_gate_holds").fetchone() == (0,)
 
+    reason = "verified review-mode cleanup"
+    evidence = _record_absent_compensation_evidence(store, run, reason=reason)
     finalized = store.finalize_publication_compensation(
         run,
-        reason="verified review-mode cleanup",
-        evidence={"branch": run.branch_name or "missing"},
+        reason=reason,
+        evidence=evidence,
     )
 
     assert finalized.status == RunStatus.FAILED
@@ -1530,14 +1752,16 @@ def test_compensation_without_a_same_run_hold_rejects_any_other_active_hold(
     store = RunStore(tmp_path / "state")
     review_run = _publication_run(store)
     _begin_publication(store, review_run, with_gate=False)
+    reason = "verified cleanup cannot release another run"
+    evidence = _record_absent_compensation_evidence(store, review_run, reason=reason)
     other = store.create_run(deployment_fingerprint="d" * 64)
     _reserve_gate(store, other)
 
     with pytest.raises(StateError, match="held by another run"):
         store.finalize_publication_compensation(
             review_run,
-            reason="verified cleanup cannot release another run",
-            evidence={"branch": review_run.branch_name or "missing"},
+            reason=reason,
+            evidence=evidence,
         )
 
     assert review_run.status == RunStatus.SUBMITTING
@@ -1917,6 +2141,118 @@ def test_gate_hold_blocks_all_evaluation_writes_until_pr_open_is_durable(
     assert json.loads(store.events(holder.run_id)[-1]["details"])["outcome"] == "pr_open"
 
 
+def test_publication_gate_hold_current_accepts_its_exact_scope(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = store.create_run(deployment_fingerprint="d" * 64)
+    _reserve_gate(store, holder)
+
+    assert (
+        store.assert_publication_gate_hold_current(
+            holder.run_id,
+            deployment_fingerprint="d" * 64,
+            publishing_login="octocat",
+            publishing_api_origin="https://api.github.com",
+        )
+        is True
+    )
+
+
+def test_publication_gate_hold_current_rejects_evaluation_cursor_drift(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    evaluated = store.create_run()
+    holder = store.create_run(deployment_fingerprint="d" * 64)
+    _reserve_gate(store, holder)
+    with store._connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        store._append_event(
+            connection,
+            evaluated.run_id,
+            "evaluation.recorded",
+            {"evaluation_hash": "a" * 64},
+        )
+
+    with pytest.raises(StateError, match="evaluation corpus"):
+        store.assert_publication_gate_hold_current(
+            holder.run_id,
+            deployment_fingerprint="d" * 64,
+            publishing_login="octocat",
+            publishing_api_origin="https://api.github.com",
+        )
+
+
+def test_publication_gate_hold_current_rejects_upstream_outcome_cursor_drift(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    prior = store.create_run(deployment_fingerprint="d" * 64)
+    _set_status(store, prior, RunStatus.PR_OPEN)
+    holder = store.create_run(deployment_fingerprint="d" * 64)
+    _reserve_gate(store, holder)
+    store.save(prior, event="test.outcome_drift", details={"version": "later"})
+
+    with pytest.raises(StateError, match="upstream-outcome corpus"):
+        store.assert_publication_gate_hold_current(
+            holder.run_id,
+            deployment_fingerprint="d" * 64,
+            publishing_login="octocat",
+            publishing_api_origin="https://api.github.com",
+        )
+
+
+def test_publication_gate_hold_current_rejects_identity_mismatch(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = store.create_run(deployment_fingerprint="d" * 64)
+    _reserve_gate(store, holder)
+
+    with pytest.raises(StateError, match="different publishing identity or scope"):
+        store.assert_publication_gate_hold_current(
+            holder.run_id,
+            deployment_fingerprint="d" * 64,
+            publishing_login="hubot",
+            publishing_api_origin="https://api.github.com",
+        )
+
+
+def test_publication_gate_hold_current_returns_cleanly_without_a_hold(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    manual = store.create_run(deployment_fingerprint="d" * 64)
+
+    assert (
+        store.assert_publication_gate_hold_current(
+            manual.run_id,
+            deployment_fingerprint="d" * 64,
+            publishing_login="octocat",
+            publishing_api_origin="https://api.github.com",
+        )
+        is False
+    )
+
+
+def test_publication_gate_hold_current_rejects_a_missing_durable_hold_row(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = store.create_run(deployment_fingerprint="d" * 64)
+    _reserve_gate(store, holder)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "DELETE FROM publication_gate_holds WHERE run_id = ?",
+            (holder.run_id,),
+        )
+
+    with pytest.raises(StateError, match="publication gate hold row is missing"):
+        store.assert_publication_gate_hold_current(
+            holder.run_id,
+            deployment_fingerprint="d" * 64,
+            publishing_login="octocat",
+            publishing_api_origin="https://api.github.com",
+        )
+
+
 def test_pr_open_refuses_to_release_a_hold_for_a_different_corpus(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     holder = store.create_run(deployment_fingerprint="d" * 64)
@@ -1967,25 +2303,220 @@ def test_arbitrary_failed_transition_never_releases_a_publication_gate_hold(
         )
 
 
+def test_verified_compensation_rejects_arbitrary_evidence_and_retains_hold(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    holder.upstream_repository_id = 1001
+    holder.upstream_repository_node_id = "R_upstream_fixture"
+    store.save(
+        holder,
+        event="test.upstream_identity.bound",
+        details={"repository_id": "1001"},
+    )
+
+    with pytest.raises(StateError, match="lacks exact remote cleanup evidence"):
+        store.finalize_publication_compensation(
+            holder,
+            reason="caller assertion is not durable proof",
+            evidence={"remote_state": "absent"},
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
+def test_verified_compensation_requires_latest_exact_absence_event(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    reason = "verified exact remote absence"
+    evidence = _record_absent_compensation_evidence(store, holder, reason=reason)
+    store.save(
+        holder,
+        event="publication.absence.verified",
+        details={
+            **evidence,
+            "reason": reason,
+            "commit_sha": "f" * 40,
+        },
+    )
+
+    with pytest.raises(StateError, match="latest exact absence verification"):
+        store.finalize_publication_compensation(
+            holder,
+            reason=reason,
+            evidence=evidence,
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "wrong_value"),
+    [
+        ("publishing_api_origin", "https://github.example.com/api/v3"),
+        ("upstream_repository_id", "9999"),
+        ("upstream_repository_node_id", "R_reused_upstream_name"),
+        ("fork_repository_id", "9998"),
+        ("fork_repository_node_id", "R_reused_fork_name"),
+    ],
+)
+def test_absence_compensation_rejects_wrong_origin_or_repository_identity(
+    tmp_path: Path,
+    field: str,
+    wrong_value: str,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    holder.fork_repository_id = 2001
+    holder.fork_repository_node_id = "R_fork_fixture"
+    reason = "verified exact remote absence"
+    evidence = _record_absent_compensation_evidence(store, holder, reason=reason)
+    wrong_event = {
+        key: value
+        for key, value in evidence.items()
+        if key not in {"pull_request", "remote_branch"}
+    }
+    wrong_event["reason"] = reason
+    wrong_event[field] = wrong_value
+    store.save(
+        holder,
+        event="publication.absence.verified",
+        details=wrong_event,
+    )
+
+    with pytest.raises(StateError, match="latest exact absence verification"):
+        store.finalize_publication_compensation(
+            holder,
+            reason=reason,
+            evidence=evidence,
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
+def test_absence_compensation_accepts_exact_bound_fork_identity(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    holder.fork_repository_id = 2001
+    holder.fork_repository_node_id = "R_fork_fixture"
+    reason = "verified exact remote absence with a bound fork"
+    evidence = _record_absent_compensation_evidence(store, holder, reason=reason)
+
+    finalized = store.finalize_publication_compensation(
+        holder,
+        reason=reason,
+        evidence=evidence,
+    )
+
+    assert finalized.status == RunStatus.FAILED
+    assert store.publication_gate_hold(holder.run_id) is None
+
+
+def test_absence_compensation_rejects_partial_fork_identity(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store, status=RunStatus.READY_FOR_APPROVAL)
+    _begin_publication(store, holder, with_gate=False)
+    holder.upstream_repository_id = 1001
+    holder.upstream_repository_node_id = "R_upstream_fixture"
+    holder.fork_repository_id = 2001
+
+    with pytest.raises(StateError, match="partial immutable fork identity"):
+        store.finalize_publication_compensation(
+            holder,
+            reason="partial identity must remain fenced",
+            evidence={"remote_state": "absent"},
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
+
+
+@pytest.mark.parametrize("remote_stage", ["stored_commit", "branch_event"])
+def test_absence_compensation_rejects_unbound_fork_after_remote_capable_stage(
+    tmp_path: Path,
+    remote_stage: str,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    if remote_stage == "stored_commit":
+        holder.commit_sha = "c" * 40
+    else:
+        store.save(
+            holder,
+            event="branch.pushed",
+            details={"commit_sha": "c" * 40},
+        )
+    reason = "unbound fork must remain fenced after remote-capable work"
+    evidence = _record_absent_compensation_evidence(store, holder, reason=reason)
+
+    with pytest.raises(StateError, match="unbound fork identity after a remote-capable stage"):
+        store.finalize_publication_compensation(
+            holder,
+            reason=reason,
+            evidence=evidence,
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
+def test_absence_proof_cannot_finalize_an_ambiguous_pull_request_post(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    holder.pull_request_creation_started = True
+    store.save(
+        holder,
+        event="pull_request.creation.started",
+        details={"head": f"octocat:{holder.branch_name}"},
+    )
+    reason = "remote lookup alone cannot resolve a started POST"
+    evidence = _record_absent_compensation_evidence(store, holder, reason=reason)
+
+    with pytest.raises(StateError, match="lacks exact remote cleanup evidence"):
+        store.finalize_publication_compensation(
+            holder,
+            reason=reason,
+            evidence=evidence,
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
 def test_verified_compensation_transition_and_exact_hold_release_are_atomic(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    _reserve_gate(store, holder)
-    _set_status(store, holder, RunStatus.SUBMITTING)
-    stale = store.get(holder.run_id)
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
     current = store.get(holder.run_id)
-    current.branch_name = "autocontribute/fix"
+    current.upstream_repository_id = 1001
+    current.upstream_repository_node_id = "R_upstream_fixture"
+    current.fork_repository_id = 2001
+    current.fork_repository_node_id = "R_fork_fixture"
     current.commit_sha = "1" * 40
-    current.pull_request_url = "https://github.com/example/project/pull/7"
     store.save(current, event="publication.identity.persisted", details={"number": "7"})
+    stale = store.get(holder.run_id)
+    reason = "verified exact remote cleanup"
+    evidence = _record_absent_compensation_evidence(store, current, reason=reason)
 
     with pytest.raises(StateError, match="changed while compensation was finalized"):
         store.finalize_publication_compensation(
             stale,
-            reason="verified exact remote cleanup",
-            evidence={"branch": "autocontribute/fix", "commit_sha": "1" * 40},
+            reason=reason,
+            evidence=evidence,
         )
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute("SELECT run_id FROM publication_gate_holds").fetchone() == (
@@ -1994,15 +2525,15 @@ def test_verified_compensation_transition_and_exact_hold_release_are_atomic(
 
     finalized = store.finalize_publication_compensation(
         current,
-        reason="verified exact remote cleanup",
-        evidence={"branch": "autocontribute/fix", "commit_sha": "1" * 40},
+        reason=reason,
+        evidence=evidence,
     )
 
     assert finalized.status == RunStatus.FAILED
     persisted = store.get(holder.run_id)
-    assert persisted.branch_name == "autocontribute/fix"
+    assert persisted.branch_name == "autocontribute/fix-exact-bug"
     assert persisted.commit_sha == "1" * 40
-    assert persisted.pull_request_url == "https://github.com/example/project/pull/7"
+    assert persisted.pull_request_url is None
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute("SELECT count(*) FROM publication_gate_holds").fetchone() == (0,)
     assert [event["event_type"] for event in store.events(holder.run_id)][-3:] == [
@@ -2010,6 +2541,453 @@ def test_verified_compensation_transition_and_exact_hold_release_are_atomic(
         "run.transitioned",
         "publication.gate.released",
     ]
+
+
+def test_created_pr_compensation_rejects_cleanup_evidence_before_its_marker(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    assert holder.candidate is not None
+    assert holder.branch_name is not None
+    holder.base_sha = "b" * 40
+    holder.commit_sha = "c" * 40
+    holder.pull_request_url = "https://github.com/example/project/pull/7"
+    holder.pull_request_node_id = "PR_fixture_7"
+    holder.upstream_repository_id = 1001
+    holder.upstream_repository_node_id = "R_upstream_fixture"
+    holder.fork_repository_id = 2001
+    holder.fork_repository_node_id = "R_fork_fixture"
+    holder.publication_compensation_reason = "created_pr_base_moved"
+    store.save(
+        holder,
+        event="branch.compensated",
+        details={
+            "fork": "octocat/project",
+            "fork_repository_id": str(holder.fork_repository_id),
+            "fork_repository_node_id": holder.fork_repository_node_id,
+            "branch": holder.branch_name,
+            "commit_sha": holder.commit_sha,
+        },
+    )
+    reason = "verified recovery of created-PR base-race compensation"
+    evidence = _record_created_pr_compensation_evidence(
+        store,
+        holder,
+        reason=reason,
+    )
+
+    with pytest.raises(StateError, match="cleanup evidence precedes its marker"):
+        store.finalize_publication_compensation(
+            holder,
+            reason=reason,
+            evidence=evidence,
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
+def test_created_pr_compensation_rejects_missing_cleanup_evidence(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    reason = "verified recovery of created-PR base-race compensation"
+    evidence = _record_created_pr_compensation_evidence(
+        store,
+        holder,
+        reason=reason,
+        repetitions=0,
+    )
+
+    with pytest.raises(StateError, match="lacks exact pull-request and branch cleanup"):
+        store.finalize_publication_compensation(
+            holder,
+            reason=reason,
+            evidence=evidence,
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
+def test_created_pr_compensation_accepts_identical_crash_retry_evidence(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    reason = "verified recovery of created-PR base-race compensation"
+    evidence = _record_created_pr_compensation_evidence(
+        store,
+        holder,
+        reason=reason,
+        repetitions=2,
+    )
+
+    finalized = store.finalize_publication_compensation(
+        holder,
+        reason=reason,
+        evidence=evidence,
+    )
+
+    assert finalized.status == RunStatus.FAILED
+    assert store.publication_gate_hold(holder.run_id) is None
+
+
+def test_created_pr_compensation_rejects_conflicting_retry_evidence(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    reason = "verified recovery of created-PR base-race compensation"
+    evidence = _record_created_pr_compensation_evidence(
+        store,
+        holder,
+        reason=reason,
+    )
+    store.save(
+        holder,
+        event="pull_request.compensation.closed",
+        details={"url": evidence["url"], "state": "open"},
+    )
+    store.save(
+        holder,
+        event="branch.compensated",
+        details={
+            "fork": evidence["fork"],
+            "fork_repository_id": evidence["fork_repository_id"],
+            "fork_repository_node_id": evidence["fork_repository_node_id"],
+            "branch": evidence["branch"],
+            "commit_sha": evidence["commit_sha"],
+        },
+    )
+
+    with pytest.raises(StateError, match="closure differs from durable intent"):
+        store.finalize_publication_compensation(
+            holder,
+            reason=reason,
+            evidence=evidence,
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
+def test_restart_allows_exact_compensation_but_not_constructive_authority_after_cursor_drift(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    prior = store.create_run(deployment_fingerprint="d" * 64)
+    _set_status(store, prior, RunStatus.PR_OPEN)
+    evaluated = store.create_run()
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    reason = "verified exact remote cleanup after rollout drift"
+    evidence = _record_absent_compensation_evidence(store, holder, reason=reason)
+    hold = store.publication_gate_hold(holder.run_id)
+    assert hold is not None and hold.outcome_corpus_cursor is not None
+
+    store.save(prior, event="test.outcome_drift", details={"version": "later"})
+    with store._connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        store._append_event(
+            connection,
+            evaluated.run_id,
+            "evaluation.recorded",
+            {"evaluation_hash": "a" * 64},
+        )
+
+    assert store.evaluation_corpus_cursor() != hold.corpus_cursor
+    assert (
+        store.upstream_outcome_corpus_cursor(
+            "d" * 64,
+            "octocat",
+            "https://api.github.com",
+            exclude_run_id=holder.run_id,
+        )
+        != hold.outcome_corpus_cursor
+    )
+
+    restarted = RunStore(store.root)
+    with pytest.raises(StateError, match="disagrees with the evaluation corpus"):
+        restarted.assert_publication_gate_hold_current(
+            holder.run_id,
+            deployment_fingerprint="d" * 64,
+            publishing_login="octocat",
+            publishing_api_origin="https://api.github.com",
+        )
+
+    recovered = restarted.get(holder.run_id)
+    finalized = restarted.finalize_publication_compensation(
+        recovered,
+        reason=reason,
+        evidence=evidence,
+    )
+
+    assert finalized.status == RunStatus.FAILED
+    assert restarted.publication_gate_hold(holder.run_id) is None
+    release = json.loads(restarted.events(holder.run_id)[-1]["details"])
+    assert release["outcome"] == "verified_compensation"
+    assert release["corpus_cursor"] == hold.corpus_cursor
+    assert release["outcome_corpus_cursor"] == hold.outcome_corpus_cursor
+    assert RunStore(store.root).get(holder.run_id).status == RunStatus.FAILED
+
+
+def test_merged_compensation_becomes_lifecycle_managed_despite_rollout_cursor_drift(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    prior = store.create_run(deployment_fingerprint="d" * 64)
+    _set_status(store, prior, RunStatus.PR_OPEN)
+    evaluated = store.create_run()
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    _record_merged_compensation_evidence(store, holder)
+    hold = store.publication_gate_hold(holder.run_id)
+    assert hold is not None and hold.outcome_corpus_cursor is not None
+
+    store.save(prior, event="test.outcome_drift", details={"version": "later"})
+    with store._connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        store._append_event(
+            connection,
+            evaluated.run_id,
+            "evaluation.recorded",
+            {"evaluation_hash": "a" * 64},
+        )
+
+    restarted = RunStore(store.root)
+    recovered = restarted.get(holder.run_id)
+    finalized = restarted.finalize_merged_publication_compensation(
+        recovered,
+        pull_request_url="https://github.com/example/project/pull/7",
+        reason="exact compensating PR merged and is lifecycle-managed",
+    )
+
+    assert finalized.status == RunStatus.PR_OPEN
+    assert finalized.publication_compensation_reason == "created_pr_base_moved"
+    assert finalized.pull_request_url == "https://github.com/example/project/pull/7"
+    assert restarted.publication_gate_hold(holder.run_id) is None
+    event_types = [event["event_type"] for event in restarted.events(holder.run_id)]
+    assert event_types[-2:] == ["run.transitioned", "publication.gate.released"]
+    release = json.loads(restarted.events(holder.run_id)[-1]["details"])
+    assert release["outcome"] == "pr_open"
+    assert release["corpus_cursor"] == hold.corpus_cursor
+    assert release["outcome_corpus_cursor"] == hold.outcome_corpus_cursor
+
+
+def test_merged_compensation_requires_exact_remote_evidence_in_same_run(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    holder.base_sha = "b" * 40
+    holder.commit_sha = "c" * 40
+    holder.pull_request_url = "https://github.com/example/project/pull/7"
+    holder.pull_request_node_id = "PR_fixture_7"
+    holder.upstream_repository_id = 1001
+    holder.upstream_repository_node_id = "R_upstream_fixture"
+    holder.fork_repository_id = 2001
+    holder.fork_repository_node_id = "R_fork_fixture"
+    holder.publication_compensation_reason = "created_pr_base_moved"
+    store.save(holder, event="test.unrelated", details={"state": "merged"})
+
+    with pytest.raises(StateError, match="one exact branch, response, rejection"):
+        store.finalize_merged_publication_compensation(
+            holder,
+            pull_request_url=holder.pull_request_url,
+            reason="must not adopt a PR without exact remote evidence",
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
+def test_merged_compensation_requires_latest_remote_reconciliation(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    _record_merged_compensation_evidence(store, holder)
+    store.save(
+        holder,
+        event="test.later_compensation_evidence",
+        details={"state": "stale"},
+    )
+
+    with pytest.raises(StateError, match="not the latest run evidence"):
+        store.finalize_merged_publication_compensation(
+            holder,
+            pull_request_url="https://github.com/example/project/pull/7",
+            reason="stale merged observation must not release the hold",
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
+def test_merged_compensation_requires_exact_marker_and_durable_pull_request_url(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    holder.pull_request_url = "https://github.com/example/project/pull/7"
+    store.save(holder, event="test.pull_request_url", details={"number": "7"})
+
+    with pytest.raises(StateError, match="created-PR base-race marker"):
+        store.finalize_merged_publication_compensation(
+            holder,
+            pull_request_url=holder.pull_request_url,
+            reason="must retain exact compensation intent",
+        )
+
+    holder.publication_compensation_reason = "created_pr_base_moved"
+    store.save(
+        holder,
+        event="publication.compensation.started",
+        details={"reason": "created_pr_base_moved", "url": holder.pull_request_url},
+    )
+    with pytest.raises(StateError, match="durable pull request URL"):
+        store.finalize_merged_publication_compensation(
+            holder,
+            pull_request_url="https://github.com/example/project/pull/8",
+            reason="must retain exact pull request identity",
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
+def test_merged_compensation_rejects_tampered_same_run_hold(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    holder.publication_compensation_reason = "created_pr_base_moved"
+    holder.pull_request_url = "https://github.com/example/project/pull/7"
+    store.save(
+        holder,
+        event="publication.compensation.started",
+        details={"reason": "created_pr_base_moved", "url": holder.pull_request_url},
+    )
+    hold = store.publication_gate_hold(holder.run_id)
+    assert hold is not None and hold.outcome_corpus_cursor is not None
+    tampered_cursor = "0" * 64 if hold.outcome_corpus_cursor != "0" * 64 else "1" * 64
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            """
+            UPDATE publication_gate_holds SET outcome_corpus_cursor = ?
+            WHERE run_id = ?
+            """,
+            (tampered_cursor, holder.run_id),
+        )
+
+    with pytest.raises(StateError, match="hold disagrees with ledger evidence"):
+        store.finalize_merged_publication_compensation(
+            holder,
+            pull_request_url=holder.pull_request_url,
+            reason="must not adopt a PR through tampered gate evidence",
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
+
+
+def test_pr_open_release_remains_strict_after_evaluation_cursor_drift(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    evaluated = store.create_run()
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    with store._connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        store._append_event(
+            connection,
+            evaluated.run_id,
+            "evaluation.recorded",
+            {"evaluation_hash": "a" * 64},
+        )
+
+    with pytest.raises(StateError, match="disagrees with the evaluation corpus"):
+        store.transition(holder, RunStatus.PR_OPEN, reason="pull request created")
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
+    assert store.publication_gate_hold(holder.run_id) is not None
+
+
+def test_verified_compensation_rejects_hold_row_tampering(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
+    reason = "must not release tampered hold evidence"
+    evidence = _record_absent_compensation_evidence(store, holder, reason=reason)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute(
+            "UPDATE publication_gate_holds SET held_at = ? WHERE run_id = ?",
+            (datetime(2020, 1, 1, tzinfo=UTC).isoformat(), holder.run_id),
+        )
+
+    with pytest.raises(StateError, match="hold disagrees with ledger evidence"):
+        store.finalize_publication_compensation(
+            holder,
+            reason=reason,
+            evidence=evidence,
+        )
+
+    assert holder.status == RunStatus.SUBMITTING
+    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
+
+
+def test_verified_compensation_releases_a_legacy_pre_outcome_hold(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    holder = _publication_run(store, status=RunStatus.READY_FOR_APPROVAL)
+    _begin_publication(store, holder, with_gate=False)
+    reason = "verified cleanup of a fenced pre-v6 publication"
+    cursor = store.evaluation_corpus_cursor()
+    held_at = datetime(2026, 7, 21, 15, tzinfo=UTC).isoformat()
+    with store._connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            INSERT INTO publication_gate_holds(
+                run_id, deployment_fingerprint, corpus_cursor,
+                outcome_corpus_cursor, held_at
+            ) VALUES (?, ?, ?, NULL, ?)
+            """,
+            (holder.run_id, "d" * 64, cursor, held_at),
+        )
+        store._append_event(
+            connection,
+            holder.run_id,
+            "publication.gate.held",
+            {
+                "deployment_fingerprint": "d" * 64,
+                "corpus_cursor": cursor,
+                "held_at": held_at,
+            },
+        )
+    evidence = _record_absent_compensation_evidence(store, holder, reason=reason)
+
+    finalized = store.finalize_publication_compensation(
+        holder,
+        reason=reason,
+        evidence=evidence,
+    )
+
+    assert finalized.status == RunStatus.FAILED
+    assert store.publication_gate_hold(holder.run_id) is None
+    assert json.loads(store.events(holder.run_id)[-1]["details"]) == {
+        "corpus_cursor": cursor,
+        "deployment_fingerprint": "d" * 64,
+        "held_at": held_at,
+        "outcome": "verified_compensation",
+    }
 
 
 def test_evaluation_corpus_cursor_is_exact_ordered_and_bounded(
@@ -2847,6 +3825,8 @@ def test_compensation_manifest_write_failure_repairs_without_reacquiring_the_hol
     store = RunStore(root)
     run = _publication_run(store)
     _begin_publication(store, run)
+    reason = "verified no remote mutation remains"
+    evidence = _record_absent_compensation_evidence(store, run, reason=reason)
 
     def fail_manifest_write(_manifest: RunManifest) -> None:
         raise OSError("injected manifest write failure")
@@ -2855,8 +3835,8 @@ def test_compensation_manifest_write_failure_repairs_without_reacquiring_the_hol
     with pytest.raises(StateError, match="Could not synchronize manifest artifact"):
         store.finalize_publication_compensation(
             run,
-            reason="verified no remote mutation remains",
-            evidence={"remote_state": "absent"},
+            reason=reason,
+            evidence=evidence,
         )
 
     assert run.status == RunStatus.FAILED

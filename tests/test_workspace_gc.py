@@ -48,8 +48,12 @@ def _terminal_run(store: RunStore, status: RunStatus = RunStatus.SKIPPED) -> Run
     return run
 
 
-def _prepared_run(store: RunStore) -> RunManifest:
-    run = store.create_run()
+def _prepared_run(
+    store: RunStore,
+    *,
+    deployment_fingerprint: str | None = None,
+) -> RunManifest:
+    run = store.create_run(deployment_fingerprint=deployment_fingerprint)
     now = run.created_at
     run.candidate = IssueCandidate(
         repository="example/project",
@@ -353,8 +357,9 @@ def test_terminal_run_with_active_publication_hold_is_an_error_and_is_retained(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    run = _prepared_run(store)
-    summary = EvaluationStore(store).summary(deployment_fingerprint="f" * 64)
+    deployment_fingerprint = "f" * 64
+    run = _prepared_run(store, deployment_fingerprint=deployment_fingerprint)
+    summary = EvaluationStore(store).summary(deployment_fingerprint=deployment_fingerprint)
     run = store.begin_publication(
         run,
         "example/project",
@@ -370,6 +375,12 @@ def test_terminal_run_with_active_publication_hold_is_an_error_and_is_retained(
         repository_cooldown=timedelta(0),
         evaluation_corpus_cursor=summary.corpus_cursor,
         evaluation_deployment_fingerprint=summary.deployment_fingerprint,
+        outcome_corpus_cursor=store.upstream_outcome_corpus_cursor(
+            summary.deployment_fingerprint,
+            "octocat",
+            "https://api.github.com",
+            exclude_run_id=run.run_id,
+        ),
     )
     run.status = RunStatus.FAILED
     store.save(run, event="fixture.failed", details={"reason": "ambiguous publication"})

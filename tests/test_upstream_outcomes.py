@@ -39,6 +39,7 @@ from autocontribute.upstream_outcomes import (
     UpstreamOutcome,
     UpstreamOutcomeGate,
     UpstreamPublicationScope,
+    classify_exact_human_approval,
 )
 
 NOW = datetime(2026, 7, 22, 12, tzinfo=UTC)
@@ -1088,6 +1089,40 @@ def test_auto_hold_wins_over_an_existing_human_approval() -> None:
 
     assert automatic.run_id not in {member.run_id for member in summary.manual_cohort}
     assert summary.prior_automatic[0].authorization == PublicationAuthorization.AUTO
+
+
+def test_exact_human_approval_exposes_ledger_bound_intent_time() -> None:
+    store = FakeStore()
+    evaluations = FakeEvaluations()
+    publication = _add_publication(store, evaluations, 0)
+    events = tuple(store.events_by_run[publication.run_id])
+
+    authority = classify_exact_human_approval(publication, events)
+
+    assert authority is not None
+    approval = _event(store, publication.run_id, "approval.created")
+    intent = _event(store, publication.run_id, "publication.intent.begun")
+    assert authority.approval_event_hash == approval["event_hash"]
+    assert authority.publication_intent_event_hash == intent["event_hash"]
+    assert authority.publication_intent_at == datetime.fromisoformat(intent["occurred_at"])
+
+
+@pytest.mark.parametrize("corruption", ["missing_intent", "automatic_hold"])
+def test_exact_human_approval_rejects_non_review_authority(corruption: str) -> None:
+    store = FakeStore()
+    evaluations = FakeEvaluations()
+    publication = _add_publication(
+        store,
+        evaluations,
+        0,
+        automatic=corruption == "automatic_hold",
+        approval=True,
+    )
+    events = store.events_by_run[publication.run_id]
+    if corruption == "missing_intent":
+        events[:] = [event for event in events if event["event_type"] != "publication.intent.begun"]
+
+    assert classify_exact_human_approval(publication, tuple(events)) is None
 
 
 def test_pre_v6_automatic_hold_is_ambiguous() -> None:

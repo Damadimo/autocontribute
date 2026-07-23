@@ -184,6 +184,10 @@ def test_prepared_evaluation_survives_publication_lifecycle_changes(tmp_path: Pa
     run.commit_committer_email = "octocat@users.noreply.github.com"
     run.publication_draft = True
     run.publication_ready_for_review = False
+    run.upstream_repository_id = 1001
+    run.upstream_repository_node_id = "R_upstream_fixture"
+    run.fork_repository_id = 2001
+    run.fork_repository_node_id = "R_fork_fixture"
     store.save(run, event="fixture.publication_context_bound", details={})
     store.transition(run, RunStatus.APPROVED, reason="fixture approval")
     run.branch_name = "autocontribute/fixture"
@@ -193,6 +197,7 @@ def test_prepared_evaluation_survives_publication_lifecycle_changes(tmp_path: Pa
     store.save(run, event="fixture.committed", details={})
     store.transition(run, RunStatus.SUBMITTING, reason="fixture publication")
     run.pull_request_url = "https://github.com/example/project/pull/1"
+    run.pull_request_node_id = "PR_fixture_1"
     store.save(run, event="fixture.pull_request", details={})
     store.transition(run, RunStatus.PR_OPEN, reason="fixture opened")
 

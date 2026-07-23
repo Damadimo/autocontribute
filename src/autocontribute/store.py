@@ -29,6 +29,7 @@ from autocontribute.github_origin import canonical_api_origin
 from autocontribute.lifecycle import (
     PullRequestLifecycleSnapshot,
     parse_lifecycle_snapshot_json,
+    parse_pull_request_url,
 )
 
 CURRENT_SCHEMA_VERSION: Final = 6
@@ -39,9 +40,8 @@ _MAX_LIFECYCLE_SNAPSHOT_CORPUS: Final = 100_000
 _MAX_RUN_CORPUS: Final = 10_000
 _MAX_EVALUATION_EVENT_CORPUS: Final = 10_000
 _UPSTREAM_OUTCOME_CURSOR_DOMAIN: Final = b"autocontribute.upstream-outcome-corpus.v1\x00"
-_GITHUB_LOGIN: Final = re.compile(
-    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$"
-)
+_GITHUB_LOGIN: Final = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+_GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _REQUIRED_STORAGE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT"
 _REQUIRED_WORKSPACE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT"
 _OFFLINE_VERIFICATION: Final = object()
@@ -196,6 +196,510 @@ def _validate_event_details(details: dict[str, str], *, field: str) -> None:
         raise ValueError(f"{field} must contain string keys and values")
     if len(_canonical_json(details).encode("utf-8")) > 20_000:
         raise ValueError(f"{field} exceeds the storage limit")
+
+
+def _stored_event_details(value: object, *, field: str) -> dict[str, str]:
+    if not isinstance(value, str):
+        raise StateError(f"{field} contains invalid stored values")
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise StateError(f"{field} contains malformed details") from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in parsed.items()
+    ):
+        raise StateError(f"{field} contains malformed details")
+    return parsed
+
+
+def _assert_merged_publication_compensation_events(
+    connection: sqlite3.Connection,
+    manifest: RunManifest,
+    *,
+    pull_request_url: str,
+) -> None:
+    """Bind merged adoption to the exact base race and later remote observation."""
+
+    if (
+        manifest.candidate is None
+        or manifest.base_sha is None
+        or manifest.branch_name is None
+        or manifest.commit_sha is None
+        or manifest.publishing_login is None
+        or manifest.publishing_api_origin is None
+        or manifest.upstream_repository_id is None
+        or manifest.upstream_repository_node_id is None
+        or manifest.fork_repository_id is None
+        or manifest.fork_repository_node_id is None
+        or manifest.pull_request_node_id is None
+    ):
+        raise StateError("Merged publication compensation lacks durable identity")
+    repository, number = parse_pull_request_url(
+        pull_request_url,
+        api_origin=manifest.publishing_api_origin,
+    )
+    if repository.casefold() != manifest.candidate.repository.casefold():
+        raise StateError("Merged publication compensation belongs to another repository")
+    expected_fork = f"{manifest.publishing_login}/{manifest.candidate.repository.split('/', 1)[1]}"
+    rows = connection.execute(
+        """
+        SELECT id, event_type, details_json FROM events
+        WHERE run_id = ? AND event_type IN (
+            'branch.pushed',
+            'pull_request.created.response',
+            'pull_request.created.rejected',
+            'publication.compensation.started',
+            'pull_request.compensation.reconciled'
+        )
+        ORDER BY id
+        """,
+        (manifest.run_id,),
+    ).fetchall()
+    grouped: dict[str, builtins.list[sqlite3.Row]] = {}
+    for row in rows:
+        event_type = row["event_type"]
+        if not isinstance(event_type, str):
+            raise StateError("Merged publication compensation has invalid event identity")
+        grouped.setdefault(event_type, []).append(row)
+    singular = (
+        "branch.pushed",
+        "pull_request.created.response",
+        "pull_request.created.rejected",
+        "publication.compensation.started",
+    )
+    if any(len(grouped.get(event_type, ())) != 1 for event_type in singular):
+        raise StateError(
+            "Merged publication compensation lacks one exact branch, response, rejection, and "
+            "marker"
+        )
+    reconciliations = grouped.get("pull_request.compensation.reconciled", [])
+    if not reconciliations:
+        raise StateError("Merged publication compensation lacks a remote merged observation")
+
+    branch_row = grouped["branch.pushed"][0]
+    response_row = grouped["pull_request.created.response"][0]
+    rejection_row = grouped["pull_request.created.rejected"][0]
+    marker_row = grouped["publication.compensation.started"][0]
+    event_ids = (
+        branch_row["id"],
+        response_row["id"],
+        rejection_row["id"],
+        marker_row["id"],
+        *(row["id"] for row in reconciliations),
+    )
+    if not all(
+        isinstance(event_id, int) and not isinstance(event_id, bool) and event_id > 0
+        for event_id in event_ids
+    ) or tuple(event_ids) != tuple(sorted(event_ids)):
+        raise StateError("Merged publication compensation evidence is out of order")
+    latest = connection.execute(
+        "SELECT id FROM events WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+        (manifest.run_id,),
+    ).fetchone()
+    if latest is None or latest["id"] != reconciliations[-1]["id"]:
+        raise StateError(
+            "Merged publication compensation observation is not the latest run evidence"
+        )
+
+    branch = _stored_event_details(
+        branch_row["details_json"],
+        field="published contribution branch",
+    )
+    response = _stored_event_details(
+        response_row["details_json"],
+        field="created pull-request response",
+    )
+    rejection = _stored_event_details(
+        rejection_row["details_json"],
+        field="created pull-request rejection",
+    )
+    marker = _stored_event_details(
+        marker_row["details_json"],
+        field="publication compensation marker",
+    )
+    returned_base = marker.get("returned_base_sha", "").casefold()
+    if not _GIT_SHA.fullmatch(returned_base) or returned_base == manifest.base_sha.casefold():
+        raise StateError("Merged publication compensation marker lacks an exact base race")
+    expected_marker = {
+        "reason": "created_pr_base_moved",
+        "url": pull_request_url,
+        "pull_request_node_id": manifest.pull_request_node_id,
+        "repository": repository,
+        "number": str(number),
+        "upstream_repository_id": str(manifest.upstream_repository_id),
+        "upstream_repository_node_id": manifest.upstream_repository_node_id,
+        "fork": expected_fork,
+        "fork_repository_id": str(manifest.fork_repository_id),
+        "fork_repository_node_id": manifest.fork_repository_node_id,
+        "branch": manifest.branch_name,
+        "commit_sha": manifest.commit_sha,
+        "approved_base_sha": manifest.base_sha,
+        "returned_base_sha": marker.get("returned_base_sha", ""),
+    }
+    if marker != expected_marker:
+        raise StateError("Merged publication compensation marker differs from durable intent")
+    if branch != {
+        "fork": expected_fork,
+        "fork_repository_id": str(manifest.fork_repository_id),
+        "fork_repository_node_id": manifest.fork_repository_node_id,
+        "upstream_repository_id": str(manifest.upstream_repository_id),
+        "upstream_repository_node_id": manifest.upstream_repository_node_id,
+        "branch": manifest.branch_name,
+        "commit_sha": manifest.commit_sha,
+    }:
+        raise StateError("Merged publication compensation branch differs from durable intent")
+    if response != {
+        "url": pull_request_url,
+        "repository": repository,
+        "number": str(number),
+        "state": "open",
+        "head_sha": manifest.commit_sha,
+        "base_sha": marker["returned_base_sha"],
+        "pull_request_node_id": manifest.pull_request_node_id,
+        "upstream_repository_id": str(manifest.upstream_repository_id),
+        "upstream_repository_node_id": manifest.upstream_repository_node_id,
+        "fork_repository_id": str(manifest.fork_repository_id),
+        "fork_repository_node_id": manifest.fork_repository_node_id,
+    }:
+        raise StateError("Merged publication compensation response differs from durable intent")
+    if set(rejection) != {
+        "url",
+        "mismatches",
+        "expected_base_sha",
+        "returned_base_sha",
+    }:
+        raise StateError("Merged publication compensation rejection is malformed")
+    mismatches = tuple(item.strip() for item in rejection["mismatches"].split(","))
+    if (
+        rejection["url"] != pull_request_url
+        or rejection["expected_base_sha"].casefold() != manifest.base_sha.casefold()
+        or rejection["returned_base_sha"].casefold() != returned_base
+        or "base commit" not in mismatches
+    ):
+        raise StateError("Merged publication compensation rejection lacks the exact base race")
+    expected_reconciliation = {
+        "url": pull_request_url,
+        "pull_request_node_id": manifest.pull_request_node_id,
+        "state": "merged",
+        "head_sha": manifest.commit_sha,
+        "upstream_repository_id": str(manifest.upstream_repository_id),
+        "upstream_repository_node_id": manifest.upstream_repository_node_id,
+        "fork_repository_id": str(manifest.fork_repository_id),
+        "fork_repository_node_id": manifest.fork_repository_node_id,
+    }
+    if any(
+        _stored_event_details(
+            row["details_json"],
+            field="merged pull-request reconciliation",
+        )
+        != expected_reconciliation
+        for row in reconciliations
+    ):
+        raise StateError("Merged publication compensation observation differs from durable intent")
+
+
+def _assert_failed_publication_compensation_events(
+    connection: sqlite3.Connection,
+    manifest: RunManifest,
+    *,
+    reason: str,
+    evidence: dict[str, str],
+) -> None:
+    """Bind failed finalization to exact, ordered, hash-verified remote cleanup evidence."""
+
+    if (
+        manifest.candidate is None
+        or manifest.branch_name is None
+        or manifest.publishing_login is None
+        or manifest.publishing_api_origin is None
+        or manifest.upstream_repository_id is None
+        or manifest.upstream_repository_node_id is None
+    ):
+        raise StateError("Publication compensation lacks durable identity")
+    if (manifest.fork_repository_id is None) != (manifest.fork_repository_node_id is None):
+        raise StateError("Publication compensation has partial immutable fork identity")
+    expected_fork = f"{manifest.publishing_login}/{manifest.candidate.repository.split('/', 1)[1]}"
+    fork_identity: dict[str, str]
+    if manifest.fork_repository_id is None:
+        branch_was_pushed = connection.execute(
+            """
+            SELECT 1 FROM events
+            WHERE run_id = ? AND event_type = 'branch.pushed'
+            LIMIT 1
+            """,
+            (manifest.run_id,),
+        ).fetchone()
+        if manifest.commit_sha is not None or branch_was_pushed is not None:
+            raise StateError(
+                "Publication compensation has unbound fork identity after a remote-capable stage"
+            )
+        fork_identity = {"fork_identity_state": "not_bound"}
+    else:
+        assert manifest.fork_repository_node_id is not None
+        fork_identity = {
+            "fork_identity_state": "bound",
+            "fork_repository_id": str(manifest.fork_repository_id),
+            "fork_repository_node_id": manifest.fork_repository_node_id,
+        }
+    expected_absence = {
+        "repository": manifest.candidate.repository,
+        "publishing_api_origin": manifest.publishing_api_origin,
+        "upstream_repository_id": str(manifest.upstream_repository_id),
+        "upstream_repository_node_id": manifest.upstream_repository_node_id,
+        "head": f"{manifest.publishing_login}:{manifest.branch_name}",
+        "fork": expected_fork,
+        **fork_identity,
+        "branch": manifest.branch_name,
+        "commit_sha": manifest.commit_sha or "not_persisted",
+        "reason": reason,
+    }
+    if (
+        manifest.pull_request_url is None
+        and not manifest.pull_request_creation_started
+        and evidence
+        == {
+            **expected_absence,
+            "pull_request": "absent",
+            "remote_branch": "absent",
+        }
+    ):
+        row = connection.execute(
+            """
+            SELECT id, details_json FROM events
+            WHERE run_id = ? AND event_type = 'publication.absence.verified'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (manifest.run_id,),
+        ).fetchone()
+        latest = connection.execute(
+            "SELECT id FROM events WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+            (manifest.run_id,),
+        ).fetchone()
+        if (
+            row is None
+            or latest is None
+            or row["id"] != latest["id"]
+            or _stored_event_details(
+                row["details_json"],
+                field="publication absence verification",
+            )
+            != expected_absence
+        ):
+            raise StateError("Publication compensation lacks the latest exact absence verification")
+        return
+
+    if (
+        manifest.publication_compensation_reason != "created_pr_base_moved"
+        or manifest.base_sha is None
+        or manifest.commit_sha is None
+        or manifest.publishing_api_origin is None
+        or manifest.upstream_repository_id is None
+        or manifest.upstream_repository_node_id is None
+        or manifest.fork_repository_id is None
+        or manifest.fork_repository_node_id is None
+        or manifest.pull_request_url is None
+        or manifest.pull_request_node_id is None
+    ):
+        raise StateError("Publication compensation lacks exact remote cleanup evidence")
+    repository, number = parse_pull_request_url(
+        manifest.pull_request_url,
+        api_origin=manifest.publishing_api_origin,
+    )
+    if repository.casefold() != manifest.candidate.repository.casefold():
+        raise StateError("Publication compensation belongs to another repository")
+    expected_final = {
+        "url": manifest.pull_request_url,
+        "repository": repository,
+        "number": str(number),
+        "pull_request_node_id": manifest.pull_request_node_id,
+        "upstream_repository_id": str(manifest.upstream_repository_id),
+        "upstream_repository_node_id": manifest.upstream_repository_node_id,
+        "fork": expected_fork,
+        "fork_repository_id": str(manifest.fork_repository_id),
+        "fork_repository_node_id": manifest.fork_repository_node_id,
+        "branch": manifest.branch_name,
+        "commit_sha": manifest.commit_sha,
+        "pull_request": "closed_unmerged",
+        "remote_branch": "absent",
+        "reason": reason,
+    }
+    if evidence != expected_final:
+        raise StateError("Publication compensation evidence differs from durable intent")
+
+    rows = connection.execute(
+        """
+        SELECT id, event_type, details_json FROM events
+        WHERE run_id = ? AND event_type IN (
+            'branch.pushed',
+            'pull_request.created.response',
+            'pull_request.created.rejected',
+            'publication.compensation.started',
+            'pull_request.compensation.closed',
+            'branch.compensated'
+        )
+        ORDER BY id
+        """,
+        (manifest.run_id,),
+    ).fetchall()
+    grouped: dict[str, builtins.list[sqlite3.Row]] = {}
+    for row in rows:
+        event_type = row["event_type"]
+        if not isinstance(event_type, str):
+            raise StateError("Publication compensation has invalid event identity")
+        grouped.setdefault(event_type, []).append(row)
+    singular = (
+        "branch.pushed",
+        "pull_request.created.response",
+        "pull_request.created.rejected",
+        "publication.compensation.started",
+    )
+    if any(len(grouped.get(event_type, ())) != 1 for event_type in singular):
+        raise StateError(
+            "Publication compensation lacks one exact branch, response, rejection, and marker"
+        )
+    closures = grouped.get("pull_request.compensation.closed", [])
+    branches = grouped.get("branch.compensated", [])
+    if not closures or not branches:
+        raise StateError("Publication compensation lacks exact pull-request and branch cleanup")
+
+    branch_row = grouped["branch.pushed"][0]
+    response_row = grouped["pull_request.created.response"][0]
+    rejection_row = grouped["pull_request.created.rejected"][0]
+    marker_row = grouped["publication.compensation.started"][0]
+    ordered_ids = (
+        branch_row["id"],
+        response_row["id"],
+        rejection_row["id"],
+        marker_row["id"],
+        closures[-1]["id"],
+        branches[-1]["id"],
+    )
+    if not all(
+        isinstance(event_id, int) and not isinstance(event_id, bool) and event_id > 0
+        for event_id in ordered_ids
+    ) or tuple(ordered_ids) != tuple(sorted(ordered_ids)):
+        raise StateError("Publication compensation evidence is out of order")
+    marker_id = marker_row["id"]
+    if any(row["id"] <= marker_id for row in (*closures, *branches)):
+        raise StateError("Publication compensation cleanup evidence precedes its marker")
+    latest = connection.execute(
+        "SELECT id FROM events WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+        (manifest.run_id,),
+    ).fetchone()
+    if latest is None or latest["id"] != branches[-1]["id"]:
+        raise StateError("Publication compensation branch cleanup is not the latest run evidence")
+
+    marker = _stored_event_details(
+        marker_row["details_json"],
+        field="publication compensation marker",
+    )
+    returned_base = marker.get("returned_base_sha", "").casefold()
+    if not _GIT_SHA.fullmatch(returned_base) or returned_base == manifest.base_sha.casefold():
+        raise StateError("Publication compensation marker lacks an exact base race")
+    expected_marker = {
+        "reason": "created_pr_base_moved",
+        "url": manifest.pull_request_url,
+        "pull_request_node_id": manifest.pull_request_node_id,
+        "repository": repository,
+        "number": str(number),
+        "upstream_repository_id": str(manifest.upstream_repository_id),
+        "upstream_repository_node_id": manifest.upstream_repository_node_id,
+        "fork": expected_fork,
+        "fork_repository_id": str(manifest.fork_repository_id),
+        "fork_repository_node_id": manifest.fork_repository_node_id,
+        "branch": manifest.branch_name,
+        "commit_sha": manifest.commit_sha,
+        "approved_base_sha": manifest.base_sha,
+        "returned_base_sha": marker.get("returned_base_sha", ""),
+    }
+    if marker != expected_marker:
+        raise StateError("Publication compensation marker differs from durable intent")
+    expected_branch = {
+        "fork": expected_fork,
+        "fork_repository_id": str(manifest.fork_repository_id),
+        "fork_repository_node_id": manifest.fork_repository_node_id,
+        "upstream_repository_id": str(manifest.upstream_repository_id),
+        "upstream_repository_node_id": manifest.upstream_repository_node_id,
+        "branch": manifest.branch_name,
+        "commit_sha": manifest.commit_sha,
+    }
+    if (
+        _stored_event_details(
+            branch_row["details_json"],
+            field="published contribution branch",
+        )
+        != expected_branch
+    ):
+        raise StateError("Publication compensation branch differs from durable intent")
+    expected_response = {
+        "url": manifest.pull_request_url,
+        "repository": repository,
+        "number": str(number),
+        "state": "open",
+        "head_sha": manifest.commit_sha,
+        "base_sha": marker["returned_base_sha"],
+        "pull_request_node_id": manifest.pull_request_node_id,
+        "upstream_repository_id": str(manifest.upstream_repository_id),
+        "upstream_repository_node_id": manifest.upstream_repository_node_id,
+        "fork_repository_id": str(manifest.fork_repository_id),
+        "fork_repository_node_id": manifest.fork_repository_node_id,
+    }
+    if (
+        _stored_event_details(
+            response_row["details_json"],
+            field="created pull-request response",
+        )
+        != expected_response
+    ):
+        raise StateError("Publication compensation response differs from durable intent")
+    rejection = _stored_event_details(
+        rejection_row["details_json"],
+        field="created pull-request rejection",
+    )
+    if set(rejection) != {
+        "url",
+        "mismatches",
+        "expected_base_sha",
+        "returned_base_sha",
+    }:
+        raise StateError("Publication compensation rejection is malformed")
+    mismatches = tuple(item.strip() for item in rejection["mismatches"].split(","))
+    if (
+        rejection["url"] != manifest.pull_request_url
+        or rejection["expected_base_sha"].casefold() != manifest.base_sha.casefold()
+        or rejection["returned_base_sha"].casefold() != returned_base
+        or "base commit" not in mismatches
+    ):
+        raise StateError("Publication compensation rejection lacks the exact base race")
+    expected_close = {
+        "url": manifest.pull_request_url,
+        "state": "closed_unmerged",
+    }
+    if any(
+        _stored_event_details(
+            row["details_json"],
+            field="pull-request compensation closure",
+        )
+        != expected_close
+        for row in closures
+    ):
+        raise StateError("Publication compensation closure differs from durable intent")
+    expected_compensated_branch = {
+        "fork": expected_fork,
+        "fork_repository_id": str(manifest.fork_repository_id),
+        "fork_repository_node_id": manifest.fork_repository_node_id,
+        "branch": manifest.branch_name,
+        "commit_sha": manifest.commit_sha,
+    }
+    if any(
+        _stored_event_details(
+            row["details_json"],
+            field="compensated publication branch",
+        )
+        != expected_compensated_branch
+        for row in branches
+    ):
+        raise StateError("Publication compensation branch cleanup differs from durable intent")
 
 
 def _normalized_schema_sql(value: str | None) -> str | None:
@@ -488,7 +992,11 @@ class RunStore:
                 else:  # pragma: no cover - guarded by the supported-version checks
                     raise StateError(f"No state migration is available from schema {version}")
                 version += 1
-            _reconcile_publication_state(connection, repair_missing=True)
+            _reconcile_publication_state(
+                connection,
+                repair_missing=True,
+                require_current_rollout_cursors=False,
+            )
             self._validate_current_schema(connection)
             connection.commit()
         except Exception:
@@ -1042,7 +1550,10 @@ class RunStore:
             _verify_publication_gate_holds(connection)
         if expected_version >= 5:
             _verify_manifest_artifact_sync(connection)
-            _verify_publication_state(connection)
+            _verify_publication_state(
+                connection,
+                require_current_rollout_cursors=False,
+            )
 
     @classmethod
     def _validate_current_schema(cls, connection: sqlite3.Connection) -> None:
@@ -1326,6 +1837,85 @@ class RunStore:
             ).fetchone()
         return _publication_gate_hold_from_row(row) if row is not None else None
 
+    def assert_publication_gate_hold_current(
+        self,
+        run_id: str,
+        *,
+        deployment_fingerprint: str | None,
+        publishing_login: str,
+        publishing_api_origin: str,
+    ) -> bool:
+        """Fail closed if an automatic publication hold has lost its exact authority.
+
+        A missing hold identifies a manual publication and requires no rollout assertion.  When
+        a hold exists, every check shares one read snapshot: ledger and publication evidence,
+        immutable deployment identity, durable publishing identity, and both rollout cursors.
+        The return value distinguishes a true manual publication from a validated automatic hold.
+        """
+
+        normalized_run_id = _lease_identity(run_id, field="publication run id")
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            # Read-only reconciliation verifies every event anchor, binds publication rows to
+            # their ledger evidence, and compares both active-hold cursors.  In particular, a
+            # deleted automatic hold row cannot masquerade as a manual publication.
+            _verify_publication_state(
+                connection,
+                require_current_rollout_cursors=True,
+            )
+            row = connection.execute(
+                """
+                SELECT run_id, deployment_fingerprint, corpus_cursor,
+                       outcome_corpus_cursor, held_at
+                FROM publication_gate_holds WHERE run_id = ?
+                """,
+                (normalized_run_id,),
+            ).fetchone()
+            if row is None:
+                return False
+
+            hold = _publication_gate_hold_from_row(row)
+            if hold.deployment_fingerprint is None or hold.outcome_corpus_cursor is None:
+                raise StateError(
+                    "Publication gate hold predates schema-v6 upstream-outcome authority; "
+                    "automatic publication is forbidden"
+                )
+            if deployment_fingerprint is None:
+                raise StateError("Automatic publication lacks its deployment fingerprint")
+            deployment, login, origin, _ = _upstream_outcome_cursor_scope(
+                deployment_fingerprint,
+                publishing_login,
+                publishing_api_origin,
+                exclude_run_id=normalized_run_id,
+            )
+            if hold.deployment_fingerprint != deployment:
+                raise StateError("Publication gate hold belongs to a different deployment")
+
+            manifest_row = connection.execute(
+                "SELECT manifest_json FROM runs WHERE run_id = ?",
+                (normalized_run_id,),
+            ).fetchone()
+            if manifest_row is None or not isinstance(manifest_row["manifest_json"], str):
+                raise StateError(
+                    f"Publication gate hold for run {normalized_run_id} lacks its run manifest"
+                )
+            try:
+                manifest = RunManifest.model_validate_json(manifest_row["manifest_json"])
+            except (TypeError, ValueError) as exc:
+                raise StateError(
+                    f"Publication gate hold for run {normalized_run_id} has an invalid run manifest"
+                ) from exc
+            if (
+                manifest.run_id != normalized_run_id
+                or manifest.deployment_fingerprint != deployment
+                or manifest.publishing_login != login
+                or manifest.publishing_api_origin != origin
+            ):
+                raise StateError(
+                    "Publication gate hold belongs to a different publishing identity or scope"
+                )
+            return True
+
     def has_publication_reconstruction_evidence(self, run_id: str) -> bool:
         """Return whether the ledger contains state relevant to publication recovery."""
 
@@ -1545,6 +2135,143 @@ class RunStore:
             manifest_sha256=_manifest_json_digest(manifest_json),
         )
 
+    def finalize_merged_publication_compensation(
+        self,
+        manifest: RunManifest,
+        *,
+        pull_request_url: str,
+        reason: str,
+    ) -> RunManifest:
+        """Adopt one exact already-merged compensating PR into lifecycle management.
+
+        This exposure-reducing recovery is intentionally tolerant of rollout-cursor drift. It is
+        not a general PR_OPEN transition: the durable created-PR compensation marker and exact
+        URL must remain intact in the committing transaction. Automatic runs must retain their
+        same-run hold; a genuine manual run may have no hold.
+        """
+
+        if manifest.status != RunStatus.SUBMITTING:
+            raise StateError("Merged publication compensation requires a SUBMITTING manifest")
+        if manifest.publication_compensation_reason != "created_pr_base_moved":
+            raise StateError(
+                "Merged publication compensation requires the created-PR base-race marker"
+            )
+        expected_pull_request_url = _canonical_publication_intent_text(
+            pull_request_url,
+            field="merged compensating pull request URL",
+            maximum=2_000,
+        )
+        if manifest.pull_request_url != expected_pull_request_url:
+            raise StateError(
+                "Merged publication compensation does not match the durable pull request URL"
+            )
+        normalized_reason = _bounded_text(
+            reason,
+            field="merged publication compensation reason",
+            maximum=2_000,
+        )
+
+        previous = manifest.status
+        expected_updated_at = manifest.updated_at
+        expected_manifest_json = manifest.model_dump_json()
+        manifest.status = RunStatus.PR_OPEN
+        manifest.updated_at = _next_run_update_time(expected_updated_at)
+        updated_manifest_json = manifest.model_dump_json()
+        candidate = manifest.candidate
+        try:
+            with self._connection() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                _reconcile_publication_state(
+                    connection,
+                    repair_missing=True,
+                    require_current_rollout_cursors=False,
+                )
+                _assert_merged_publication_compensation_events(
+                    connection,
+                    manifest,
+                    pull_request_url=expected_pull_request_url,
+                )
+                other_hold = connection.execute(
+                    """
+                    SELECT run_id FROM publication_gate_holds
+                    WHERE run_id <> ? ORDER BY run_id LIMIT 1
+                    """,
+                    (manifest.run_id,),
+                ).fetchone()
+                if other_hold is not None:
+                    other_run_id = other_hold["run_id"]
+                    if not isinstance(other_run_id, str) or not other_run_id:
+                        raise StateError("Publication gate hold contains invalid stored values")
+                    raise StateError(f"Publication gate is held by another run: {other_run_id}")
+                hold_row = connection.execute(
+                    "SELECT run_id FROM publication_gate_holds WHERE run_id = ?",
+                    (manifest.run_id,),
+                ).fetchone()
+                result = connection.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?, repository = ?, issue_number = ?, updated_at = ?,
+                        manifest_json = ?
+                    WHERE run_id = ? AND updated_at = ? AND status = ? AND manifest_json = ?
+                    """,
+                    (
+                        RunStatus.PR_OPEN.value,
+                        candidate.repository if candidate else None,
+                        candidate.number if candidate else None,
+                        manifest.updated_at.isoformat(),
+                        updated_manifest_json,
+                        manifest.run_id,
+                        expected_updated_at.isoformat(),
+                        RunStatus.SUBMITTING.value,
+                        expected_manifest_json,
+                    ),
+                )
+                if result.rowcount != 1:
+                    if (
+                        connection.execute(
+                            "SELECT 1 FROM runs WHERE run_id = ?", (manifest.run_id,)
+                        ).fetchone()
+                        is None
+                    ):
+                        raise StateError(f"Unknown run: {manifest.run_id}")
+                    raise StateError(
+                        f"Run {manifest.run_id} changed while merged compensation was finalized"
+                    )
+                self._append_event(
+                    connection,
+                    manifest.run_id,
+                    "run.transitioned",
+                    {
+                        "from": previous.value,
+                        "to": RunStatus.PR_OPEN.value,
+                        "reason": normalized_reason,
+                    },
+                )
+                if hold_row is not None:
+                    _release_publication_gate_hold_for_compensation(
+                        self,
+                        connection,
+                        manifest.run_id,
+                        outcome="pr_open",
+                        required=True,
+                    )
+                _mark_manifest_artifact_sync(
+                    connection,
+                    run_id=manifest.run_id,
+                    updated_at=manifest.updated_at.isoformat(),
+                    manifest_json=updated_manifest_json,
+                )
+        except Exception:
+            manifest.status = previous
+            manifest.updated_at = expected_updated_at
+            raise
+        self._synchronize_manifest_artifact(
+            manifest.run_id,
+            updated_at=manifest.updated_at.isoformat(),
+            manifest_sha256=_manifest_json_digest(updated_manifest_json),
+        )
+        return manifest
+
     def finalize_publication_compensation(
         self,
         manifest: RunManifest,
@@ -1579,7 +2306,17 @@ class RunStore:
         try:
             with self._connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                _reconcile_publication_state(connection, repair_missing=True)
+                _reconcile_publication_state(
+                    connection,
+                    repair_missing=True,
+                    require_current_rollout_cursors=False,
+                )
+                _assert_failed_publication_compensation_events(
+                    connection,
+                    manifest,
+                    reason=normalized_reason,
+                    evidence=verified_details,
+                )
                 other_hold = connection.execute(
                     """
                     SELECT run_id FROM publication_gate_holds
@@ -1640,7 +2377,7 @@ class RunStore:
                     },
                 )
                 if hold_row is not None:
-                    _release_publication_gate_hold(
+                    _release_publication_gate_hold_for_compensation(
                         self,
                         connection,
                         manifest.run_id,
@@ -1965,9 +2702,7 @@ class RunStore:
                 or stored_manifest.deployment_fingerprint != creation_fingerprint
                 or creation_fingerprint != request.evaluation_deployment_fingerprint
             ):
-                raise StateError(
-                    "Automatic publication run belongs to a different deployment"
-                )
+                raise StateError("Automatic publication run belongs to a different deployment")
 
         reservation_created = existing is None
         if existing is not None:
@@ -2102,9 +2837,7 @@ class RunStore:
                     "automatic recovery is forbidden"
                 )
             if request.publishing_login is None or request.publishing_api_origin is None:
-                raise StateError(
-                    "Automatic publication recovery lacks its publishing identity"
-                )
+                raise StateError("Automatic publication recovery lacks its publishing identity")
             current_outcome_cursor = _upstream_outcome_corpus_cursor_from_connection(
                 connection,
                 hold.deployment_fingerprint,
@@ -4458,8 +5191,14 @@ def _reconcile_publication_state(
     connection: sqlite3.Connection,
     *,
     repair_missing: bool,
+    require_current_rollout_cursors: bool = True,
 ) -> None:
-    """Cross-check publication tables against their verified per-run ledger evidence."""
+    """Cross-check publication tables against their verified per-run ledger evidence.
+
+    Recovery-capable schema validation and exact compensation may waive current rollout-cursor
+    equality without granting constructive authority. Ledger anchors, durable rows, hold identity,
+    and every recorded modern deployment scope remain mandatory.
+    """
 
     _verify_event_anchors(connection)
     event_reservations, event_holds, releases = _publication_evidence_from_connection(connection)
@@ -4529,7 +5268,9 @@ def _reconcile_publication_state(
         raise StateError(f"Run {run_id} publication gate hold lacks ledger evidence")
 
     active_holds = [hold for run_id, hold in row_holds.items() if run_id not in releases]
-    if active_holds:
+    for hold in active_holds:
+        _validated_active_outcome_scope(connection, hold)
+    if active_holds and require_current_rollout_cursors:
         current_cursor = _evaluation_corpus_cursor_from_connection(connection)
         for hold in active_holds:
             if hold.corpus_cursor != current_cursor:
@@ -4540,8 +5281,16 @@ def _reconcile_publication_state(
             _verify_active_outcome_hold(connection, hold)
 
 
-def _verify_publication_state(connection: sqlite3.Connection) -> None:
-    _reconcile_publication_state(connection, repair_missing=False)
+def _verify_publication_state(
+    connection: sqlite3.Connection,
+    *,
+    require_current_rollout_cursors: bool,
+) -> None:
+    _reconcile_publication_state(
+        connection,
+        repair_missing=False,
+        require_current_rollout_cursors=require_current_rollout_cursors,
+    )
 
 
 def _verify_active_outcome_hold(
@@ -4550,8 +5299,29 @@ def _verify_active_outcome_hold(
 ) -> None:
     """Validate a v6 outcome cursor; a NULL cursor remains fenced legacy evidence."""
 
+    scope = _validated_active_outcome_scope(connection, hold)
     if hold.outcome_corpus_cursor is None:
         return
+    if scope is None:  # pragma: no cover - guarded by validated outcome authority
+        raise StateError("Publication gate hold outcome scope is missing")
+    actual = _upstream_outcome_corpus_cursor_from_connection(connection, *scope)
+    if actual != hold.outcome_corpus_cursor:
+        raise StateError(
+            f"Publication gate hold for run {hold.run_id} disagrees with the "
+            "upstream-outcome corpus"
+        )
+
+
+def _validated_active_outcome_scope(
+    connection: sqlite3.Connection,
+    hold: PublicationGateHold | _PublicationGateEvidence,
+) -> tuple[str, str, str, str | None] | None:
+    """Validate hold ownership and return its modern outcome scope without comparing cursors."""
+
+    if hold.outcome_corpus_cursor is None:
+        # Pre-v6 holds remain eligible only for exposure-reducing compensation. Their exact row
+        # and ledger evidence is checked by reconciliation, but no outcome scope was ever held.
+        return None
     if hold.deployment_fingerprint is None:
         raise StateError(
             f"Publication gate hold for run {hold.run_id} has outcome authority without a "
@@ -4583,24 +5353,17 @@ def _verify_active_outcome_hold(
         raise StateError(
             f"Publication gate hold for run {hold.run_id} lacks its publishing identity"
         )
-    deployment, login, origin, excluded = _upstream_outcome_cursor_scope(
-        hold.deployment_fingerprint,
-        manifest.publishing_login,
-        manifest.publishing_api_origin,
-        exclude_run_id=hold.run_id,
-    )
-    actual = _upstream_outcome_corpus_cursor_from_connection(
-        connection,
-        deployment,
-        login,
-        origin,
-        excluded,
-    )
-    if actual != hold.outcome_corpus_cursor:
-        raise StateError(
-            f"Publication gate hold for run {hold.run_id} disagrees with the "
-            "upstream-outcome corpus"
+    try:
+        return _upstream_outcome_cursor_scope(
+            hold.deployment_fingerprint,
+            manifest.publishing_login,
+            manifest.publishing_api_origin,
+            exclude_run_id=hold.run_id,
         )
+    except (TypeError, ValueError) as exc:
+        raise StateError(
+            f"Publication gate hold for run {hold.run_id} has an invalid publishing scope"
+        ) from exc
 
 
 def _publication_gate_hold_from_row(row: sqlite3.Row) -> PublicationGateHold:
@@ -4669,7 +5432,52 @@ def _release_publication_gate_hold(
     outcome: str,
     required: bool,
 ) -> bool:
-    _reconcile_publication_state(connection, repair_missing=True)
+    """Release a successful publication hold only while both rollout cursors remain current."""
+
+    return _release_publication_gate_hold_with_policy(
+        store,
+        connection,
+        run_id,
+        outcome=outcome,
+        required=required,
+        require_current_rollout_cursors=True,
+    )
+
+
+def _release_publication_gate_hold_for_compensation(
+    store: RunStore,
+    connection: sqlite3.Connection,
+    run_id: str,
+    *,
+    outcome: str,
+    required: bool,
+) -> bool:
+    """Release an exact compensated hold without treating rollout drift as new authority."""
+
+    return _release_publication_gate_hold_with_policy(
+        store,
+        connection,
+        run_id,
+        outcome=outcome,
+        required=required,
+        require_current_rollout_cursors=False,
+    )
+
+
+def _release_publication_gate_hold_with_policy(
+    store: RunStore,
+    connection: sqlite3.Connection,
+    run_id: str,
+    *,
+    outcome: str,
+    required: bool,
+    require_current_rollout_cursors: bool,
+) -> bool:
+    _reconcile_publication_state(
+        connection,
+        repair_missing=True,
+        require_current_rollout_cursors=require_current_rollout_cursors,
+    )
     row = connection.execute(
         """
         SELECT run_id, deployment_fingerprint, corpus_cursor,
@@ -4685,10 +5493,13 @@ def _release_publication_gate_hold(
     hold = _publication_gate_hold_from_row(row)
     if hold.run_id != run_id:
         raise StateError("Publication gate hold identity changed during release")
-    current_cursor = _evaluation_corpus_cursor_from_connection(connection)
-    if current_cursor != hold.corpus_cursor:
-        raise StateError("Evaluation corpus differs from the active publication gate hold")
-    _verify_active_outcome_hold(connection, hold)
+    if require_current_rollout_cursors:
+        current_cursor = _evaluation_corpus_cursor_from_connection(connection)
+        if current_cursor != hold.corpus_cursor:
+            raise StateError("Evaluation corpus differs from the active publication gate hold")
+        _verify_active_outcome_hold(connection, hold)
+    else:
+        _validated_active_outcome_scope(connection, hold)
     release_details = {
         "outcome": outcome,
         "corpus_cursor": hold.corpus_cursor,
@@ -4905,9 +5716,7 @@ def _publication_reservation_request(
             field="upstream-outcome corpus cursor",
         )
         if expected_login is None or expected_origin is None:
-            raise ValueError(
-                "automatic publication requires a publishing login and API origin"
-            )
+            raise ValueError("automatic publication requires a publishing login and API origin")
     reserved_at = _aware_utc(now or utc_now(), field="publication reservation time")
     day_start = reserved_at.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end = day_start + timedelta(days=1)

@@ -160,8 +160,12 @@ SQLite snapshot together as one generation.
 The guarded automatic publisher records both exact validated corpus cursors--expert evaluation and
 upstream outcome--in a non-expiring SQLite hold atomically with its publication reservation. Initial
 evaluations and amendments are rejected while any hold remains. Both cursors are recomputed and
-revalidated during recovery. A process crash or expired coordination lease cannot reopen either
-corpus; only a durable open-PR state or fully verified exact remote compensation releases the hold.
+revalidated before constructive recovery. A process crash or expired coordination lease cannot
+reopen either corpus. Once exact compensation evidence is durably marked, it may only close/delete
+that already-bound PR/branch despite cursor or opt-in drift, or despite the breaker already being
+active; after its remote result is reverified and hash-chained, it may release the hold. An exact PR
+that already merged may instead be adopted into lifecycle management without a GitHub mutation. No
+drift can authorize a constructive write.
 
 Autonomous mode also requires an operator-managed, non-ephemeral deployment; the included hosted
 Actions workflow remains permanently `review_required` and an evictable cache cannot serve as the

@@ -35,6 +35,8 @@ def _client(
 
 def _repository_payload(full_name: str) -> dict[str, object]:
     return {
+        "id": 1001,
+        "node_id": "R_fixture_1001",
         "full_name": full_name,
         "html_url": f"https://github.com/{full_name}",
         "clone_url": f"https://github.com/{full_name}.git",
@@ -66,12 +68,20 @@ def _pull_request_payload(*, merged: bool = False, draft: bool = False) -> dict[
             "sha": "a" * 40,
             "ref": "fix",
             "label": "octocat:fix",
-            "repo": {"full_name": "octocat/project"},
+            "repo": {
+                "id": 2001,
+                "node_id": "R_fixture_2001",
+                "full_name": "octocat/project",
+            },
         },
         "base": {
             "sha": "c" * 40,
             "ref": "main",
-            "repo": {"full_name": "example/project"},
+            "repo": {
+                "id": 1001,
+                "node_id": "R_fixture_1001",
+                "full_name": "example/project",
+            },
         },
         "comments": 1,
         "review_comments": 1,
@@ -329,6 +339,60 @@ def test_get_repository_accepts_exact_configured_ghes_web_urls() -> None:
     assert repository.clone_url == "https://git.example.com:8443/example/project.git"
 
 
+def test_repository_identity_reads_database_and_graphql_ids() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/example/project"
+        return httpx.Response(200, json=_repository_payload("example/project"))
+
+    with _client(handler) as github:
+        identity = github.get_repository_identity("example/project")
+
+    assert identity.full_name == "example/project"
+    assert identity.database_id == 1001
+    assert identity.node_id == "R_fixture_1001"
+
+
+def test_fork_identity_binds_immutable_parent() -> None:
+    payload = _repository_payload("octocat/project")
+    payload.update(
+        {
+            "id": 2001,
+            "node_id": "R_fixture_2001",
+            "fork": True,
+            "parent": _repository_payload("example/project"),
+        }
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/octocat/project"
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github:
+        identity = github.get_fork_identity("octocat/project")
+
+    assert identity.repository.database_id == 2001
+    assert identity.repository.node_id == "R_fixture_2001"
+    assert identity.parent.database_id == 1001
+    assert identity.parent.node_id == "R_fixture_1001"
+
+
+def test_repository_identity_assertion_uses_immutable_route_and_rejects_name_reuse() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(200, json=_repository_payload("attacker/project"))
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="durable immutable"):
+        github.assert_repository_identity(
+            "example/project",
+            expected_database_id=1001,
+            expected_node_id="R_fixture_1001",
+        )
+
+    assert paths == ["/repositories/1001"]
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -429,6 +493,60 @@ def test_existing_unrelated_repository_cannot_be_reused_as_fork() -> None:
 
     with _client(handler) as github, pytest.raises(GitHubError, match="not a fork"):
         github.ensure_fork("upstream/project", "octocat")
+
+
+def test_ensure_fork_callback_can_block_creation_before_post() -> None:
+    requests: list[tuple[str, str]] = []
+    callbacks: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        assert request.method == "GET"
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    def block_creation() -> None:
+        callbacks.append("called")
+        raise RuntimeError("stop before fork creation")
+
+    with (
+        _client(handler) as github,
+        pytest.raises(RuntimeError, match="stop before fork creation"),
+    ):
+        github.ensure_fork(
+            "upstream/project",
+            "octocat",
+            before_mutation=block_creation,
+        )
+
+    assert callbacks == ["called"]
+    assert requests == [("GET", "/repos/octocat/project")]
+
+
+def test_ensure_fork_does_not_invoke_mutation_callback_for_existing_fork() -> None:
+    requests: list[tuple[str, str]] = []
+    callbacks: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(
+            200,
+            json={
+                "fork": True,
+                "full_name": "octocat/project",
+                "parent": {"full_name": "upstream/project"},
+            },
+        )
+
+    with _client(handler) as github:
+        fork = github.ensure_fork(
+            "upstream/project",
+            "octocat",
+            before_mutation=lambda: callbacks.append("called"),
+        )
+
+    assert fork == "octocat/project"
+    assert callbacks == []
+    assert requests == [("GET", "/repos/octocat/project")]
 
 
 def test_competing_pull_request_search_paginates_issue_timeline() -> None:
@@ -1239,6 +1357,39 @@ def test_create_pull_request_returns_canonical_success_details() -> None:
     assert details.base_sha == "c" * 40
 
 
+def test_create_pull_request_callback_can_block_before_post() -> None:
+    requests: list[tuple[str, str]] = []
+    callbacks: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(200, json=_pull_request_payload())
+
+    def block_creation() -> None:
+        callbacks.append("called")
+        raise RuntimeError("stop before pull-request creation")
+
+    with (
+        _client(handler) as github,
+        pytest.raises(RuntimeError, match="stop before pull-request creation"),
+    ):
+        github.create_pull_request(
+            "example/project",
+            title="Fix parser boundary",
+            body="Fixes #42.",
+            head="octocat:fix",
+            expected_head_sha="a" * 40,
+            expected_head_repository="octocat/project",
+            base="main",
+            expected_base_sha="c" * 40,
+            draft=False,
+            before_mutation=block_creation,
+        )
+
+    assert callbacks == ["called"]
+    assert requests == []
+
+
 def test_create_pull_request_accepts_exact_ghes_url_with_custom_port() -> None:
     api_url = "https://git.example.com:8443/api/v3"
     expected_url = "https://git.example.com:8443/example/project/pull/7"
@@ -1387,7 +1538,7 @@ def test_mark_pull_request_ready_for_review_uses_exact_graphql_identity() -> Non
             get_count += 1
             return httpx.Response(
                 200,
-                json=_pull_request_payload(draft=get_count == 1),
+                json=_pull_request_payload(draft=get_count <= 2),
             )
         assert request.url.path == "/graphql"
         body = request.read().decode("utf-8")
@@ -1414,6 +1565,7 @@ def test_mark_pull_request_ready_for_review_uses_exact_graphql_identity() -> Non
             "example/project",
             7,
             expected_url="https://github.com/example/project/pull/7",
+            expected_node_id="PR_fixture_node_7",
             expected_head_repository="octocat/project",
             expected_head_ref="fix",
             expected_head_sha="a" * 40,
@@ -1422,7 +1574,209 @@ def test_mark_pull_request_ready_for_review_uses_exact_graphql_identity() -> Non
     assert not details.draft
     assert requests == [
         ("GET", "/repos/example/project/pulls/7"),
+        ("GET", "/repos/example/project/pulls/7"),
         ("POST", "/graphql"),
+        ("GET", "/repos/example/project/pulls/7"),
+    ]
+
+
+def test_ready_for_review_local_callback_runs_after_final_get_and_before_graphql() -> None:
+    requests: list[tuple[str, str]] = []
+    callbacks: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        assert request.method == "GET"
+        return httpx.Response(200, json=_pull_request_payload(draft=True))
+
+    def block_mutation() -> None:
+        callbacks.append("called")
+        raise RuntimeError("stop before ready-for-review mutation")
+
+    with (
+        _client(handler) as github,
+        pytest.raises(RuntimeError, match="stop before ready-for-review mutation"),
+    ):
+        github.mark_pull_request_ready_for_review(
+            "example/project",
+            7,
+            expected_url="https://github.com/example/project/pull/7",
+            expected_node_id="PR_fixture_node_7",
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+            before_mutation=block_mutation,
+        )
+
+    assert callbacks == ["called"]
+    assert requests == [
+        ("GET", "/repos/example/project/pulls/7"),
+        ("GET", "/repos/example/project/pulls/7"),
+    ]
+
+
+def test_ready_for_review_returns_when_exact_pull_request_became_ready_after_callback() -> None:
+    requests: list[tuple[str, str]] = []
+    callback_ran = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        assert request.method == "GET"
+        return httpx.Response(200, json=_pull_request_payload(draft=not callback_ran))
+
+    def concurrent_ready_transition() -> None:
+        nonlocal callback_ran
+        callback_ran = True
+
+    with _client(handler) as github:
+        details = github.mark_pull_request_ready_for_review(
+            "example/project",
+            7,
+            expected_url="https://github.com/example/project/pull/7",
+            expected_node_id="PR_fixture_node_7",
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+            before_observation=concurrent_ready_transition,
+        )
+
+    assert callback_ran
+    assert not details.draft
+    assert requests == [
+        ("GET", "/repos/example/project/pulls/7"),
+        ("GET", "/repos/example/project/pulls/7"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("drift", "message"),
+    [
+        ("node", "different pull-request node"),
+        ("head", "different head commit"),
+    ],
+)
+def test_ready_for_review_rechecks_exact_identity_after_callback(
+    drift: str,
+    message: str,
+) -> None:
+    requests: list[tuple[str, str]] = []
+    callback_ran = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        assert request.method == "GET"
+        payload = _pull_request_payload(draft=True)
+        if callback_ran and drift == "node":
+            payload["node_id"] = "PR_replaced_after_callback"
+        elif callback_ran:
+            head = payload["head"]
+            assert isinstance(head, dict)
+            head["sha"] = "d" * 40
+        return httpx.Response(200, json=payload)
+
+    def repository_identity_check() -> None:
+        nonlocal callback_ran
+        callback_ran = True
+
+    with _client(handler) as github, pytest.raises(GitHubError, match=message):
+        github.mark_pull_request_ready_for_review(
+            "example/project",
+            7,
+            expected_url="https://github.com/example/project/pull/7",
+            expected_node_id="PR_fixture_node_7",
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+            before_observation=repository_identity_check,
+        )
+
+    assert requests == [
+        ("GET", "/repos/example/project/pulls/7"),
+        ("GET", "/repos/example/project/pulls/7"),
+    ]
+
+
+def test_ready_for_review_rechecks_authority_at_final_dispatch_boundary() -> None:
+    requests: list[tuple[str, str]] = []
+    final_identity_read_completed = False
+    callbacks: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal final_identity_read_completed
+        requests.append((request.method, request.url.path))
+        assert request.method == "GET"
+        if len(requests) == 2:
+            final_identity_read_completed = True
+        return httpx.Response(200, json=_pull_request_payload(draft=True))
+
+    def remote_preflight() -> None:
+        callbacks.append("remote preflight")
+
+    def local_authority_check() -> None:
+        callbacks.append("local authority")
+        if final_identity_read_completed:
+            raise RuntimeError("authority changed during final pull-request read")
+
+    with (
+        _client(handler) as github,
+        pytest.raises(RuntimeError, match="authority changed during final"),
+    ):
+        github.mark_pull_request_ready_for_review(
+            "example/project",
+            7,
+            expected_url="https://github.com/example/project/pull/7",
+            expected_node_id="PR_fixture_node_7",
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+            before_observation=remote_preflight,
+            before_mutation=local_authority_check,
+        )
+
+    assert callbacks == ["remote preflight", "local authority"]
+    assert requests == [
+        ("GET", "/repos/example/project/pulls/7"),
+        ("GET", "/repos/example/project/pulls/7"),
+    ]
+
+
+@pytest.mark.parametrize("concurrent_state", ["closed", "merged"])
+def test_ready_for_review_rejects_terminal_state_after_callback(
+    concurrent_state: str,
+) -> None:
+    requests: list[tuple[str, str]] = []
+    callback_ran = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        assert request.method == "GET"
+        payload = _pull_request_payload(
+            draft=True,
+            merged=callback_ran and concurrent_state == "merged",
+        )
+        if callback_ran and concurrent_state == "closed":
+            payload["state"] = "closed"
+            payload["closed_at"] = "2026-07-21T13:01:00Z"
+        return httpx.Response(200, json=payload)
+
+    def terminal_transition() -> None:
+        nonlocal callback_ran
+        callback_ran = True
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="state changed"):
+        github.mark_pull_request_ready_for_review(
+            "example/project",
+            7,
+            expected_url="https://github.com/example/project/pull/7",
+            expected_node_id="PR_fixture_node_7",
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+            before_observation=terminal_transition,
+        )
+
+    assert requests == [
+        ("GET", "/repos/example/project/pulls/7"),
         ("GET", "/repos/example/project/pulls/7"),
     ]
 
@@ -1439,6 +1793,7 @@ def test_mark_pull_request_ready_for_review_is_idempotent_when_already_ready() -
             "example/project",
             7,
             expected_url="https://github.com/example/project/pull/7",
+            expected_node_id="PR_fixture_node_7",
             expected_head_repository="octocat/project",
             expected_head_ref="fix",
             expected_head_sha="a" * 40,
@@ -1457,7 +1812,7 @@ def test_mark_pull_request_ready_for_review_uses_ghes_graphql_path() -> None:
         paths.append(request.url.path)
         if request.method == "GET":
             get_count += 1
-            payload = _pull_request_payload(draft=get_count == 1)
+            payload = _pull_request_payload(draft=get_count <= 2)
             payload["html_url"] = "https://git.example.com/example/project/pull/7"
             return httpx.Response(200, json=payload)
         return httpx.Response(
@@ -1482,6 +1837,7 @@ def test_mark_pull_request_ready_for_review_uses_ghes_graphql_path() -> None:
             "example/project",
             7,
             expected_url="https://git.example.com/example/project/pull/7",
+            expected_node_id="PR_fixture_node_7",
             expected_head_repository="octocat/project",
             expected_head_ref="fix",
             expected_head_sha="a" * 40,
@@ -1489,37 +1845,69 @@ def test_mark_pull_request_ready_for_review_uses_ghes_graphql_path() -> None:
 
     assert paths == [
         "/api/v3/repos/example/project/pulls/7",
+        "/api/v3/repos/example/project/pulls/7",
         "/api/graphql",
         "/api/v3/repos/example/project/pulls/7",
     ]
 
 
-def test_close_pull_request_validates_identity_before_and_after_patch() -> None:
-    methods: list[str] = []
+def test_close_pull_request_uses_immutable_node_and_confirms_identity() -> None:
+    requests: list[tuple[str, str]] = []
+    get_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
-        methods.append(request.method)
-        payload = _pull_request_payload()
-        if request.method == "PATCH":
-            payload["state"] = "closed"
-            payload["closed_at"] = "2026-07-21T13:01:00Z"
-        return httpx.Response(200, json=payload)
+        nonlocal get_count
+        requests.append((request.method, request.url.path))
+        if request.method == "GET":
+            get_count += 1
+            payload = _pull_request_payload()
+            if get_count == 3:
+                payload["state"] = "closed"
+                payload["closed_at"] = "2026-07-21T13:01:00Z"
+            return httpx.Response(200, json=payload)
+        assert request.url.path == "/graphql"
+        body = request.read().decode("utf-8")
+        assert "closePullRequest" in body
+        assert "PR_fixture_node_7" in body
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "closePullRequest": {
+                        "pullRequest": {
+                            "id": "PR_fixture_node_7",
+                            "number": 7,
+                            "url": "https://github.com/example/project/pull/7",
+                            "state": "CLOSED",
+                            "merged": False,
+                            "headRefOid": "a" * 40,
+                        }
+                    }
+                }
+            },
+        )
 
     with _client(handler) as github:
         closed = github.close_pull_request(
             "example/project",
             7,
+            expected_node_id="PR_fixture_node_7",
             expected_head_repository="octocat/project",
             expected_head_ref="fix",
             expected_head_sha="a" * 40,
         )
 
-    assert methods == ["GET", "PATCH"]
+    assert requests == [
+        ("GET", "/repos/example/project/pulls/7"),
+        ("GET", "/repos/example/project/pulls/7"),
+        ("POST", "/graphql"),
+        ("GET", "/repos/example/project/pulls/7"),
+    ]
     assert closed.state == "closed"
     assert not closed.merged
 
 
-def test_close_pull_request_refuses_head_drift_without_patch() -> None:
+def test_close_pull_request_refuses_head_drift_without_mutation() -> None:
     methods: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -1534,9 +1922,104 @@ def test_close_pull_request_refuses_head_drift_without_patch() -> None:
         github.close_pull_request(
             "example/project",
             7,
+            expected_node_id="PR_fixture_node_7",
             expected_head_repository="octocat/project",
             expected_head_ref="fix",
             expected_head_sha="a" * 40,
         )
 
     assert methods == ["GET"]
+
+
+def test_close_pull_request_refuses_node_drift_without_mutation() -> None:
+    methods: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        payload = _pull_request_payload()
+        payload["node_id"] = "PR_different_node"
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="different pull-request"):
+        github.close_pull_request(
+            "example/project",
+            7,
+            expected_node_id="PR_fixture_node_7",
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+        )
+
+    assert methods == ["GET"]
+
+
+def test_close_pull_request_rechecks_node_after_repository_identity_callback() -> None:
+    methods: list[str] = []
+    callback_ran = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        payload = _pull_request_payload()
+        if callback_ran:
+            payload["node_id"] = "PR_replaced_after_callback"
+        return httpx.Response(200, json=payload)
+
+    def repository_identity_check() -> None:
+        nonlocal callback_ran
+        callback_ran = True
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="different pull-request"):
+        github.close_pull_request(
+            "example/project",
+            7,
+            expected_node_id="PR_fixture_node_7",
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+            before_observation=repository_identity_check,
+        )
+
+    assert methods == ["GET", "GET"]
+
+
+def test_close_pull_request_rechecks_authority_at_final_dispatch_boundary() -> None:
+    requests: list[tuple[str, str]] = []
+    final_identity_read_completed = False
+    callbacks: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal final_identity_read_completed
+        requests.append((request.method, request.url.path))
+        assert request.method == "GET"
+        if len(requests) == 2:
+            final_identity_read_completed = True
+        return httpx.Response(200, json=_pull_request_payload())
+
+    def remote_preflight() -> None:
+        callbacks.append("remote preflight")
+
+    def local_authority_check() -> None:
+        callbacks.append("local authority")
+        if final_identity_read_completed:
+            raise RuntimeError("authority changed during final pull-request read")
+
+    with (
+        _client(handler) as github,
+        pytest.raises(RuntimeError, match="authority changed during final"),
+    ):
+        github.close_pull_request(
+            "example/project",
+            7,
+            expected_node_id="PR_fixture_node_7",
+            expected_head_repository="octocat/project",
+            expected_head_ref="fix",
+            expected_head_sha="a" * 40,
+            before_observation=remote_preflight,
+            before_mutation=local_authority_check,
+        )
+
+    assert callbacks == ["remote preflight", "local authority"]
+    assert requests == [
+        ("GET", "/repos/example/project/pulls/7"),
+        ("GET", "/repos/example/project/pulls/7"),
+    ]

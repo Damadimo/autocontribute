@@ -11,6 +11,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,8 +40,8 @@ from autocontribute.discovery import (
     validate_legal_publication,
 )
 from autocontribute.domain import EligibilityResult, RunManifest, RunStatus
-from autocontribute.evaluation import EvaluationStore
 from autocontribute.exceptions import (
+    AutomaticRolloutBlocked,
     GitHubError,
     GitHubSafetyError,
     PolicyError,
@@ -48,9 +49,9 @@ from autocontribute.exceptions import (
     RepositoryError,
     StateError,
 )
-from autocontribute.github import GitHubClient, PullRequestDetails
+from autocontribute.github import GitHubClient, PullRequestDetails, RepositoryIdentity
 from autocontribute.github_origin import canonical_api_origin, git_push_url
-from autocontribute.lifecycle import parse_pull_request_url
+from autocontribute.lifecycle import LifecycleObserver, parse_pull_request_url
 from autocontribute.pr_template import visible_markdown
 from autocontribute.preparation import (
     validate_preparation_config_fingerprint,
@@ -59,7 +60,13 @@ from autocontribute.preparation import (
 )
 from autocontribute.redaction import contains_credential_material, redact_text
 from autocontribute.repository import RepositoryWorkspace
-from autocontribute.store import RunStore
+from autocontribute.rollout import RolloutGate, RolloutSummary
+from autocontribute.store import PublicationGateHold, RunStore
+from autocontribute.upstream_outcomes import (
+    ExactHumanApproval,
+    UpstreamPublicationScope,
+    classify_exact_human_approval,
+)
 
 _SAFE_SLUG = re.compile(r"[^a-z0-9-]+")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
@@ -486,15 +493,345 @@ class Publisher:
         if callable(bind_safety):
             bind_safety(store.trip_circuit_breaker_trigger)
 
-    def publish(self, run_id: str) -> RunManifest:
+    def _require_automatic_rollout(
+        self,
+        *,
+        run_id: str,
+        deployment_fingerprint: str,
+        context: _PublicationContext,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> RolloutSummary:
+        """Return exact dual-gate authority or an expected no-publication decision."""
+
+        if not auto_publish_opt_in_enabled(self.config.publishing):
+            raise AutomaticRolloutBlocked(
+                "Automatic publication is disabled; set "
+                f"{self.config.publishing.auto_publish_env}=1 deliberately"
+            )
+        scope = UpstreamPublicationScope(
+            deployment_fingerprint=deployment_fingerprint,
+            publishing_login=context.login,
+            publishing_api_origin=context.api_origin,
+        )
         self.store.assert_circuit_breaker_clear()
+        lease_guard.assert_owned()
+        summary = RolloutGate.for_store(self.store).summary(
+            scope,
+            exclude_run_id=run_id,
+        )
+        if not summary.overall_gate_passed:
+            blockers: list[str] = []
+            if not summary.evaluation_gate_passed:
+                blockers.append("expert-evaluation shadow cohort")
+            if not summary.manual_cohort_passed:
+                blockers.append("fixed manual upstream-outcome cohort")
+            if not summary.prior_automatic_passed:
+                blockers.append("prior automatic upstream outcomes")
+            if not summary.upstream_outcome_gate_passed and not blockers:
+                blockers.append("complete upstream-outcome evidence")
+            raise AutomaticRolloutBlocked(
+                "Automatic publication requires every measured rollout gate to pass; blocked: "
+                + ", ".join(blockers)
+            )
+        return summary
+
+    @staticmethod
+    def _validate_recovery_hold(
+        hold: PublicationGateHold,
+        summary: RolloutSummary,
+    ) -> None:
+        """Require recovery to retain the exact authority atomically held before the crash."""
+
+        if hold.deployment_fingerprint is None or hold.outcome_corpus_cursor is None:
+            raise StateError(
+                "Publication gate hold predates schema-v6 upstream-outcome authority; "
+                "automatic recovery is forbidden"
+            )
+        if (
+            hold.deployment_fingerprint != summary.scope.deployment_fingerprint
+            or hold.corpus_cursor != summary.evaluation_corpus_cursor
+            or hold.outcome_corpus_cursor != summary.outcome_corpus_cursor
+        ):
+            raise StateError(
+                "Current semantic rollout authority differs from the durable publication hold"
+            )
+
+    def _assert_constructive_mutation_authorized(
+        self,
+        manifest: RunManifest,
+        *,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> None:
+        """Revalidate exact durable authority immediately before a constructive write."""
+
+        if manifest.publishing_login is None or manifest.publishing_api_origin is None:
+            raise StateError("Publication mutation lacks its durable publishing identity")
+        lease_guard.assert_owned()
+        self.store.assert_circuit_breaker_clear()
+        automatic = self.store.assert_publication_gate_hold_current(
+            manifest.run_id,
+            deployment_fingerprint=manifest.deployment_fingerprint,
+            publishing_login=manifest.publishing_login,
+            publishing_api_origin=manifest.publishing_api_origin,
+        )
+        lease_guard.assert_owned()
+        if automatic and not auto_publish_opt_in_enabled(self.config.publishing):
+            raise AutomaticRolloutBlocked(
+                "Automatic publication was disabled before the next remote mutation"
+            )
+        self.store.assert_circuit_breaker_clear()
+        lease_guard.assert_owned()
+        if automatic and not auto_publish_opt_in_enabled(self.config.publishing):
+            raise AutomaticRolloutBlocked(
+                "Automatic publication was disabled before the next remote mutation"
+            )
+
+    def _require_exact_review_recovery(
+        self,
+        manifest: RunManifest,
+    ) -> ExactHumanApproval:
+        """Prove exact ledger-bound human authority for a review recovery."""
+
+        self.store.verify_event_chains(run_id=manifest.run_id)
+        authority = classify_exact_human_approval(
+            manifest,
+            tuple(self.store.events(manifest.run_id)),
+        )
+        if authority is None or manifest.approval is None:
+            raise StateError(
+                "Submitting recovery without an automatic gate hold requires one exact "
+                "ledger-bound human approval preceding publication intent"
+            )
+        return authority
+
+    def _validate_exact_review_recovery_payload(
+        self,
+        manifest: RunManifest,
+        authority: ExactHumanApproval,
+    ) -> None:
+        """Revalidate the exact approved payload before a constructive recovery write."""
+
+        patch = _read_approval_artifact(
+            self.store,
+            manifest.run_id,
+            "contribution.patch",
+            description="Contribution patch",
+        )
+        validate_preparation_fingerprint(manifest, diff=patch)
+        approval_manifest = build_approval_manifest(
+            manifest,
+            diff=patch,
+            disclosure=self.config.policy.ai_disclosure,
+            draft=_required_publication_draft(manifest),
+            ready_for_review=_required_publication_ready_for_review(manifest),
+        )
+        assert manifest.approval is not None
+        validate_approval(
+            manifest.approval,
+            approval_manifest,
+            now=authority.publication_intent_at,
+        )
+
+    def _observe_pull_request_before_mutation(
+        self,
+        manifest: RunManifest,
+        details: PullRequestDetails,
+        *,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> PullRequestDetails:
+        """Persist complete current safety evidence before mutating one exact pull request."""
+
+        if (
+            manifest.candidate is None
+            or manifest.commit_sha is None
+            or manifest.pull_request_url is None
+            or manifest.pull_request_node_id is None
+            or manifest.publishing_api_origin is None
+        ):
+            raise StateError("Pull-request safety observation lacks durable publication identity")
+        repository, number = parse_pull_request_url(
+            manifest.pull_request_url,
+            api_origin=manifest.publishing_api_origin,
+        )
+        if (
+            repository.casefold() != manifest.candidate.repository.casefold()
+            or details.repository.casefold() != repository.casefold()
+            or details.number != number
+            or details.html_url != manifest.pull_request_url
+            or details.node_id != manifest.pull_request_node_id
+        ):
+            raise StateError("Pull-request safety observation differs from durable identity")
+        lease_guard.assert_owned()
+        observation = LifecycleObserver(
+            self.github,
+            self.store,
+            assert_owned=lease_guard.assert_owned,
+        ).observe(
+            manifest.run_id,
+            repository=repository,
+            number=number,
+            expected_head_sha=manifest.commit_sha,
+        )
+        lease_guard.assert_owned()
+        self.store.assert_circuit_breaker_clear()
+        return observation.snapshot.pull_request
+
+    def _bind_or_validate_upstream_identity(
+        self,
+        manifest: RunManifest,
+        *,
+        allow_new: bool,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> RepositoryIdentity:
+        """Bind a mutable upstream name once, then validate only by immutable repository ID."""
+
+        if manifest.candidate is None:
+            raise StateError("Publication lacks an upstream repository identity")
+        repository = manifest.candidate.repository
+        if manifest.upstream_repository_id is None or manifest.upstream_repository_node_id is None:
+            if not allow_new:
+                raise StateError(
+                    "Existing publication evidence predates immutable upstream identity; "
+                    "autonomous recovery is forbidden"
+                )
+            lease_guard.assert_owned()
+            identity = self.github.get_repository_identity(repository)
+            lease_guard.assert_owned()
+            if identity.full_name.casefold() != repository.casefold():
+                raise PolicyError("The upstream repository name resolved to a different identity")
+            manifest.upstream_repository_id = identity.database_id
+            manifest.upstream_repository_node_id = identity.node_id
+            self.store.save(
+                manifest,
+                event="publication.upstream_identity.bound",
+                details={
+                    "repository": repository,
+                    "repository_id": str(identity.database_id),
+                    "repository_node_id": identity.node_id,
+                },
+            )
+            return identity
+        lease_guard.assert_owned()
+        identity = self.github.assert_repository_identity(
+            repository,
+            expected_database_id=manifest.upstream_repository_id,
+            expected_node_id=manifest.upstream_repository_node_id,
+        )
+        lease_guard.assert_owned()
+        return identity
+
+    def _bind_or_validate_fork_identity(
+        self,
+        manifest: RunManifest,
+        *,
+        fork: str,
+        allow_new: bool,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> RepositoryIdentity:
+        """Bind the exact fork and immutable upstream parent before any branch mutation."""
+
+        if manifest.upstream_repository_id is None or manifest.upstream_repository_node_id is None:
+            raise StateError("Fork identity lacks its durable upstream identity")
+        if manifest.fork_repository_id is None or manifest.fork_repository_node_id is None:
+            if not allow_new:
+                raise StateError(
+                    "Existing publication evidence predates immutable fork identity; "
+                    "autonomous recovery is forbidden"
+                )
+            lease_guard.assert_owned()
+            observed = self.github.get_fork_identity(fork)
+            lease_guard.assert_owned()
+            if observed.repository.full_name.casefold() != fork.casefold():
+                raise PolicyError("The publication fork name resolved to a different identity")
+            if (
+                observed.parent.database_id != manifest.upstream_repository_id
+                or observed.parent.node_id != manifest.upstream_repository_node_id
+            ):
+                raise PolicyError("The publication fork has a different immutable upstream parent")
+            manifest.fork_repository_id = observed.repository.database_id
+            manifest.fork_repository_node_id = observed.repository.node_id
+            self.store.save(
+                manifest,
+                event="publication.fork_identity.bound",
+                details={
+                    "fork": fork,
+                    "fork_repository_id": str(observed.repository.database_id),
+                    "fork_repository_node_id": observed.repository.node_id,
+                    "upstream_repository_id": str(observed.parent.database_id),
+                    "upstream_repository_node_id": observed.parent.node_id,
+                },
+            )
+            return observed.repository
+        lease_guard.assert_owned()
+        identity = self.github.assert_repository_identity(
+            fork,
+            expected_database_id=manifest.fork_repository_id,
+            expected_node_id=manifest.fork_repository_node_id,
+        )
+        lease_guard.assert_owned()
+        return identity
+
+    def _assert_compensation_remote_identities(
+        self,
+        manifest: RunManifest,
+        *,
+        fork: str,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> None:
+        """Revalidate both immutable repositories immediately before destructive cleanup."""
+
+        if (
+            manifest.candidate is None
+            or manifest.upstream_repository_id is None
+            or manifest.upstream_repository_node_id is None
+            or manifest.fork_repository_id is None
+            or manifest.fork_repository_node_id is None
+        ):
+            raise StateError("Publication compensation lacks immutable repository identity")
+        lease_guard.assert_owned()
+        self.github.assert_repository_identity(
+            manifest.candidate.repository,
+            expected_database_id=manifest.upstream_repository_id,
+            expected_node_id=manifest.upstream_repository_node_id,
+        )
+        lease_guard.assert_owned()
+        self.github.assert_repository_identity(
+            fork,
+            expected_database_id=manifest.fork_repository_id,
+            expected_node_id=manifest.fork_repository_node_id,
+        )
+        lease_guard.assert_owned()
+
+    def _assert_constructive_remote_identities(
+        self,
+        manifest: RunManifest,
+        *,
+        fork: str,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> None:
+        """Bracket immutable repository checks with constructive authority at a write boundary."""
+
+        self._assert_constructive_mutation_authorized(
+            manifest,
+            lease_guard=lease_guard,
+        )
+        self._assert_compensation_remote_identities(
+            manifest,
+            fork=fork,
+            lease_guard=lease_guard,
+        )
+        self._assert_constructive_mutation_authorized(
+            manifest,
+            lease_guard=lease_guard,
+        )
+
+    def publish(self, run_id: str) -> RunManifest:
         with LeaseHeartbeatGuard(
             self.store,
             PUBLICATION_LEASE_NAME,
             ttl=PUBLICATION_LEASE_TTL,
             heartbeat_interval=PUBLICATION_HEARTBEAT_INTERVAL,
         ) as lease_guard:
-            self.store.assert_circuit_breaker_clear()
             lease_guard.assert_owned()
             return self._publish(run_id, lease_guard=lease_guard)
 
@@ -504,9 +841,16 @@ class Publisher:
         *,
         lease_guard: LeaseHeartbeatGuard,
     ) -> RunManifest:
+        lease_guard.assert_owned()
         manifest = self.store.get(run_id)
         if manifest.status == RunStatus.PR_OPEN and manifest.pull_request_url:
             return manifest
+        if manifest.status == RunStatus.SUBMITTING and manifest.publication_compensation_reason:
+            return self._resume_started_compensation(
+                manifest,
+                lease_guard=lease_guard,
+            )
+        self.store.assert_circuit_breaker_clear()
         if manifest.status not in {
             RunStatus.READY_FOR_APPROVAL,
             RunStatus.APPROVED,
@@ -518,6 +862,9 @@ class Publisher:
         branch: str | None = None
         head: str | None = None
         recovered_remote_sha: str | None = None
+        review_recovery_authority: ExactHumanApproval | None = None
+        deployment_fingerprint: str | None = None
+        rollout_summary: RolloutSummary | None = None
         if recovering:
             if (
                 manifest.candidate is None
@@ -533,6 +880,39 @@ class Publisher:
                 login=self.github.authenticated_login(),
                 api_origin=self.github.api_origin,
             )
+            publication_hold = self.store.publication_gate_hold(run_id)
+            if publication_hold is not None:
+                _validate_current_config(self.config)
+                if (
+                    publication_hold.deployment_fingerprint is None
+                    or publication_hold.outcome_corpus_cursor is None
+                ):
+                    raise StateError(
+                        "Publication gate hold predates schema-v6 upstream-outcome authority; "
+                        "automatic recovery is forbidden"
+                    )
+                creation_deployment_fingerprint = self.store.run_deployment_fingerprint(run_id)
+                if (
+                    manifest.deployment_fingerprint != creation_deployment_fingerprint
+                    or publication_hold.deployment_fingerprint != creation_deployment_fingerprint
+                ):
+                    raise PolicyError(
+                        "Automatic publication recovery differs from its immutable deployment "
+                        "evidence"
+                    )
+                deployment_fingerprint = validate_deployment_fingerprint(
+                    creation_deployment_fingerprint,
+                    self.config,
+                )
+                rollout_summary = self._require_automatic_rollout(
+                    run_id=run_id,
+                    deployment_fingerprint=deployment_fingerprint,
+                    context=context,
+                    lease_guard=lease_guard,
+                )
+                self._validate_recovery_hold(publication_hold, rollout_summary)
+            else:
+                review_recovery_authority = self._require_exact_review_recovery(manifest)
             branch = manifest.branch_name
             head = f"{context.login}:{branch}"
             self.store.assert_circuit_breaker_clear()
@@ -551,24 +931,34 @@ class Publisher:
                 publication_ready_for_review=context.ready_for_review,
                 max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
                 repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
+                evaluation_corpus_cursor=(
+                    rollout_summary.evaluation_corpus_cursor if rollout_summary else None
+                ),
+                evaluation_deployment_fingerprint=(
+                    rollout_summary.scope.deployment_fingerprint if rollout_summary else None
+                ),
+                outcome_corpus_cursor=(
+                    rollout_summary.outcome_corpus_cursor if rollout_summary else None
+                ),
             )
             assert manifest.candidate is not None
             assert manifest.repository is not None
             assert manifest.base_sha is not None
             assert manifest.branch_name is not None
+            self._bind_or_validate_upstream_identity(
+                manifest,
+                allow_new=(
+                    manifest.commit_sha is None
+                    and manifest.pull_request_url is None
+                    and not manifest.pull_request_creation_started
+                ),
+                lease_guard=lease_guard,
+            )
             existing_pr = manifest.pull_request_url
             if existing_pr is None and manifest.commit_sha:
                 existing_pr = self.github.find_pull_request(
                     manifest.candidate.repository,
                     head=head,
-                )
-            if manifest.publication_compensation_reason is not None:
-                return self._reconcile_started_compensation(
-                    manifest,
-                    existing_pr=existing_pr,
-                    login=context.login,
-                    head=head,
-                    lease_guard=lease_guard,
                 )
             if existing_pr is not None:
                 return self._accept_existing_pull_request(
@@ -576,6 +966,9 @@ class Publisher:
                     existing_pr,
                     login=context.login,
                     head=head,
+                    allow_remote_mutation=True,
+                    allow_new_repository_identity=False,
+                    review_recovery_authority=review_recovery_authority,
                     lease_guard=lease_guard,
                 )
             if manifest.pull_request_creation_started:
@@ -617,7 +1010,6 @@ class Publisher:
                     "autonomous recovery cannot safely adopt or replace it"
                 )
 
-        deployment_fingerprint: str | None = None
         if not recovering:
             _validate_current_config(self.config)
             if not manifest.quality or not manifest.quality.ready:
@@ -662,29 +1054,11 @@ class Publisher:
                     lease_guard=lease_guard,
                 )
             raise
-        evaluation_corpus_cursor: str | None = None
-        evaluation_deployment_fingerprint: str | None = None
-        if not recovering and self.config.publishing.mode == "review_required":
-            if manifest.approval is None:
-                raise PolicyError("A human approval is required before publication")
-        elif not recovering:
-            if not auto_publish_opt_in_enabled(self.config.publishing):
-                raise PolicyError(
-                    f"Automatic publication is disabled; set "
-                    f"{self.config.publishing.auto_publish_env}=1 deliberately"
-                )
-            assert deployment_fingerprint is not None
-            evaluation_summary = EvaluationStore(self.store).summary(
-                deployment_fingerprint=deployment_fingerprint
+        if review_recovery_authority is not None:
+            self._validate_exact_review_recovery_payload(
+                manifest,
+                review_recovery_authority,
             )
-            if not evaluation_summary.shadow_gate_passed:
-                raise PolicyError(
-                    "Automatic publication requires the measured expert-evaluation shadow "
-                    "gate to pass"
-                )
-            evaluation_corpus_cursor = evaluation_summary.corpus_cursor
-            evaluation_deployment_fingerprint = evaluation_summary.deployment_fingerprint
-
         if context is None:
             context = _publication_context(
                 self.config,
@@ -709,6 +1083,21 @@ class Publisher:
                         "publication_ready_for_review": str(context.ready_for_review).lower(),
                     },
                 )
+        if not recovering and self.config.publishing.mode == "review_required":
+            if manifest.approval is None:
+                raise PolicyError("A human approval is required before publication")
+        elif not recovering:
+            if manifest.status != RunStatus.READY_FOR_APPROVAL:
+                raise PolicyError(
+                    "Automatic publication requires an unapproved ready-for-approval run"
+                )
+            assert deployment_fingerprint is not None
+            rollout_summary = self._require_automatic_rollout(
+                run_id=run_id,
+                deployment_fingerprint=deployment_fingerprint,
+                context=context,
+                lease_guard=lease_guard,
+            )
         login = context.login
         if manifest.eligibility is None or manifest.proposal is None:
             raise PolicyError("Run is missing durable legal-publication evidence")
@@ -755,14 +1144,27 @@ class Publisher:
                 publication_ready_for_review=context.ready_for_review,
                 max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
                 repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
-                evaluation_corpus_cursor=evaluation_corpus_cursor,
-                evaluation_deployment_fingerprint=evaluation_deployment_fingerprint,
+                evaluation_corpus_cursor=(
+                    rollout_summary.evaluation_corpus_cursor if rollout_summary else None
+                ),
+                evaluation_deployment_fingerprint=(
+                    rollout_summary.scope.deployment_fingerprint if rollout_summary else None
+                ),
+                outcome_corpus_cursor=(
+                    rollout_summary.outcome_corpus_cursor if rollout_summary else None
+                ),
             )
         assert manifest.candidate is not None
         assert manifest.repository is not None
         assert manifest.base_sha is not None
         if manifest.status != RunStatus.SUBMITTING or manifest.branch_name != branch:
             raise StateError("Publication intent was not durably established")
+
+        self._bind_or_validate_upstream_identity(
+            manifest,
+            allow_new=not recovering,
+            lease_guard=lease_guard,
+        )
 
         existing_pr = self.github.find_pull_request(
             manifest.candidate.repository,
@@ -774,6 +1176,9 @@ class Publisher:
                 existing_pr,
                 login=login,
                 head=head,
+                allow_remote_mutation=True,
+                allow_new_repository_identity=not recovering,
+                review_recovery_authority=review_recovery_authority,
                 lease_guard=lease_guard,
             )
 
@@ -806,14 +1211,45 @@ class Publisher:
         else:
             workspace = self._prepare_workspace(manifest, workspace_path, patch)
 
-        self.store.assert_circuit_breaker_clear()
-        lease_guard.assert_owned()
-        fork = self.github.ensure_fork(manifest.candidate.repository, login)
+        upstream_repository = manifest.candidate.repository
+
+        def authorize_fork_creation() -> None:
+            self._assert_constructive_mutation_authorized(
+                manifest,
+                lease_guard=lease_guard,
+            )
+            if (
+                manifest.upstream_repository_id is None
+                or manifest.upstream_repository_node_id is None
+            ):
+                raise StateError("Fork creation lacks immutable upstream identity")
+            self.github.assert_repository_identity(
+                upstream_repository,
+                expected_database_id=manifest.upstream_repository_id,
+                expected_node_id=manifest.upstream_repository_node_id,
+            )
+            self._assert_constructive_mutation_authorized(
+                manifest,
+                lease_guard=lease_guard,
+            )
+
+        fork = self.github.ensure_fork(
+            upstream_repository,
+            login,
+            before_mutation=authorize_fork_creation,
+        )
         if fork.casefold() != expected_fork.casefold():
             raise PolicyError("GitHub returned a fork outside the durable publishing account")
         self.store.assert_circuit_breaker_clear()
         lease_guard.assert_owned()
         self._wait_for_fork(fork, manifest.repository.default_branch)
+        self.store.assert_circuit_breaker_clear()
+        self._bind_or_validate_fork_identity(
+            manifest,
+            fork=fork,
+            allow_new=not recovering or manifest.commit_sha is None,
+            lease_guard=lease_guard,
+        )
         self.store.assert_circuit_breaker_clear()
         lease_guard.assert_owned()
         if manifest.commit_sha:
@@ -862,15 +1298,31 @@ class Publisher:
                         "The durable publication intent became stale before its absent remote "
                         "branch could be resumed; no remote publication state remains"
                     ) from exc
-            self.store.assert_circuit_breaker_clear()
-            lease_guard.assert_owned()
-            self._push(workspace_path, fork, branch, commit_sha)
+            self._push(
+                workspace_path,
+                fork,
+                branch,
+                commit_sha,
+                before_mutation=lambda: self._assert_constructive_remote_identities(
+                    manifest,
+                    fork=fork,
+                    lease_guard=lease_guard,
+                ),
+            )
             self.store.assert_circuit_breaker_clear()
             lease_guard.assert_owned()
             self.store.save(
                 manifest,
                 event="branch.pushed",
-                details={"fork": fork, "branch": branch, "commit_sha": commit_sha},
+                details={
+                    "fork": fork,
+                    "fork_repository_id": str(manifest.fork_repository_id),
+                    "fork_repository_node_id": str(manifest.fork_repository_node_id),
+                    "upstream_repository_id": str(manifest.upstream_repository_id),
+                    "upstream_repository_node_id": str(manifest.upstream_repository_node_id),
+                    "branch": branch,
+                    "commit_sha": commit_sha,
+                },
             )
         elif remote_sha.casefold() != commit_sha.casefold():
             raise PolicyError(
@@ -901,28 +1353,17 @@ class Publisher:
                     "approved_base_sha": manifest.base_sha,
                     "current_base_sha": current_base_sha,
                     "fork": fork,
+                    "fork_repository_id": str(manifest.fork_repository_id),
+                    "fork_repository_node_id": str(manifest.fork_repository_node_id),
+                    "upstream_repository_id": str(manifest.upstream_repository_id),
+                    "upstream_repository_node_id": str(manifest.upstream_repository_node_id),
                     "branch": branch,
                     "commit_sha": commit_sha,
                 },
             )
-            self._compensate_branch_only(
+            self._resume_started_compensation(
                 manifest,
-                fork=fork,
-                branch=branch,
-                commit_sha=commit_sha,
                 lease_guard=lease_guard,
-            )
-            lease_guard.assert_owned()
-            self.store.finalize_publication_compensation(
-                manifest,
-                reason="verified pre-PR base-race compensation completed",
-                evidence={
-                    "approved_base_sha": manifest.base_sha,
-                    "current_base_sha": current_base_sha,
-                    "fork": fork,
-                    "branch": branch,
-                    "commit_sha": commit_sha,
-                },
             )
             raise PolicyError(
                 "The upstream base branch moved after the contribution branch was pushed; "
@@ -941,27 +1382,17 @@ class Publisher:
                 details={
                     "repository": manifest.candidate.repository,
                     "fork": fork,
+                    "fork_repository_id": str(manifest.fork_repository_id),
+                    "fork_repository_node_id": str(manifest.fork_repository_node_id),
+                    "upstream_repository_id": str(manifest.upstream_repository_id),
+                    "upstream_repository_node_id": str(manifest.upstream_repository_node_id),
                     "branch": branch,
                     "commit_sha": commit_sha,
                 },
             )
-            self._compensate_branch_only(
+            self._resume_started_compensation(
                 manifest,
-                fork=fork,
-                branch=branch,
-                commit_sha=commit_sha,
                 lease_guard=lease_guard,
-            )
-            lease_guard.assert_owned()
-            self.store.finalize_publication_compensation(
-                manifest,
-                reason="verified pre-PR policy-race compensation completed",
-                evidence={
-                    "repository": manifest.candidate.repository,
-                    "fork": fork,
-                    "branch": branch,
-                    "commit_sha": commit_sha,
-                },
             )
             raise PolicyError(
                 "Repository policy changed after the contribution branch was pushed; the exact "
@@ -970,36 +1401,55 @@ class Publisher:
 
         proposal = manifest.proposal
         assert proposal is not None
-        self.store.assert_circuit_breaker_clear()
-        lease_guard.assert_owned()
+        self._assert_constructive_mutation_authorized(
+            manifest,
+            lease_guard=lease_guard,
+        )
         if manifest.pull_request_creation_started:
             self._stop_ambiguous_pull_request_creation(manifest)
-        manifest.pull_request_creation_started = True
-        self.store.save(
-            manifest,
-            event="pull_request.creation.started",
-            details={
-                "repository": manifest.candidate.repository,
-                "head": head,
-                "head_sha": commit_sha,
-                "base": manifest.repository.default_branch,
-                "base_sha": manifest.base_sha,
-            },
-        )
-        self.store.assert_circuit_breaker_clear()
-        lease_guard.assert_owned()
+        repository_name = manifest.candidate.repository
+        base_branch = manifest.repository.default_branch
+        approved_base_sha = manifest.base_sha
+        creation_details = {
+            "repository": repository_name,
+            "head": head,
+            "head_sha": commit_sha,
+            "base": base_branch,
+            "base_sha": approved_base_sha,
+        }
+
+        def begin_pull_request_creation() -> None:
+            self._assert_constructive_mutation_authorized(
+                manifest,
+                lease_guard=lease_guard,
+            )
+            manifest.pull_request_creation_started = True
+            self.store.save(
+                manifest,
+                event="pull_request.creation.started",
+                details=creation_details,
+            )
+            self._assert_constructive_remote_identities(
+                manifest,
+                fork=fork,
+                lease_guard=lease_guard,
+            )
+
         try:
             created_pull_request = self.github.create_pull_request(
-                manifest.candidate.repository,
+                repository_name,
                 title=proposal.pull_request_title,
                 body=proposal.pull_request_body,
                 head=head,
                 expected_head_sha=commit_sha,
                 expected_head_repository=fork,
-                base=manifest.repository.default_branch,
-                expected_base_sha=manifest.base_sha,
+                base=base_branch,
+                expected_base_sha=approved_base_sha,
                 draft=_required_publication_draft(manifest),
+                before_mutation=begin_pull_request_creation,
             )
+        except (AutomaticRolloutBlocked, StateError):
+            raise
         except Exception as exc:
             self._trip_ambiguous_pull_request_creation(
                 manifest,
@@ -1094,6 +1544,7 @@ class Publisher:
             created_pull_request,
             head=head,
             fork=fork,
+            allow_remote_mutation=True,
             lease_guard=lease_guard,
         )
         self.store.assert_circuit_breaker_clear()
@@ -1109,6 +1560,14 @@ class Publisher:
         """Persist the canonical POST result before applying any response policy checks."""
 
         assert manifest.candidate is not None and manifest.publishing_api_origin is not None
+        if (
+            manifest.upstream_repository_id is None
+            or manifest.upstream_repository_node_id is None
+            or manifest.fork_repository_id is None
+            or manifest.fork_repository_node_id is None
+            or not created.node_id
+        ):
+            raise StateError("Created pull request lacks durable immutable remote identity")
         repository, number = parse_pull_request_url(
             created.html_url,
             api_origin=manifest.publishing_api_origin,
@@ -1120,6 +1579,7 @@ class Publisher:
         ):
             raise GitHubError("GitHub returned an inconsistent created pull-request identity")
         manifest.pull_request_url = created.html_url
+        manifest.pull_request_node_id = created.node_id
         try:
             self.store.save(
                 manifest,
@@ -1131,6 +1591,11 @@ class Publisher:
                     "state": "merged" if created.merged else created.state,
                     "head_sha": created.head_sha,
                     "base_sha": created.base_sha,
+                    "pull_request_node_id": created.node_id,
+                    "upstream_repository_id": str(manifest.upstream_repository_id),
+                    "upstream_repository_node_id": str(manifest.upstream_repository_node_id),
+                    "fork_repository_id": str(manifest.fork_repository_id),
+                    "fork_repository_node_id": str(manifest.fork_repository_node_id),
                 },
             )
         except Exception as exc:
@@ -1159,6 +1624,7 @@ class Publisher:
         *,
         head: str,
         fork: str,
+        allow_remote_mutation: bool,
         lease_guard: LeaseHeartbeatGuard,
     ) -> PullRequestDetails:
         """Finish the durably authorized draft-to-ready transition for one exact PR."""
@@ -1171,10 +1637,17 @@ class Publisher:
         if (
             manifest.commit_sha is None
             or manifest.pull_request_url is None
+            or manifest.pull_request_node_id is None
             or manifest.branch_name is None
         ):
             raise StateError(
                 "Ready-for-review publication lacks durable PR, branch, or commit identity"
+            )
+        if details.draft and allow_remote_mutation and not manifest.pull_request_ready_completed:
+            details = self._observe_pull_request_before_mutation(
+                manifest,
+                details,
+                lease_guard=lease_guard,
             )
         mismatches = tuple(
             mismatch
@@ -1218,6 +1691,12 @@ class Publisher:
                 )
             return details
 
+        if details.draft and not allow_remote_mutation:
+            raise PublicationResumeRequired(
+                "The exact draft pull request requires authorized publication resumption "
+                "before it can be marked ready for review"
+            )
+
         if not manifest.pull_request_ready_started:
             manifest.pull_request_ready_started = True
             self.store.assert_circuit_breaker_clear()
@@ -1235,20 +1714,50 @@ class Publisher:
 
         confirmed = details
         if details.draft:
-            self.store.assert_circuit_breaker_clear()
-            lease_guard.assert_owned()
+            mutation_callback_failed = False
+
+            def assert_ready_observation_authorized() -> None:
+                nonlocal mutation_callback_failed
+                try:
+                    self._assert_constructive_remote_identities(
+                        manifest,
+                        fork=fork,
+                        lease_guard=lease_guard,
+                    )
+                except Exception:
+                    mutation_callback_failed = True
+                    raise
+
+            def assert_ready_mutation_authorized() -> None:
+                nonlocal mutation_callback_failed
+                try:
+                    self._assert_constructive_mutation_authorized(
+                        manifest,
+                        lease_guard=lease_guard,
+                    )
+                except Exception:
+                    mutation_callback_failed = True
+                    raise
+
             try:
                 confirmed = self.github.mark_pull_request_ready_for_review(
                     details.repository,
                     details.number,
                     expected_url=manifest.pull_request_url,
+                    expected_node_id=manifest.pull_request_node_id,
                     expected_head_repository=fork,
                     expected_head_ref=manifest.branch_name,
                     expected_head_sha=manifest.commit_sha,
+                    before_observation=assert_ready_observation_authorized,
+                    before_mutation=assert_ready_mutation_authorized,
                 )
+            except (AutomaticRolloutBlocked, StateError):
+                raise
             except GitHubSafetyError:
                 raise
             except Exception as exc:
+                if mutation_callback_failed:
+                    raise
                 # A transport or response failure may follow a successful mutation. Re-read the
                 # exact PR once; a still-draft result remains safely retryable from SUBMITTING.
                 try:
@@ -1324,6 +1833,7 @@ class Publisher:
             manifest.candidate and manifest.repository and manifest.proposal and manifest.base_sha
         )
         expected: dict[str, tuple[object, object]] = {
+            "pull request node": (created.node_id, manifest.pull_request_node_id),
             "repository": (
                 created.repository.casefold(),
                 manifest.candidate.repository.casefold(),
@@ -1397,6 +1907,8 @@ class Publisher:
 
         exact_compensation_identity = (
             created.repository.casefold() == manifest.candidate.repository.casefold()
+            and manifest.pull_request_node_id is not None
+            and created.node_id == manifest.pull_request_node_id
             and created.head_repository.casefold() == fork.casefold()
             and created.head_ref == branch
             and created.head_sha.casefold() == commit_sha.casefold()
@@ -1411,32 +1923,30 @@ class Publisher:
                 details={
                     "reason": manifest.publication_compensation_reason,
                     "url": manifest.pull_request_url,
+                    "pull_request_node_id": str(manifest.pull_request_node_id),
+                    "repository": created.repository,
+                    "number": str(created.number),
+                    "upstream_repository_id": str(manifest.upstream_repository_id),
+                    "upstream_repository_node_id": str(manifest.upstream_repository_node_id),
                     "fork": fork,
-                    "branch": branch,
-                    "commit_sha": commit_sha,
-                },
-            )
-            self._compensate_created_pull_request(
-                manifest,
-                created,
-                fork=fork,
-                branch=branch,
-                commit_sha=commit_sha,
-                lease_guard=lease_guard,
-            )
-            lease_guard.assert_owned()
-            self.store.finalize_publication_compensation(
-                manifest,
-                reason="verified created-PR base-race compensation completed",
-                evidence={
-                    "url": manifest.pull_request_url,
-                    "fork": fork,
+                    "fork_repository_id": str(manifest.fork_repository_id),
+                    "fork_repository_node_id": str(manifest.fork_repository_node_id),
                     "branch": branch,
                     "commit_sha": commit_sha,
                     "approved_base_sha": manifest.base_sha,
                     "returned_base_sha": created.base_sha,
                 },
             )
+            compensated = self._resume_started_compensation(
+                manifest,
+                lease_guard=lease_guard,
+            )
+            if compensated.status == RunStatus.PR_OPEN:
+                raise PublicationResumeRequired(
+                    "The exact compensating pull request merged before cleanup and is now "
+                    "retained for lifecycle management; the global safety stop requires "
+                    "operator reconciliation"
+                )
             raise PublicationResumeRequired(
                 "The upstream base moved during pull-request creation. The exact created PR was "
                 "closed, its exact branch was removed, and its canonical URL remains durable; "
@@ -1467,20 +1977,38 @@ class Publisher:
         lease_guard: LeaseHeartbeatGuard,
     ) -> None:
         assert manifest.candidate and manifest.pull_request_url
+        if manifest.pull_request_node_id is None:
+            raise StateError("Pull-request compensation lacks immutable node identity")
+        candidate_repository = manifest.candidate.repository
         try:
+
+            def assert_compensation_identity_before_observation() -> None:
+                self._assert_compensation_remote_identities(
+                    manifest,
+                    fork=fork,
+                    lease_guard=lease_guard,
+                )
+
+            def assert_owned_before_close_mutation() -> None:
+                lease_guard.assert_owned()
+
             lease_guard.assert_owned()
             closed = self.github.close_pull_request(
-                manifest.candidate.repository,
+                candidate_repository,
                 created.number,
+                expected_node_id=manifest.pull_request_node_id,
                 expected_head_repository=fork,
                 expected_head_ref=branch,
                 expected_head_sha=commit_sha,
+                before_observation=assert_compensation_identity_before_observation,
+                before_mutation=assert_owned_before_close_mutation,
             )
             lease_guard.assert_owned()
             if (
-                closed.repository.casefold() != manifest.candidate.repository.casefold()
+                closed.repository.casefold() != candidate_repository.casefold()
                 or closed.number != created.number
                 or closed.html_url != manifest.pull_request_url
+                or closed.node_id != manifest.pull_request_node_id
                 or closed.state != "closed"
                 or closed.merged
             ):
@@ -1492,12 +2020,58 @@ class Publisher:
                 event="pull_request.compensation.closed",
                 details={"url": manifest.pull_request_url, "state": "closed_unmerged"},
             )
+
+            def assert_pull_request_closed_before_branch_delete() -> None:
+                lease_guard.assert_owned()
+                current = self.github.get_pull_request(
+                    candidate_repository,
+                    created.number,
+                )
+                lease_guard.assert_owned()
+                expected_head_label = f"{fork.split('/', 1)[0]}:{branch}"
+                identity = {
+                    "repository": (
+                        current.repository.casefold(),
+                        candidate_repository.casefold(),
+                    ),
+                    "number": (current.number, created.number),
+                    "canonical URL": (current.html_url, manifest.pull_request_url),
+                    "pull request node": (
+                        current.node_id,
+                        manifest.pull_request_node_id,
+                    ),
+                    "head branch": (current.head_ref, branch),
+                    "head label": (
+                        current.head_label.casefold(),
+                        expected_head_label.casefold(),
+                    ),
+                    "head repository": (
+                        current.head_repository.casefold(),
+                        fork.casefold(),
+                    ),
+                    "head commit": (
+                        current.head_sha.casefold(),
+                        commit_sha.casefold(),
+                    ),
+                    "state": (current.state, "closed"),
+                    "merged": (current.merged, False),
+                }
+                mismatches = tuple(
+                    name for name, (actual, expected) in identity.items() if actual != expected
+                )
+                if mismatches:
+                    raise PublicationResumeRequired(
+                        "The exact compensating pull request changed immediately before branch "
+                        "deletion; its branch was retained for reconciliation"
+                    )
+
             self._compensate_branch_only(
                 manifest,
                 fork=fork,
                 branch=branch,
                 commit_sha=commit_sha,
                 lease_guard=lease_guard,
+                before_mutation=assert_pull_request_closed_before_branch_delete,
             )
         except StateError:
             raise
@@ -1527,13 +2101,24 @@ class Publisher:
         branch: str,
         commit_sha: str,
         lease_guard: LeaseHeartbeatGuard,
+        before_mutation: Callable[[], None],
     ) -> None:
+        if manifest.fork_repository_id is None or manifest.fork_repository_node_id is None:
+            raise StateError("Branch compensation lacks immutable fork identity")
         try:
+            self._assert_compensation_remote_identities(
+                manifest,
+                fork=fork,
+                lease_guard=lease_guard,
+            )
             self._delete_remote_branch(
                 fork,
                 branch,
                 commit_sha,
+                expected_repository_id=manifest.fork_repository_id,
+                expected_repository_node_id=manifest.fork_repository_node_id,
                 lease_guard=lease_guard,
+                before_mutation=before_mutation,
             )
         except StateError:
             raise
@@ -1543,6 +2128,8 @@ class Publisher:
                 event="branch.compensation.failed",
                 details={
                     "fork": fork,
+                    "fork_repository_id": str(manifest.fork_repository_id),
+                    "fork_repository_node_id": str(manifest.fork_repository_node_id),
                     "branch": branch,
                     "commit_sha": commit_sha,
                     "error_type": type(exc).__name__,
@@ -1556,7 +2143,13 @@ class Publisher:
         self.store.save(
             manifest,
             event="branch.compensated",
-            details={"fork": fork, "branch": branch, "commit_sha": commit_sha},
+            details={
+                "fork": fork,
+                "fork_repository_id": str(manifest.fork_repository_id),
+                "fork_repository_node_id": str(manifest.fork_repository_node_id),
+                "branch": branch,
+                "commit_sha": commit_sha,
+            },
         )
 
     def _trip_publication_breaker(
@@ -1623,6 +2216,16 @@ class Publisher:
 
         if manifest.candidate is None or not manifest.branch_name:
             raise StateError("Absent publication compensation lacks durable branch evidence")
+        if (
+            manifest.publishing_api_origin is None
+            or manifest.upstream_repository_id is None
+            or manifest.upstream_repository_node_id is None
+        ):
+            raise StateError(
+                "Absent publication compensation lacks durable publishing or upstream identity"
+            )
+        if (manifest.fork_repository_id is None) != (manifest.fork_repository_node_id is None):
+            raise StateError("Absent publication compensation has partial immutable fork identity")
         if manifest.pull_request_creation_started:
             raise PublicationResumeRequired(
                 "Post-intent publication state cannot use pre-POST absence compensation"
@@ -1633,6 +2236,43 @@ class Publisher:
             )
         expected_fork = f"{login}/{manifest.candidate.repository.split('/', 1)[1]}"
         commit_evidence = manifest.commit_sha or "not_persisted"
+        fork_identity_bound = manifest.fork_repository_id is not None
+        if not fork_identity_bound and manifest.commit_sha is not None:
+            raise StateError(
+                "Absent publication compensation has a commit without immutable fork identity"
+            )
+        if not fork_identity_bound and any(
+            event["event_type"] == "branch.pushed" for event in self.store.events(manifest.run_id)
+        ):
+            raise StateError(
+                "Absent publication compensation has remote branch evidence without immutable "
+                "fork identity"
+            )
+        identity_evidence = {
+            "repository": manifest.candidate.repository,
+            "publishing_api_origin": manifest.publishing_api_origin,
+            "upstream_repository_id": str(manifest.upstream_repository_id),
+            "upstream_repository_node_id": manifest.upstream_repository_node_id,
+            "head": head,
+            "fork": expected_fork,
+            "fork_identity_state": "bound" if fork_identity_bound else "not_bound",
+            "branch": manifest.branch_name,
+            "commit_sha": commit_evidence,
+        }
+        if fork_identity_bound:
+            assert manifest.fork_repository_id is not None
+            assert manifest.fork_repository_node_id is not None
+            identity_evidence.update(
+                {
+                    "fork_repository_id": str(manifest.fork_repository_id),
+                    "fork_repository_node_id": manifest.fork_repository_node_id,
+                }
+            )
+            self._assert_compensation_remote_identities(
+                manifest,
+                fork=expected_fork,
+                lease_guard=lease_guard,
+            )
         lease_guard.assert_owned()
         existing_pr = self.github.find_pull_request(
             manifest.candidate.repository,
@@ -1654,15 +2294,28 @@ class Publisher:
             raise PublicationResumeRequired(
                 "The contribution branch exists, so absent pre-POST state cannot be finalized"
             )
+        lease_guard.assert_owned()
+        confirmed_absent_pr = self.github.find_pull_request(
+            manifest.candidate.repository,
+            head=head,
+        )
+        lease_guard.assert_owned()
+        if confirmed_absent_pr is not None:
+            raise PublicationResumeRequired(
+                "A pull request appeared while absent pre-POST state was being confirmed; "
+                "reconcile its exact identity before finalization"
+            )
+        if fork_identity_bound:
+            self._assert_compensation_remote_identities(
+                manifest,
+                fork=expected_fork,
+                lease_guard=lease_guard,
+            )
         self.store.save(
             manifest,
             event="publication.absence.verified",
             details={
-                "repository": manifest.candidate.repository,
-                "head": head,
-                "fork": expected_fork,
-                "branch": manifest.branch_name,
-                "commit_sha": commit_evidence,
+                **identity_evidence,
                 "reason": reason,
             },
         )
@@ -1671,41 +2324,254 @@ class Publisher:
             manifest,
             reason=reason,
             evidence={
-                "repository": manifest.candidate.repository,
-                "head": head,
-                "fork": expected_fork,
-                "branch": manifest.branch_name,
-                "commit_sha": commit_evidence,
+                **identity_evidence,
                 "pull_request": "absent",
                 "remote_branch": "absent",
             },
         )
 
-    def _reconcile_started_compensation(
+    def _assert_durable_compensation_marker(
         self,
         manifest: RunManifest,
         *,
-        existing_pr: str | None,
-        login: str,
-        head: str,
-        lease_guard: LeaseHeartbeatGuard,
-    ) -> RunManifest:
-        """Finalize a durably marked cleanup only from exact remote absence evidence."""
+        expected_fork: str,
+    ) -> None:
+        """Bind a recovery cleanup to its one exact immutable marker event."""
 
         reason = manifest.publication_compensation_reason
         if (
             reason is None
+            or manifest.candidate is None
+            or manifest.base_sha is None
+            or manifest.branch_name is None
+            or manifest.commit_sha is None
+            or manifest.upstream_repository_id is None
+            or manifest.upstream_repository_node_id is None
+            or manifest.fork_repository_id is None
+            or manifest.fork_repository_node_id is None
+        ):
+            raise StateError("Started publication compensation lacks durable marker evidence")
+        self.store.verify_event_chains(run_id=manifest.run_id)
+        events = tuple(self.store.events(manifest.run_id))
+        marker_types = {
+            "pre_pr_base_moved": "publication.base_moved_before_pull_request",
+            "pre_pr_policy_stale": "publication.policy_stale_before_pull_request",
+            "created_pr_base_moved": "publication.compensation.started",
+        }
+        try:
+            marker_type = marker_types[reason]
+        except KeyError:
+            raise StateError("Unsupported publication compensation reason") from None
+        markers = tuple(
+            (index, event)
+            for index, event in enumerate(events)
+            if event["event_type"] == marker_type
+        )
+        if len(markers) != 1:
+            raise StateError("Started publication compensation lacks one exact marker event")
+        marker_index, marker = markers[0]
+        try:
+            details = json.loads(marker["details"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StateError("Publication compensation marker is malformed") from exc
+        if not isinstance(details, dict) or not all(
+            isinstance(key, str) and isinstance(value, str) for key, value in details.items()
+        ):
+            raise StateError("Publication compensation marker is malformed")
+        expected_common = {
+            "fork": expected_fork,
+            "fork_repository_id": str(manifest.fork_repository_id),
+            "fork_repository_node_id": manifest.fork_repository_node_id,
+            "upstream_repository_id": str(manifest.upstream_repository_id),
+            "upstream_repository_node_id": manifest.upstream_repository_node_id,
+            "branch": manifest.branch_name,
+            "commit_sha": manifest.commit_sha,
+        }
+        if reason == "pre_pr_base_moved":
+            if set(details) != {
+                "approved_base_sha",
+                "current_base_sha",
+                *expected_common,
+            } or any(details.get(key) != value for key, value in expected_common.items()):
+                raise StateError("Pre-PR base compensation marker differs from durable intent")
+            current_base = _validated_git_sha(
+                details["current_base_sha"],
+                field="compensation marker current base SHA",
+            )
+            if (
+                details["approved_base_sha"].casefold() != manifest.base_sha.casefold()
+                or current_base == manifest.base_sha.casefold()
+            ):
+                raise StateError("Pre-PR base compensation marker lacks an exact base race")
+        elif reason == "pre_pr_policy_stale":
+            expected = {
+                "repository": manifest.candidate.repository,
+                **expected_common,
+            }
+            if details != expected:
+                raise StateError("Pre-PR policy compensation marker differs from durable intent")
+        else:
+            if (
+                manifest.pull_request_url is None
+                or manifest.pull_request_node_id is None
+                or manifest.publishing_api_origin is None
+            ):
+                raise StateError("Created-PR compensation lacks its durable canonical URL")
+            repository, number = parse_pull_request_url(
+                manifest.pull_request_url,
+                api_origin=manifest.publishing_api_origin,
+            )
+            expected = {
+                "reason": reason,
+                "url": manifest.pull_request_url,
+                "pull_request_node_id": manifest.pull_request_node_id,
+                "repository": repository,
+                "number": str(number),
+                **expected_common,
+                "approved_base_sha": manifest.base_sha,
+                "returned_base_sha": details.get("returned_base_sha", ""),
+            }
+            if details != expected:
+                raise StateError("Created-PR compensation marker differs from durable intent")
+
+            returned_base = _validated_git_sha(
+                details["returned_base_sha"],
+                field="compensation marker returned base SHA",
+            )
+            if (
+                details["approved_base_sha"].casefold() != manifest.base_sha.casefold()
+                or returned_base == manifest.base_sha.casefold()
+            ):
+                raise StateError("Created-PR compensation marker lacks an exact base race")
+
+        event_types = tuple(event["event_type"] for event in events[:marker_index])
+        if "publication.intent.begun" not in event_types or "branch.pushed" not in event_types:
+            raise StateError("Publication compensation marker precedes durable remote intent")
+        branch_events = tuple(
+            event for event in events[:marker_index] if event["event_type"] == "branch.pushed"
+        )
+        if len(branch_events) != 1:
+            raise StateError("Publication compensation lacks one exact branch event")
+        try:
+            branch_details = json.loads(branch_events[0]["details"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise StateError("Publication compensation branch evidence is malformed") from exc
+        if branch_details != expected_common:
+            raise StateError("Publication compensation branch differs from immutable intent")
+        if reason == "created_pr_base_moved":
+            response_events = tuple(
+                (index, event)
+                for index, event in enumerate(events[:marker_index])
+                if event["event_type"] == "pull_request.created.response"
+            )
+            rejected_events = tuple(
+                (index, event)
+                for index, event in enumerate(events[:marker_index])
+                if event["event_type"] == "pull_request.created.rejected"
+            )
+            if len(response_events) != 1 or len(rejected_events) != 1:
+                raise StateError("Created-PR compensation lacks one exact response and rejection")
+            response_index, response_event = response_events[0]
+            rejected_index, rejected_event = rejected_events[0]
+            if response_index >= rejected_index:
+                raise StateError("Created-PR compensation evidence is out of order")
+            try:
+                response = json.loads(response_event["details"])
+                rejection = json.loads(rejected_event["details"])
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise StateError("Created-PR compensation evidence is malformed") from exc
+            if not isinstance(response, dict) or not isinstance(rejection, dict):
+                raise StateError("Created-PR compensation evidence is malformed")
+            expected_response = {
+                "url": details["url"],
+                "repository": details["repository"],
+                "number": details["number"],
+                "state": "open",
+                "head_sha": details["commit_sha"],
+                "base_sha": details["returned_base_sha"],
+                "pull_request_node_id": details["pull_request_node_id"],
+                "upstream_repository_id": details["upstream_repository_id"],
+                "upstream_repository_node_id": details["upstream_repository_node_id"],
+                "fork_repository_id": details["fork_repository_id"],
+                "fork_repository_node_id": details["fork_repository_node_id"],
+            }
+            if response != expected_response:
+                raise StateError("Created-PR response differs from its compensation marker")
+            expected_rejection_keys = {
+                "url",
+                "mismatches",
+                "expected_base_sha",
+                "returned_base_sha",
+            }
+            if set(rejection) != expected_rejection_keys or not all(
+                isinstance(value, str) for value in rejection.values()
+            ):
+                raise StateError("Created-PR rejection evidence is malformed")
+            mismatches = tuple(mismatch.strip() for mismatch in rejection["mismatches"].split(","))
+            if (
+                rejection["url"] != details["url"]
+                or rejection["expected_base_sha"].casefold()
+                != details["approved_base_sha"].casefold()
+                or rejection["returned_base_sha"].casefold()
+                != details["returned_base_sha"].casefold()
+                or "base commit" not in mismatches
+            ):
+                raise StateError("Created-PR rejection does not prove the exact base race")
+
+    def _resume_started_compensation(
+        self,
+        manifest: RunManifest,
+        *,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> RunManifest:
+        """Idempotently reduce exact marked remote state despite constructive gate drift."""
+
+        reason = manifest.publication_compensation_reason
+        if (
+            manifest.status != RunStatus.SUBMITTING
+            or reason is None
             or manifest.candidate is None
             or manifest.repository is None
             or manifest.base_sha is None
             or not manifest.branch_name
             or not manifest.commit_sha
             or not manifest.publishing_api_origin
+            or manifest.upstream_repository_id is None
+            or manifest.upstream_repository_node_id is None
+            or manifest.fork_repository_id is None
+            or manifest.fork_repository_node_id is None
         ):
             raise StateError("Started publication compensation lacks durable evidence")
+        candidate_repository = manifest.candidate.repository
+        context = _durable_publication_context(
+            self.config,
+            manifest,
+            login=self.github.authenticated_login(),
+            api_origin=self.github.api_origin,
+        )
+        login = context.login
+        head = f"{login}:{manifest.branch_name}"
         expected_fork = f"{login}/{manifest.candidate.repository.split('/', 1)[1]}"
+        self._assert_durable_compensation_marker(
+            manifest,
+            expected_fork=expected_fork,
+        )
+        self._assert_compensation_remote_identities(
+            manifest,
+            fork=expected_fork,
+            lease_guard=lease_guard,
+        )
+
         if reason in {"pre_pr_base_moved", "pre_pr_policy_stale"}:
-            if manifest.pull_request_url is not None or existing_pr is not None:
+            if manifest.pull_request_url is not None or manifest.pull_request_creation_started:
+                raise StateError("Pre-PR compensation contains pull-request creation evidence")
+            lease_guard.assert_owned()
+            existing_pr = self.github.find_pull_request(
+                manifest.candidate.repository,
+                head=head,
+            )
+            lease_guard.assert_owned()
+            if existing_pr is not None:
                 self._trip_publication_breaker(
                     source="publication:unexpected_pr_during_pre_pr_compensation",
                     reason=(
@@ -1715,12 +2581,70 @@ class Publisher:
                     evidence={
                         "repository": manifest.candidate.repository,
                         "head": head,
-                        "url": manifest.pull_request_url or existing_pr or "unknown",
+                        "url": existing_pr,
                     },
                 )
                 raise PublicationResumeRequired(
                     "A pull request exists for a durably marked pre-PR compensation; autonomous "
-                    "finalization is unsafe"
+                    "cleanup is unsafe"
+                )
+            remote_sha = self.github.ref_sha(
+                expected_fork,
+                f"heads/{manifest.branch_name}",
+            )
+            lease_guard.assert_owned()
+            if remote_sha is not None:
+                remote_commit = _validated_git_sha(
+                    remote_sha,
+                    field="remote compensation branch SHA",
+                )
+                if remote_commit != manifest.commit_sha.casefold():
+                    self._trip_publication_breaker(
+                        source="publication:compensation_branch_mismatch",
+                        reason="A durably compensating branch changed before cleanup",
+                        evidence={
+                            "fork": expected_fork,
+                            "branch": manifest.branch_name,
+                            "expected_head_sha": manifest.commit_sha,
+                            "returned_head_sha": remote_commit,
+                        },
+                    )
+                    raise PublicationResumeRequired(
+                        "The durably compensating branch no longer matches exact publication intent"
+                    )
+
+                def assert_pull_request_absent_before_branch_delete() -> None:
+                    lease_guard.assert_owned()
+                    appeared_pr = self.github.find_pull_request(
+                        candidate_repository,
+                        head=head,
+                    )
+                    lease_guard.assert_owned()
+                    if appeared_pr is not None:
+                        self._trip_publication_breaker(
+                            source="publication:unexpected_pr_during_pre_pr_compensation",
+                            reason=(
+                                "A pull request appeared immediately before a durably marked "
+                                "pre-PR branch cleanup"
+                            ),
+                            evidence={
+                                "repository": candidate_repository,
+                                "head": head,
+                                "url": appeared_pr,
+                            },
+                        )
+                        raise PublicationResumeRequired(
+                            "A pull request appeared immediately before pre-PR branch deletion; "
+                            "the exact branch was retained for reconciliation"
+                        )
+
+                self._compensate_branch_only(
+                    manifest,
+                    fork=expected_fork,
+                    branch=manifest.branch_name,
+                    commit_sha=manifest.commit_sha,
+                    lease_guard=lease_guard,
+                    before_mutation=assert_pull_request_absent_before_branch_delete,
                 )
             return self._finalize_absent_pre_post_publication(
                 manifest,
@@ -1730,7 +2654,11 @@ class Publisher:
                 lease_guard=lease_guard,
             )
 
-        if reason != "created_pr_base_moved" or manifest.pull_request_url is None:
+        if (
+            reason != "created_pr_base_moved"
+            or manifest.pull_request_url is None
+            or manifest.pull_request_node_id is None
+        ):
             raise StateError("Created-PR compensation lacks its durable canonical URL")
         repository, number = parse_pull_request_url(
             manifest.pull_request_url,
@@ -1742,6 +2670,7 @@ class Publisher:
         details = self.github.get_pull_request(repository, number)
         lease_guard.assert_owned()
         identity = {
+            "pull request node": (details.node_id, manifest.pull_request_node_id),
             "canonical URL": (details.html_url, manifest.pull_request_url),
             "repository": (
                 details.repository.casefold(),
@@ -1783,54 +2712,95 @@ class Publisher:
                 event="pull_request.compensation.reconciled",
                 details={
                     "url": manifest.pull_request_url,
+                    "pull_request_node_id": manifest.pull_request_node_id,
                     "state": "merged",
                     "head_sha": details.head_sha,
+                    "upstream_repository_id": str(manifest.upstream_repository_id),
+                    "upstream_repository_node_id": manifest.upstream_repository_node_id,
+                    "fork_repository_id": str(manifest.fork_repository_id),
+                    "fork_repository_node_id": manifest.fork_repository_node_id,
                 },
             )
             lease_guard.assert_owned()
-            self.store.transition(
+            return self.store.finalize_merged_publication_compensation(
                 manifest,
-                RunStatus.PR_OPEN,
+                pull_request_url=manifest.pull_request_url,
                 reason="exact compensating PR merged and is lifecycle-managed",
             )
-            return manifest
-        if details.state != "closed":
+        if details.state not in {"open", "closed"}:
             raise PublicationResumeRequired(
-                "Created-PR compensation is not yet verified closed without merge"
+                "Created-PR compensation has an unsupported remote state"
             )
-        self.store.save(
+        self._compensate_created_pull_request(
             manifest,
-            event="pull_request.compensation.reconciled",
-            details={
-                "url": manifest.pull_request_url,
-                "state": "closed_unmerged",
-                "head_sha": details.head_sha,
-            },
+            details,
+            fork=expected_fork,
+            branch=manifest.branch_name,
+            commit_sha=manifest.commit_sha,
+            lease_guard=lease_guard,
         )
         lease_guard.assert_owned()
-        remote_sha = self.github.ref_sha(
+        confirmed = self.github.get_pull_request(repository, number)
+        lease_guard.assert_owned()
+        confirmed_mismatches = {
+            "pull request node": (confirmed.node_id, manifest.pull_request_node_id),
+            "canonical URL": (confirmed.html_url, manifest.pull_request_url),
+            "repository": (
+                confirmed.repository.casefold(),
+                manifest.candidate.repository.casefold(),
+            ),
+            "head branch": (confirmed.head_ref, manifest.branch_name),
+            "head repository": (
+                confirmed.head_repository.casefold(),
+                expected_fork.casefold(),
+            ),
+            "head commit": (
+                confirmed.head_sha.casefold(),
+                manifest.commit_sha.casefold(),
+            ),
+            "state": (confirmed.state, "closed"),
+            "merged": (confirmed.merged, False),
+        }
+        if any(actual != expected for actual, expected in confirmed_mismatches.values()):
+            raise PublicationResumeRequired(
+                "GitHub did not confirm exact closed-unmerged compensation state"
+            )
+        remaining = self.github.ref_sha(
             expected_fork,
             f"heads/{manifest.branch_name}",
         )
         lease_guard.assert_owned()
-        if remote_sha is not None:
-            if remote_sha.casefold() != manifest.commit_sha.casefold():
-                self._trip_publication_breaker(
-                    source="publication:compensation_branch_mismatch",
-                    reason=(
-                        "A durably compensating branch changed before absence could be verified"
-                    ),
-                    evidence={
-                        "fork": expected_fork,
-                        "branch": manifest.branch_name,
-                        "expected_head_sha": manifest.commit_sha,
-                        "returned_head_sha": remote_sha,
-                    },
-                )
+        if remaining is not None:
             raise PublicationResumeRequired(
-                "Created-PR compensation is closed, but its exact contribution branch remains"
+                "Created-PR compensation did not remove the exact contribution branch"
             )
         lease_guard.assert_owned()
+        final_details = self.github.get_pull_request(repository, number)
+        lease_guard.assert_owned()
+        final_mismatches = {
+            "pull request node": (final_details.node_id, manifest.pull_request_node_id),
+            "canonical URL": (final_details.html_url, manifest.pull_request_url),
+            "repository": (
+                final_details.repository.casefold(),
+                manifest.candidate.repository.casefold(),
+            ),
+            "head branch": (final_details.head_ref, manifest.branch_name),
+            "head label": (final_details.head_label.casefold(), head.casefold()),
+            "head repository": (
+                final_details.head_repository.casefold(),
+                expected_fork.casefold(),
+            ),
+            "head commit": (
+                final_details.head_sha.casefold(),
+                manifest.commit_sha.casefold(),
+            ),
+            "state": (final_details.state, "closed"),
+            "merged": (final_details.merged, False),
+        }
+        if any(actual != expected for actual, expected in final_mismatches.values()):
+            raise PublicationResumeRequired(
+                "The exact compensating pull request changed during final branch verification"
+            )
         return self.store.finalize_publication_compensation(
             manifest,
             reason="verified recovery of created-PR base-race compensation",
@@ -1838,7 +2808,12 @@ class Publisher:
                 "url": manifest.pull_request_url,
                 "repository": repository,
                 "number": str(number),
+                "pull_request_node_id": manifest.pull_request_node_id,
+                "upstream_repository_id": str(manifest.upstream_repository_id),
+                "upstream_repository_node_id": manifest.upstream_repository_node_id,
                 "fork": expected_fork,
+                "fork_repository_id": str(manifest.fork_repository_id),
+                "fork_repository_node_id": manifest.fork_repository_node_id,
                 "branch": manifest.branch_name,
                 "commit_sha": manifest.commit_sha,
                 "pull_request": "closed_unmerged",
@@ -1855,7 +2830,10 @@ class Publisher:
             ttl=PUBLICATION_LEASE_TTL,
             heartbeat_interval=PUBLICATION_HEARTBEAT_INTERVAL,
         ) as lease_guard:
-            return self._reconcile_submitting(run_id, lease_guard=lease_guard)
+            return self._reconcile_submitting(
+                run_id,
+                lease_guard=lease_guard,
+            )
 
     def _reconcile_submitting(
         self,
@@ -1877,6 +2855,11 @@ class Publisher:
             or not manifest.branch_name
         ):
             raise StateError(f"Submitting run {run_id} lacks durable publication evidence")
+        if manifest.publication_compensation_reason is not None:
+            return self._resume_started_compensation(
+                manifest,
+                lease_guard=lease_guard,
+            )
         context = _durable_publication_context(
             self.config,
             manifest,
@@ -1884,6 +2867,17 @@ class Publisher:
             api_origin=self.github.api_origin,
         )
         login = context.login
+        publication_hold = self.store.publication_gate_hold(run_id)
+        if publication_hold is not None and (
+            publication_hold.deployment_fingerprint is None
+            or publication_hold.outcome_corpus_cursor is None
+        ):
+            raise StateError(
+                "Publication gate hold predates schema-v6 upstream-outcome authority; "
+                "automatic recovery is forbidden"
+            )
+        if publication_hold is None:
+            self._require_exact_review_recovery(manifest)
         lease_guard.assert_owned()
         manifest = self.store.begin_publication(
             manifest,
@@ -1899,6 +2893,13 @@ class Publisher:
             publication_ready_for_review=context.ready_for_review,
             max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
             repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
+            evaluation_corpus_cursor=(publication_hold.corpus_cursor if publication_hold else None),
+            evaluation_deployment_fingerprint=(
+                publication_hold.deployment_fingerprint if publication_hold else None
+            ),
+            outcome_corpus_cursor=(
+                publication_hold.outcome_corpus_cursor if publication_hold else None
+            ),
         )
         assert manifest.candidate is not None
         assert manifest.branch_name is not None
@@ -1915,14 +2916,6 @@ class Publisher:
                 manifest.candidate.repository,
                 head=head,
             )
-        if manifest.publication_compensation_reason is not None:
-            return self._reconcile_started_compensation(
-                manifest,
-                existing_pr=existing_pr,
-                login=login,
-                head=head,
-                lease_guard=lease_guard,
-            )
         if not existing_pr:
             if manifest.pull_request_creation_started:
                 self._stop_ambiguous_pull_request_creation(manifest)
@@ -1935,6 +2928,8 @@ class Publisher:
             existing_pr,
             login=login,
             head=head,
+            allow_remote_mutation=False,
+            allow_new_repository_identity=False,
             lease_guard=lease_guard,
         )
 
@@ -1984,7 +2979,10 @@ class Publisher:
         *,
         login: str,
         head: str,
+        allow_remote_mutation: bool,
+        allow_new_repository_identity: bool,
         lease_guard: LeaseHeartbeatGuard,
+        review_recovery_authority: ExactHumanApproval | None = None,
     ) -> RunManifest:
         """Bind exact remote PR evidence to one durable intent before lifecycle monitoring."""
 
@@ -2013,8 +3011,24 @@ class Publisher:
         )
         if repository.casefold() != manifest.candidate.repository.casefold():
             raise PolicyError("Existing pull request belongs to a different repository")
-        details = self.github.get_pull_request(repository, number)
+        self._bind_or_validate_upstream_identity(
+            manifest,
+            allow_new=False,
+            lease_guard=lease_guard,
+        )
         expected_fork = f"{login}/{manifest.candidate.repository.split('/', 1)[1]}"
+        self._bind_or_validate_fork_identity(
+            manifest,
+            fork=expected_fork,
+            allow_new=allow_new_repository_identity,
+            lease_guard=lease_guard,
+        )
+        details = self.github.get_pull_request(repository, number)
+        if manifest.pull_request_url is not None and manifest.pull_request_node_id is None:
+            raise StateError(
+                "Existing publication evidence predates immutable pull-request identity; "
+                "autonomous recovery is forbidden"
+            )
         identity_expected = {
             "canonical URL": (details.html_url, pull_request_url),
             "head branch": (details.head_ref, manifest.branch_name),
@@ -2028,6 +3042,11 @@ class Publisher:
                 manifest.commit_sha.casefold(),
             ),
         }
+        if manifest.pull_request_node_id is not None:
+            identity_expected["pull request node"] = (
+                details.node_id,
+                manifest.pull_request_node_id,
+            )
         identity_mismatches = tuple(
             name for name, (actual, wanted) in identity_expected.items() if actual != wanted
         )
@@ -2054,6 +3073,7 @@ class Publisher:
 
         if manifest.pull_request_url is None:
             manifest.pull_request_url = pull_request_url
+            manifest.pull_request_node_id = details.node_id
             lease_guard.assert_owned()
             self.store.save(
                 manifest,
@@ -2063,6 +3083,11 @@ class Publisher:
                     "repository": repository,
                     "number": str(number),
                     "head_sha": details.head_sha,
+                    "pull_request_node_id": details.node_id,
+                    "upstream_repository_id": str(manifest.upstream_repository_id),
+                    "upstream_repository_node_id": str(manifest.upstream_repository_node_id),
+                    "fork_repository_id": str(manifest.fork_repository_id),
+                    "fork_repository_node_id": str(manifest.fork_repository_node_id),
                 },
             )
         elif manifest.pull_request_url != pull_request_url:
@@ -2141,11 +3166,22 @@ class Publisher:
                 details,
                 mismatches=mismatches,
             )
+        if (
+            review_recovery_authority is not None
+            and allow_remote_mutation
+            and details.draft
+            and _required_publication_ready_for_review(manifest)
+        ):
+            self._validate_exact_review_recovery_payload(
+                manifest,
+                review_recovery_authority,
+            )
         self._ensure_pull_request_ready_for_review(
             manifest,
             details,
             head=head,
             fork=expected_fork,
+            allow_remote_mutation=allow_remote_mutation,
             lease_guard=lease_guard,
         )
         lease_guard.assert_owned()
@@ -2499,7 +3535,15 @@ class Publisher:
             if status:
                 raise PolicyError("Committed publication workspace is not clean")
 
-    def _push(self, workspace: Path, fork: str, branch: str, commit_sha: str) -> None:
+    def _push(
+        self,
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation: Callable[[], None],
+    ) -> None:
         commit = _validated_git_sha(commit_sha, field="contribution commit SHA")
         branch = _validated_git_branch(branch)
         with tempfile.TemporaryDirectory(prefix="autocontribute-askpass-") as temporary:
@@ -2513,7 +3557,7 @@ class Publisher:
                 encoding="utf-8",
             )
             askpass.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-            self.store.assert_circuit_breaker_clear()
+            before_mutation()
             _git(
                 workspace,
                 [
@@ -2522,6 +3566,7 @@ class Publisher:
                     "-c",
                     "http.followRedirects=false",
                     "push",
+                    f"--force-with-lease=refs/heads/{branch}:",
                     git_push_url(self.github.api_origin, fork),
                     f"{commit}:refs/heads/{branch}",
                 ],
@@ -2538,7 +3583,10 @@ class Publisher:
         branch: str,
         commit_sha: str,
         *,
+        expected_repository_id: int,
+        expected_repository_node_id: str,
         lease_guard: LeaseHeartbeatGuard,
+        before_mutation: Callable[[], None],
     ) -> None:
         """Delete only ``branch`` at ``commit_sha`` and verify that it is absent."""
 
@@ -2571,6 +3619,15 @@ class Publisher:
                 encoding="utf-8",
             )
             askpass.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
+            lease_guard.assert_owned()
+            self.github.assert_repository_identity(
+                fork,
+                expected_database_id=expected_repository_id,
+                expected_node_id=expected_repository_node_id,
+            )
+            lease_guard.assert_owned()
+            before_mutation()
+            lease_guard.assert_owned()
             _git(
                 repository,
                 [

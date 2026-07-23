@@ -79,8 +79,10 @@ immutable observations and trips the global circuit breaker for any of these sig
 
 If polling is incomplete or inconsistent, the scheduled attempt fails closed. If a signal trips the
 breaker, the following preparation is rejected before discovery or model work. The same breaker is
-checked throughout publication, including immediately before GitHub writes. Lifecycle sync itself
-prints the evidence and exits with status 2 while a stop is active.
+checked throughout constructive publication, including immediately before its GitHub writes. Once
+exact compensation evidence is marked, it may only finish its exposure-reducing close/delete even if
+the breaker was already tripped while detecting the base race; this grants no constructive authority.
+Lifecycle sync itself prints the evidence and exits with status 2 while a stop is active.
 
 Operators can inspect or activate the stop without running a contribution attempt:
 
@@ -92,10 +94,12 @@ uv run autocontribute safety stop \
   --reason "CONCRETE REASON"
 ```
 
-The stop applies globally to preparation and publication. It does not expire and must not be cleared
-just to make the schedule green. First inspect the source and reason from `safety status`, review the
-PR/review/check evidence printed by lifecycle sync, and determine the safe operational response.
-Only then record the operator and reviewed resolution:
+The stop applies globally to preparation and constructive publication. It does not expire and must
+not be cleared just to make the schedule green. A compensation already bound to exact remote
+identity may still reduce that state; stop the scheduler/worker when the incident requires zero
+remote writes. First inspect the source and reason from `safety status`, review the PR/review/check
+evidence printed by lifecycle sync, and determine the safe operational response. Only then record the
+operator and reviewed resolution:
 
 ```bash
 uv run autocontribute lifecycle sync
@@ -396,9 +400,13 @@ the live SQLite database, `runs/`, and `evaluations/`. Its safety decisions depe
 duplicate history, leases, publication reservations, lifecycle snapshots, circuit-breaker state, and
 ledger-anchored evaluation records; an evictable runner cache is not an acceptable source of truth.
 
-First keep `publishing.mode: review_required` while collecting the fixed first-100 expert cohort and
-the fixed first-20 manually approved, published outcome cohort. `autocontribute eval report` is useful
-for expert calibration, but it does not authorize auto mode. Inspect the combined scoped decision:
+First configure the final single-repository pilot shape below while keeping
+`publishing.mode: review_required`. Model identities, repository scope, publication safety settings,
+and other material configuration are part of the deployment fingerprint; changing them after
+calibration starts requires new cohorts. With that final shape fixed, collect the first-100 expert
+cohort and the fixed first-20 manually approved, published outcome cohort. `autocontribute eval
+report` is useful for expert calibration, but it does not authorize auto mode. Inspect the combined
+scoped decision:
 
 ```bash
 uv run autocontribute rollout report
@@ -407,7 +415,8 @@ uv run autocontribute rollout report
 Only after that report confirms that the expert cohort is fully reviewed, contains at least 20
 prepared cases, has at least 95% accept-as-is precision, and has zero policy, security, or etiquette
 failures, and that all 20 fixed manual outcomes plus every prior automatic outcome are
-`merged_as_is`, should you consider the guarded pilot shape:
+`merged_as_is`, may you change only the mode and runtime opt-in to enable the calibrated pilot. The
+shape used to collect those cohorts must already be:
 
 ```yaml
 github:
@@ -429,7 +438,7 @@ models:
     immutable_response_model_attested: true
 
 publishing:
-  mode: auto
+  mode: review_required
   draft: true
   ready_for_review: true
   max_open_pull_requests: 1
@@ -444,7 +453,8 @@ not infer immutability from a naming pattern. If a provider or compatible gatewa
 guarantee, keep that deployment in `review_required` mode. The bounded `doctor` probe prints the
 resolved model ID to use for this verification.
 
-and the durable worker's runtime environment variable:
+After both cohorts pass, change only `publishing.mode` to `auto` and add the durable worker's runtime
+environment variable:
 
 ```text
 AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH=1
@@ -469,15 +479,20 @@ Immediately before any GitHub mutation, it transactionally records the run's res
 SQLite ledger is the source of truth for the UTC daily limit and repository cooldown even if GitHub
 Search lags. Reservations are idempotent for the same run and survive failed or ambiguous attempts.
 For automatic mode, that same transaction installs a non-expiring hold over the exact validated
-evaluation and upstream-outcome corpus cursors. Both are recomputed and revalidated during recovery.
-Evaluation records and amendments are rejected until the matching run is durably `pr_open` or exact
-remote compensation is verified and durably finalized; process crashes and lease expiry do not clear
-the hold.
-Removing the variable is the kill switch. It prevents scheduled mutation resumption for durable
-`submitting` intents left by an interrupted worker as well as publication of newly prepared work.
-Read-only reconciliation still runs and can adopt a pull request that already exists remotely; it
-does not issue a new GitHub write. In `review_required` mode, use an explicitly confirmed
-`autocontribute publish RUN_ID` command to resume a stranded intent. Do not raise cadence to
+evaluation and upstream-outcome corpus cursors. Both are recomputed and revalidated before
+constructive recovery. Evaluation records and amendments are rejected until the matching run is
+durably `pr_open` or exact remote compensation is verified and durably finalized; process crashes
+and lease expiry do not clear the hold.
+Starting or restarting the worker without the variable is the constructive-publication kill switch;
+removing a drop-in does not alter an already-running process. It prevents scheduled creation, update,
+or resumption for durable `submitting` intents and publication of newly prepared work. Read-only
+reconciliation still runs and can adopt a pull request that already exists remotely. Once exact
+compensation evidence is durably bound to an immutable PR/branch, cleanup may finish only the
+close/delete needed to reduce that exposure despite cursor or opt-in drift, or despite the breaker
+already being active. If the PR already merged, it may instead be adopted into lifecycle management
+without a GitHub write. Disable the scheduler and stop the worker itself when every remote write must
+cease. In `review_required` mode, use an explicitly confirmed `autocontribute publish RUN_ID` command
+to resume any other stranded intent. Do not raise cadence to
 compensate for skipped runs.
 
 API credentials pay for API usage and are separate from ChatGPT/Codex product subscriptions. Put the

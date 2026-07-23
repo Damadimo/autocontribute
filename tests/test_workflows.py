@@ -144,8 +144,7 @@ def test_scheduler_cache_uses_externally_committed_exact_lineage(
     lineage_suffix = "${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
     for version in (3, 4, 5, 6):
         assert (
-            f'v{version}_lineage_pattern="^committed:{key_stem}v{version}-'
-            f'{lineage_suffix}"'
+            f'v{version}_lineage_pattern="^committed:{key_stem}v{version}-{lineage_suffix}"'
         ) in resolve["run"]
         assert f'[[ "$current" =~ $v{version}_lineage_pattern ]]' in resolve["run"]
         assert f'parent_schema="v{version}"' in resolve["run"]
@@ -153,8 +152,7 @@ def test_scheduler_cache_uses_externally_committed_exact_lineage(
     assert "== committed:" not in resolve["run"]
     assert 'echo "parent_schema=$parent_schema"' in resolve["run"]
     assert (
-        f'new_key="{key_stem}v6-$RUNNER_OS-$REPOSITORY_ID-$RUN_ID-$RUN_ATTEMPT"'
-        in resolve["run"]
+        f'new_key="{key_stem}v6-$RUNNER_OS-$REPOSITORY_ID-$RUN_ID-$RUN_ATTEMPT"' in resolve["run"]
     )
     assert restore["with"]["key"] == "${{ steps.state_lineage.outputs.parent_key }}"
     assert "restore-keys" not in restore["with"]
@@ -406,7 +404,7 @@ def test_hosted_lineage_recovery_requires_exact_claim_and_exact_retained_evidenc
     assert 'candidate_pattern="^${KEY_PREFIX}v(5|6)-' in resolve["run"]
     assert '[[ ! "$candidate_key" =~ $candidate_pattern ]]' in resolve["run"]
     assert 'candidate_schema="v${BASH_REMATCH[1]}"' in resolve["run"]
-    assert '^${KEY_PREFIX}v(3|4|5|6)-' in resolve["run"]
+    assert "^${KEY_PREFIX}v(3|4|5|6)-" in resolve["run"]
     assert 'recovery_key="${KEY_PREFIX}v6-' in resolve["run"]
     assert 'echo "candidate_schema=$candidate_schema"' in resolve["run"]
     assert "requires an explicit committed or handoff intent" in resolve["run"]

@@ -212,11 +212,21 @@ transition, one new PR per day, and at least a seven-day same-repository cooldow
 limits, maximum open/new PR counts, same-repository cooldowns, duplicate checks, issue assignment,
 policy changes, or base-branch drift stop publication.
 
-Removing that runtime variable immediately prevents scheduled GitHub mutation, including recovery
-of a durable `submitting` publication intent left by an interrupted worker. Scheduled runs still
-perform read-only reconciliation and may adopt an already-open remote pull request. In
-`review_required` mode, resume a stranded intent only with an explicitly confirmed
-`autocontribute publish RUN_ID` command.
+Before branch or pull-request mutation, the broker durably binds the upstream and fork to GitHub's
+immutable database and GraphQL node IDs and records the created PR's node ID. Every later write
+revalidates those identities; compensation fails closed instead of closing or deleting through a
+reused owner/name.
+
+Starting or restarting a worker without that runtime variable prevents new or resumed constructive
+GitHub mutation; removing a systemd drop-in does not change the environment of a process that is
+already running. Scheduled runs still perform read-only reconciliation and may adopt an already-open
+remote pull request. One deliberately narrow exception remains: once exact compensation evidence is
+durably marked, the worker may finish closing or deleting only that immutable remote identity to
+reduce exposure, even if the breaker had already tripped while detecting the base race. If that exact
+PR has already merged, reconciliation may instead record it as `pr_open` for lifecycle observation
+without another GitHub write. Stop both the scheduler and worker when an operator must prohibit
+every remote write. In `review_required` mode, resume any other stranded intent only with an
+explicitly confirmed `autocontribute publish RUN_ID` command.
 
 The publication recheck refetches the complete issue and repository, reruns deterministic
 eligibility, and requires the sealed issue title/body/labels/discussion to be unchanged. Repository
@@ -276,8 +286,14 @@ plus material model, budget, discovery, sandbox, validation, policy, quality, an
 settings. That fixed cohort must contain at least 20 prepared cases, at least 95% accept-as-is
 precision, and zero policy, security, or etiquette failures. Runs or reviews from another deployment
 cannot fill the cohort. Any material code, model, or configuration change starts a new calibration
-cohort; later favorable reviews cannot replace a missing or unfavorable member. Passing that measured
-gate does not enable publication; the configuration and environment opt-ins are still required.
+cohort; later favorable reviews cannot replace a missing or unfavorable member. That expert gate is
+necessary but not sufficient. The exact publishing account and API origin must also have a fixed
+first-20 cohort of manually approved pull requests that were both graded `accept_as_is` and verified
+`merged_as_is`; every earlier automatic pull request must still prove `merged_as_is` as well. Adverse
+lifecycle evidence is permanent for this decision. Use `autocontribute rollout report` to inspect the
+combined result. A scheduled auto invocation observes lifecycle state and evaluates this result before
+creating a run, performing discovery, or invoking a model, so an unready cohort incurs no model bill.
+Configuration and environment opt-ins remain independently required.
 
 The build/lock identity comes from the validated `_build_identity.json` packaged beside the Python
 modules. CI requires its SHA-256 values to match this project's `pyproject.toml` and `uv.lock`, and the
@@ -302,11 +318,16 @@ durable event anchor. Preserve all three parts of the corpus as one generation: 
 `state restore --complete` to promote that bundle into an absent storage root. The backward-compatible commands
 without `--complete` intentionally handle only the SQLite snapshot.
 
-An automatic publisher binds the exact validated evaluation-corpus cursor in a non-expiring SQLite
-hold in the same transaction that reserves publication capacity. New grades and amendments fail
-closed while any such hold is active. Lease expiry or a worker crash never clears it: the matching
-hold is released only with a durable `pr_open` transition or after exact PR/branch compensation is
-verified and durably marks the attempt failed.
+An automatic publisher binds both exact validated evaluation and upstream-outcome corpus cursors,
+plus their deployment and publishing scope, in a non-expiring SQLite hold in the same transaction
+that reserves publication capacity. New grades and amendments fail closed while any such hold is
+active. Constructive recovery must recompute both gates and match that hold before another GitHub
+write. Once exact compensation evidence is hash-chained, cleanup may only reduce its bound remote
+state despite cursor or opt-in drift, or despite the breaker already being active; it cannot perform
+a constructive GitHub mutation. If the bound PR already merged, the read-only reconciliation path
+may adopt that exact PR into lifecycle management. Lease expiry or a worker crash never clears the
+hold: it is released only with a durable `pr_open` transition or after the exact PR/branch
+compensation is verified and durably marks the attempt failed.
 
 Target-repository workspaces are not included. If a `submitting` run already has a stored commit,
 complete backup fails closed because that exact Git object cannot be reconstructed from the bundle;
@@ -375,11 +396,13 @@ A stop is global, not limited to the PR that triggered it. Every distinct stop c
 trigger-set revision shown by `safety status`. Resume is never automatic; inspect every active source,
 reason, and trigger hash, review the linked GitHub evidence, resolve the conditions, and pass that
 exact set revision when recording a concrete justification. A stale revision is rejected. On an ephemeral runner, this
-persistence depends on restoring the
-verified state snapshot. A lost or evicted cache loses local breaker history, so set
-`AUTOCONTRIBUTE_ENABLED=false` and remove `AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH` for an out-of-band stop.
-The removed publication variable also blocks scheduled recovery writes for existing `submitting`
-intents; read-only remote reconciliation remains enabled.
+persistence depends on restoring the verified state snapshot. A lost or evicted cache loses local
+breaker history, so stop the active worker, set `AUTOCONTRIBUTE_ENABLED=false`, and remove
+`AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH` before restarting it. A worker started without the publication
+variable blocks constructive recovery writes for existing `submitting` intents; read-only
+reconciliation remains enabled, and only a compensation already bound to exact hash-chained remote
+evidence may continue. Keep both the scheduler and worker stopped to prohibit that final
+exposure-reducing write as well.
 
 See [SECURITY.md](SECURITY.md) before enabling a schedule and [CONTRIBUTING.md](CONTRIBUTING.md) before
 working on the agent itself.

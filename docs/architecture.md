@@ -145,7 +145,10 @@ transaction. Full validation recomputes the chain and compares both values, whic
 truncation detectable. Manifest updates use an `updated_at` compare-and-swap so a stale in-memory copy
 cannot replace newer state or pull-request evidence. GitHub publication uses a stable branch, records
 mutation intent before the first write, never force-pushes, and reconciles an existing branch/PR after
-uncertain failures.
+uncertain failures. The manifest and hash-chained publication events bind the upstream and fork
+database/node IDs plus the PR node ID. Constructive writes and compensating close/delete operations
+re-read those immutable identities at the mutation boundary, so an owner/name rename or reuse fails
+closed; historical `submitting` compensation without that evidence is not mutated autonomously.
 
 Leases carry fencing generations from a durable per-name counter. A clean release removes only the
 active lease, not its counter; takeover or reacquisition advances the counter, so an earlier token
@@ -282,10 +285,19 @@ missing history is represented as unavailable rather than an empty history, and 
 inspected for safety signals, but they can never prove a successful upstream outcome. A fresh
 format-2 observation is required before outcome authority can be granted.
 
-Lifecycle synchronization attempts every bounded ambiguous `submitting` reconciliation while
-retaining any failures, then observes every tracked pull request, including newly reconciled ones,
-before reporting the retained failure. Thus one stranded publication cannot suppress fresh safety
-evidence from other open contributions.
+Lifecycle synchronization first observes every tracked `pr_open` pull request, then attempts every
+bounded ambiguous `submitting` reconciliation while retaining any failures. Thus stale outcome or
+safety evidence cannot authorize recovery, and one stranded publication cannot suppress fresh
+signals from other open contributions. A pull request newly adopted from `submitting` becomes part
+of the next observation cycle; reconciliation itself remains read-only unless an explicitly
+authorized publication-resume path is entered. Constructive resumption revalidates the exact rollout
+hold, breaker, lease, opt-in, and immutable remote identities at each write boundary. Once a
+compensation is bound to exact hash-chained PR/branch evidence, it is narrower: it may continue only
+the exposure-reducing close/delete despite cursor or opt-in drift, or despite the breaker already
+being active, and its finalizer must validate the ordered same-run evidence before releasing the
+hold. If the exact PR already merged, it may instead be adopted into lifecycle management without a
+GitHub write. Stopping the scheduler and worker, rather than only removing the constructive opt-in,
+is the operator boundary that forbids every remote write.
 
 The breaker never clears itself. `safety stop` lets an operator activate it without GitHub access;
 every distinct trip changes the hash of the complete active trigger set. `safety resume` requires an

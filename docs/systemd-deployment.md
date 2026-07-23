@@ -699,17 +699,22 @@ or run only after all Autocontribute services are stopped. Never run `approve`, 
 
 ### Deliberately enabling automatic publication
 
-Do not add the runtime opt-in during installation. First collect and grade the complete deterministic
-100-run cohort in `review_required` mode, satisfy the measured gate, perform a successful recovery
-drill, and review the automatic pilot constraints in [Scheduled operation](scheduled-operation.md).
-The production configuration must use one explicit repository, immutable attested model IDs, draft
-staging followed by the durable exact ready-for-review transition, at most one new PR per UTC day,
-and a repository cooldown of at least seven days.
+Do not add the runtime opt-in during installation. First configure the final pilot shape while
+keeping `publishing.mode: review_required`: one explicit repository, immutable attested model IDs,
+draft staging followed by the durable exact ready-for-review transition, at most one new PR per UTC
+day, and a repository cooldown of at least seven days. Those settings are part of the deployment
+fingerprint, so changing them later requires new cohorts. Under that fixed shape, collect and grade
+the complete deterministic 100-run expert cohort and the fixed first 20 manually approved,
+published PRs. Every fixed manual member must have both an anchored expert `accept_as_is` grade and
+verified upstream `merged_as_is` history; a failed member is not replaceable. Confirm the combined
+scoped decision with `autocontribute rollout report`, perform a successful recovery drill, and
+review the automatic pilot constraints in [Scheduled operation](scheduled-operation.md).
 
 Only then change `publishing.mode` to `auto`, provision the narrowly scoped publication credential,
-and install the same root-owned opt-in drop-in for both services. The doctor is non-mutating and
-cannot publish; it needs the opt-in only so its automatic-publication kill-switch check validates the
-exact environment that the worker will receive.
+and install the same root-owned opt-in drop-in for both services. The doctor makes no repository or
+GitHub writes and cannot publish, although opening the store can migrate or repair local durable
+state; it needs the opt-in only so its automatic-publication kill-switch check validates the exact
+environment that the worker will receive.
 
 ```bash
 sudo install -d -o root -g root -m 0755 \
@@ -751,10 +756,14 @@ sudo systemctl stop autocontribute-worker.service
 ```
 
 For automatic mode, also remove both dedicated opt-in drop-ins and reload systemd. Removing the
-worker copy prevents future scheduled GitHub writes, including resuming a stranded publication; a
-future worker still performs read-only remote reconciliation. Removing the doctor copy keeps its
-preflight consistent with the disabled worker. Revoke the GitHub credential if host integrity or
-token secrecy is uncertain.
+worker copy prevents constructive GitHub writes after the worker is restarted; it does not alter the
+environment of an already-running process. A future worker still performs read-only remote
+reconciliation and, once exact compensation evidence has been durably marked, may finish only its
+exposure-reducing cleanup despite the missing opt-in. An exact PR that already merged may instead be
+adopted into lifecycle management without a GitHub write. The stopped service/timer above, not the
+opt-in alone, is the boundary that prevents every scheduled remote write. Removing the doctor copy
+keeps its preflight consistent with the disabled worker. Revoke the GitHub credential if host
+integrity or token secrecy is uncertain.
 
 ```bash
 sudo rm -- \

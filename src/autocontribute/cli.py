@@ -46,6 +46,7 @@ from autocontribute.evaluation import (
 )
 from autocontribute.exceptions import (
     AutocontributeError,
+    AutomaticRolloutBlocked,
     ConfigurationError,
     PublicationResumeRequired,
     StateError,
@@ -56,7 +57,9 @@ from autocontribute.lifecycle import LifecycleSyncResult, sync_open_pull_request
 from autocontribute.orchestrator import Orchestrator
 from autocontribute.publication import Publisher, approve_run, build_approval_review
 from autocontribute.reporting import render_approval_review, render_run_report
+from autocontribute.rollout import RolloutGate, RolloutSummary
 from autocontribute.store import RunStore
+from autocontribute.upstream_outcomes import UpstreamPublicationScope
 from autocontribute.workspace_gc import WorkspaceGCReport, collect_terminal_workspaces
 
 app = typer.Typer(
@@ -68,6 +71,10 @@ runs_app = typer.Typer(help="Inspect durable contribution runs.", no_args_is_hel
 config_app = typer.Typer(help="Inspect configuration safely.", no_args_is_help=True)
 evaluation_app = typer.Typer(
     help="Record expert shadow-run grades and inspect rollout gates.",
+    no_args_is_help=True,
+)
+rollout_app = typer.Typer(
+    help="Inspect the complete evidence-backed autonomous rollout decision.",
     no_args_is_help=True,
 )
 state_app = typer.Typer(
@@ -89,6 +96,7 @@ policy_app = typer.Typer(
 app.add_typer(runs_app, name="runs")
 app.add_typer(config_app, name="config")
 app.add_typer(evaluation_app, name="eval")
+app.add_typer(rollout_app, name="rollout")
 app.add_typer(state_app, name="state")
 app.add_typer(lifecycle_app, name="lifecycle")
 app.add_typer(safety_app, name="safety")
@@ -202,7 +210,11 @@ def run_once(
                     settings.publishing.mode == "auto"
                     and auto_publish_opt_in_enabled(settings.publishing)
                 ),
+                scheduled_preflight=True,
             )
+            store.assert_circuit_breaker_clear()
+            if not _scheduled_auto_preflight(settings, store, github):
+                return
         with Orchestrator(settings, store=store, github=github) as orchestrator:
             manifest = orchestrator.run(issue_reference=issue)
         if manifest.status == RunStatus.READY_FOR_APPROVAL and settings.publishing.mode == "auto":
@@ -671,13 +683,46 @@ def evaluation_report(
     except AutocontributeError as exc:
         _fail(str(exc))
     if json_output:
-        console.print(summary.model_dump_json(indent=2), markup=False)
+        console.print(summary.model_dump_json(indent=2), markup=False, soft_wrap=True)
         return
     marker = "PASS" if summary.shadow_gate_passed else "NOT READY"
     color = "green" if summary.shadow_gate_passed else "yellow"
     console.print(f"[{color}]Shadow rollout gate: {marker}[/{color}]")
     for evidence in summary.gate_evidence:
         console.print(f"- {evidence}")
+
+
+@rollout_app.command(name="report")
+def rollout_report(
+    config: ConfigOption = DEFAULT_CONFIG,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the complete machine-readable decision."),
+    ] = False,
+) -> None:
+    """Report every gate required before autonomous publication is authorized."""
+
+    settings = _config(config)
+    store = RunStore(settings.storage.path)
+    try:
+        with _github_client(settings, store) as github:
+            summary = _rollout_summary(settings, store, github)
+    except (AutocontributeError, ValueError) as exc:
+        _fail(str(exc))
+    if json_output:
+        console.print(summary.model_dump_json(indent=2), markup=False, soft_wrap=True)
+        return
+    marker = "PASS" if summary.overall_gate_passed else "NOT READY"
+    color = "green" if summary.overall_gate_passed else "yellow"
+    console.print(f"[{color}]Combined autonomous rollout gate: {marker}[/{color}]")
+    console.print(
+        "Scope: "
+        f"{summary.scope.publishing_login} at {summary.scope.publishing_api_origin} "
+        f"(deployment {summary.scope.deployment_fingerprint})",
+        markup=False,
+    )
+    for evidence in summary.gate_evidence:
+        console.print(f"- {evidence}", markup=False)
 
 
 @state_app.command(name="backup")
@@ -803,7 +848,7 @@ def gc_workspaces(
     except (AutocontributeError, ValueError) as exc:
         _fail(str(exc))
     if json_output:
-        console.print(report.model_dump_json(indent=2), markup=False)
+        console.print(report.model_dump_json(indent=2), markup=False, soft_wrap=True)
     else:
         _print_workspace_gc_report(report)
     if report.errors:
@@ -1074,6 +1119,64 @@ def _github_client(
     )
 
 
+def _rollout_summary(
+    settings: AutocontributeConfig,
+    store: RunStore,
+    github: GitHubClient,
+    *,
+    exclude_run_id: str | None = None,
+) -> RolloutSummary:
+    """Compute one decision for the exact deployed code and publishing identity."""
+
+    scope = UpstreamPublicationScope(
+        deployment_fingerprint=compute_deployment_fingerprint(settings),
+        publishing_login=github.authenticated_login().strip().casefold(),
+        publishing_api_origin=github.api_origin,
+    )
+    return RolloutGate.for_store(store).summary(
+        scope,
+        exclude_run_id=exclude_run_id,
+    )
+
+
+def _scheduled_auto_preflight(
+    settings: AutocontributeConfig,
+    store: RunStore,
+    github: GitHubClient,
+) -> bool:
+    """Defer scheduled automatic work before a run or model call when authority is absent."""
+
+    if settings.publishing.mode != "auto":
+        return True
+    summary = _rollout_summary(settings, store, github)
+    switch_enabled = auto_publish_opt_in_enabled(settings.publishing)
+    if switch_enabled and summary.overall_gate_passed:
+        return True
+
+    blockers: list[str] = []
+    if not switch_enabled:
+        blockers.append(
+            f"{settings.publishing.auto_publish_env} is not enabled as the dedicated "
+            "automatic-publication switch"
+        )
+    if not summary.evaluation_gate_passed:
+        blockers.append("expert-evaluation shadow cohort")
+    if not summary.manual_cohort_passed:
+        blockers.append("fixed manual upstream-outcome cohort")
+    if not summary.prior_automatic_passed:
+        blockers.append("prior automatic upstream outcomes")
+    if (
+        not summary.upstream_outcome_gate_passed
+        and summary.manual_cohort_passed
+        and summary.prior_automatic_passed
+    ):
+        blockers.append("complete upstream-outcome evidence")
+    console.print(
+        "[yellow]Scheduled automatic run deferred before model use:[/yellow] " + ", ".join(blockers)
+    )
+    return False
+
+
 def _sync_lifecycle(
     settings: AutocontributeConfig,
     store: RunStore,
@@ -1081,6 +1184,7 @@ def _sync_lifecycle(
     *,
     publication_retry_run_id: str | None = None,
     resume_submitting_publications: bool = False,
+    scheduled_preflight: bool = False,
 ) -> LifecycleSyncResult:
     publisher = Publisher(settings, store, github)
     reconciliation_failures: list[tuple[str, AutocontributeError]] = []
@@ -1091,12 +1195,21 @@ def _sync_lifecycle(
         heartbeat_interval=PUBLICATION_HEARTBEAT_INTERVAL,
     ) as lease_guard:
         lease_guard.assert_owned()
+        result = sync_open_pull_requests(
+            github,
+            store,
+            assert_owned=lease_guard.assert_owned,
+        )
+        lease_guard.assert_owned()
         for manifest in store.list_submitting_runs():
             lease_guard.assert_owned()
             try:
                 reconcile_owned = getattr(publisher, "_reconcile_submitting", None)
                 if callable(reconcile_owned):
-                    reconcile_owned(manifest.run_id, lease_guard=lease_guard)
+                    reconcile_owned(
+                        manifest.run_id,
+                        lease_guard=lease_guard,
+                    )
                 else:  # Narrow compatibility path for injected CLI test doubles.
                     publisher.reconcile_submitting(manifest.run_id)
             except PublicationResumeRequired:
@@ -1108,6 +1221,8 @@ def _sync_lifecycle(
                     and auto_publish_opt_in_enabled(settings.publishing)
                 )
                 if not (scheduled_resume_allowed or retry_this_run):
+                    if scheduled_preflight:
+                        continue
                     if settings.publishing.mode != "auto":
                         reason = "publishing.mode is review_required"
                     elif not auto_publish_opt_in_enabled(settings.publishing):
@@ -1135,6 +1250,10 @@ def _sync_lifecycle(
                         publish_owned(manifest.run_id, lease_guard=lease_guard)
                     else:  # Narrow compatibility path for injected CLI test doubles.
                         publisher.publish(manifest.run_id)
+                except AutomaticRolloutBlocked as resume_exc:
+                    lease_guard.assert_owned()
+                    if not scheduled_preflight:
+                        reconciliation_failures.append((manifest.run_id, resume_exc))
                 except AutocontributeError as resume_exc:
                     lease_guard.assert_owned()
                     reconciliation_failures.append((manifest.run_id, resume_exc))
@@ -1145,13 +1264,6 @@ def _sync_lifecycle(
                 reconciliation_failures.append((manifest.run_id, exc))
             else:
                 lease_guard.assert_owned()
-        lease_guard.assert_owned()
-        result = sync_open_pull_requests(
-            github,
-            store,
-            assert_owned=lease_guard.assert_owned,
-        )
-        lease_guard.assert_owned()
     if len(reconciliation_failures) == 1:
         raise reconciliation_failures[0][1]
     if reconciliation_failures:

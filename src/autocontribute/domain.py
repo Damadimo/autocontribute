@@ -338,6 +338,14 @@ class RunManifest(DomainModel):
     commit_committer_email: str | None = None
     publication_draft: bool | None = None
     publication_ready_for_review: bool | None = None
+    # GitHub owner/name pairs are mutable.  These immutable remote identifiers are bound before
+    # publication mutates a branch and are required by automatic compensation.  ``None`` remains
+    # accepted so historical manifests can be inspected, but old in-flight publication evidence
+    # is deliberately not eligible for destructive recovery.
+    upstream_repository_id: int | None = Field(default=None, gt=0)
+    upstream_repository_node_id: str | None = Field(default=None, min_length=1, max_length=256)
+    fork_repository_id: int | None = Field(default=None, gt=0)
+    fork_repository_node_id: str | None = Field(default=None, min_length=1, max_length=256)
     branch_name: str | None = None
     commit_sha: str | None = None
     pull_request_creation_started: bool = False
@@ -352,6 +360,7 @@ class RunManifest(DomainModel):
         | None
     ) = None
     pull_request_url: str | None = None
+    pull_request_node_id: str | None = Field(default=None, min_length=1, max_length=256)
     skip_reason: str | None = None
     error: str | None = None
     model_calls: int = 0
@@ -360,6 +369,33 @@ class RunManifest(DomainModel):
     model_cost_usd: Decimal = Field(default=Decimal("0"), ge=0)
     model_seconds: float = Field(default=0, ge=0)
     model_reservation: ModelBudgetReservation | None = None
+
+    @field_validator(
+        "upstream_repository_node_id",
+        "fork_repository_node_id",
+        "pull_request_node_id",
+    )
+    @classmethod
+    def immutable_github_node_id(cls, value: str | None) -> str | None:
+        if value is not None and (
+            value != value.strip() or any(not character.isprintable() for character in value)
+        ):
+            raise ValueError("GitHub node identifiers must be bounded printable strings")
+        return value
+
+    @model_validator(mode="after")
+    def immutable_remote_identity_is_complete(self) -> RunManifest:
+        upstream = (self.upstream_repository_id, self.upstream_repository_node_id)
+        fork = (self.fork_repository_id, self.fork_repository_node_id)
+        if (upstream[0] is None) != (upstream[1] is None):
+            raise ValueError("upstream repository immutable identity must be complete")
+        if (fork[0] is None) != (fork[1] is None):
+            raise ValueError("fork repository immutable identity must be complete")
+        if fork[0] is not None and upstream[0] is None:
+            raise ValueError("fork immutable identity requires upstream immutable identity")
+        if self.pull_request_node_id is not None and self.pull_request_url is None:
+            raise ValueError("pull-request node identity requires its canonical URL")
+        return self
 
 
 __all__ = [

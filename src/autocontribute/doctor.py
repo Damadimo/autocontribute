@@ -26,10 +26,12 @@ from autocontribute.config import (
     auto_publish_opt_in_enabled,
     validate_model_identifier,
 )
+from autocontribute.deployment import compute_deployment_fingerprint
 from autocontribute.exceptions import SandboxError
 from autocontribute.github import GitHubClient
 from autocontribute.providers import create_provider
 from autocontribute.redaction import redact_text
+from autocontribute.rollout import RolloutGate, RolloutSummary
 from autocontribute.sandbox import (
     DockerDaemonMode,
     DockerSandbox,
@@ -38,6 +40,7 @@ from autocontribute.sandbox import (
     docker_container_identity,
 )
 from autocontribute.store import RunStore
+from autocontribute.upstream_outcomes import UpstreamPublicationScope
 
 _DETAIL_LIMIT = 500
 _MODEL_PROBE_MAX_OUTPUT_TOKENS = 1_024
@@ -386,6 +389,17 @@ def _github_checks(
             )
             target_access = _github_target_access_check(config, github)
             permissions = _github_permission_check(config, github, login=login, scopes=scopes)
+            rollout_checks: list[DoctorCheck] = []
+            if store is not None:
+                try:
+                    rollout_checks = _rollout_readiness_checks(
+                        config,
+                        store,
+                        publishing_login=login,
+                        publishing_api_origin=github.api_origin,
+                    )
+                except Exception as exc:
+                    rollout_checks = _rollout_readiness_error_checks(exc)
     except Exception as exc:
         detail = _safe_detail(str(exc))
         return [
@@ -402,10 +416,121 @@ def _github_checks(
             ),
         ]
     else:
-        return [authentication, target_access, permissions]
+        return [authentication, target_access, permissions, *rollout_checks]
     finally:
         if github_token is not None:
             _DOCTOR_SECRET_VALUES.reset(github_token)
+
+
+def _rollout_readiness_checks(
+    config: AutocontributeConfig,
+    store: RunStore,
+    *,
+    publishing_login: str,
+    publishing_api_origin: str,
+) -> list[DoctorCheck]:
+    """Evaluate the exact production rollout scope without mutating durable state."""
+
+    scope = UpstreamPublicationScope(
+        deployment_fingerprint=compute_deployment_fingerprint(config),
+        publishing_login=publishing_login.strip().casefold(),
+        publishing_api_origin=publishing_api_origin,
+    )
+    summary = RolloutGate.for_store(store).summary(scope)
+    return _rollout_summary_checks(config, summary)
+
+
+def _rollout_summary_checks(
+    config: AutocontributeConfig,
+    summary: RolloutSummary,
+) -> list[DoctorCheck]:
+    """Render valid gate results as failures in auto and warnings while calibrating."""
+
+    evaluation = summary.evaluation
+    upstream = summary.upstream_outcomes
+    precision = (
+        "unavailable"
+        if evaluation.accept_as_is_precision is None
+        else f"{evaluation.accept_as_is_precision:.1%}"
+    )
+    manual_passed = sum(member.manual_member_passed for member in upstream.manual_cohort)
+    automatic_passed = sum(member.automatic_member_passed for member in upstream.prior_automatic)
+    components = (
+        (
+            "rollout evaluation gate",
+            summary.evaluation_gate_passed,
+            (
+                f"{evaluation.total_cases} evaluated deployment case(s), "
+                f"{evaluation.prepared_cases} prepared, {precision} accept-as-is precision, "
+                f"{evaluation.safety_failures} safety failure(s)"
+            ),
+        ),
+        (
+            "rollout fixed manual cohort",
+            summary.manual_cohort_passed,
+            (
+                f"{len(upstream.manual_cohort)}/{upstream.required_manual_publications} fixed "
+                f"manual publication(s) found; {manual_passed}/"
+                f"{upstream.required_manual_publications} have merged-as-is and expert "
+                "accept-as-is "
+                f"evidence ({upstream.exact_manual_publications} eligible publication(s) found)"
+            ),
+        ),
+        (
+            "rollout prior automatic outcomes",
+            summary.prior_automatic_passed,
+            (
+                f"{automatic_passed}/{len(upstream.prior_automatic)} prior automatic "
+                "publication(s) remain merged-as-is"
+            ),
+        ),
+        (
+            "rollout overall readiness",
+            summary.overall_gate_passed,
+            (
+                "combined expert-evaluation and upstream-outcome decision for "
+                f"{summary.scope.publishing_login} at "
+                f"{summary.scope.publishing_api_origin}; "
+                f"{len(upstream.ambiguous)} ambiguous publication(s)"
+            ),
+        ),
+    )
+    review_required = config.publishing.mode == "review_required"
+    checks: list[DoctorCheck] = []
+    for name, ready, detail in components:
+        if ready:
+            rendered_detail = f"ready; {detail}"
+        elif review_required:
+            rendered_detail = (
+                "not ready; review_required mode remains non-publishing while calibration "
+                f"continues; {detail}"
+            )
+        else:
+            rendered_detail = f"blocked; {detail}"
+        checks.append(
+            DoctorCheck(
+                name,
+                ready or review_required,
+                _safe_detail(rendered_detail),
+                warning=review_required and not ready,
+            )
+        )
+    return checks
+
+
+def _rollout_readiness_error_checks(error: Exception) -> list[DoctorCheck]:
+    """Fail every rollout check when the evidence corpus cannot be validated."""
+
+    detail = _safe_detail(f"rollout evidence could not be validated: {error}")
+    return [
+        DoctorCheck(name, False, detail)
+        for name in (
+            "rollout evaluation gate",
+            "rollout fixed manual cohort",
+            "rollout prior automatic outcomes",
+            "rollout overall readiness",
+        )
+    ]
 
 
 def _authenticated_login_and_scopes(

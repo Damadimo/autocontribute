@@ -201,6 +201,15 @@ class _AuthorizationEvidence:
 
 
 @dataclass(frozen=True, slots=True)
+class ExactHumanApproval:
+    """One ledger-bound approval that authorized an exact publication intent."""
+
+    approval_event_hash: str
+    publication_intent_event_hash: str
+    publication_intent_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class _PublicationProof:
     repository: str
     event_hashes: tuple[str, ...]
@@ -805,7 +814,7 @@ def _authorization(
             "publication gate release lacks its automatic hold evidence",
             tuple(event["event_hash"] for event in releases),
         )
-    approval = _exact_approval(manifest, events)
+    approval = classify_exact_human_approval(manifest, events)
     if approval is None:
         return _AuthorizationEvidence(
             PublicationAuthorization.AMBIGUOUS,
@@ -815,14 +824,30 @@ def _authorization(
     return _AuthorizationEvidence(
         PublicationAuthorization.REVIEW_REQUIRED,
         None,
-        (approval["event_hash"],),
+        (approval.approval_event_hash,),
     )
 
 
-def _exact_approval(
+def classify_exact_human_approval(
     manifest: RunManifest,
     events: tuple[dict[str, str], ...],
-) -> dict[str, str] | None:
+) -> ExactHumanApproval | None:
+    """Classify an approval only when the exact ledger intent follows it while live.
+
+    Event-chain integrity remains the caller's responsibility.  Production callers must verify
+    the selected run's hash chain before treating this classification as recovery authority.
+    """
+
+    if any(
+        event["event_type"]
+        in {
+            "publication.gate.held",
+            "publication.gate.legacy",
+            "publication.gate.released",
+        }
+        for event in events
+    ):
+        return None
     approval = manifest.approval
     approval_events = [event for event in events if event["event_type"] == "approval.created"]
     if approval is None or len(approval_events) != 1:
@@ -837,19 +862,29 @@ def _exact_approval(
             for index, item in enumerate(events)
             if item["event_type"] == "publication.intent.begun"
         ]
+        if len(intent_events) != 1:
+            return None
+        intent_index, intent = intent_events[0]
         approved_at = _aware_utc(approval.approved_at, field="approval time")
         expires_at = _aware_utc(approval.expires_at, field="approval expiry")
-        if any(
-            approval_index >= intent_index
-            or not approved_at
-            <= _event_time(intent["occurred_at"], field="publication intent time")
-            < expires_at
-            for intent_index, intent in intent_events
-        ):
+        intent_at = _event_time(intent["occurred_at"], field="publication intent time")
+        if approval_index >= intent_index or not approved_at <= intent_at < expires_at:
             return None
+        approval_event_hash = _event_hash(
+            event["event_hash"],
+            field="approval event hash",
+        )
+        intent_event_hash = _event_hash(
+            intent["event_hash"],
+            field="publication intent event hash",
+        )
     except (StateError, TypeError, ValueError):
         return None
-    return event
+    return ExactHumanApproval(
+        approval_event_hash=approval_event_hash,
+        publication_intent_event_hash=intent_event_hash,
+        publication_intent_at=intent_at,
+    )
 
 
 def _validate_approval_values(
@@ -1573,6 +1608,7 @@ def _run_id(value: str) -> str:
 
 __all__ = [
     "MANUAL_OUTCOME_COHORT_SIZE",
+    "ExactHumanApproval",
     "ExpertOutcome",
     "PublicationAuthorization",
     "UpstreamGateSummary",
@@ -1580,4 +1616,5 @@ __all__ = [
     "UpstreamOutcomeGate",
     "UpstreamPublicationScope",
     "UpstreamRunAssessment",
+    "classify_exact_human_approval",
 ]

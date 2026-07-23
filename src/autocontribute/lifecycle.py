@@ -598,9 +598,7 @@ def _parsed_lifecycle_payload(value: object) -> tuple[dict[str, object], int]:
         or not isinstance(version, int)
         or version != CURRENT_LIFECYCLE_EVIDENCE_VERSION
     ):
-        raise ValueError(
-            f"lifecycle evidence version must be {CURRENT_LIFECYCLE_EVIDENCE_VERSION}"
-        )
+        raise ValueError(f"lifecycle evidence version must be {CURRENT_LIFECYCLE_EVIDENCE_VERSION}")
     return payload, version
 
 
@@ -627,9 +625,7 @@ def _parsed_pull_request(value: object, *, complete_history: bool) -> PullReques
         "title",
         "updated_at",
     }
-    has_node_identity = complete_history or (
-        isinstance(value, dict) and "node_id" in value
-    )
+    has_node_identity = complete_history or (isinstance(value, dict) and "node_id" in value)
     if has_node_identity:
         keys.add("node_id")
     if complete_history:
