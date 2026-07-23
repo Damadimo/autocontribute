@@ -146,6 +146,15 @@ def _ready_run(
             "github": {"repositories": ["example/project"]},
             "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
             "storage": {"path": tmp_path / "state"},
+            "s3_replication": {
+                "bundle_directory": tmp_path / "backups",
+                "receipt_directory": tmp_path / "backups" / "receipts",
+                "scratch_directory": tmp_path / "backups" / "replication-scratch",
+                "bucket": "autocontribute-backup",
+                "expected_bucket_owner": "123456789012",
+                "region": "ca-central-1",
+                "prefix": "production/test",
+            },
         }
     )
     if guarded_auto:

@@ -54,6 +54,12 @@ _EXPECTED_ASSETS: Final[dict[str, _ExpectedAsset]] = {
     "deploy/systemd/autocontribute-health.timer": _ExpectedAsset(
         "/etc/systemd/system/autocontribute-health.timer", "0644", True
     ),
+    "deploy/systemd/autocontribute-replication.service": _ExpectedAsset(
+        "/etc/systemd/system/autocontribute-replication.service", "0644", True
+    ),
+    "deploy/systemd/autocontribute-replication.timer": _ExpectedAsset(
+        "/etc/systemd/system/autocontribute-replication.timer", "0644", True
+    ),
     "deploy/systemd/autocontribute-rootless-docker.service": _ExpectedAsset(
         "/etc/systemd/system/autocontribute-rootless-docker.service", "0644", True
     ),
@@ -85,6 +91,9 @@ _EXPECTED_ASSETS: Final[dict[str, _ExpectedAsset]] = {
     ),
     "deploy/systemd/libexec/autocontribute-record-failure": _ExpectedAsset(
         "/usr/local/libexec/autocontribute-record-failure", "0755", True
+    ),
+    "deploy/systemd/libexec/autocontribute-replication": _ExpectedAsset(
+        "/usr/local/libexec/autocontribute-replication", "0755", True
     ),
     "deploy/systemd/libexec/autocontribute-rootless-docker": _ExpectedAsset(
         "/usr/local/libexec/autocontribute-rootless-docker", "0755", True

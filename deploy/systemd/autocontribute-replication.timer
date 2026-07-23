@@ -1,0 +1,14 @@
+[Unit]
+Description=Retry immutable Autocontribute backup replication hourly
+Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
+
+[Timer]
+OnCalendar=*-*-* *:37:00 UTC
+Persistent=yes
+RandomizedDelaySec=10m
+FixedRandomDelay=yes
+AccuracySec=1m
+Unit=autocontribute-replication.service
+
+[Install]
+WantedBy=timers.target

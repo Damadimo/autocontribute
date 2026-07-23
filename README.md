@@ -32,8 +32,10 @@ base commit, diff, commit message, and PR text before publication.
 - Red/green evidence: behavioral fixes must use the same reproduction command that fails on pristine
   upstream and passes with the patch; missing tools, files, tests, permissions, or networking do not
   count as a reproduced defect.
-- Credential isolation: model calls happen in the control process; repository commands run in a
-  credential-free Docker sandbox with networking disabled and a disposable working-tree copy.
+- Credential isolation: each production model call runs in a fresh subprocess with only its model
+  credential and a minimal runtime environment; GitHub credentials are excluded. Repository
+  commands run in a credential-free Docker sandbox with networking disabled and a disposable
+  working-tree copy.
 - Exact approval: an expiring hash binds approval to the complete outbound artifact. Any drift
   invalidates it.
 - Provider choice: first-class OpenAI Responses API support and an OpenAI-compatible structured-output
@@ -248,6 +250,13 @@ reported usage; missing or inconsistent usage fails closed, while an ambiguous f
 its reservation. Model prices are deliberately operator-supplied because compatible endpoints and
 custom model names cannot be priced safely from a hard-coded table.
 
+The configured per-call timeout is also an application-owned hard deadline, not just an SDK hint.
+It includes subprocess startup and bounded JSON IPC. At the deadline, the parent rejects late output,
+terminates the model worker's private process group, escalates to `SIGKILL` after a short grace
+period, and reaps it. For a contribution-run call, the durable `model.call.timed_out` event records
+that outcome, the conservative budget reservation remains charged, and no completed model-call
+artifact is created.
+
 ## GitHub publication safety
 
 Scheduled runs are prepare-only by default. `publishing.mode: auto` is supported for deliberate,
@@ -367,8 +376,12 @@ durable event anchor. Preserve all three parts of the corpus as one generation: 
 `state restore --complete` to promote that bundle into an absent storage root. The backward-compatible commands
 without `--complete` intentionally handle only the SQLite snapshot.
 For an independently read-back, compliance-locked AWS S3 version and an immutable off-host receipt,
-use `state replicate-s3` after bundle creation; see
-[Immutable S3 backup replication](docs/s3-backup-replication.md).
+configure `s3_replication` and use `state replicate-s3` after bundle creation; see
+[Immutable S3 backup replication](docs/s3-backup-replication.md). The block is optional for local or
+manual `review_required` use, but `publishing.mode: auto` is rejected without it. The packaged systemd
+backup triggers the separately credentialed replication service, its hourly timer retries pending
+bundles, and the worker and health service require recent exact receipt evidence before scheduled
+work. AWS credentials are never given to the backup, worker, doctor, or model subprocesses.
 
 An automatic publisher binds both exact validated evaluation and upstream-outcome corpus cursors,
 plus their deployment and publishing scope, in a non-expiring SQLite hold in the same transaction
@@ -402,8 +415,10 @@ or beginning model work. Operators can run the dry form first at any time under 
 The included GitHub-hosted Actions workflow permanently requires
 `publishing.mode: review_required`; setting the auto-publish environment opt-in does not bypass that
 check. A guarded `auto` pilot must run on an operator-managed, non-ephemeral worker whose live SQLite
-state, run bundles, and evaluation files survive restarts and are backed up. Do not use an evictable
-Actions cache as the durability boundary for autonomous publication.
+state, run bundles, and evaluation files survive restarts and are backed up. Auto configuration must
+also include the immutable S3 replication policy, and every scheduled invocation verifies the newest
+complete bundle and exact receipt within its configured maximum age before rollout or model work.
+Do not use an evictable Actions cache as the durability boundary for autonomous publication.
 
 The hosted review workflow uses `AUTOCONTRIBUTE_STATE_LINEAGE` as an external fail-closed pointer to
 one exact cache generation. It advances that pointer only after a verified snapshot is saved and

@@ -324,6 +324,54 @@ def test_scheduler_claims_before_lifecycle_doctor_and_run_then_always_snapshots(
     assert "doctor" not in snapshot["if"]
 
 
+@pytest.mark.parametrize(
+    ("requested_issue", "expected_arguments"),
+    [
+        ("", ["run", "autocontribute", "run", "--scheduled"]),
+        (
+            "owner/repository#123",
+            ["run", "autocontribute", "run", "--issue", "owner/repository#123"],
+        ),
+    ],
+)
+def test_production_hosted_run_uses_scheduled_mode_only_without_an_issue(
+    tmp_path: Path,
+    requested_issue: str,
+    expected_arguments: list[str],
+) -> None:
+    document = yaml.safe_load((ROOT / ".github" / "workflows" / "autocontribute.yml").read_text())
+    step = next(
+        step
+        for step in document["jobs"]["prepare"]["steps"]
+        if step.get("name") == "Prepare one contribution attempt"
+    )
+    captured_arguments = tmp_path / "arguments"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "CAPTURED_ARGUMENTS": str(captured_arguments),
+            "REQUESTED_ISSUE": requested_issue,
+        }
+    )
+    script = "\n".join(
+        (
+            'uv() { printf \'%s\\n\' "$@" >"$CAPTURED_ARGUMENTS"; }',
+            str(step["run"]),
+        )
+    )
+
+    subprocess.run(
+        ["bash", "-c", script],
+        cwd=ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert captured_arguments.read_text(encoding="utf-8").splitlines() == expected_arguments
+
+
 @pytest.mark.parametrize("workflow", ["autocontribute.yml", "staging.yml"])
 def test_scheduler_commits_only_after_cache_and_evidence_upload(workflow: str) -> None:
     document = yaml.safe_load((ROOT / ".github" / "workflows" / workflow).read_text())
@@ -685,11 +733,38 @@ def test_ci_verifies_complete_systemd_assets_in_source_distribution() -> None:
     script = verify_sdist["run"]
 
     assert steps.index(build_sdist) < steps.index(verify_sdist) < steps.index(build_wheel)
-    assert "len(assets) != 23" in script
+    assert "len(assets) != 26" in script
     assert "source distribution contains non-regular systemd assets" in script
     assert "archived_assets != set(expected)" in script
     assert "extracted.read() != Path(source_path).read_bytes()" in script
     assert "member.mode != expected_mode" in script
+
+
+def test_ci_runs_installed_replication_chain_acceptance_on_controlled_ubuntu() -> None:
+    document = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    job = document["jobs"]["ubuntu-deployment-recovery"]
+    steps = job["steps"]
+    checkout = next(
+        step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    acceptance = next(
+        step for step in steps if step["name"] == "Exercise installed backup and recovery"
+    )
+    script = (ROOT / acceptance["run"]).read_text(encoding="utf-8")
+
+    assert job["runs-on"] == "ubuntu-24.04"
+    assert job["timeout-minutes"] == 20
+    assert checkout["with"] == {"persist-credentials": False}
+    assert steps.index(checkout) < steps.index(acceptance)
+    assert "autocontribute-replication.timer" in script
+    assert "autocontribute-replication.service" in script
+    assert "/usr/local/libexec/autocontribute-replication" in script
+    assert "state replicate-next-s3" not in script
+    assert "No unreplicated complete state bundles" in script
+    assert "OnSuccess" in script
+    assert "OnFailure" in script
+    assert "ConditionResult" in script
+    assert "replication trigger did not honor its explicit enable condition" in script
 
 
 def test_ci_exercises_workspace_quota_preflight_on_a_real_hardened_mount() -> None:

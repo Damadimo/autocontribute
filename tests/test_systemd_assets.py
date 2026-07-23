@@ -82,14 +82,14 @@ def installed_root(tmp_path: Path) -> Path:
 def test_manifest_and_project_source_have_complete_verified_inventory() -> None:
     manifest = _manifest()
 
-    assert len(manifest.assets) == 23
-    assert sum(asset.required for asset in manifest.assets) == 22
+    assert len(manifest.assets) == 26
+    assert sum(asset.required for asset in manifest.assets) == 25
 
     result = verify_source_systemd_assets(PROJECT_ROOT, manifest_path=MANIFEST_PATH)
 
     assert result.scope == "source"
-    assert result.checked_assets == 23
-    assert result.required_assets == 22
+    assert result.checked_assets == 26
+    assert result.required_assets == 25
     assert result.source_only_assets == 1
 
 
@@ -97,8 +97,8 @@ def test_installed_release_verifies_with_explicit_identity(installed_root: Path)
     result = _verify_installed(installed_root)
 
     assert result.scope == "installed"
-    assert result.checked_assets == 22
-    assert result.required_assets == 22
+    assert result.checked_assets == 25
+    assert result.required_assets == 25
     assert result.source_only_assets == 1
 
 
@@ -124,6 +124,38 @@ def test_manager_policy_is_installed_only_for_the_resolved_service_uid(
     assert not (
         installed_root / "etc" / "systemd" / "system" / "user@.service.d" / "50-autocontribute.conf"
     ).exists()
+
+
+@pytest.mark.parametrize(
+    ("source_path", "installed_path", "mode"),
+    [
+        (
+            "deploy/systemd/autocontribute-replication.service",
+            "/etc/systemd/system/autocontribute-replication.service",
+            "0644",
+        ),
+        (
+            "deploy/systemd/autocontribute-replication.timer",
+            "/etc/systemd/system/autocontribute-replication.timer",
+            "0644",
+        ),
+        (
+            "deploy/systemd/libexec/autocontribute-replication",
+            "/usr/local/libexec/autocontribute-replication",
+            "0755",
+        ),
+    ],
+)
+def test_replication_assets_are_required_release_bound_files(
+    source_path: str,
+    installed_path: str,
+    mode: str,
+) -> None:
+    asset = _asset(_manifest(), source_path)
+
+    assert asset.installed_path == installed_path
+    assert asset.mode == mode
+    assert asset.required
 
 
 def test_installed_release_resolves_the_production_service_account_uid(
@@ -483,7 +515,7 @@ def test_installed_release_allows_filesystem_safe_unattested_service_dropin(
 
     result = _verify_installed(installed_root)
 
-    assert result.checked_assets == 22
+    assert result.checked_assets == 25
 
 
 @pytest.mark.parametrize(

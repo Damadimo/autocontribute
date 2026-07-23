@@ -2,6 +2,7 @@
 Description=Create a verified complete Autocontribute state backup
 Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
 OnFailure=autocontribute-failure@%n.service
+OnSuccess=autocontribute-replication.service
 StartLimitIntervalSec=8h
 StartLimitBurst=2
 RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute

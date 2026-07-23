@@ -1466,6 +1466,8 @@ def test_systemd_bundle_contains_expected_units_and_executable_helpers() -> None
         "autocontribute-failure@.service",
         "autocontribute-health.service",
         "autocontribute-health.timer",
+        "autocontribute-replication.service",
+        "autocontribute-replication.timer",
         "autocontribute-rootless-docker.service",
         "autocontribute-user-manager.conf",
         "autocontribute-worker.service",
@@ -1482,6 +1484,7 @@ def test_systemd_bundle_contains_expected_units_and_executable_helpers() -> None
         "autocontribute-docker-data-check",
         "autocontribute-healthcheck",
         "autocontribute-record-failure",
+        "autocontribute-replication",
         "autocontribute-rootless-docker",
         "autocontribute-rootless-docker-check",
         "autocontribute-rootless-dockerd",
@@ -1514,6 +1517,7 @@ def test_operational_units_fail_closed_on_release_asset_mismatch() -> None:
         "autocontribute-doctor.service",
         "autocontribute-backup.service",
         "autocontribute-health.service",
+        "autocontribute-replication.service",
         "autocontribute-rootless-docker.service",
     ):
         unit = _directives(SYSTEMD / name)
@@ -1521,7 +1525,11 @@ def test_operational_units_fail_closed_on_release_asset_mismatch() -> None:
     user_daemon = _directives(SYSTEMD / "user" / "autocontribute-rootless-docker-daemon.service")
     assert verifier in user_daemon[("Service", "ExecStartPre")]
 
-    for name in ("autocontribute-worker.service", "autocontribute-doctor.service"):
+    for name in (
+        "autocontribute-worker.service",
+        "autocontribute-doctor.service",
+        "autocontribute-replication.service",
+    ):
         unit = _directives(SYSTEMD / name)
         assert "AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS=1" in unit[("Service", "Environment")]
 
@@ -1530,10 +1538,14 @@ def test_operational_units_fail_closed_on_release_asset_mismatch() -> None:
 
     worker = (SYSTEMD / "libexec" / "autocontribute-worker").read_text(encoding="utf-8")
     backup = (SYSTEMD / "libexec" / "autocontribute-backup").read_text(encoding="utf-8")
+    replication = (SYSTEMD / "libexec" / "autocontribute-replication").read_text(encoding="utf-8")
     verifier_call = '"$executable" deployment verify-systemd-assets'
     assert worker.index(verifier_call) < worker.index('if [[ ! -r "$config" ]]')
     assert worker.index(verifier_call) < worker.index('credential_value="$(<"$credential_path")"')
     assert backup.index(verifier_call) < backup.index('"$storage_capacity_check"')
+    assert replication.index(verifier_call) < replication.index(
+        'credential_value="$(<"$credential_path")"'
+    )
 
 
 @pytest.mark.parametrize(
@@ -1541,9 +1553,10 @@ def test_operational_units_fail_closed_on_release_asset_mismatch() -> None:
     [
         ("autocontribute-worker", ["run"]),
         ("autocontribute-backup", []),
+        ("autocontribute-replication", []),
     ],
 )
-def test_worker_and_backup_abort_when_release_asset_verification_fails(
+def test_operational_helpers_abort_when_release_asset_verification_fails(
     tmp_path: Path,
     wrapper_name: str,
     arguments: list[str],
@@ -1641,11 +1654,13 @@ def test_ci_runs_real_version_controlled_systemd_validation() -> None:
     assert "systemd-analyze verify" in verify["run"]
     assert "--recursive-errors=no" in verify["run"]
     assert "autocontribute-rootless-docker-daemon.service" in verify["run"]
+    assert '"${#units[@]}" -ne 11' in verify["run"]
     assert "systemd-analyze security" in security["run"]
     assert "--offline=yes" in security["run"]
     assert "[autocontribute-worker.service]=40" in security["run"]
     assert "[autocontribute-doctor.service]=40" in security["run"]
     assert "[autocontribute-backup.service]=30" in security["run"]
+    assert "[autocontribute-replication.service]=30" in security["run"]
     assert "[autocontribute-health.service]=30" in security["run"]
     assert "[autocontribute-failure@.service]=30" in security["run"]
 
@@ -1685,6 +1700,13 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
 
     helper = (SYSTEMD / "libexec" / "autocontribute-worker").read_text(encoding="utf-8")
     assert 'run --scheduled --config "$config"' in helper
+    assert "state verify-latest-s3" in helper
+    assert "--if-configured" in helper
+    assert "--max-age-hours 36" in helper
+    assert 'replication_check+=(--required-after "$worker_attempt_marker")' in helper
+    assert 'worker_attempt_marker="$health_directory/worker-attempt"' in helper
+    assert '"${INVOCATION_ID:-}" =~ ^[0-9A-Fa-f]{32}$' in helper
+    assert '/usr/bin/mv --no-target-directory -- "$worker_attempt_temporary"' in helper
     assert "state gc-workspaces" in helper
     assert "--older-than-days 7" in helper
     assert "--limit 25" in helper
@@ -1695,9 +1717,14 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
     structural_call = '"$workspace_quota_check" --structural "$workspace_root"'
     headroom_call = '"$workspace_quota_check" --headroom "$workspace_root"'
     marker_export = 'export AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT="$workspace_root"'
+    replication_call = helper.index('"$executable" "${replication_check[@]}"')
+    attempt_marker = helper.index(
+        '/usr/bin/mv --no-target-directory -- "$worker_attempt_temporary"'
+    )
     assert structural_call in helper
     assert headroom_call in helper
-    assert helper.index(structural_call) < helper.index(marker_export) < gc_call
+    assert helper.index(structural_call) < helper.index(marker_export) < replication_call
+    assert replication_call < attempt_marker < gc_call
     assert gc_call < helper.index(headroom_call) < credential_read < run_call
     assert 'runtime_directory="/run/autocontribute"' in helper
     assert 'export DOCKER_HOST="unix://$docker_socket"' in helper
@@ -1730,6 +1757,134 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
     assert helper.index(structural_call) < helper.index('credential_value="$(<"$credential_path")"')
     assert 'export AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT="$workspace_root"' in helper
     assert 'export AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT="$state_root"' in helper
+
+
+def test_replication_timer_service_and_helper_form_a_separate_provider_boundary() -> None:
+    timer = _directives(SYSTEMD / "autocontribute-replication.timer")
+    assert _one(timer, "Timer", "OnCalendar") == "*-*-* *:37:00 UTC"
+    assert _one(timer, "Timer", "Persistent") == "yes"
+    assert _one(timer, "Timer", "RandomizedDelaySec") == "10m"
+    assert _one(timer, "Timer", "FixedRandomDelay") == "yes"
+    assert _one(timer, "Timer", "Unit") == "autocontribute-replication.service"
+
+    service = _directives(SYSTEMD / "autocontribute-replication.service")
+    assert _one(service, "Unit", "ConditionPathExists") == (
+        "/etc/autocontribute/s3-replication.enabled"
+    )
+    assert _one(service, "Unit", "Wants") == "network-online.target"
+    assert _one(service, "Unit", "After") == "network-online.target"
+    assert _one(service, "Unit", "OnFailure") == "autocontribute-failure@%n.service"
+    assert _one(service, "Service", "User") == "autocontribute"
+    assert _one(service, "Service", "ExecStart") == (
+        "/usr/bin/flock --exclusive --timeout 21600 "
+        f"{LOCK_PATH} /usr/local/libexec/autocontribute-replication"
+    )
+    assert service[("Service", "LoadCredentialEncrypted")] == [
+        "AWS_ACCESS_KEY_ID:/etc/autocontribute/credentials/AWS_ACCESS_KEY_ID.cred",
+        "AWS_SECRET_ACCESS_KEY:/etc/autocontribute/credentials/AWS_SECRET_ACCESS_KEY.cred",
+        "AWS_SESSION_TOKEN:/etc/autocontribute/credentials/AWS_SESSION_TOKEN.cred",
+    ]
+    assert "AWS_EC2_METADATA_DISABLED=true" in service[("Service", "Environment")]
+    assert _one(service, "Service", "RestrictAddressFamilies") == "AF_UNIX AF_INET AF_INET6"
+    assert ("Service", "PrivateNetwork") not in service
+    assert _one(service, "Service", "ReadOnlyPaths") == (
+        "/etc/autocontribute /opt/autocontribute /var/lib/autocontribute/state"
+    )
+    assert _one(service, "Service", "ReadWritePaths") == (
+        "/var/backups/autocontribute /var/lib/autocontribute/health "
+        "/var/lib/autocontribute/operation.lock"
+    )
+
+    helper = (SYSTEMD / "libexec" / "autocontribute-replication").read_text(encoding="utf-8")
+    assert "AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN" in helper
+    assert "AWS_CONFIG_FILE AWS_CONTAINER_AUTHORIZATION_TOKEN" in helper
+    assert "AWS_PROFILE AWS_ROLE_ARN AWS_SHARED_CREDENTIALS_FILE" in helper
+    assert "AWS_WEB_IDENTITY_TOKEN_FILE" in helper
+    assert "export AWS_EC2_METADATA_DISABLED=true" in helper
+    assert 'exec "$executable" state replicate-next-s3 --config "$config"' in helper
+    assert "AWS_ACCESS_KEY_ID=" not in helper
+    assert "AWS_SECRET_ACCESS_KEY=" not in helper
+    assert "AWS_SESSION_TOKEN=" not in helper
+
+
+def test_replication_helper_loads_exact_credentials_and_scrubs_ambient_aws_state(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "autocontribute"
+    config = tmp_path / "autocontribute.yml"
+    credentials = tmp_path / "credentials"
+    calls = tmp_path / "calls"
+    observed = tmp_path / "observed"
+    config.write_text("publishing:\n  mode: review_required\n", encoding="utf-8")
+    credentials.mkdir(mode=0o700)
+    credential_values = {
+        "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
+        "AWS_SECRET_ACCESS_KEY": "acceptance-secret",
+        "AWS_SESSION_TOKEN": "acceptance-session",
+    }
+    for name, value in credential_values.items():
+        path = credentials / name
+        path.write_text(value, encoding="utf-8")
+        path.chmod(0o400)
+    _write_executable(
+        executable,
+        """#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$AUTOCONTRIBUTE_TEST_CALLS"
+if [[ "$*" == "deployment verify-systemd-assets" ]]; then
+  exit 0
+fi
+[[ "$*" == "state replicate-next-s3 --config $AUTOCONTRIBUTE_TEST_CONFIG" ]]
+for variable in AWS_CONFIG_FILE AWS_CONTAINER_AUTHORIZATION_TOKEN \
+  AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_CREDENTIALS_RELATIVE_URI \
+  AWS_PROFILE AWS_ROLE_ARN AWS_SHARED_CREDENTIALS_FILE AWS_WEB_IDENTITY_TOKEN_FILE; do
+  if /usr/bin/env | /usr/bin/grep -q "^${variable}="; then
+    exit 91
+  fi
+done
+printf '%s\n' \
+  "$AWS_ACCESS_KEY_ID" \
+  "$AWS_SECRET_ACCESS_KEY" \
+  "$AWS_SESSION_TOKEN" \
+  "$AWS_EC2_METADATA_DISABLED" >"$AUTOCONTRIBUTE_TEST_OBSERVED"
+""",
+    )
+    environment = {
+        **os.environ,
+        "AUTOCONTRIBUTE_CONFIG": os.fspath(config),
+        "AUTOCONTRIBUTE_EXECUTABLE": os.fspath(executable),
+        "AUTOCONTRIBUTE_TEST_CALLS": os.fspath(calls),
+        "AUTOCONTRIBUTE_TEST_CONFIG": os.fspath(config),
+        "AUTOCONTRIBUTE_TEST_OBSERVED": os.fspath(observed),
+        "CREDENTIALS_DIRECTORY": os.fspath(credentials),
+        "AWS_CONFIG_FILE": "must-be-removed",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN": "must-be-removed",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI": "must-be-removed",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": "must-be-removed",
+        "AWS_PROFILE": "must-be-removed",
+        "AWS_ROLE_ARN": "must-be-removed",
+        "AWS_SHARED_CREDENTIALS_FILE": "must-be-removed",
+        "AWS_WEB_IDENTITY_TOKEN_FILE": "must-be-removed",
+    }
+
+    result = subprocess.run(
+        ["bash", os.fspath(SYSTEMD / "libexec" / "autocontribute-replication")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "deployment verify-systemd-assets",
+        f"state replicate-next-s3 --config {config}",
+    ]
+    assert observed.read_text(encoding="utf-8").splitlines() == [
+        *credential_values.values(),
+        "true",
+    ]
 
 
 def test_workspace_quota_check_accepts_bounded_dedicated_ext4_mount(tmp_path: Path) -> None:
@@ -2758,16 +2913,26 @@ def test_worker_and_doctor_have_matching_credential_override_surfaces() -> None:
         assert worker[("Service", key)] == doctor[("Service", key)]
 
 
-def test_worker_doctor_and_complete_backup_share_one_exclusive_lock() -> None:
+def test_worker_backup_and_replication_chain_shares_one_exclusive_lock() -> None:
     for name in (
         "autocontribute-worker.service",
         "autocontribute-doctor.service",
         "autocontribute-backup.service",
+        "autocontribute-replication.service",
     ):
         directives = _directives(SYSTEMD / name)
         command = _one(directives, "Service", "ExecStart")
         assert "/usr/bin/flock --exclusive" in command
         assert LOCK_PATH in command
+
+    worker_unit = _directives(SYSTEMD / "autocontribute-worker.service")
+    assert worker_unit[("Unit", "OnSuccess")] == ["autocontribute-backup.service"]
+    assert set(worker_unit[("Unit", "OnFailure")]) == {
+        "autocontribute-failure@%n.service",
+        "autocontribute-backup.service",
+    }
+    backup_directives = _directives(SYSTEMD / "autocontribute-backup.service")
+    assert backup_directives[("Unit", "OnSuccess")] == ["autocontribute-replication.service"]
 
     backup = (SYSTEMD / "libexec" / "autocontribute-backup").read_text(encoding="utf-8")
     assert '"$executable" state backup' in backup
@@ -2796,6 +2961,7 @@ def test_worker_doctor_and_complete_backup_share_one_exclusive_lock() -> None:
         "autocontribute-doctor.service",
         "autocontribute-backup.service",
         "autocontribute-health.service",
+        "autocontribute-replication.service",
     ):
         storage_unit = (SYSTEMD / name).read_text(encoding="utf-8")
         assert (
@@ -2809,6 +2975,14 @@ def test_worker_doctor_and_complete_backup_share_one_exclusive_lock() -> None:
         assert "EnvironmentFile=" not in signal_unit
 
     health_unit = _directives(SYSTEMD / "autocontribute-health.service")
+    replication_preflight = next(
+        command
+        for command in health_unit[("Service", "ExecStartPre")]
+        if "state verify-latest-s3" in command
+    )
+    assert "--if-configured" in replication_preflight
+    assert "--max-age-hours 36" in replication_preflight
+    assert "--required-after /var/lib/autocontribute/health/worker-attempt" in replication_preflight
     assert "/var/lib/autocontribute/docker" in health_unit[("Unit", "RequiresMountsFor")]
     assert (
         "/usr/local/libexec/autocontribute-docker-data-check "
@@ -2824,6 +2998,7 @@ def test_services_have_failure_signaling_and_core_hardening() -> None:
         "autocontribute-doctor.service",
         "autocontribute-backup.service",
         "autocontribute-health.service",
+        "autocontribute-replication.service",
     ):
         unit = (SYSTEMD / name).read_text(encoding="utf-8")
         assert "OnFailure=autocontribute-failure@%n.service" in unit
@@ -2866,6 +3041,11 @@ def test_tmpfiles_keeps_state_private_and_docs_cover_safe_recovery() -> None:
         in tmpfiles
     )
     assert "d /var/backups/autocontribute 0700 autocontribute autocontribute -" in tmpfiles
+    assert "d /var/backups/autocontribute/receipts 0700 autocontribute autocontribute -" in tmpfiles
+    assert (
+        "d /var/backups/autocontribute/replication-scratch 0700 "
+        "autocontribute autocontribute -" in tmpfiles
+    )
     assert "d /var/lib/autocontribute/docker 0710 autocontribute autocontribute -" in tmpfiles
 
     guide = (ROOT / "docs" / "systemd-deployment.md").read_text(encoding="utf-8")

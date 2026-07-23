@@ -405,6 +405,15 @@ JSON.” Reasoning effort is forwarded to compatible endpoints, but the Response
 is rejected because it cannot be enforced portably. Scout, builder, and critic are stateless calls,
 and critic uses a separate profile and fresh context.
 
+Production provider calls execute in a fresh process group. The application parent owns an absolute
+monotonic deadline that includes process startup and IPC; an SDK timeout is only a cooperative inner
+limit. At the deadline the parent rejects any result, sends `SIGTERM`, escalates to `SIGKILL` after a
+short grace period, and reaps the worker. Requests and results use size-limited canonical JSON over
+inherited file descriptors, never pickle, and accept only the planner, builder, critic, and doctor
+schemas. The worker receives the configured model credential and a small runtime environment
+allowlist, not GitHub credentials. A timeout retains the pre-call budget reservation and appends
+explicit termination evidence; it cannot create a completed model-call artifact.
+
 Current OpenAI implementation choices follow the official documentation:
 
 - [Latest model guidance](https://developers.openai.com/api/docs/guides/latest-model)

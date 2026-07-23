@@ -179,7 +179,10 @@ cleanup() {
       autocontribute-health.timer \
       autocontribute-backup.timer \
       autocontribute-backup.service \
-      autocontribute-failure@autocontribute-backup.service.service; do
+      autocontribute-replication.timer \
+      autocontribute-replication.service \
+      autocontribute-failure@autocontribute-backup.service.service \
+      autocontribute-failure@autocontribute-replication.service.service; do
       sudo systemctl stop "$path" >/dev/null 2>&1 || true
     done
   fi
@@ -292,6 +295,8 @@ cleanup() {
       /etc/systemd/system/autocontribute-failure@.service \
       /etc/systemd/system/autocontribute-health.service \
       /etc/systemd/system/autocontribute-health.timer \
+      /etc/systemd/system/autocontribute-replication.service \
+      /etc/systemd/system/autocontribute-replication.timer \
       /etc/systemd/system/autocontribute-rootless-docker.service \
       /etc/systemd/system/autocontribute-worker.service \
       /etc/systemd/system/autocontribute-worker.timer \
@@ -301,6 +306,7 @@ cleanup() {
       /usr/local/libexec/autocontribute-docker-data-check \
       /usr/local/libexec/autocontribute-healthcheck \
       /usr/local/libexec/autocontribute-record-failure \
+      /usr/local/libexec/autocontribute-replication \
       /usr/local/libexec/autocontribute-rootless-docker \
       /usr/local/libexec/autocontribute-rootless-docker-check \
       /usr/local/libexec/autocontribute-rootless-dockerd \
@@ -784,8 +790,8 @@ mapfile -d '' -t system_units < <(
 mapfile -d '' -t helpers < <(
   find "${release}/deploy/systemd/libexec" -maxdepth 1 -type f -print0 | sort -z
 )
-[[ "${#system_units[@]}" -eq 9 ]] || fail "the release must contain nine system units"
-[[ "${#helpers[@]}" -eq 10 ]] || fail "the release must contain ten helpers"
+[[ "${#system_units[@]}" -eq 11 ]] || fail "the release must contain eleven system units"
+[[ "${#helpers[@]}" -eq 11 ]] || fail "the release must contain eleven helpers"
 
 assets_install_started=1
 for shared_directory in /etc/systemd/system /etc/systemd/user /etc/tmpfiles.d; do
@@ -836,7 +842,20 @@ sudo install -d -o root -g "$service_account" -m 0750 "$config_root"
 sudo install -o root -g root -m 0600 \
   "${smoke_root}/marker" "${config_root}/.autocontribute-acceptance"
 config_root_created=1
-printf 'storage:\n  path: /var/lib/autocontribute/state\n' >"${smoke_root}/production.yml"
+printf '%s\n' \
+  'storage:' \
+  '  path: /var/lib/autocontribute/state' \
+  's3_replication:' \
+  '  bundle_directory: /var/backups/autocontribute' \
+  '  receipt_directory: /var/backups/autocontribute/receipts' \
+  '  scratch_directory: /var/backups/autocontribute/replication-scratch' \
+  '  bucket: acceptance-object-lock-vault' \
+  '  expected_bucket_owner: "123456789012"' \
+  '  region: ca-central-1' \
+  '  prefix: acceptance/worker' \
+  '  retention_days: 30' \
+  '  timeout_seconds: 10' \
+  '  max_age_hours: 36' >"${smoke_root}/production.yml"
 sudo install -o root -g "$service_account" -m 0640 \
   "${smoke_root}/production.yml" "$production_config"
 
@@ -874,17 +893,44 @@ sudo chown "$service_account:$service_account" "$state_root" "$backup_root"
 sudo chmod 0700 "$state_root" "$backup_root"
 sudo install -d -o "$service_account" -g "$service_account" -m 0700 \
   "${state_root}/workspaces"
+sudo systemd-tmpfiles --create /etc/tmpfiles.d/autocontribute.conf
+for replication_directory in \
+  "${backup_root}/receipts" \
+  "${backup_root}/replication-scratch"; do
+  [[ "$(sudo stat --format=%U:%G:%a -- "$replication_directory")" == \
+    "${service_account}:${service_account}:700" ]] || \
+    fail "tmpfiles did not create a private replication directory"
+done
+unset replication_directory
 
 sudo systemctl daemon-reload
 systemd_reloaded=1
 for timer in \
   autocontribute-worker.timer \
   autocontribute-health.timer \
-  autocontribute-backup.timer; do
+  autocontribute-backup.timer \
+  autocontribute-replication.timer; do
   timer_state="$(sudo systemctl is-enabled "$timer" 2>/dev/null || true)"
   [[ "$timer_state" == "disabled" ]] || fail "acceptance unexpectedly enabled $timer"
 done
 unset timer timer_state
+
+worker_success_targets="$(
+  sudo systemctl show autocontribute-worker.service --property=OnSuccess --value
+)"
+worker_failure_targets="$(
+  sudo systemctl show autocontribute-worker.service --property=OnFailure --value
+)"
+backup_success_targets="$(
+  sudo systemctl show autocontribute-backup.service --property=OnSuccess --value
+)"
+[[ " $worker_success_targets " == *" autocontribute-backup.service "* ]] || \
+  fail "the installed worker success path does not trigger a complete backup"
+[[ " $worker_failure_targets " == *" autocontribute-backup.service "* ]] || \
+  fail "the installed worker failure path does not trigger a complete backup"
+[[ " $backup_success_targets " == *" autocontribute-replication.service "* ]] || \
+  fail "the installed complete backup does not trigger immutable replication"
+unset backup_success_targets worker_failure_targets worker_success_targets
 
 run_as_service() {
   sudo -u "$service_account" /usr/bin/env -i \
@@ -895,6 +941,26 @@ run_as_service() {
     PYTHONUNBUFFERED=1 \
     "$@"
 }
+
+replication_credentials="${config_root}/acceptance-replication-credentials"
+sudo install -d -o root -g "$service_account" -m 0750 "$replication_credentials"
+for credential_name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+  printf 'acceptance-%s\n' "$credential_name" >"${smoke_root}/${credential_name}"
+  sudo install -o "$service_account" -g "$service_account" -m 0400 \
+    "${smoke_root}/${credential_name}" "${replication_credentials}/${credential_name}"
+done
+unset credential_name
+sudo test ! -e "${config_root}/s3-replication.enabled" || \
+  fail "the acceptance fixture unexpectedly enabled network replication"
+replication_empty_output="$(
+  run_as_service /usr/bin/env \
+    CREDENTIALS_DIRECTORY="$replication_credentials" \
+    AWS_PROFILE=must-be-cleared \
+    /usr/local/libexec/autocontribute-replication
+)"
+[[ "$replication_empty_output" == *"No unreplicated complete state bundles"* ]] || \
+  fail "the installed replication helper did not accept an empty offline queue"
+unset replication_credentials replication_empty_output
 
 run_id="$({
   run_as_service "${current_release}/.venv/bin/python" - "$state_root" <<'PY'
@@ -918,6 +984,18 @@ if ! sudo systemctl start autocontribute-backup.service; then
 fi
 [[ "$(sudo systemctl show autocontribute-backup.service --property=Result --value)" == \
   "success" ]] || fail "the hardened backup service did not report success"
+replication_condition_result=""
+for _ in {1..100}; do
+  replication_condition_result="$(
+    sudo systemctl show autocontribute-replication.service \
+      --property=ConditionResult --value
+  )"
+  [[ "$replication_condition_result" == "no" ]] && break
+  sleep 0.1
+done
+[[ "$replication_condition_result" == "no" ]] || \
+  fail "the backup replication trigger did not honor its explicit enable condition"
+unset replication_condition_result
 
 mapfile -t bundles < <(
   sudo -u "$service_account" find "$backup_root" -maxdepth 1 -type f \

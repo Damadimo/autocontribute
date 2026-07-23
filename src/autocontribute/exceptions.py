@@ -38,6 +38,28 @@ class ModelError(AutocontributeError):
     """A model request failed or returned an invalid result."""
 
 
+class ModelTimeoutError(ModelError):
+    """The application killed a model worker after its absolute deadline."""
+
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float,
+        elapsed_seconds: float,
+        term_sent: bool,
+        kill_sent: bool,
+        child_exit_code: int | None,
+    ) -> None:
+        super().__init__(
+            f"Model call exceeded its {timeout_seconds:.3f}-second application deadline"
+        )
+        self.timeout_seconds = timeout_seconds
+        self.elapsed_seconds = elapsed_seconds
+        self.term_sent = term_sent
+        self.kill_sent = kill_sent
+        self.child_exit_code = child_exit_code
+
+
 class RepositoryError(AutocontributeError):
     """A repository operation could not be completed safely."""
 

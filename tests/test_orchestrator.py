@@ -21,7 +21,7 @@ from autocontribute.domain import (
     ReviewScores,
     RunStatus,
 )
-from autocontribute.exceptions import PolicyError, StateError
+from autocontribute.exceptions import ModelTimeoutError, PolicyError, StateError
 from autocontribute.orchestrator import Orchestrator, RunInvocationMode
 from autocontribute.preparation import validate_preparation_fingerprint
 from autocontribute.providers import ModelResult, ModelUsage
@@ -2566,6 +2566,95 @@ def test_failed_model_call_retains_durable_reservation(tmp_path: Path) -> None:
     assert manifest.model_seconds == 1.5
     persisted = store.get(manifest.run_id)
     assert persisted.model_reservation == manifest.model_reservation
+
+
+def test_hard_model_timeout_retains_reservation_records_evidence_and_releases_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    class TimedOutProvider:
+        def generate(self, **_: object) -> ModelResult[Any]:
+            raise ModelTimeoutError(
+                timeout_seconds=10,
+                elapsed_seconds=10.27,
+                term_sent=True,
+                kill_sent=True,
+                child_exit_code=-9,
+            )
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "budget": {"max_model_seconds_per_run": 10},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    providers = _providers()
+    providers["scout"] = TimedOutProvider()  # type: ignore[assignment]
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(
+            issue_reference="example/project#42",
+            invocation_mode=RunInvocationMode.MANUAL,
+        )
+
+    assert manifest.status == RunStatus.FAILED
+    assert manifest.model_reservation is not None
+    persisted = store.get(manifest.run_id)
+    assert persisted.model_reservation == manifest.model_reservation
+    events = store.events(manifest.run_id)
+    event_types = [event["event_type"] for event in events]
+    assert "model.call.started" in event_types
+    assert "model.call.timed_out" in event_types
+    assert "model.call.completed" not in event_types
+    timeout_event = next(event for event in events if event["event_type"] == "model.call.timed_out")
+    timeout_details = json.loads(timeout_event["details"])
+    assert timeout_details == {
+        "call": "1",
+        "child_exit_code": "-9",
+        "deadline_kind": "absolute_monotonic",
+        "deadline_seconds": "10",
+        "elapsed_seconds": timeout_details["elapsed_seconds"],
+        "kill_sent": "true",
+        "reservation_retained": "true",
+        "role": "scout",
+        "term_sent": "true",
+        "worker_elapsed_seconds": "10.27",
+    }
+    assert (
+        json.loads(
+            (store.artifact_dir(manifest.run_id) / "model-calls.json").read_text(encoding="utf-8")
+        )
+        == []
+    )
+    next_lease = store.acquire_lease(
+        "autocontribute.run",
+        "next-worker",
+        ttl=timedelta(minutes=1),
+    )
+    assert next_lease is not None
+    assert store.release_lease("autocontribute.run", "next-worker", next_lease.generation)
 
 
 def test_provider_usage_above_forwarded_limit_is_charged_then_rejected(tmp_path: Path) -> None:

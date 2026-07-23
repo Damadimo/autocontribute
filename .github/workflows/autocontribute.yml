@@ -320,6 +320,8 @@ jobs:
           args=()
           if [ -n "$REQUESTED_ISSUE" ]; then
             args+=(--issue "$REQUESTED_ISSUE")
+          else
+            args+=(--scheduled)
           fi
           uv run autocontribute run "${args[@]}"
       - name: Create verified scheduler-state snapshot

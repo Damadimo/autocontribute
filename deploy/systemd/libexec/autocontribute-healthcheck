@@ -52,4 +52,4 @@ if ((${#failures[@]})); then
   exit 1
 fi
 
-printf 'Autocontribute worker and complete backup are fresh\n'
+printf 'Autocontribute worker and complete backup stamps are fresh; configured replication evidence passed preflight\n'

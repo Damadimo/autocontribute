@@ -10,6 +10,7 @@ from rich.text import Text
 from typer.testing import CliRunner
 
 import autocontribute.cli as cli
+from autocontribute.backup_replication import PendingStateBundleReplication
 from autocontribute.cli import app
 from autocontribute.config import load_config
 from autocontribute.deployment import compute_deployment_fingerprint
@@ -79,6 +80,14 @@ def _guarded_auto_config_text(state: Path) -> str:
         "    pricing: *pricing\n"
         "budget:\n"
         "  max_model_cost_usd_per_run: 10\n"
+        "s3_replication:\n"
+        f"  bundle_directory: {state.parent / 'backups'}\n"
+        f"  receipt_directory: {state.parent / 'backups' / 'receipts'}\n"
+        f"  scratch_directory: {state.parent / 'backups' / 'scratch'}\n"
+        "  bucket: autocontribute-backup\n"
+        "  expected_bucket_owner: '123456789012'\n"
+        "  region: ca-central-1\n"
+        "  prefix: production/test\n"
         f"storage:\n  path: {state}\n"
     )
 
@@ -864,6 +873,164 @@ def test_complete_state_backup_cli_uses_distinct_default(tmp_path: Path) -> None
     assert (state / "snapshots" / "state.bundle.zip").is_file()
 
 
+def _s3_replication_config_text(tmp_path: Path) -> str:
+    return (
+        "s3_replication:\n"
+        f"  bundle_directory: {tmp_path / 'backups'}\n"
+        f"  receipt_directory: {tmp_path / 'receipts'}\n"
+        f"  scratch_directory: {tmp_path / 'scratch'}\n"
+        "  bucket: backup-vault\n"
+        "  expected_bucket_owner: '123456789012'\n"
+        "  region: ca-central-1\n"
+        "  prefix: production/test\n"
+        "  retention_days: 120\n"
+        "  timeout_seconds: 300\n"
+        "  max_age_hours: 36\n"
+    )
+
+
+def test_replicate_next_s3_cli_uses_only_configured_policy_and_environment_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(_s3_replication_config_text(tmp_path), encoding="utf-8")
+    bundle = tmp_path / "backups" / "autocontribute-state-test.bundle.zip"
+    receipt = tmp_path / "receipts" / f"{bundle.name}.s3-replication.json"
+    pending = PendingStateBundleReplication(bundle_path=bundle, record_path=receipt)
+    captured: dict[str, object] = {}
+    record = SimpleNamespace(
+        receipt=SimpleNamespace(
+            bundle=SimpleNamespace(
+                bucket="backup-vault",
+                key="production/test/bundles/example.bundle.zip",
+                version_id="version-1",
+            )
+        )
+    )
+
+    def select(**kwargs: object) -> PendingStateBundleReplication:
+        captured["selection"] = kwargs
+        return pending
+
+    def replicate(path: Path, **kwargs: object) -> object:
+        captured["bundle"] = path
+        captured["replication"] = kwargs
+        return record
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-never-print")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "session-never-print")
+    monkeypatch.setattr(cli, "select_next_state_bundle_for_s3", select)
+    monkeypatch.setattr(cli, "replicate_state_bundle_to_s3", replicate)
+
+    result = runner.invoke(app, ["state", "replicate-next-s3", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "Verified next immutable S3 backup replica" in result.output
+    assert "Local bundle:" in result.output
+    assert "Local record:" in result.output
+    assert "secret-never-print" not in result.output
+    assert "session-never-print" not in result.output
+    selection = captured["selection"]
+    assert isinstance(selection, dict)
+    assert selection["bundle_directory"] == tmp_path / "backups"
+    replication = captured["replication"]
+    assert isinstance(replication, dict)
+    assert captured["bundle"] == bundle
+    assert replication["record_destination"] == receipt
+    assert replication["timeout_seconds"] == 300
+    assert replication["access_key_id"] == "AKIAIOSFODNN7EXAMPLE"
+    assert replication["secret_access_key"] == "secret-never-print"
+    assert replication["session_token"] == "session-never-print"
+    assert replication["retention_period"] == timedelta(days=120)
+
+
+def test_replicate_next_s3_cli_is_idempotent_without_credentials_when_queue_is_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(_s3_replication_config_text(tmp_path), encoding="utf-8")
+    monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
+    monkeypatch.delenv("AWS_SECRET_ACCESS_KEY", raising=False)
+    monkeypatch.setattr(cli, "select_next_state_bundle_for_s3", lambda **_: None)
+    monkeypatch.setattr(
+        cli,
+        "replicate_state_bundle_to_s3",
+        lambda *_args, **_kwargs: pytest.fail("an empty queue must not use the network"),
+    )
+
+    result = runner.invoke(app, ["state", "replicate-next-s3", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "No unreplicated complete state bundles" in result.output
+
+
+def test_verify_latest_s3_cli_is_read_only_and_honors_health_constraints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(_s3_replication_config_text(tmp_path), encoding="utf-8")
+    marker = tmp_path / "health" / "worker-attempt"
+    bundle = tmp_path / "backups" / "latest.bundle.zip"
+    receipt = tmp_path / "receipts" / "latest.s3-replication.json"
+    captured: dict[str, object] = {}
+
+    def verify(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(bundle_path=bundle, record_path=receipt)
+
+    monkeypatch.setattr(cli, "verify_latest_state_bundle_replication", verify)
+
+    result = runner.invoke(
+        app,
+        [
+            "state",
+            "verify-latest-s3",
+            "--config",
+            str(config),
+            "--max-age-hours",
+            "12",
+            "--required-after",
+            str(marker),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "exact S3 receipt evidence" in result.output
+    assert captured["maximum_age"] == timedelta(hours=12)
+    assert captured["minimum_retention"] == timedelta(days=120)
+    assert captured["required_after"] == marker
+    assert captured["bucket"] == "backup-vault"
+
+
+def test_automated_s3_commands_fail_when_optional_review_configuration_is_disabled(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text("publishing:\n  mode: review_required\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["state", "verify-latest-s3", "--config", str(config)])
+    conditional = runner.invoke(
+        app,
+        [
+            "state",
+            "verify-latest-s3",
+            "--config",
+            str(config),
+            "--if-configured",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "S3 replication is not configured" in result.output
+    assert conditional.exit_code == 0, conditional.output
+    assert "optional review-mode replication" in conditional.output
+    assert "configured" in conditional.output
+
+
 def test_state_restore_cli_promotes_only_verified_snapshot(tmp_path: Path) -> None:
     source = RunStore(tmp_path / "source")
     run = source.create_run()
@@ -1325,6 +1492,11 @@ def test_auto_path_resyncs_lifecycle_immediately_before_publisher(
     monkeypatch.setattr(cli, "Orchestrator", FakeOrchestrator)
     monkeypatch.setattr(cli, "Publisher", FakePublisher)
     monkeypatch.setattr(cli, "_sync_lifecycle", fake_sync)
+    monkeypatch.setattr(
+        cli,
+        "verify_latest_state_bundle_replication",
+        lambda **_kwargs: calls.append("replication"),
+    )
     monkeypatch.setattr(cli, "_rollout_summary", fake_rollout_summary)
     monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
 
@@ -1333,6 +1505,7 @@ def test_auto_path_resyncs_lifecycle_immediately_before_publisher(
     assert result.exit_code == 0, result.output
     assert calls == [
         "sync:True:True",
+        "replication",
         "gate",
         "run",
         "sync:False:False",
@@ -1383,6 +1556,11 @@ def test_scheduled_auto_preflight_never_creates_a_run_or_model_session_when_bloc
     monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
     monkeypatch.setattr(cli, "Orchestrator", ForbiddenOrchestrator)
     monkeypatch.setattr(cli, "_sync_lifecycle", fake_sync)
+    monkeypatch.setattr(
+        cli,
+        "verify_latest_state_bundle_replication",
+        lambda **_kwargs: calls.append("replication"),
+    )
     monkeypatch.setattr(cli, "_rollout_summary", fake_rollout_summary)
     monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
 
@@ -1394,7 +1572,56 @@ def test_scheduled_auto_preflight_never_creates_a_run_or_model_session_when_bloc
     else:
         assert result.exit_code == 0, result.output
         assert "deferred before model use" in result.output
-    assert calls == ["observe", "gate", "close"]
+    assert calls == ["observe", "replication", "gate", "close"]
+    assert RunStore(state).oldest_runs() == []
+
+
+def test_scheduled_auto_requires_replication_after_lifecycle_before_gate_or_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(_guarded_auto_config_text(state), encoding="utf-8")
+    calls: list[str] = []
+
+    class FakeGitHub:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def close(self) -> None:
+            calls.append("close")
+
+    def fake_sync(*_: object, **kwargs: object) -> LifecycleSyncResult:
+        assert kwargs["scheduled_preflight"] is True
+        calls.append("lifecycle")
+        return LifecycleSyncResult(observations=())
+
+    def fail_replication(**kwargs: object) -> None:
+        calls.append("replication")
+        assert kwargs["maximum_age"] == timedelta(hours=48)
+        assert kwargs["minimum_retention"] == timedelta(days=90)
+        raise StateError("latest complete bundle lacks exact off-host evidence")
+
+    monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
+    monkeypatch.setattr(cli, "_sync_lifecycle", fake_sync)
+    monkeypatch.setattr(cli, "verify_latest_state_bundle_replication", fail_replication)
+    monkeypatch.setattr(
+        cli,
+        "_rollout_summary",
+        lambda *_args, **_kwargs: pytest.fail("rollout gate must follow replication proof"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "Orchestrator",
+        lambda *_args, **_kwargs: pytest.fail("model work must follow replication proof"),
+    )
+
+    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert "lacks exact off-host evidence" in result.output
+    assert calls == ["lifecycle", "replication", "close"]
     assert RunStore(state).oldest_runs() == []
 
 
@@ -1506,6 +1733,11 @@ def test_scheduled_auto_preflight_checks_gate_but_defers_when_live_switch_is_off
         "_sync_lifecycle",
         lambda *_args, **_kwargs: LifecycleSyncResult(observations=()),
     )
+    monkeypatch.setattr(
+        cli,
+        "verify_latest_state_bundle_replication",
+        lambda **_kwargs: calls.append("replication"),
+    )
     monkeypatch.setattr(cli, "_rollout_summary", fake_rollout_summary)
     monkeypatch.delenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", raising=False)
 
@@ -1513,7 +1745,7 @@ def test_scheduled_auto_preflight_checks_gate_but_defers_when_live_switch_is_off
 
     assert result.exit_code == 0, result.output
     assert "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH" in result.output
-    assert calls == ["gate", "close"]
+    assert calls == ["replication", "gate", "close"]
     assert RunStore(state).oldest_runs() == []
 
 

@@ -1,0 +1,74 @@
+[Unit]
+Description=Replicate verified Autocontribute state backups to immutable S3 storage
+Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
+ConditionPathExists=/etc/autocontribute/s3-replication.enabled
+Wants=network-online.target
+After=network-online.target
+OnFailure=autocontribute-failure@%n.service
+StartLimitIntervalSec=8h
+StartLimitBurst=3
+RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute
+
+[Service]
+Type=oneshot
+User=autocontribute
+Group=autocontribute
+WorkingDirectory=/var/lib/autocontribute
+UMask=0077
+
+Environment=HOME=/var/lib/autocontribute
+Environment=TMPDIR=/var/backups/autocontribute/replication-scratch
+Environment=NO_COLOR=1
+Environment=PYTHONUNBUFFERED=1
+Environment=AWS_EC2_METADATA_DISABLED=true
+Environment=AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS=1
+LoadCredentialEncrypted=AWS_ACCESS_KEY_ID:/etc/autocontribute/credentials/AWS_ACCESS_KEY_ID.cred
+LoadCredentialEncrypted=AWS_SECRET_ACCESS_KEY:/etc/autocontribute/credentials/AWS_SECRET_ACCESS_KEY.cred
+LoadCredentialEncrypted=AWS_SESSION_TOKEN:/etc/autocontribute/credentials/AWS_SESSION_TOKEN.cred
+
+ExecStartPre=/usr/bin/test -x /opt/autocontribute/current/.venv/bin/autocontribute
+ExecStartPre=/opt/autocontribute/current/.venv/bin/autocontribute deployment verify-systemd-assets
+ExecStartPre=/usr/bin/test -f /etc/autocontribute/s3-replication.enabled
+ExecStartPre=/usr/bin/test -r /etc/autocontribute/autocontribute.yml
+ExecStartPre=/usr/bin/test -d /var/backups/autocontribute
+ExecStartPre=/usr/bin/test -d /var/backups/autocontribute/receipts
+ExecStartPre=/usr/bin/test -d /var/backups/autocontribute/replication-scratch
+ExecStart=/usr/bin/flock --exclusive --timeout 21600 /var/lib/autocontribute/operation.lock /usr/local/libexec/autocontribute-replication
+ExecStartPost=/usr/bin/touch /var/lib/autocontribute/health/replication-success
+
+TimeoutStartSec=7h
+TimeoutStopSec=2m
+KillMode=control-group
+Restart=no
+Nice=10
+IOSchedulingClass=idle
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProtectSystem=strict
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+KeyringMode=private
+ReadOnlyPaths=/etc/autocontribute /opt/autocontribute /var/lib/autocontribute/state
+ReadWritePaths=/var/backups/autocontribute /var/lib/autocontribute/health /var/lib/autocontribute/operation.lock
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autocontribute-replication

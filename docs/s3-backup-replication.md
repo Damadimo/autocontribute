@@ -64,6 +64,43 @@ The client performs one signed `PutObject` per artifact, so the complete bundle 
 single-request object limit. It does not implement multipart upload because an incomplete multipart
 state complicates immutable acknowledgement. The existing complete-bundle bound fits that limit.
 
+## Configuration
+
+Automated selection, replication, and verification use one strict non-secret policy block:
+
+```yaml
+s3_replication:
+  bundle_directory: /var/backups/autocontribute
+  receipt_directory: /var/backups/autocontribute/receipts
+  scratch_directory: /var/backups/autocontribute/replication-scratch
+  bucket: your-object-lock-bucket
+  expected_bucket_owner: "123456789012"
+  region: ca-central-1
+  prefix: production/worker-1
+  retention_days: 90
+  timeout_seconds: 21600
+  max_age_hours: 48
+```
+
+The three directories, `bucket`, `expected_bucket_owner`, and `region` are required. `prefix`
+defaults to `autocontribute`; it must be a non-empty safe namespace with no leading or trailing
+slash. `retention_days` accepts 30 through 3650 and defaults to 90. `timeout_seconds` accepts 10
+through 86400 seconds and defaults to 21600. `max_age_hours` accepts 1 through 8760 and defaults to
+48; `doctor` and the application-level scheduled-auto preflight use it when checking the latest
+bundle and receipt. Relative directory paths resolve from the configuration file, but production
+deployments should use the explicit dedicated paths above. Credentials never belong in YAML.
+
+This block is optional for local or manual `publishing.mode: review_required` use. The strict
+configuration validator rejects `publishing.mode: auto` when it is absent. A configured block is
+always checked: invalid, missing, or stale evidence fails `doctor`, even in review mode. The
+`state verify-latest-s3 --if-configured` option skips only when the block is absent *and* the mode is
+`review_required`; it is not a general bypass and cannot skip verification in auto mode.
+
+`state replicate-next-s3` selects at most the oldest complete bundle without a matching receipt and
+applies this policy. `state verify-latest-s3` then proves that the newest complete bundle and its
+local receipt describe the exact configured bucket, account, region, prefix, hashes, and immutable
+version IDs within the allowed age.
+
 ## Run a replication
 
 Run replication only after the local backup command has finished, preferably under the same
@@ -133,8 +170,9 @@ retention deadline satisfies policy. Compliance retention prevents even the norm
 deleting that version before expiry; it does not replace account recovery, cross-account controls,
 monitoring, or a second-region/cross-account replication policy.
 
-For a recovery drill, fetch the bundle by the `bucket`, `key`, and `version_id` in the record—not by
-the latest key—and independently compare its byte size and SHA-256 to the receipt. Then run:
+For a recovery drill, fetch the receipt and bundle by their exact immutable version IDs—not by a
+latest object name. Use the receipt's `bucket`, `key`, and `version_id`, independently compare the
+bundle byte size and SHA-256 to the receipt, and then run:
 
 ```bash
 autocontribute state restore --complete \
@@ -145,8 +183,41 @@ autocontribute state restore --complete \
 Restore only into an absent state root and continue with the full recovery procedure in
 [Operator-managed systemd deployment](systemd-deployment.md#backups-and-recovery-drills).
 
-The repository does not yet install a credential-bearing replication systemd unit or provision an
-AWS bucket/IAM policy. Automating this CLI therefore still requires the operator to provide a
-separately reviewed service, short-lived credential delivery, alerting, and bucket policy. Keep that
-networked service separate from `autocontribute-backup.service`, which intentionally remains
-credential-free and network-isolated.
+Keep automatic publication disabled throughout recovery. After restoring and validating the exact
+generation into an absent root, create a fresh complete bundle, let the replication service upload
+and independently read it back, and run `state verify-latest-s3` successfully before re-enabling the
+worker timer. This creates evidence for the recovered live lineage instead of resuming from only an
+old off-host acknowledgement.
+
+## Packaged systemd replication
+
+The packaged deployment keeps local backup creation and networked replication in separate services.
+`autocontribute-backup.service` has no credentials, uses a private network namespace, and triggers
+`autocontribute-replication.service` with `OnSuccess=` only after a complete bundle succeeds. The
+replication service is inert unless the root-owned
+`/etc/autocontribute/s3-replication.enabled` marker exists. Its timer retries one pending bundle
+hourly at `*:37 UTC` (plus its fixed randomized delay), so a network or credential failure does not
+require another state mutation or backup.
+
+Only the replication service loads the encrypted `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
+`AWS_SESSION_TOKEN` credential files. Its wrapper rejects unsafe credential paths, unsets alternate
+AWS profile, shared-file, container, role, and web-identity discovery variables, and sets
+`AWS_EC2_METADATA_DISABLED=true` before invoking `state replicate-next-s3`. The backup remains
+credential-free and private-networked. Worker and doctor receive GitHub/model credentials but no AWS
+credentials; the replication service receives the AWS triplet but no GitHub or model credential.
+
+Before every packaged scheduled attempt, the worker runs `state verify-latest-s3` with a maximum age
+of 36 hours. Once `/var/lib/autocontribute/health/worker-attempt` exists, both the newest complete
+bundle and its receipt must also postdate that marker, proving the prior attempt was captured and
+replicated before another begins. The health service performs the same receipt and postdating check.
+Both use `--if-configured`, which explicitly skips an absent block only in `review_required`; an auto
+configuration cannot omit the block. The Python scheduled-auto preflight separately enforces the
+configured `max_age_hours` before rollout evaluation or model work.
+
+Bootstrap in this order: provision and independently verify the Object Lock bucket and least-
+privilege IAM policy; add the complete `s3_replication` block; create the bundle, receipt, and scratch
+directories; install the encrypted AWS credentials; and create the enable marker. Run the backup
+service once, allow its immediate replication service to finish, and verify the newest exact receipt.
+Only then enable the worker, backup, replication, and health timers. The operator must still provide
+the AWS bucket, IAM policy, credential rotation, monitoring, and recovery identity; the repository
+does not provision cloud resources.

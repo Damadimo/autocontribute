@@ -17,6 +17,8 @@ readonly docker_data_check="/usr/local/libexec/autocontribute-docker-data-check"
 readonly workspace_quota_check="/usr/local/libexec/autocontribute-workspace-quota-check"
 readonly state_root="/var/lib/autocontribute/state"
 readonly backup_root="/var/backups/autocontribute"
+readonly health_directory="/var/lib/autocontribute/health"
+readonly worker_attempt_marker="$health_directory/worker-attempt"
 readonly docker_data_root="/var/lib/autocontribute/docker"
 readonly workspace_root="/var/lib/autocontribute/state/workspaces"
 
@@ -58,6 +60,48 @@ fi
 export AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT="$state_root"
 export AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT="$workspace_root"
 if [[ "$operation" == run ]]; then
+  if [[ ! -d "$health_directory" || -L "$health_directory" || \
+        ! -w "$health_directory" ]]; then
+    printf 'Autocontribute health directory is unavailable or unsafe\n' >&2
+    exit 1
+  fi
+  replication_check=(
+    state verify-latest-s3
+    --config "$config"
+    --if-configured
+    --max-age-hours 36
+  )
+  if [[ -e "$worker_attempt_marker" || -L "$worker_attempt_marker" ]]; then
+    if [[ ! -f "$worker_attempt_marker" || -L "$worker_attempt_marker" ]]; then
+      printf 'Autocontribute worker-attempt marker is unsafe\n' >&2
+      exit 1
+    fi
+    replication_check+=(--required-after "$worker_attempt_marker")
+  fi
+  "$executable" "${replication_check[@]}"
+  unset replication_check
+
+  if [[ ! "${INVOCATION_ID:-}" =~ ^[0-9A-Fa-f]{32}$ ]]; then
+    printf 'Autocontribute systemd invocation identity is unavailable or invalid\n' >&2
+    exit 1
+  fi
+  worker_attempt_temporary="$health_directory/.worker-attempt.${INVOCATION_ID}.tmp"
+  cleanup_worker_attempt_temporary() {
+    /usr/bin/rm -f -- "$worker_attempt_temporary"
+  }
+  trap cleanup_worker_attempt_temporary EXIT
+  if ! (set -o noclobber; umask 077; printf '%s\n' "$INVOCATION_ID" >"$worker_attempt_temporary") \
+    2>/dev/null; then
+    printf 'Autocontribute worker-attempt marker could not be staged\n' >&2
+    exit 1
+  fi
+  /usr/bin/chmod 0400 -- "$worker_attempt_temporary"
+  /usr/bin/sync -f "$worker_attempt_temporary"
+  /usr/bin/mv --no-target-directory -- "$worker_attempt_temporary" "$worker_attempt_marker"
+  /usr/bin/sync -f "$health_directory"
+  trap - EXIT
+  unset worker_attempt_temporary
+
   "$executable" state gc-workspaces \
     --config "$config" \
     --older-than-days 7 \

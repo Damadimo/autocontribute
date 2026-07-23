@@ -194,6 +194,15 @@ def _rollout_config(
                 "repository_cooldown_days": 7,
                 "auto_publish_env": auto_publish_env,
             },
+            "s3_replication": {
+                "bundle_directory": "/var/backups/autocontribute",
+                "receipt_directory": "/var/backups/autocontribute/receipts",
+                "scratch_directory": "/var/backups/autocontribute/replication-scratch",
+                "bucket": "autocontribute-backup",
+                "expected_bucket_owner": "123456789012",
+                "region": "ca-central-1",
+                "prefix": "production/test",
+            },
         }
     )
 

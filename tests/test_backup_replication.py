@@ -18,9 +18,12 @@ from autocontribute.backup import create_state_bundle
 from autocontribute.backup_replication import (
     BackupReplicaReceipt,
     BackupReplicationRecord,
+    PendingStateBundleReplication,
     _Credentials,
     _S3ObjectLockClient,
     replicate_state_bundle_to_s3,
+    select_next_state_bundle_for_s3,
+    verify_latest_state_bundle_replication,
     write_backup_replication_record,
 )
 from autocontribute.exceptions import StateError
@@ -240,7 +243,7 @@ def _replicate(
             bucket="backup-vault",
             expected_bucket_owner=_ACCOUNT_ID,
             region="ca-central-1",
-            retain_until=retain_until,
+            retention_period=retain_until - _NOW,
             scratch_directory=scratch_directory or _scratch(bundle.parents[1]),
             access_key_id=_ACCESS_KEY,
             secret_access_key=_SECRET_KEY,
@@ -250,6 +253,30 @@ def _replicate(
             client=client,
             now=_NOW,
         )
+
+
+def _production_bundle(
+    tmp_path: Path,
+    timestamp: str,
+    process_id: int,
+) -> Path:
+    source = _bundle(tmp_path / f"source-{process_id}")
+    destination = tmp_path / "backups" / f"autocontribute-state-{timestamp}-{process_id}.bundle.zip"
+    destination.parent.mkdir(mode=0o700, exist_ok=True)
+    source.replace(destination)
+    destination.chmod(0o400)
+    return destination
+
+
+def _receipt_directory(tmp_path: Path) -> Path:
+    receipts = tmp_path / "backups" / "receipts"
+    receipts.mkdir(mode=0o700, parents=True, exist_ok=True)
+    receipts.chmod(0o700)
+    return receipts
+
+
+def _record_path(receipts: Path, bundle: Path) -> Path:
+    return receipts / f"{bundle.name}.s3-replication.json"
 
 
 def test_s3_replication_locks_reads_back_and_receipts_exact_versions(tmp_path: Path) -> None:
@@ -266,6 +293,9 @@ def test_s3_replication_locks_reads_back_and_receipts_exact_versions(tmp_path: P
     assert record.receipt.bundle.version_id == "version-1"
     assert record.receipt.bundle.retention_mode == "COMPLIANCE"
     assert record.receipt.bundle.retain_until == _RETAIN_UNTIL
+    assert record.receipt.schema_version == 2
+    assert record.receipt.retention_requested_at == _NOW
+    assert record.receipt.minimum_retain_until == _RETAIN_UNTIL
     assert record.receipt.read_back.complete_bundle_verified
     assert record.receipt_object.version_id == "version-2"
     assert record.receipt_object.retain_until == _RETAIN_UNTIL
@@ -376,7 +406,7 @@ def test_s3_replication_fails_closed_on_bucket_configuration(
             bucket="backup-vault",
             expected_bucket_owner=_ACCOUNT_ID,
             region="ca-central-1",
-            retain_until=_RETAIN_UNTIL,
+            retention_period=timedelta(days=90),
             scratch_directory=_scratch(tmp_path),
             access_key_id=_ACCESS_KEY,
             secret_access_key=_SECRET_KEY,
@@ -407,7 +437,7 @@ def test_s3_replication_rejects_entity_declarations_without_expanding_them(
             bucket="backup-vault",
             expected_bucket_owner=_ACCOUNT_ID,
             region="ca-central-1",
-            retain_until=_RETAIN_UNTIL,
+            retention_period=timedelta(days=90),
             scratch_directory=_scratch(tmp_path),
             access_key_id=_ACCESS_KEY,
             secret_access_key=_SECRET_KEY,
@@ -436,7 +466,7 @@ def test_s3_error_does_not_expand_hostile_entity_content(tmp_path: Path) -> None
             bucket="backup-vault",
             expected_bucket_owner=_ACCOUNT_ID,
             region="ca-central-1",
-            retain_until=_RETAIN_UNTIL,
+            retention_period=timedelta(days=90),
             scratch_directory=_scratch(tmp_path),
             access_key_id=_ACCESS_KEY,
             secret_access_key=_SECRET_KEY,
@@ -462,7 +492,7 @@ def test_s3_replication_bounds_control_response_before_parsing(tmp_path: Path) -
             bucket="backup-vault",
             expected_bucket_owner=_ACCOUNT_ID,
             region="ca-central-1",
-            retain_until=_RETAIN_UNTIL,
+            retention_period=timedelta(days=90),
             scratch_directory=_scratch(tmp_path),
             access_key_id=_ACCESS_KEY,
             secret_access_key=_SECRET_KEY,
@@ -489,7 +519,7 @@ def test_s3_replication_validates_complete_bundle_before_using_network(tmp_path:
             bucket="backup-vault",
             expected_bucket_owner=_ACCOUNT_ID,
             region="ca-central-1",
-            retain_until=_RETAIN_UNTIL,
+            retention_period=timedelta(days=90),
             scratch_directory=_scratch(tmp_path),
             access_key_id=_ACCESS_KEY,
             secret_access_key=_SECRET_KEY,
@@ -518,7 +548,7 @@ def test_s3_replication_refuses_existing_record_before_using_network(tmp_path: P
             bucket="backup-vault",
             expected_bucket_owner=_ACCOUNT_ID,
             region="ca-central-1",
-            retain_until=_RETAIN_UNTIL,
+            retention_period=timedelta(days=90),
             scratch_directory=_scratch(tmp_path),
             access_key_id=_ACCESS_KEY,
             secret_access_key=_SECRET_KEY,
@@ -590,7 +620,7 @@ def test_s3_replication_rejects_non_finite_timeout_before_network(
             bucket="backup-vault",
             expected_bucket_owner=_ACCOUNT_ID,
             region="ca-central-1",
-            retain_until=_RETAIN_UNTIL,
+            retention_period=timedelta(days=90),
             scratch_directory=_scratch(tmp_path),
             access_key_id=_ACCESS_KEY,
             secret_access_key=_SECRET_KEY,
@@ -683,7 +713,7 @@ def test_s3_replication_does_not_expose_credentials_in_expected_failures(
             bucket="backup-vault",
             expected_bucket_owner=_ACCOUNT_ID,
             region="ca-central-1",
-            retain_until=_RETAIN_UNTIL,
+            retention_period=timedelta(days=90),
             scratch_directory=_scratch(tmp_path),
             access_key_id=_ACCESS_KEY,
             secret_access_key=_SECRET_KEY,
@@ -795,6 +825,340 @@ def test_local_replication_record_rejects_group_writable_parent(tmp_path: Path) 
     assert not (parent / "record.json").exists()
 
 
+def test_selector_skips_only_exact_receipts_and_returns_oldest_pending_bundle(
+    tmp_path: Path,
+) -> None:
+    oldest = _production_bundle(tmp_path, "20260721T010203.000000001Z", 11)
+    pending = _production_bundle(tmp_path, "20260722T010203.000000002Z", 12)
+    newest = _production_bundle(tmp_path, "20260723T010203.000000003Z", 13)
+    receipts = _receipt_directory(tmp_path)
+    _replicate(
+        oldest,
+        _ObjectLockS3(),
+        record_destination=_record_path(receipts, oldest),
+        scratch_directory=_scratch(tmp_path),
+    )
+
+    selected = select_next_state_bundle_for_s3(
+        bundle_directory=oldest.parent,
+        receipt_directory=receipts,
+        bucket="backup-vault",
+        expected_bucket_owner=_ACCOUNT_ID,
+        region="ca-central-1",
+        prefix="autocontribute/production",
+    )
+
+    assert selected == PendingStateBundleReplication(
+        bundle_path=pending,
+        record_path=_record_path(receipts, pending),
+    )
+    assert selected.bundle_path != newest
+
+
+def test_selector_rejects_receipt_when_the_exact_local_bundle_changed(tmp_path: Path) -> None:
+    bundle = _production_bundle(tmp_path, "20260723T010203.000000001Z", 21)
+    receipts = _receipt_directory(tmp_path)
+    _replicate(
+        bundle,
+        _ObjectLockS3(),
+        record_destination=_record_path(receipts, bundle),
+        scratch_directory=_scratch(tmp_path),
+    )
+    bundle.chmod(0o600)
+    with bundle.open("ab") as output:
+        output.write(b"changed after replication")
+    bundle.chmod(0o400)
+
+    with pytest.raises(StateError, match="does not bind the exact bundle bytes"):
+        select_next_state_bundle_for_s3(
+            bundle_directory=bundle.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+        )
+
+
+def test_selector_rejects_malformed_expected_receipt_instead_of_skipping(
+    tmp_path: Path,
+) -> None:
+    bundle = _production_bundle(tmp_path, "20260723T010203.000000001Z", 22)
+    receipts = _receipt_directory(tmp_path)
+    receipt = _record_path(receipts, bundle)
+    receipt.write_text("{}\n", encoding="utf-8")
+    receipt.chmod(0o400)
+
+    with pytest.raises(StateError, match="receipt is invalid"):
+        select_next_state_bundle_for_s3(
+            bundle_directory=bundle.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+        )
+
+
+def test_selector_rejects_unsafe_bundle_names_symlinks_and_modes(tmp_path: Path) -> None:
+    valid = _production_bundle(tmp_path, "20260723T010203.000000001Z", 23)
+    receipts = _receipt_directory(tmp_path)
+    unsafe_name = valid.parent / "autocontribute-state-latest.bundle.zip"
+    unsafe_name.write_bytes(b"not a bundle")
+    unsafe_name.chmod(0o400)
+
+    with pytest.raises(StateError, match="unsafe bundle filename"):
+        select_next_state_bundle_for_s3(
+            bundle_directory=valid.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+        )
+
+    unsafe_name.unlink()
+    valid.chmod(0o600)
+    with pytest.raises(StateError, match="exact mode 0400"):
+        select_next_state_bundle_for_s3(
+            bundle_directory=valid.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+        )
+
+    valid.chmod(0o400)
+    link = valid.with_name("autocontribute-state-20260723T010204.000000001Z-24.bundle.zip")
+    link.symlink_to(valid)
+    with pytest.raises(StateError, match="regular file, not a symbolic link"):
+        select_next_state_bundle_for_s3(
+            bundle_directory=valid.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+        )
+
+
+def test_selector_bounds_directory_inventory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = _production_bundle(tmp_path, "20260723T010203.000000001Z", 25)
+    receipts = _receipt_directory(tmp_path)
+    (bundle.parent / "unrelated-entry").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(backup_replication_module, "_MAX_LOCAL_DIRECTORY_ENTRIES", 1)
+
+    with pytest.raises(StateError, match="safe entry limit"):
+        select_next_state_bundle_for_s3(
+            bundle_directory=bundle.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+        )
+
+
+def test_latest_replication_verification_proves_fresh_bundle_and_receipt_after_marker(
+    tmp_path: Path,
+) -> None:
+    bundle = _production_bundle(tmp_path, "20260723T010203.000000001Z", 26)
+    receipts = _receipt_directory(tmp_path)
+    receipt = _record_path(receipts, bundle)
+    _replicate(
+        bundle,
+        _ObjectLockS3(),
+        record_destination=receipt,
+        scratch_directory=_scratch(tmp_path),
+    )
+    marker = tmp_path / "health" / "worker-attempt"
+    marker.parent.mkdir(mode=0o700)
+    marker.touch(mode=0o600)
+    marker_ns = int(_NOW.timestamp() * 1_000_000_000)
+    os.utime(marker, ns=(marker_ns, marker_ns))
+    os.utime(bundle, ns=(marker_ns + 1_000_000_000, marker_ns + 1_000_000_000))
+    os.utime(receipt, ns=(marker_ns + 2_000_000_000, marker_ns + 2_000_000_000))
+
+    verified = verify_latest_state_bundle_replication(
+        bundle_directory=bundle.parent,
+        receipt_directory=receipts,
+        bucket="backup-vault",
+        expected_bucket_owner=_ACCOUNT_ID,
+        region="ca-central-1",
+        prefix="autocontribute/production",
+        maximum_age=timedelta(hours=1),
+        minimum_retention=timedelta(days=90),
+        required_after=marker,
+        now=_NOW + timedelta(seconds=3),
+    )
+
+    assert verified.bundle_path == bundle
+    assert verified.record_path == receipt
+
+
+def test_latest_replication_verification_rejects_retention_policy_drift(
+    tmp_path: Path,
+) -> None:
+    bundle = _production_bundle(tmp_path, "20260723T010203.000000001Z", 260)
+    receipts = _receipt_directory(tmp_path)
+    receipt = _record_path(receipts, bundle)
+    backend = _ObjectLockS3()
+    backend.retain_until = _NOW + timedelta(days=30)
+    _replicate(
+        bundle,
+        backend,
+        record_destination=receipt,
+        retain_until=backend.retain_until,
+        scratch_directory=_scratch(tmp_path),
+    )
+
+    with pytest.raises(StateError, match="shorter retention policy than configured"):
+        verify_latest_state_bundle_replication(
+            bundle_directory=bundle.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+            minimum_retention=timedelta(days=90),
+            now=_NOW + timedelta(hours=1),
+        )
+
+
+def test_latest_replication_verification_rejects_expired_compliance_lock(
+    tmp_path: Path,
+) -> None:
+    bundle = _production_bundle(tmp_path, "20260723T010203.000000001Z", 261)
+    receipts = _receipt_directory(tmp_path)
+    receipt = _record_path(receipts, bundle)
+    backend = _ObjectLockS3()
+    backend.retain_until = _NOW + timedelta(days=30)
+    _replicate(
+        bundle,
+        backend,
+        record_destination=receipt,
+        retain_until=backend.retain_until,
+        scratch_directory=_scratch(tmp_path),
+    )
+
+    with pytest.raises(StateError, match="bundle compliance lock has expired"):
+        verify_latest_state_bundle_replication(
+            bundle_directory=bundle.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+            minimum_retention=timedelta(days=30),
+            now=_NOW + timedelta(days=31),
+        )
+
+
+def test_latest_replication_verification_fails_closed_for_legacy_receipt_schema(
+    tmp_path: Path,
+) -> None:
+    bundle = _production_bundle(tmp_path, "20260723T010203.000000001Z", 262)
+    receipts = _receipt_directory(tmp_path)
+    receipt = _record_path(receipts, bundle)
+    record = _replicate(
+        bundle,
+        _ObjectLockS3(),
+        record_destination=receipt,
+        scratch_directory=_scratch(tmp_path),
+    )
+    payload = json.loads(record.model_dump_json())
+    payload["schema_version"] = 1
+    payload["receipt"]["schema_version"] = 1
+    receipt.chmod(0o600)
+    receipt.write_text(json.dumps(payload), encoding="utf-8")
+    receipt.chmod(0o400)
+
+    with pytest.raises(StateError, match="legacy schema without retention-policy evidence"):
+        verify_latest_state_bundle_replication(
+            bundle_directory=bundle.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+            minimum_retention=timedelta(days=90),
+            now=_NOW,
+        )
+
+
+def test_latest_replication_verification_fails_for_unreplicated_newest_bundle(
+    tmp_path: Path,
+) -> None:
+    replicated = _production_bundle(tmp_path, "20260722T010203.000000001Z", 27)
+    newest = _production_bundle(tmp_path, "20260723T010203.000000001Z", 28)
+    receipts = _receipt_directory(tmp_path)
+    _replicate(
+        replicated,
+        _ObjectLockS3(),
+        record_destination=_record_path(receipts, replicated),
+        scratch_directory=_scratch(tmp_path),
+    )
+
+    with pytest.raises(StateError, match="cannot be opened safely"):
+        verify_latest_state_bundle_replication(
+            bundle_directory=replicated.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+            now=_NOW,
+        )
+    assert not _record_path(receipts, newest).exists()
+
+
+def test_latest_replication_verification_rejects_ambiguous_or_symlinked_marker(
+    tmp_path: Path,
+) -> None:
+    bundle = _production_bundle(tmp_path, "20260723T010203.000000001Z", 29)
+    receipts = _receipt_directory(tmp_path)
+    receipt = _record_path(receipts, bundle)
+    _replicate(
+        bundle,
+        _ObjectLockS3(),
+        record_destination=receipt,
+        scratch_directory=_scratch(tmp_path),
+    )
+    marker = tmp_path / "health" / "worker-attempt"
+    marker.parent.mkdir(mode=0o700)
+    marker.touch(mode=0o600)
+    same_ns = bundle.stat().st_mtime_ns
+    os.utime(marker, ns=(same_ns, same_ns))
+
+    with pytest.raises(StateError, match="not unambiguously newer"):
+        verify_latest_state_bundle_replication(
+            bundle_directory=bundle.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+            required_after=marker,
+        )
+
+    marker_link = marker.with_name("worker-attempt-link")
+    marker_link.symlink_to(marker)
+    with pytest.raises(StateError, match="cannot be a symbolic link"):
+        verify_latest_state_bundle_replication(
+            bundle_directory=bundle.parent,
+            receipt_directory=receipts,
+            bucket="backup-vault",
+            expected_bucket_owner=_ACCOUNT_ID,
+            region="ca-central-1",
+            prefix="autocontribute/production",
+            required_after=marker_link,
+        )
+
+
 def test_s3_replication_cli_uses_environment_credentials_without_printing_them(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -854,9 +1218,7 @@ def test_s3_replication_cli_uses_environment_credentials_without_printing_them(
     assert captured["access_key_id"] == _ACCESS_KEY
     assert captured["secret_access_key"] == _SECRET_KEY
     assert captured["session_token"] == "temporary-session-token"
-    retention = captured["retain_until"]
-    assert isinstance(retention, datetime)
-    assert timedelta(days=119) < retention - datetime.now(UTC) <= timedelta(days=120)
+    assert captured["retention_period"] == timedelta(days=120)
 
 
 def test_s3_replication_cli_requires_credentials_before_network(

@@ -106,3 +106,18 @@ budget:
 
 storage:
   path: .autocontribute
+
+# Optional for local/manual `review_required` use. Uncomment the complete block for the packaged
+# scheduled systemd worker; `publishing.mode: auto` also rejects configurations without it.
+# Credentials never belong here: the replication service receives a separate encrypted AWS triplet.
+# s3_replication:
+#   bundle_directory: /var/backups/autocontribute
+#   receipt_directory: /var/backups/autocontribute/receipts
+#   scratch_directory: /var/backups/autocontribute/replication-scratch
+#   bucket: your-object-lock-bucket       # lowercase DNS name without dots; no custom endpoint
+#   expected_bucket_owner: "123456789012" # exact independently verified AWS account ID
+#   region: ca-central-1                  # standard commercial AWS partition only
+#   prefix: production/worker-1           # non-empty safe namespace, with no leading/trailing slash
+#   retention_days: 90                    # 30..3650, S3 Object Lock COMPLIANCE mode
+#   timeout_seconds: 21600                # 10..86400 per signed upload/read-back request
+#   max_age_hours: 48                     # 1..8760 for doctor and scheduled auto preflight

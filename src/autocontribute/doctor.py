@@ -12,14 +12,15 @@ import tempfile
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path, PurePosixPath
-from typing import Literal, cast
+from typing import cast
 from urllib.parse import quote
 
 import httpx
-from pydantic import BaseModel, ConfigDict
 from rich.markup import escape
 
+from autocontribute.backup_replication import verify_latest_state_bundle_replication
 from autocontribute.config import (
     AutocontributeConfig,
     ModelProfile,
@@ -29,7 +30,7 @@ from autocontribute.config import (
 from autocontribute.deployment import compute_deployment_fingerprint
 from autocontribute.exceptions import AutocontributeError, SandboxError
 from autocontribute.github import GitHubClient
-from autocontribute.providers import create_provider
+from autocontribute.providers import ModelCapabilityResponse, create_provider
 from autocontribute.redaction import redact_text
 from autocontribute.rollout import RolloutGate, RolloutSummary
 from autocontribute.sandbox import (
@@ -136,14 +137,6 @@ class _ToolchainRequirements:
     command_count: int
 
 
-class _ModelCapabilityResponse(BaseModel):
-    """Minimal strict schema used to prove the configured provider path."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    status: Literal["ready"]
-
-
 def run_doctor(
     config: AutocontributeConfig,
     *,
@@ -229,6 +222,7 @@ def _run_doctor(
                 )
             )
 
+    checks.append(_s3_replication_check(config))
     checks.append(_command_check("git", ["git", "--version"]))
     if config.sandbox.backend == "docker":
         checks.append(
@@ -322,6 +316,45 @@ def _run_doctor(
     return checks
 
 
+def _s3_replication_check(config: AutocontributeConfig) -> DoctorCheck:
+    replication = config.s3_replication
+    if replication is None:
+        return DoctorCheck(
+            "latest S3 backup replication",
+            config.publishing.mode == "review_required",
+            (
+                "not configured; optional while publishing.mode is review_required"
+                if config.publishing.mode == "review_required"
+                else "missing from automatic-publication configuration"
+            ),
+            warning=config.publishing.mode == "review_required",
+        )
+    try:
+        verified = verify_latest_state_bundle_replication(
+            bundle_directory=replication.bundle_directory,
+            receipt_directory=replication.receipt_directory,
+            bucket=replication.bucket,
+            expected_bucket_owner=replication.expected_bucket_owner,
+            region=replication.region,
+            prefix=replication.prefix,
+            maximum_age=timedelta(hours=replication.max_age_hours),
+            minimum_retention=timedelta(days=replication.retention_days),
+        )
+    except (AutocontributeError, OSError, ValueError) as exc:
+        return DoctorCheck(
+            "latest S3 backup replication",
+            False,
+            _safe_detail(str(exc)),
+        )
+    return DoctorCheck(
+        "latest S3 backup replication",
+        True,
+        _safe_detail(
+            f"{verified.bundle_path.name} is bound to exact receipt {verified.record_path.name}"
+        ),
+    )
+
+
 def _model_capability_checks(config: AutocontributeConfig) -> list[DoctorCheck]:
     grouped: dict[str, tuple[ModelProfile, list[str]]] = {}
     for role in ("scout", "builder", "critic"):
@@ -353,7 +386,7 @@ def _model_capability_checks(config: AutocontributeConfig) -> list[DoctorCheck]:
                     "with status set to ready. No tools are available."
                 ),
                 prompt="Confirm strict structured-output support.",
-                output_type=_ModelCapabilityResponse,
+                output_type=ModelCapabilityResponse,
                 max_output_tokens=_MODEL_PROBE_MAX_OUTPUT_TOKENS,
                 timeout_seconds=_MODEL_PROBE_TIMEOUT_SECONDS,
             )

@@ -5,7 +5,7 @@
     {
       "source_path": "deploy/systemd/autocontribute-backup.service",
       "installed_path": "/etc/systemd/system/autocontribute-backup.service",
-      "sha256": "0e1c9f06fcf35904f1518408e24921b4b18ce762b0c45209e25e1edc86bd1c0a",
+      "sha256": "26419b02f3e4921ddb39f9bd9f0f2c745e6878b34e4be33985726c822153d80b",
       "mode": "0644",
       "required": true
     },
@@ -33,7 +33,7 @@
     {
       "source_path": "deploy/systemd/autocontribute-health.service",
       "installed_path": "/etc/systemd/system/autocontribute-health.service",
-      "sha256": "f69ae898011bc1fb51c0db38d46a11f7f413aafc741ffbb376745eb2c998922c",
+      "sha256": "b0c0908c4f48c5ed985ce9ce1c4055eba89f58697ed0797d5750671c9d47a257",
       "mode": "0644",
       "required": true
     },
@@ -41,6 +41,20 @@
       "source_path": "deploy/systemd/autocontribute-health.timer",
       "installed_path": "/etc/systemd/system/autocontribute-health.timer",
       "sha256": "58b05246086d46f9e3fc7f3538794dee510f2554b3fa85b386db38eb15be90e2",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute-replication.service",
+      "installed_path": "/etc/systemd/system/autocontribute-replication.service",
+      "sha256": "b34ed3a71705a1727eac6943506763581caa382e402b30c7eeaee54b9682f433",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute-replication.timer",
+      "installed_path": "/etc/systemd/system/autocontribute-replication.timer",
+      "sha256": "c88f2de7c5984b08779101b71daa939fc25e3328186457369420c8cb966dda24",
       "mode": "0644",
       "required": true
     },
@@ -61,7 +75,7 @@
     {
       "source_path": "deploy/systemd/autocontribute-worker.service",
       "installed_path": "/etc/systemd/system/autocontribute-worker.service",
-      "sha256": "565bb244ab184fa9adb4b1d79fc2c30bfdf5ed991439683b26514428e9fd02bd",
+      "sha256": "c2ba3a5f61b7333051edd4e81a18951bc4fa1afe34ddbd4c6b47f08bb411c55e",
       "mode": "0644",
       "required": true
     },
@@ -82,7 +96,7 @@
     {
       "source_path": "deploy/systemd/autocontribute.tmpfiles.conf",
       "installed_path": "/etc/tmpfiles.d/autocontribute.conf",
-      "sha256": "93478efe2a7a48d2966f051acbd7f4f8a6cdcb15de57cdf625639ec9bdc89717",
+      "sha256": "029bd22e8996434cfdd2409269e35da4ce8bd0a95c3571e503856b3414d4ef4a",
       "mode": "0644",
       "required": true
     },
@@ -103,7 +117,7 @@
     {
       "source_path": "deploy/systemd/libexec/autocontribute-healthcheck",
       "installed_path": "/usr/local/libexec/autocontribute-healthcheck",
-      "sha256": "49ec1e011946b291cf3f45fd8d6b508f182e1d57606236c4b73b79930928e9ec",
+      "sha256": "b35e7f359d8bd9016a1eb50ba4c6d1c7b771cc12af30426ef74446a37bf4f784",
       "mode": "0755",
       "required": true
     },
@@ -111,6 +125,13 @@
       "source_path": "deploy/systemd/libexec/autocontribute-record-failure",
       "installed_path": "/usr/local/libexec/autocontribute-record-failure",
       "sha256": "9cd4f239dbbf1ead85ae803ada0b20ee6c9604e8b694f05680c775527f0e7634",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-replication",
+      "installed_path": "/usr/local/libexec/autocontribute-replication",
+      "sha256": "d1cd698120622d2fc90676a972260d4161a2faf29829eca1bb4b4378bb31904e",
       "mode": "0755",
       "required": true
     },
@@ -145,7 +166,7 @@
     {
       "source_path": "deploy/systemd/libexec/autocontribute-worker",
       "installed_path": "/usr/local/libexec/autocontribute-worker",
-      "sha256": "28fdf3f3565e234c53d5e7d472f27518c4f4dfff706e67dd85e5c797107f5a3a",
+      "sha256": "32cd8f7b4458fa5fe05d5b63b9d96d5c4bad6ffb174cf7d724b6ca64497d94c2",
       "mode": "0755",
       "required": true
     },

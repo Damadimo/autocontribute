@@ -28,6 +28,18 @@ def _priced_models() -> dict[str, object]:
     return {role: profile for role in ("scout", "builder", "critic")}
 
 
+def _s3_replication() -> dict[str, object]:
+    return {
+        "bundle_directory": "/var/backups/autocontribute",
+        "receipt_directory": "/var/backups/autocontribute/receipts",
+        "scratch_directory": "/var/backups/autocontribute/replication-scratch",
+        "bucket": "autocontribute-backup",
+        "expected_bucket_owner": "123456789012",
+        "region": "ca-central-1",
+        "prefix": "production/worker-1",
+    }
+
+
 def test_example_config_is_valid() -> None:
     config = AutocontributeConfig.model_validate(yaml.safe_load(example_config()))
 
@@ -53,6 +65,46 @@ def test_defaults_disclose_autonomous_work_without_claiming_human_validation() -
     assert "validated by the contributor" not in disclosure
     assert config.publishing.draft is True
     assert config.github.max_repository_inactivity_days == 180
+    assert config.s3_replication is None
+
+
+def test_s3_replication_configuration_is_strict_and_contains_no_credentials() -> None:
+    config = AutocontributeConfig.model_validate({"s3_replication": _s3_replication()})
+
+    assert config.s3_replication is not None
+    assert config.s3_replication.bucket == "autocontribute-backup"
+    assert config.s3_replication.retention_days == 90
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        AutocontributeConfig.model_validate(
+            {
+                "s3_replication": {
+                    **_s3_replication(),
+                    "secret_access_key": "must-never-live-in-config",
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("bucket", "Backup.With.Dots", "DNS-safe lowercase"),
+        ("expected_bucket_owner", "1234", "12-digit"),
+        ("region", "cn-north-1", "standard commercial AWS partition"),
+        ("prefix", "../production", "prefix is unsafe"),
+        ("bundle_directory", "../backups", "safe filesystem paths"),
+    ],
+)
+def test_s3_replication_configuration_rejects_unsafe_boundaries(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    replication = _s3_replication()
+    replication[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        AutocontributeConfig.model_validate({"s3_replication": replication})
 
 
 def test_ready_for_review_requires_draft_staging() -> None:
@@ -271,6 +323,7 @@ def test_guarded_auto_mode_accepts_one_repository_weekly_draft_pilot() -> None:
             },
             "models": _priced_models(),
             "budget": {"max_model_cost_usd_per_run": "25"},
+            "s3_replication": _s3_replication(),
         }
     )
 
@@ -291,6 +344,23 @@ def test_guarded_auto_mode_requires_the_dedicated_publication_switch() -> None:
                     "ready_for_review": True,
                     "max_open_pull_requests": 1,
                     "auto_publish_env": "CI",
+                },
+                "models": _priced_models(),
+                "budget": {"max_model_cost_usd_per_run": "25"},
+            }
+        )
+
+
+def test_guarded_auto_mode_requires_s3_replication_configuration() -> None:
+    with pytest.raises(ValueError, match="s3_replication must be configured"):
+        AutocontributeConfig.model_validate(
+            {
+                "github": {"repositories": ["example/project"], "owners": []},
+                "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
+                "publishing": {
+                    "mode": "auto",
+                    "ready_for_review": True,
+                    "max_open_pull_requests": 1,
                 },
                 "models": _priced_models(),
                 "budget": {"max_model_cost_usd_per_run": "25"},
@@ -479,6 +549,43 @@ def test_load_config_resolves_storage_relative_to_config(tmp_path: Path) -> None
     config = load_config(path)
 
     assert config.storage.path == tmp_path / "state"
+
+
+def test_load_config_resolves_s3_replication_paths_relative_to_config(tmp_path: Path) -> None:
+    path = tmp_path / "autocontribute.yml"
+    replication = _s3_replication()
+    replication.update(
+        {
+            "bundle_directory": "backups",
+            "receipt_directory": "backups/receipts",
+            "scratch_directory": "scratch",
+        }
+    )
+    path.write_text(yaml.safe_dump({"s3_replication": replication}), encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.s3_replication is not None
+    assert config.s3_replication.bundle_directory == tmp_path / "backups"
+    assert config.s3_replication.receipt_directory == tmp_path / "backups" / "receipts"
+    assert config.s3_replication.scratch_directory == tmp_path / "scratch"
+
+
+def test_load_config_preserves_replication_symlink_for_runtime_rejection(tmp_path: Path) -> None:
+    real = tmp_path / "real-backups"
+    real.mkdir()
+    linked = tmp_path / "linked-backups"
+    linked.symlink_to(real, target_is_directory=True)
+    path = tmp_path / "autocontribute.yml"
+    replication = _s3_replication()
+    replication["bundle_directory"] = str(linked)
+    path.write_text(yaml.safe_dump({"s3_replication": replication}), encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.s3_replication is not None
+    assert config.s3_replication.bundle_directory == linked
+    assert config.s3_replication.bundle_directory.is_symlink()
 
 
 def test_secret_value_cannot_be_mistaken_for_environment_name() -> None:

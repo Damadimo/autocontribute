@@ -1,10 +1,11 @@
 # Operator-managed systemd deployment
 
 This bundle runs one persistent Autocontribute installation on a Linux host. It schedules the
-worker at 09:17 and 21:17 UTC, creates one verified complete backup at 03:17 UTC, and checks the
-freshness of both. Before each scheduled attempt, the worker inspects at most 25 terminal workspaces
-older than seven days and removes only those that pass the durable-evidence checks below.
-The worker and backup take the same local `flock`, so they cannot read or change the state lineage
+worker at 09:17 and 21:17 UTC, creates one verified complete backup at 03:17 UTC, retries immutable
+S3 replication hourly at `*:37 UTC`, and checks worker, backup, and replication freshness. Before
+each scheduled attempt, the worker inspects at most 25 terminal workspaces older than seven days and
+removes only those that pass the durable-evidence checks below. Worker, doctor, backup, and
+replication take the same local `flock`, so they cannot inspect or change the state lineage
 concurrently.
 
 The units are intentionally inert until an operator installs them. They do not enable automatic
@@ -649,8 +650,8 @@ sudo -u autocontribute /usr/bin/env -i \
 
 Run this source verification before installing any file from `deploy/systemd`. It binds the selected
 Python package to the complete checked-out deployment inventory and rejects missing, extra,
-symlinked, non-regular, incorrectly mode-set, or content-mismatched assets. The manifest contains 23
-source assets: 22 have mandatory production paths and the journald example is deliberately
+symlinked, non-regular, incorrectly mode-set, or content-mismatched assets. The manifest contains 26
+source assets: 25 have mandatory production paths and the journald example is deliberately
 source-bound but optional to install because retention is host policy.
 
 `--no-editable` keeps runtime imports inside the installed virtual environment. `--no-config`
@@ -694,7 +695,28 @@ publishing:
 
 storage:
   path: /var/lib/autocontribute/state
+
+s3_replication:
+  bundle_directory: /var/backups/autocontribute
+  receipt_directory: /var/backups/autocontribute/receipts
+  scratch_directory: /var/backups/autocontribute/replication-scratch
+  bucket: your-object-lock-bucket
+  expected_bucket_owner: "123456789012"
+  region: ca-central-1
+  prefix: production/worker-1
+  retention_days: 90
+  timeout_seconds: 21600
+  max_age_hours: 48
 ```
+
+The S3 block is non-secret. All three directories, the bucket, independently verified 12-digit
+bucket owner, and standard commercial AWS region are required. `prefix` defaults to
+`autocontribute`; retention defaults to 90 days (allowed 30–3650), request timeout to 21600 seconds
+(allowed 10–86400), and receipt age to 48 hours (allowed 1–8760). See
+[Immutable S3 backup replication](s3-backup-replication.md) for the bucket, Object Lock, IAM, and
+recovery requirements. A local/manual `review_required` configuration may omit the block, in which
+case the packaged verification command reports an explicit skip. `publishing.mode: auto` rejects a
+missing block, and this production deployment should configure it before enabling any timer.
 
 Keep API keys and GitHub tokens out of YAML. Install the reviewed file so the service account can
 read but not modify it:
@@ -725,6 +747,27 @@ printf '%s' "$autocontribute_secret" | sudo systemd-creds encrypt \
 unset autocontribute_secret
 printf '\n'
 
+read -rsp 'AWS access key ID: ' autocontribute_secret
+printf '%s' "$autocontribute_secret" | sudo systemd-creds encrypt \
+  --name=AWS_ACCESS_KEY_ID - \
+  /etc/autocontribute/credentials/AWS_ACCESS_KEY_ID.cred
+unset autocontribute_secret
+printf '\n'
+
+read -rsp 'AWS secret access key: ' autocontribute_secret
+printf '%s' "$autocontribute_secret" | sudo systemd-creds encrypt \
+  --name=AWS_SECRET_ACCESS_KEY - \
+  /etc/autocontribute/credentials/AWS_SECRET_ACCESS_KEY.cred
+unset autocontribute_secret
+printf '\n'
+
+read -rsp 'AWS session token: ' autocontribute_secret
+printf '%s' "$autocontribute_secret" | sudo systemd-creds encrypt \
+  --name=AWS_SESSION_TOKEN - \
+  /etc/autocontribute/credentials/AWS_SESSION_TOKEN.cred
+unset autocontribute_secret
+printf '\n'
+
 sudo chmod 0600 /etc/autocontribute/credentials/*.cred
 sudo chown root:root /etc/autocontribute/credentials/*.cred
 ```
@@ -734,6 +777,14 @@ GitHub credential with only the target repositories and operations required by t
 The worker wrapper copies named systemd credentials into its process environment immediately before
 `exec`; it never prints them. Because processes owned by the same Unix user can be a credential
 boundary risk, keep this account locked and dedicated to Autocontribute and its rootless daemon.
+
+The AWS triplet is loaded only by `autocontribute-replication.service`; it is never exposed to the
+worker, doctor, local backup, sandbox, or model subprocess. The replication service receives no
+GitHub or model credential. Its wrapper unsets AWS profile/shared-file, container, role, and web-
+identity discovery variables and disables EC2 instance metadata before exporting only the three
+validated credential files. Conversely, the local backup service has no credential and runs with
+`PrivateNetwork=yes`. Rotate the short-lived AWS triplet as one set and rerun replication under
+observation before relying on the next timer.
 
 For another API-key environment name, install the same drop-in for both the worker and doctor. Each
 unit independently defines the default encrypted credentials, so changing only one leaves the two
@@ -784,8 +835,8 @@ Never inspect a credential with a command that writes the decrypted value to the
 ## Install and validate the units
 
 Use the verified immutable release, not another checkout. These steps apply to first installation and
-every upgrade. Before replacing an installed asset, disable all three timers and stop worker,
-backup, doctor, health, and the system rootless-Docker proxy. Stopping the proxy synchronously stops
+every upgrade. Before replacing an installed asset, disable all four timers and stop worker,
+backup, replication, doctor, health, and the system rootless-Docker proxy. Stopping the proxy synchronously stops
 the daemon user unit. On a migration from an older deployment, also stop any generic
 `docker.service` while the old user manager is still reachable. Then stop the user manager itself so
 no user unit can execute during the trust-path replacement. First-install commands skip units that
@@ -826,6 +877,7 @@ unset manager_policy manager_uid
 for unit in \
   autocontribute-worker.timer \
   autocontribute-backup.timer \
+  autocontribute-replication.timer \
   autocontribute-health.timer
 do
   if sudo systemctl cat "$unit" >/dev/null 2>&1; then
@@ -836,6 +888,7 @@ done
 for unit in \
   autocontribute-worker.service \
   autocontribute-backup.service \
+  autocontribute-replication.service \
   autocontribute-doctor.service \
   autocontribute-health.service \
   autocontribute-rootless-docker.service
@@ -966,6 +1019,8 @@ for unit in \
   autocontribute-worker.timer \
   autocontribute-backup.service \
   autocontribute-backup.timer \
+  autocontribute-replication.service \
+  autocontribute-replication.timer \
   autocontribute-doctor.service \
   autocontribute-health.service \
   autocontribute-health.timer \
@@ -1060,13 +1115,13 @@ sandbox image as the `autocontribute` user before doctor; never use a tag in pro
 sets `TMPDIR=/var/lib/autocontribute/tmp` because Docker's daemon must see the CID files created by
 the client; systemd's private `/tmp` mount is deliberately not used for those files.
 
-The installed verifier checks all 22 mandatory paths against the manifest shipped by the selected
+The installed verifier checks all 25 mandatory paths against the manifest shipped by the selected
 Python release. It requires exact path, SHA-256 content, mode, and `root:root` ownership and rejects
 symlinks and non-regular files. The user-manager drop-in directory and root-owned user-unit inventory
 are exact: an unreviewed second manager drop-in, a home-owned replacement, or a retired generic
 Docker unit is a verification failure. Consequently, a partial copy, a mixture of old and new
 assets, or a stale helper fails closed before `current` is switched and again before an operational
-service can run. Worker, backup, doctor, health, the system proxy, and the daemon user unit execute
+service can run. Worker, backup, replication, doctor, health, the system proxy, and the daemon user unit execute
 the same verifier as a fixed pre-start check. The
 failure recorder intentionally does not: it remains available through `OnFailure=` to record an
 asset-mismatch failure and emit its journal alert.
@@ -1086,7 +1141,7 @@ keep their directories root-owned and non-writable by the service account, compa
 doctor copies as instructed, and inspect `systemctl cat` output after every change.
 
 Run `systemd-tmpfiles` only while all four filesystems are mounted so their filesystem roots receive
-the required ownership and mode. Worker, doctor, backup, and health declare `RequiresMountsFor=` for
+the required ownership and mode. Worker, doctor, backup, replication, and health declare `RequiresMountsFor=` for
 the storage they inspect, and the credential-bearing services require both the workspace and Docker
 data mounts. Their wrappers still repeat exact mount and capacity verification at every invocation;
 an accidentally unmounted directory on a parent filesystem is rejected rather than used as a
@@ -1096,10 +1151,10 @@ rootless Docker daemon user unit performs the data-mount check before the daemon
 
 Validate the installed files on the target host. `systemd-analyze security` is advisory; review
 every relaxation instead of chasing a score that breaks rootless Docker or durable state.
-CI also parses all nine system units and the protected user unit with systemd 255 on Ubuntu 24.04
-and fails on parser warnings. It performs an offline security assessment of the six system services,
-with an exposure ceiling of 4.0 for the networked worker and doctor and 3.0 for the private-network
-backup, health, failure, and rootless-Docker proxy units. The user daemon is deliberately assessed
+CI also parses all eleven system units and the protected user unit with systemd 255 on Ubuntu 24.04
+and fails on parser warnings. It performs an offline security assessment of the seven system services,
+with an exposure ceiling of 4.0 for the networked worker and doctor and 3.0 for replication and the
+private-network backup, health, failure, and rootless-Docker proxy units. The user daemon is deliberately assessed
 separately because filesystem/mount, namespace, capability, security-label, and seccomp sandbox
 directives can break subordinate-ID mapping. These are regression ceilings, not a substitute for
 reviewing the full report or validating the installed units against the target host's systemd
@@ -1111,6 +1166,8 @@ sudo systemd-analyze verify \
   autocontribute-worker.timer \
   autocontribute-backup.service \
   autocontribute-backup.timer \
+  autocontribute-replication.service \
+  autocontribute-replication.timer \
   autocontribute-doctor.service \
   autocontribute-health.service \
   autocontribute-health.timer \
@@ -1124,11 +1181,46 @@ sudo -u autocontribute env \
   systemd-analyze --user verify autocontribute-rootless-docker-daemon.service
 sudo systemd-analyze calendar '*-*-* 09,21:17:00 UTC'
 sudo systemd-analyze calendar '*-*-* 03:17:00 UTC'
+sudo systemd-analyze calendar '*-*-* *:37:00 UTC'
 sudo systemd-analyze security autocontribute-worker.service
+sudo systemd-analyze security autocontribute-replication.service
 ```
 
-Run the secure preflight. This makes bounded, potentially billable model probes and Docker probes,
-as documented for `autocontribute doctor`:
+Bootstrap immutable replication before the credential-bearing preflight. Independently provision and
+verify the Object Lock bucket and least-privilege IAM policy described in
+[Immutable S3 backup replication](s3-backup-replication.md), install the complete configuration and
+AWS credential triplet above, and check the directories created by tmpfiles. The enable marker is a
+deliberate root-owned switch: without it, both the backup's `OnSuccess=` activation and the retry
+timer leave the conditioned replication service inert.
+
+```bash
+test "$(stat --format=%U:%G:%a -- /var/backups/autocontribute/receipts)" = \
+  autocontribute:autocontribute:700
+test "$(stat --format=%U:%G:%a -- /var/backups/autocontribute/replication-scratch)" = \
+  autocontribute:autocontribute:700
+sudo install -o root -g root -m 0400 /dev/null \
+  /etc/autocontribute/s3-replication.enabled
+sudo systemctl start autocontribute-backup.service
+sudo systemctl start autocontribute-replication.service
+test "$(sudo systemctl show --property=Result --value \
+  autocontribute-backup.service)" = success
+test "$(sudo systemctl show --property=Result --value \
+  autocontribute-replication.service)" = success
+sudo -u autocontribute \
+  /opt/autocontribute/current/.venv/bin/autocontribute \
+  state verify-latest-s3 \
+  --config /etc/autocontribute/autocontribute.yml \
+  --max-age-hours 36
+```
+
+`autocontribute-backup.service` is credential-free and private-networked. Its successful completion
+activates `autocontribute-replication.service`, which alone loads the AWS credentials, uploads at
+most the oldest pending complete bundle, and independently reads back the exact bundle and receipt
+versions. The separate hourly timer retries failures at `*:37 UTC`; it does not create another
+backup.
+
+Now run the secure preflight. This makes bounded, potentially billable model probes and Docker
+probes, as documented for `autocontribute doctor`:
 
 ```bash
 sudo systemctl start autocontribute-doctor.service
@@ -1140,14 +1232,25 @@ sudo journalctl -u autocontribute-doctor.service --since today
 ```
 
 Fix every failed check before enabling timers. The normal activation sequence intentionally creates
-real first-run and backup success stamps before enabling freshness alerts:
+real first-run, backup, and replication evidence before enabling freshness alerts. The worker writes
+`worker-attempt` before credential loading; after that marker exists, both the newest bundle and its
+receipt must postdate it. Let the worker's success/failure-triggered backup chain complete, then
+explicitly run both idempotent services and verify that postdating condition before enabling timers:
 
 ```bash
 sudo systemctl start autocontribute-worker.service
 sudo systemctl start autocontribute-backup.service
+sudo systemctl start autocontribute-replication.service
+sudo -u autocontribute \
+  /opt/autocontribute/current/.venv/bin/autocontribute \
+  state verify-latest-s3 \
+  --config /etc/autocontribute/autocontribute.yml \
+  --max-age-hours 36 \
+  --required-after /var/lib/autocontribute/health/worker-attempt
 sudo systemctl enable --now \
   autocontribute-worker.timer \
   autocontribute-backup.timer \
+  autocontribute-replication.timer \
   autocontribute-health.timer
 sudo systemctl list-timers 'autocontribute-*'
 ```
@@ -1161,13 +1264,18 @@ unchanged-suppressed candidates are filtered before model work and discovery con
 candidate; an exhausted search is still a successful safe skip. A rejected or failed attempt is a
 service failure. The complete-backup command verifies the SQLite snapshot, event chains, run
 manifests, evidence, evaluations, file sizes, and SHA-256 hashes before it publishes the uniquely
-named bundle. It receives no credentials and has no network.
+named bundle. It receives no credentials and has no network. Each production model request runs in
+a fresh private process group with only its model credential and a minimal environment. The parent
+owns an absolute monotonic deadline covering startup and bounded JSON IPC, rejects late output, and
+terminates, escalates, and reaps a timed-out group. A hard timeout retains its conservative budget
+reservation and records `model.call.timed_out` for a contribution-run call; it cannot produce a
+completed call artifact.
 
 ## Routine operation and monitoring
 
-The worker and backup are `Type=oneshot`; they should normally be inactive between invocations. Use
-timer state, last service result, journal priority, and the two success-stamp modification times as
-monitoring signals:
+Worker, backup, and replication are `Type=oneshot`; they should normally be inactive between
+invocations. Use timer state, last service result, journal priority, worker/backup stamp times, and
+the newest exact replication receipt as monitoring signals:
 
 ```bash
 systemctl list-timers 'autocontribute-*'
@@ -1175,6 +1283,15 @@ systemctl show autocontribute-worker.service \
   -p ActiveState -p Result -p ExecMainStatus -p ExecMainStartTimestamp -p ExecMainExitTimestamp
 systemctl show autocontribute-backup.service \
   -p ActiveState -p Result -p ExecMainStatus -p ExecMainStartTimestamp -p ExecMainExitTimestamp
+systemctl show autocontribute-replication.service \
+  -p ActiveState -p Result -p ExecMainStatus -p ExecMainStartTimestamp -p ExecMainExitTimestamp
+sudo -u autocontribute \
+  /opt/autocontribute/current/.venv/bin/autocontribute \
+  state verify-latest-s3 \
+  --config /etc/autocontribute/autocontribute.yml \
+  --if-configured \
+  --max-age-hours 36 \
+  --required-after /var/lib/autocontribute/health/worker-attempt
 sudo -u autocontribute /usr/local/libexec/autocontribute-healthcheck
 df --block-size=1 \
   /var/lib/autocontribute/state \
@@ -1189,6 +1306,7 @@ df --inodes \
 sudo journalctl \
   -u autocontribute-worker.service \
   -u autocontribute-backup.service \
+  -u autocontribute-replication.service \
   -u autocontribute-health.service \
   -u 'autocontribute-failure@*' \
   --since '24 hours ago'
@@ -1197,11 +1315,16 @@ sudo journalctl \
 The health timer runs every 15 minutes. It fails when the last successful worker is older than 18
 hours, the last complete backup is older than 36 hours, either durable filesystem violates its
 fixed ceiling, state or backup falls below its fixed reserve, or Docker data has less than 1 GiB or
-16,384 inodes available. Its storage checks receive read-only namespace views; the Docker check
+16,384 inodes available. Before those checks, the health service also requires the newest bundle and
+exact S3 receipt to be no older than 36 hours and, once `worker-attempt` exists, to postdate that
+marker. The worker performs the same receipt check before cleanup, credential loading, or model
+work. Both invoke `verify-latest-s3 --if-configured`: only an absent block in `review_required`
+produces an explicit skip, while a configured-but-invalid/stale block fails and auto mode cannot omit
+the block. The health service's storage checks receive read-only namespace views; the Docker check
 requires an explicit read-only layer over the same safe writable ext4 mount. The worker, doctor, and
 backup apply the corresponding writable checks before doing work, so low capacity stops new
-contributions even while a success stamp is still fresh. Every worker, backup, doctor, or health
-failure invokes `autocontribute-failure@.service`, which writes the last failed unit and UTC time to
+contributions even while a success stamp is still fresh. Every worker, backup, replication, doctor,
+or health failure invokes `autocontribute-failure@.service`, which writes the last failed unit and UTC time to
 `/var/lib/autocontribute/health/last-failure` and emits an error-priority journal event. Forward those
 events to the existing host alerting system, or add another `OnFailure=` target in a drop-in. An
 on-host stamp alone is not a page and is lost with the host.
@@ -1276,7 +1399,8 @@ eligibility/quality gate and must never be added to the unit or timer.
 Do not add the runtime opt-in during installation. First configure the final pilot shape while
 keeping `publishing.mode: review_required`: one explicit repository, immutable attested model IDs,
 draft staging followed by the durable exact ready-for-review transition, at most one new PR per UTC
-day, and a repository cooldown of at least seven days. Those settings are part of the deployment
+day, a repository cooldown of at least seven days, and the complete final `s3_replication` policy.
+Auto mode is rejected when that replication block is absent. Those settings are part of the deployment
 fingerprint, so changing them later requires new cohorts. Under that fixed shape, collect and grade
 the complete deterministic 100-run expert cohort and the fixed first 20 manually approved,
 published PRs. Every fixed manual member must have both an anchored expert `accept_as_is` grade and
@@ -1334,9 +1458,24 @@ sudo systemctl daemon-reload
 ```
 
 Run the doctor service and a manual worker under observation, create and replicate a new complete
-backup, and only then re-enable the worker timer with `sudo systemctl enable --now
-autocontribute-worker.timer`. The opt-in is intentionally absent from the checked-in unit, so
-installing the bundle alone can never enable GitHub writes.
+backup, and require the newest exact receipt to postdate that worker's attempt marker:
+
+```bash
+sudo systemctl start autocontribute-doctor.service
+sudo systemctl start autocontribute-worker.service
+sudo systemctl start autocontribute-backup.service
+sudo systemctl start autocontribute-replication.service
+sudo -u autocontribute \
+  /opt/autocontribute/current/.venv/bin/autocontribute \
+  state verify-latest-s3 \
+  --config /etc/autocontribute/autocontribute.yml \
+  --max-age-hours 36 \
+  --required-after /var/lib/autocontribute/health/worker-attempt
+sudo systemctl enable --now autocontribute-worker.timer
+```
+
+Do not re-enable the worker timer until every command succeeds. The opt-in is intentionally absent
+from the checked-in unit, so installing the bundle alone can never enable GitHub writes.
 
 ## Kill switch and incident response
 
@@ -1429,9 +1568,10 @@ workspace filesystem while a publication is ambiguous.
 ## Backups and recovery drills
 
 The backup timer retains every successful local generation; it deliberately performs no automatic
-deletion. The service account can still delete its own `0400` files, so replicate each new bundle to
-versioned, access-controlled off-host storage with retention lock. Monitor that replication and keep
-more than one generation. Configuration, encrypted credential sources, rootless Docker data, and
+deletion. A successful backup immediately activates the separately credentialed replication service,
+and the `*:37 UTC` timer retries the oldest pending bundle hourly. The service account can still
+delete its own `0400` files, so monitor exact receipt creation and keep more than one versioned,
+retention-locked off-host generation. Configuration, encrypted credential sources, rootless Docker data, and
 target workspaces are excluded and require separate secure recovery procedures. The collector's
 eligibility checks mirror the portable-evidence boundary: a prepared terminal workspace is not
 removed unless its patch and validation artifact can be verified without the checkout. A complete
@@ -1457,9 +1597,16 @@ If the provider cannot return the original bytes for independent hashing, has no
 identity, or has not acknowledged retention, do not delete the local generation. The AWS S3
 provider-specific replication/receipt protocol is available through `state replicate-s3`; it
 compliance-locks and independently reads back both the exact bundle version and its receipt. See
-[Immutable S3 backup replication](s3-backup-replication.md). It deliberately does not automate
-local retention. The fixed backup reserve turns missing acknowledgement into a visible fail-closed
+[Immutable S3 backup replication](s3-backup-replication.md). The packaged
+`autocontribute-replication.service` invokes the configured one-at-a-time form but deliberately does
+not automate local retention. The fixed backup reserve turns missing acknowledgement into a visible fail-closed
 stop instead of silently discarding the last trustworthy recovery point.
+
+For every drill or real recovery, begin from the receipt rather than an S3 latest-object lookup.
+Fetch the receipt object by the exact immutable receipt version recorded in the local locator,
+validate its bytes and hash against that locator when available, then fetch the bundle by the exact
+immutable bucket, key, and version recorded in the receipt. Independently verify the recorded byte
+count and SHA-256 before presenting that download to `state restore --complete`.
 
 At least once per release, restore a copied bundle into a fresh path on a non-production host using
 the same packaged version and configuration except for `storage.path`. The restore target must not
@@ -1520,20 +1667,23 @@ retry from the retained bundle; never guess which partial files are current. Onc
 the replacement, update `/etc/fstab` to its verified UUID, mount it at
 `/var/lib/autocontribute/state`, recreate and mount a compliant workspace filesystem, and run the
 packaged capacity checks before starting any service. Start in `review_required` mode without the
-automatic-publish opt-in. Run `doctor`, inspect `safety status`, list every known upstream PR, and
-reconcile lifecycle state before allowing another attempt. A stale restore can forget a publication
-reservation, gate hold, lifecycle signal, or breaker event and must never be treated as safe merely
-because its archive checksum passes.
+automatic-publish opt-in. Create a fresh complete bundle from the promoted live lineage, replicate
+and read back its exact bundle and receipt versions, and require `state verify-latest-s3` to succeed.
+Then run `doctor`, inspect `safety status`, list every known upstream PR, and reconcile lifecycle
+state before allowing another attempt. After any observed manual worker, repeat the fresh
+backup/replication cycle and verify that both files postdate `worker-attempt` before re-enabling the
+worker timer. A stale restore can forget a publication reservation, gate hold, lifecycle signal, or
+breaker event and must never be treated as safe merely because its archive checksum passes.
 
 ## Upgrade and rollback
 
-Treat the application, nine system units, ten helpers, tmpfiles policy, instance-specific user-
+Treat the application, eleven system units, eleven helpers, tmpfiles policy, instance-specific user-
 manager drop-in, and protected daemon user unit as one release. An upgrade is complete only when the
-new release's packaged manifest verifies all 22 installed assets. Use this order:
+new release's packaged manifest verifies all 25 installed assets. Use this order:
 
-1. Disable all three timers. Reconcile any in-flight publication, let the worker reach a safe
+1. Disable all four timers. Reconcile any in-flight publication, let the worker reach a safe
    boundary, and create and replicate a verified complete bundle with the currently selected
-   release. Stop worker, backup, doctor, and health, wait for every failure-recorder instance to
+   release. Stop worker, backup, replication, doctor, and health, wait for every failure-recorder instance to
    finish, then stop the system rootless-Docker proxy. The proxy stops the daemon user unit. Stop the
    `autocontribute` user manager before replacing its unit or manager drop-in.
 2. Install the new application into a new, never-reused, root-owned release directory. Do not modify
@@ -1551,14 +1701,15 @@ new release's packaged manifest verifies all 22 installed assets. Use this order
    `autocontribute-rootless-docker-daemon.service`, and re-run the exact manager/UnitPath checks.
    Only then atomically repoint `current` and repeat installed verification through the new
    executable.
-5. Start the system rootless-Docker proxy, run doctor, and fix every failure. Create and replicate a new
-   complete backup before re-enabling any timer. Re-review the deployment fingerprint: a material
+5. Start the system rootless-Docker proxy, create and replicate a new complete backup, verify its
+   fresh exact receipt, run doctor, and fix every failure before re-enabling any timer. Re-review the
+   deployment fingerprint: a material
    code, dependency, interpreter, model, deployment-asset, or policy change starts a new evaluation
    cohort and cannot inherit an automatic-publication gate. Re-enable timers only after these checks
    and any required observed manual worker run succeed.
 
 Per-file rename prevents a reader from seeing a partially written individual file; it does not make
-the 22-file set atomic. Quiescence prevents that intermediate set from executing, and manifest
+the 25-file set atomic. Quiescence prevents that intermediate set from executing, and manifest
 verification detects any interrupted, stale, or mixed installation. Never work around a mismatch by
 starting an old `current` against new assets. Either finish the new installation, or reinstall the
 complete old asset set from its verified immutable release, reload both managers, prove no reload is
@@ -1574,4 +1725,5 @@ remote state is reconciled.
 After recovery or rollback, keep automatic publication disabled until the restored lineage,
 upstream PRs, reservations, lifecycle observations, breaker state, and evaluation corpus have all
 been reviewed. Re-enable timers only after a fresh doctor pass, a successful manual worker in the
-intended mode, and a newly verified off-host backup.
+intended mode, and a newly verified off-host backup whose exact receipt postdates that worker
+attempt.

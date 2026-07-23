@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal
 
 import yaml
@@ -24,6 +25,13 @@ _CANONICAL_UTC_TIMESTAMP = re.compile(
 )
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _IMAGE_DIGEST = re.compile(r"@sha256:[0-9a-fA-F]{64}$")
+_S3_BUCKET = re.compile(r"^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
+_STANDARD_AWS_REGION = re.compile(
+    r"^(?:af|ap|ca|eu|il|me|mx|sa|us)-"
+    r"(?:central|east|north|northeast|northwest|south|southeast|southwest|west)-"
+    r"[1-9][0-9]*$"
+)
+_AWS_ACCOUNT_ID = re.compile(r"^[0-9]{12}$")
 _DEFAULT_SANDBOX_IMAGE = (
     "python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a"
 )
@@ -611,6 +619,84 @@ class StorageConfig(StrictModel):
     path: Path = Path(".autocontribute")
 
 
+class S3ReplicationConfig(StrictModel):
+    """Non-secret policy and filesystem boundary for automated S3 replication."""
+
+    bundle_directory: Path
+    receipt_directory: Path
+    scratch_directory: Path
+    bucket: str
+    expected_bucket_owner: str
+    region: str
+    prefix: str = "autocontribute"
+    retention_days: int = Field(default=90, ge=30, le=3_650)
+    timeout_seconds: float = Field(default=21_600, ge=10, le=86_400)
+    max_age_hours: int = Field(default=48, ge=1, le=8_760)
+
+    @field_validator("bundle_directory", "receipt_directory", "scratch_directory", mode="before")
+    @classmethod
+    def directory_is_a_safe_path(cls, value: object) -> object:
+        if not isinstance(value, (str, Path)):
+            raise ValueError("S3 replication directories must be filesystem paths")
+        rendered = os.fspath(value)
+        if (
+            not rendered
+            or "\x00" in rendered
+            or any(not character.isprintable() for character in rendered)
+            or ".." in Path(rendered).parts
+        ):
+            raise ValueError("S3 replication directories must be safe filesystem paths")
+        return value
+
+    @field_validator("bucket")
+    @classmethod
+    def bucket_is_a_standard_aws_name(cls, value: str) -> str:
+        if not _S3_BUCKET.fullmatch(value):
+            raise ValueError("S3 replication bucket must be a DNS-safe lowercase name without dots")
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            return value
+        raise ValueError("S3 replication bucket cannot be formatted as an IP address")
+
+    @field_validator("expected_bucket_owner")
+    @classmethod
+    def bucket_owner_is_exact(cls, value: str) -> str:
+        if not _AWS_ACCOUNT_ID.fullmatch(value):
+            raise ValueError(
+                "S3 replication expected_bucket_owner must be a 12-digit AWS account ID"
+            )
+        return value
+
+    @field_validator("region")
+    @classmethod
+    def region_is_standard_commercial_aws(cls, value: str) -> str:
+        if not _STANDARD_AWS_REGION.fullmatch(value):
+            raise ValueError(
+                "S3 replication region must belong to the standard commercial AWS partition"
+            )
+        return value
+
+    @field_validator("prefix")
+    @classmethod
+    def prefix_is_a_safe_object_namespace(cls, value: str) -> str:
+        try:
+            encoded_size = len(value.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("S3 replication prefix is unsafe") from exc
+        if (
+            not value
+            or value.startswith("/")
+            or value.endswith("/")
+            or "//" in value
+            or encoded_size > 700
+            or any(part in {"", ".", ".."} for part in PurePosixPath(value).parts)
+            or any(not character.isprintable() or character == "\\" for character in value)
+        ):
+            raise ValueError("S3 replication prefix is unsafe")
+        return value
+
+
 class AutocontributeConfig(StrictModel):
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     github: GitHubConfig = Field(default_factory=GitHubConfig)
@@ -622,6 +708,7 @@ class AutocontributeConfig(StrictModel):
     publishing: PublishingConfig = Field(default_factory=PublishingConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    s3_replication: S3ReplicationConfig | None = None
 
     @model_validator(mode="after")
     def trusted_validation_is_complete(self) -> AutocontributeConfig:
@@ -778,6 +865,8 @@ class AutocontributeConfig(StrictModel):
                 )
             if self.budget.max_model_cost_usd_per_run is None:
                 auto_violations.append("budget.max_model_cost_usd_per_run must be configured")
+            if self.s3_replication is None:
+                auto_violations.append("s3_replication must be configured")
             if auto_violations:
                 raise ValueError(
                     "publishing.mode=auto requires guarded pilot configuration: "
@@ -813,6 +902,14 @@ def load_config(path: Path) -> AutocontributeConfig:
         raise ConfigurationError(str(exc)) from exc
     if not config.storage.path.is_absolute():
         config.storage.path = (config_path.parent / config.storage.path).resolve()
+    if config.s3_replication is not None:
+        for field_name in ("bundle_directory", "receipt_directory", "scratch_directory"):
+            configured = getattr(config.s3_replication, field_name)
+            absolute = configured.expanduser()
+            if not absolute.is_absolute():
+                absolute = config_path.parent / absolute
+            # Keep the final path component lexical so the runtime boundary can reject a symlink.
+            setattr(config.s3_replication, field_name, Path(os.path.abspath(absolute)))
     return config
 
 

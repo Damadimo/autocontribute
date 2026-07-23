@@ -12,6 +12,7 @@ import base64
 import hashlib
 import hmac
 import ipaddress
+import json
 import math
 import os
 import re
@@ -34,7 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from autocontribute.backup import restore_state_bundle
 from autocontribute.exceptions import StateError
 
-_REPLICATION_SCHEMA_VERSION: Final = 1
+_REPLICATION_SCHEMA_VERSION: Final = 2
 _COPY_CHUNK_BYTES: Final = 1024 * 1024
 # A complete bundle contains at most 5 GB of uncompressed state.  ZIP framing can add a small
 # amount, but a larger local source is never a bundle this implementation could have created.
@@ -51,6 +52,16 @@ _STANDARD_AWS_REGION = re.compile(
 )
 _AWS_ACCOUNT_ID = re.compile(r"^[0-9]{12}$")
 _ACCESS_KEY = re.compile(r"^[A-Z0-9]{16,128}$")
+_LOCAL_BUNDLE = re.compile(
+    r"^autocontribute-state-(?P<second>[0-9]{8}T[0-9]{6})\."
+    r"(?P<nanosecond>[0-9]{9})Z-(?P<pid>[1-9][0-9]{0,9})\.bundle\.zip$"
+)
+_LOCAL_BUNDLE_PREFIX: Final = "autocontribute-state-"
+_LOCAL_BUNDLE_SUFFIX: Final = ".bundle.zip"
+_LOCAL_RECEIPT_SUFFIX: Final = ".s3-replication.json"
+_MAX_LOCAL_DIRECTORY_ENTRIES: Final = 10_000
+_MARKER_MAX_BYTES: Final = 1_024
+_FUTURE_MTIME_TOLERANCE_NS: Final = 5 * 60 * 1_000_000_000
 
 
 class _StrictModel(BaseModel):
@@ -111,17 +122,19 @@ class ReplicaReadBack(_StrictModel):
 class BackupReplicaReceipt(_StrictModel):
     """Portable receipt persisted in immutable off-host storage."""
 
-    schema_version: Literal[1] = _REPLICATION_SCHEMA_VERSION
+    schema_version: Literal[2] = _REPLICATION_SCHEMA_VERSION
     created_at: datetime
+    retention_requested_at: datetime
+    minimum_retain_until: datetime
     source_filename: str
     bundle: ImmutableS3Object
     read_back: ReplicaReadBack
 
-    @field_validator("created_at")
+    @field_validator("created_at", "retention_requested_at", "minimum_retain_until")
     @classmethod
-    def created_at_is_aware(cls, value: datetime) -> datetime:
+    def receipt_times_are_aware(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("created_at must include a timezone")
+            raise ValueError("receipt timestamps must include a timezone")
         return value.astimezone(UTC)
 
     @field_validator("source_filename")
@@ -133,6 +146,10 @@ class BackupReplicaReceipt(_StrictModel):
 
     @model_validator(mode="after")
     def read_back_matches_object(self) -> BackupReplicaReceipt:
+        if self.minimum_retain_until <= self.retention_requested_at:
+            raise ValueError("receipt retention interval must be positive")
+        if self.created_at < self.retention_requested_at:
+            raise ValueError("receipt verification cannot predate its retention request")
         if not self.read_back.complete_bundle_verified:
             raise ValueError("receipt requires complete bundle verification")
         if (self.read_back.size, self.read_back.sha256) != (
@@ -144,13 +161,15 @@ class BackupReplicaReceipt(_StrictModel):
             raise ValueError("receipt time must be the completed read-back verification time")
         if self.bundle.retain_until <= self.created_at:
             raise ValueError("receipt cannot acknowledge an already-expired retention lock")
+        if self.bundle.retain_until < self.minimum_retain_until:
+            raise ValueError("receipt bundle lock is shorter than the requested retention deadline")
         return self
 
 
 class BackupReplicationRecord(_StrictModel):
     """Local locator for the independently verified off-host receipt version."""
 
-    schema_version: Literal[1] = _REPLICATION_SCHEMA_VERSION
+    schema_version: Literal[2] = _REPLICATION_SCHEMA_VERSION
     created_at: datetime
     receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     receipt: BackupReplicaReceipt
@@ -214,6 +233,47 @@ class _ValidatedRecordDestination:
     path: Path
     parent_device: int
     parent_inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class PendingStateBundleReplication:
+    """The exact oldest local complete bundle that still needs an S3 receipt."""
+
+    bundle_path: Path
+    record_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedStateBundleReplication:
+    """Read-only proof that one local bundle has exact off-host receipt evidence."""
+
+    bundle_path: Path
+    record_path: Path
+    record: BackupReplicationRecord
+
+
+@dataclass(frozen=True, slots=True)
+class _DirectorySnapshot:
+    path: Path
+    device: int
+    inode: int
+    modified_ns: int
+    changed_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _BundleCandidate:
+    path: Path
+    record_path: Path
+    order: tuple[datetime, int, int, str]
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+    mode: int
+    links: int
+    owner: int
 
 
 class _S3ObjectLockClient:
@@ -560,13 +620,142 @@ class _S3ObjectLockClient:
         return f"https://{self._host}{canonical_uri}{query_suffix}", request_headers
 
 
+def select_next_state_bundle_for_s3(
+    *,
+    bundle_directory: Path,
+    receipt_directory: Path,
+    bucket: str,
+    expected_bucket_owner: str,
+    region: str,
+    prefix: str,
+) -> PendingStateBundleReplication | None:
+    """Return the oldest exact production bundle without valid local S3 evidence.
+
+    Receipt presence alone never makes a bundle eligible to skip.  Every existing expected receipt
+    is parsed, checked against the configured S3 boundary, and compared to a SHA-256 digest read
+    safely from that exact local bundle.
+    """
+
+    _validate_replication_boundary(
+        bucket=bucket,
+        expected_bucket_owner=expected_bucket_owner,
+        region=region,
+        prefix=prefix,
+    )
+    receipt_root = _trusted_local_directory(receipt_directory, label="S3 receipt directory")
+    candidates, bundle_snapshot = _local_bundle_inventory(
+        bundle_directory,
+        receipt_root=receipt_root,
+    )
+    for candidate in candidates:
+        if _path_entry_exists(candidate.record_path):
+            _verify_local_replication_record(
+                candidate,
+                bucket=bucket,
+                expected_bucket_owner=expected_bucket_owner,
+                region=region,
+                prefix=prefix,
+            )
+            continue
+        _assert_directory_unchanged(bundle_snapshot, label="S3 bundle directory")
+        return PendingStateBundleReplication(
+            bundle_path=candidate.path,
+            record_path=candidate.record_path,
+        )
+    _assert_directory_unchanged(bundle_snapshot, label="S3 bundle directory")
+    return None
+
+
+def verify_latest_state_bundle_replication(
+    *,
+    bundle_directory: Path,
+    receipt_directory: Path,
+    bucket: str,
+    expected_bucket_owner: str,
+    region: str,
+    prefix: str,
+    maximum_age: timedelta | None = None,
+    minimum_retention: timedelta | None = None,
+    required_after: Path | None = None,
+    now: datetime | None = None,
+) -> VerifiedStateBundleReplication:
+    """Prove that the newest exact local bundle has matching immutable S3 evidence."""
+
+    _validate_replication_boundary(
+        bucket=bucket,
+        expected_bucket_owner=expected_bucket_owner,
+        region=region,
+        prefix=prefix,
+    )
+    if maximum_age is not None and (
+        maximum_age <= timedelta(0) or maximum_age > timedelta(days=365)
+    ):
+        raise StateError("S3 replication maximum age must be between 1 second and 365 days")
+    if minimum_retention is not None and (
+        minimum_retention <= timedelta(0) or minimum_retention > timedelta(days=3_650)
+    ):
+        raise StateError("S3 replication minimum retention must be between 1 second and 3,650 days")
+    receipt_root = _trusted_local_directory(receipt_directory, label="S3 receipt directory")
+    candidates, bundle_snapshot = _local_bundle_inventory(
+        bundle_directory,
+        receipt_root=receipt_root,
+    )
+    if not candidates:
+        raise StateError("No exact complete state bundles are available for S3 verification")
+    candidate = candidates[-1]
+    verified, receipt_metadata = _verify_local_replication_record(
+        candidate,
+        bucket=bucket,
+        expected_bucket_owner=expected_bucket_owner,
+        region=region,
+        prefix=prefix,
+    )
+    operation_time = (now or datetime.now(UTC)).astimezone(UTC)
+    receipt = verified.record.receipt
+    if receipt.bundle.retain_until <= operation_time:
+        raise StateError("The latest S3 bundle compliance lock has expired")
+    if verified.record.receipt_object.retain_until <= operation_time:
+        raise StateError("The latest S3 receipt compliance lock has expired")
+    if minimum_retention is not None:
+        bound_interval = receipt.minimum_retain_until - receipt.retention_requested_at
+        if bound_interval < minimum_retention:
+            raise StateError(
+                "The latest S3 replication receipt binds a shorter retention policy than configured"
+            )
+    operation_ns = int(operation_time.timestamp() * 1_000_000_000)
+    for label, modified_ns in (
+        ("latest complete state bundle", candidate.modified_ns),
+        ("latest S3 replication receipt", receipt_metadata.st_mtime_ns),
+    ):
+        if modified_ns > operation_ns + _FUTURE_MTIME_TOLERANCE_NS:
+            raise StateError(f"The {label} has an unsafe future modification time")
+        if maximum_age is not None:
+            maximum_age_ns = int(maximum_age.total_seconds() * 1_000_000_000)
+            if modified_ns < operation_ns - maximum_age_ns:
+                raise StateError(f"The {label} is older than the allowed replication age")
+    if required_after is not None:
+        marker_modified_ns = _trusted_marker_mtime(required_after)
+        if candidate.modified_ns <= marker_modified_ns:
+            raise StateError(
+                "The latest complete state bundle is not unambiguously newer than the "
+                "required-after marker"
+            )
+        if receipt_metadata.st_mtime_ns <= marker_modified_ns:
+            raise StateError(
+                "The latest S3 replication receipt is not unambiguously newer than the "
+                "required-after marker"
+            )
+    _assert_directory_unchanged(bundle_snapshot, label="S3 bundle directory")
+    return verified
+
+
 def replicate_state_bundle_to_s3(
     source: Path,
     *,
     bucket: str,
     expected_bucket_owner: str,
     region: str,
-    retain_until: datetime,
+    retention_period: timedelta,
     scratch_directory: Path,
     access_key_id: str,
     secret_access_key: str,
@@ -585,11 +774,11 @@ def replicate_state_bundle_to_s3(
     """
 
     operation_time = (now or datetime.now(UTC)).astimezone(UTC)
-    if retain_until.tzinfo is None or retain_until.utcoffset() is None:
-        raise StateError("S3 retention deadline must include a timezone")
-    requested_retention = _ceil_utc_second(retain_until)
-    if requested_retention <= operation_time:
-        raise StateError("S3 retention deadline must be in the future")
+    if not isinstance(retention_period, timedelta):
+        raise StateError("S3 retention period must be a duration")
+    if retention_period <= timedelta(0) or retention_period > timedelta(days=3_650):
+        raise StateError("S3 retention period must be between 1 second and 3,650 days")
+    requested_retention = _ceil_utc_second(operation_time + retention_period)
     source_filename = _validate_source_filename(source.name)
     _validate_prefix(prefix)
     if record_destination is not None:
@@ -656,6 +845,8 @@ def replicate_state_bundle_to_s3(
             bundle_verified_at = (now or datetime.now(UTC)).astimezone(UTC)
             receipt = BackupReplicaReceipt(
                 created_at=bundle_verified_at,
+                retention_requested_at=operation_time,
+                minimum_retain_until=requested_retention,
                 source_filename=source_filename,
                 bundle=bundle_object,
                 read_back=ReplicaReadBack(
@@ -829,6 +1020,359 @@ def write_backup_replication_record(
         if parent_descriptor >= 0:
             with suppress(OSError):
                 os.close(parent_descriptor)
+
+
+def _validate_replication_boundary(
+    *,
+    bucket: str,
+    expected_bucket_owner: str,
+    region: str,
+    prefix: str,
+) -> None:
+    _validate_bucket(bucket)
+    _validate_expected_bucket_owner(expected_bucket_owner)
+    _validate_region(region)
+    _validate_prefix(prefix)
+
+
+def _trusted_local_directory(directory: Path, *, label: str) -> Path:
+    requested = directory.expanduser()
+    if requested.is_symlink():
+        raise StateError(f"{label} cannot be a symbolic link")
+    try:
+        root = requested.resolve(strict=True)
+        metadata = root.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise StateError(f"{label} is unavailable") from exc
+    _validate_trusted_directory_metadata(metadata, label=label)
+    return root
+
+
+def _local_bundle_inventory(
+    bundle_directory: Path,
+    *,
+    receipt_root: Path,
+) -> tuple[list[_BundleCandidate], _DirectorySnapshot]:
+    root = _trusted_local_directory(bundle_directory, label="S3 bundle directory")
+    try:
+        root_metadata = root.stat(follow_symlinks=False)
+        candidates: list[_BundleCandidate] = []
+        entries = 0
+        with os.scandir(root) as directory_entries:
+            for entry in directory_entries:
+                entries += 1
+                if entries > _MAX_LOCAL_DIRECTORY_ENTRIES:
+                    raise StateError("S3 bundle directory exceeds the safe entry limit")
+                name = entry.name
+                resembles_bundle = name.startswith(_LOCAL_BUNDLE_PREFIX) or name.endswith(
+                    _LOCAL_BUNDLE_SUFFIX
+                )
+                match = _LOCAL_BUNDLE.fullmatch(name)
+                if match is None:
+                    if resembles_bundle:
+                        raise StateError("S3 bundle directory contains an unsafe bundle filename")
+                    continue
+                if not _is_safe_source_filename(name):
+                    raise StateError("S3 bundle directory contains an unsafe bundle filename")
+                try:
+                    second = datetime.strptime(match.group("second"), "%Y%m%dT%H%M%S").replace(
+                        tzinfo=UTC
+                    )
+                    nanosecond = int(match.group("nanosecond"))
+                    process_id = int(match.group("pid"))
+                except (ValueError, OverflowError) as exc:
+                    raise StateError(
+                        "S3 bundle directory contains an invalid bundle timestamp"
+                    ) from exc
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise StateError("S3 bundle entry changed during inventory") from exc
+                _validate_local_evidence_file(
+                    metadata,
+                    label="S3 bundle entry",
+                    maximum_bytes=_MAX_BUNDLE_BYTES,
+                )
+                record_name = f"{name}{_LOCAL_RECEIPT_SUFFIX}"
+                if not _is_safe_source_filename(record_name):
+                    raise StateError("S3 receipt filename derived from a bundle is unsafe")
+                candidates.append(
+                    _BundleCandidate(
+                        path=root / name,
+                        record_path=receipt_root / record_name,
+                        order=(second, nanosecond, process_id, name),
+                        device=metadata.st_dev,
+                        inode=metadata.st_ino,
+                        size=metadata.st_size,
+                        modified_ns=metadata.st_mtime_ns,
+                        changed_ns=metadata.st_ctime_ns,
+                        mode=metadata.st_mode,
+                        links=metadata.st_nlink,
+                        owner=metadata.st_uid,
+                    )
+                )
+    except StateError:
+        raise
+    except OSError as exc:
+        raise StateError("Could not inventory the S3 bundle directory safely") from exc
+    candidates.sort(key=lambda candidate: candidate.order)
+    return candidates, _directory_snapshot(root, root_metadata)
+
+
+def _directory_snapshot(root: Path, metadata: os.stat_result) -> _DirectorySnapshot:
+    return _DirectorySnapshot(
+        path=root,
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        modified_ns=metadata.st_mtime_ns,
+        changed_ns=metadata.st_ctime_ns,
+    )
+
+
+def _assert_directory_unchanged(snapshot: _DirectorySnapshot, *, label: str) -> None:
+    try:
+        metadata = snapshot.path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise StateError(f"{label} changed during verification") from exc
+    if (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    ) != (
+        snapshot.device,
+        snapshot.inode,
+        snapshot.modified_ns,
+        snapshot.changed_ns,
+    ):
+        raise StateError(f"{label} changed during verification")
+
+
+def _path_entry_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise StateError("S3 replication receipt availability could not be determined") from exc
+    return True
+
+
+def _verify_local_replication_record(
+    candidate: _BundleCandidate,
+    *,
+    bucket: str,
+    expected_bucket_owner: str,
+    region: str,
+    prefix: str,
+) -> tuple[VerifiedStateBundleReplication, os.stat_result]:
+    receipt_bytes, receipt_metadata = _read_exact_local_file(
+        candidate.record_path,
+        label="S3 replication receipt",
+        maximum_bytes=_MAX_RECEIPT_BYTES,
+    )
+    try:
+        raw_record = json.loads(receipt_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise StateError("Local S3 replication receipt is invalid") from exc
+    if isinstance(raw_record, dict) and raw_record.get("schema_version") == 1:
+        raise StateError(
+            "Local S3 replication receipt uses a legacy schema without retention-policy evidence"
+        )
+    try:
+        record = BackupReplicationRecord.model_validate(raw_record)
+    except ValueError as exc:
+        raise StateError("Local S3 replication receipt is invalid") from exc
+    bundle_size, bundle_sha256 = _digest_local_bundle(candidate)
+    remote_bundle = record.receipt.bundle
+    if record.receipt.source_filename != candidate.path.name:
+        raise StateError("Local S3 replication receipt names a different source bundle")
+    if (remote_bundle.size, remote_bundle.sha256) != (bundle_size, bundle_sha256):
+        raise StateError("Local S3 replication receipt does not bind the exact bundle bytes")
+    if (
+        remote_bundle.bucket,
+        remote_bundle.bucket_owner_account_id,
+        remote_bundle.region,
+    ) != (bucket, expected_bucket_owner, region):
+        raise StateError("Local S3 replication receipt is outside the configured bucket boundary")
+    retention_key = remote_bundle.retain_until.strftime("%Y%m%dT%H%M%SZ")
+    expected_bundle_key = (
+        f"{prefix}/bundles/sha256/{bundle_sha256}/retain-until-{retention_key}.bundle.zip"
+    )
+    expected_receipt_key = f"{prefix}/receipts/sha256/{record.receipt_sha256}.json"
+    if remote_bundle.key != expected_bundle_key:
+        raise StateError("Local S3 replication receipt names an unexpected bundle object key")
+    if record.receipt_object.key != expected_receipt_key:
+        raise StateError("Local S3 replication receipt names an unexpected receipt object key")
+    verified = VerifiedStateBundleReplication(
+        bundle_path=candidate.path,
+        record_path=candidate.record_path,
+        record=record,
+    )
+    return verified, receipt_metadata
+
+
+def _digest_local_bundle(candidate: _BundleCandidate) -> tuple[int, str]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(candidate.path, flags)
+    except OSError as exc:
+        raise StateError("S3 bundle entry cannot be opened safely") from exc
+    try:
+        before = os.fstat(descriptor)
+        _validate_local_evidence_file(
+            before,
+            label="S3 bundle entry",
+            maximum_bytes=_MAX_BUNDLE_BYTES,
+        )
+        _require_candidate_identity(candidate, before)
+        digest = hashlib.sha256()
+        copied = 0
+        with os.fdopen(os.dup(descriptor), "rb") as input_file:
+            while chunk := input_file.read(_COPY_CHUNK_BYTES):
+                copied += len(chunk)
+                if copied > _MAX_BUNDLE_BYTES:
+                    raise StateError("S3 bundle entry exceeds the safe bundle size limit")
+                digest.update(chunk)
+        after = os.fstat(descriptor)
+        _require_unchanged_file(before, after, label="S3 bundle entry")
+        if copied != before.st_size:
+            raise StateError("S3 bundle entry changed while its digest was computed")
+        return copied, digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _require_candidate_identity(candidate: _BundleCandidate, metadata: os.stat_result) -> None:
+    if (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+    ) != (
+        candidate.device,
+        candidate.inode,
+        candidate.size,
+        candidate.modified_ns,
+        candidate.changed_ns,
+        candidate.mode,
+        candidate.links,
+        candidate.owner,
+    ):
+        raise StateError("S3 bundle entry changed after inventory")
+
+
+def _read_exact_local_file(
+    path: Path,
+    *,
+    label: str,
+    maximum_bytes: int,
+) -> tuple[bytes, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise StateError(f"{label} cannot be opened safely") from exc
+    try:
+        before = os.fstat(descriptor)
+        _validate_local_evidence_file(before, label=label, maximum_bytes=maximum_bytes)
+        with os.fdopen(os.dup(descriptor), "rb") as input_file:
+            content = input_file.read(maximum_bytes + 1)
+        if len(content) > maximum_bytes:
+            raise StateError(f"{label} exceeds the safe size limit")
+        after = os.fstat(descriptor)
+        _require_unchanged_file(before, after, label=label)
+        if len(content) != before.st_size:
+            raise StateError(f"{label} changed while it was read")
+        return content, before
+    finally:
+        os.close(descriptor)
+
+
+def _validate_local_evidence_file(
+    metadata: os.stat_result,
+    *,
+    label: str,
+    maximum_bytes: int,
+) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise StateError(f"{label} must be a regular file, not a symbolic link or special file")
+    if metadata.st_uid != os.geteuid():
+        raise StateError(f"{label} must be owned by the replication identity")
+    if stat.S_IMODE(metadata.st_mode) != 0o400:
+        raise StateError(f"{label} must have exact mode 0400")
+    if metadata.st_nlink != 1:
+        raise StateError(f"{label} cannot have multiple hard links")
+    if metadata.st_size < 0 or metadata.st_size > maximum_bytes:
+        raise StateError(f"{label} exceeds the safe size limit")
+
+
+def _require_unchanged_file(
+    before: os.stat_result,
+    after: os.stat_result,
+    *,
+    label: str,
+) -> None:
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+        before.st_mode,
+        before.st_nlink,
+        before.st_uid,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+        after.st_mode,
+        after.st_nlink,
+        after.st_uid,
+    ):
+        raise StateError(f"{label} changed while it was read")
+
+
+def _trusted_marker_mtime(path: Path) -> int:
+    requested = path.expanduser()
+    if (
+        not requested.name
+        or not _has_bounded_utf8_size(requested.name, maximum_bytes=255)
+        or any(not character.isprintable() for character in requested.name)
+    ):
+        raise StateError("Required-after marker filename is unsafe")
+    if requested.is_symlink() or requested.parent.is_symlink():
+        raise StateError("Required-after marker cannot be a symbolic link")
+    parent = _trusted_local_directory(requested.parent, label="Required-after marker parent")
+    marker = parent / requested.name
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(marker, flags)
+    except OSError as exc:
+        raise StateError("Required-after marker is unavailable") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise StateError("Required-after marker must be a regular file")
+        if before.st_uid != os.geteuid():
+            raise StateError("Required-after marker must be owned by the replication identity")
+        if stat.S_IMODE(before.st_mode) & 0o022:
+            raise StateError("Required-after marker cannot be writable by group or other users")
+        if before.st_nlink != 1:
+            raise StateError("Required-after marker cannot have multiple hard links")
+        if before.st_size > _MARKER_MAX_BYTES:
+            raise StateError("Required-after marker exceeds the safe size limit")
+        after = os.fstat(descriptor)
+        _require_unchanged_file(before, after, label="Required-after marker")
+        return before.st_mtime_ns
+    finally:
+        os.close(descriptor)
 
 
 def _validate_record_destination(destination: Path) -> _ValidatedRecordDestination:
@@ -1162,7 +1706,11 @@ __all__ = [
     "BackupReplicaReceipt",
     "BackupReplicationRecord",
     "ImmutableS3Object",
+    "PendingStateBundleReplication",
     "ReplicaReadBack",
+    "VerifiedStateBundleReplication",
     "replicate_state_bundle_to_s3",
+    "select_next_state_bundle_for_s3",
+    "verify_latest_state_bundle_replication",
     "write_backup_replication_record",
 ]

@@ -502,8 +502,8 @@ jobs:
               \( -name '*.service' -o -name '*.timer' \) \
               -print | sort
           )
-          if [[ "${#units[@]}" -ne 9 ]]; then
-            echo "Expected exactly nine packaged systemd system units" >&2
+          if [[ "${#units[@]}" -ne 11 ]]; then
+            echo "Expected exactly eleven packaged systemd system units" >&2
             exit 1
           fi
           systemd-analyze verify \
@@ -565,6 +565,7 @@ jobs:
             [autocontribute-doctor.service]=40
             [autocontribute-rootless-docker.service]=30
             [autocontribute-backup.service]=30
+            [autocontribute-replication.service]=30
             [autocontribute-health.service]=30
             [autocontribute-failure@.service]=30
           )
@@ -676,8 +677,8 @@ jobs:
           manifest_bytes = manifest_path.read_bytes()
           manifest = json.loads(manifest_bytes)
           assets = manifest.get("assets")
-          if not isinstance(assets, list) or len(assets) != 23:
-              raise SystemExit("source systemd asset manifest must contain exactly 23 assets")
+          if not isinstance(assets, list) or len(assets) != 26:
+              raise SystemExit("source systemd asset manifest must contain exactly 26 assets")
           expected = {
               asset["source_path"]: int(asset["mode"], 8)
               for asset in assets

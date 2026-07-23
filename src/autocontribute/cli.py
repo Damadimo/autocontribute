@@ -20,7 +20,11 @@ from rich.text import Text
 
 from autocontribute import __version__
 from autocontribute.backup import create_state_bundle, restore_state_bundle
-from autocontribute.backup_replication import replicate_state_bundle_to_s3
+from autocontribute.backup_replication import (
+    replicate_state_bundle_to_s3,
+    select_next_state_bundle_for_s3,
+    verify_latest_state_bundle_replication,
+)
 from autocontribute.config import (
     CLA_ATTESTATION_STATEMENT,
     DCO_ATTESTATION_STATEMENT,
@@ -960,7 +964,7 @@ def replicate_state_s3(
             expected_bucket_owner=expected_bucket_owner,
             region=region,
             prefix=prefix,
-            retain_until=datetime.now(UTC) + timedelta(days=retention_days),
+            retention_period=timedelta(days=retention_days),
             scratch_directory=scratch_directory,
             access_key_id=access_key_id,
             secret_access_key=secret_access_key,
@@ -982,6 +986,122 @@ def replicate_state_s3(
         markup=False,
     )
     console.print(f"Local record: {destination}", markup=False)
+
+
+@state_app.command(name="replicate-next-s3")
+def replicate_next_state_s3(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Replicate at most one oldest complete production bundle using configured S3 policy."""
+
+    settings = _config(config)
+    replication = settings.s3_replication
+    if replication is None:
+        _fail("S3 replication is not configured; set s3_replication in the configuration")
+    try:
+        pending = select_next_state_bundle_for_s3(
+            bundle_directory=replication.bundle_directory,
+            receipt_directory=replication.receipt_directory,
+            bucket=replication.bucket,
+            expected_bucket_owner=replication.expected_bucket_owner,
+            region=replication.region,
+            prefix=replication.prefix,
+        )
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    if pending is None:
+        console.print("[green]No unreplicated complete state bundles.[/green]")
+        return
+    access_key_id = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    if not access_key_id or not secret_access_key:
+        _fail(
+            "AWS S3 replication credentials are missing; set AWS_ACCESS_KEY_ID and "
+            "AWS_SECRET_ACCESS_KEY"
+        )
+    assert access_key_id is not None and secret_access_key is not None
+    try:
+        record = replicate_state_bundle_to_s3(
+            pending.bundle_path,
+            bucket=replication.bucket,
+            expected_bucket_owner=replication.expected_bucket_owner,
+            region=replication.region,
+            prefix=replication.prefix,
+            retention_period=timedelta(days=replication.retention_days),
+            scratch_directory=replication.scratch_directory,
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            session_token=os.environ.get("AWS_SESSION_TOKEN"),
+            record_destination=pending.record_path,
+            timeout_seconds=replication.timeout_seconds,
+        )
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    console.print("[green]Verified next immutable S3 backup replica and receipt.[/green]")
+    console.print(f"Local bundle: {pending.bundle_path}", markup=False)
+    console.print(f"Local record: {pending.record_path}", markup=False)
+    console.print(
+        f"Bundle: s3://{record.receipt.bundle.bucket}/{record.receipt.bundle.key} "
+        f"(version {record.receipt.bundle.version_id})",
+        markup=False,
+    )
+
+
+@state_app.command(name="verify-latest-s3")
+def verify_latest_state_s3(
+    config: ConfigOption = DEFAULT_CONFIG,
+    if_configured: Annotated[
+        bool,
+        typer.Option(
+            "--if-configured",
+            help="Succeed explicitly when optional review-mode S3 replication is not configured.",
+        ),
+    ] = False,
+    max_age_hours: Annotated[
+        int | None,
+        typer.Option(
+            "--max-age-hours",
+            min=1,
+            max=8_760,
+            help="Maximum age of both the latest local bundle and its exact receipt.",
+        ),
+    ] = None,
+    required_after: Annotated[
+        Path | None,
+        typer.Option(
+            "--required-after",
+            help="Trusted marker that both the latest bundle and receipt must postdate.",
+        ),
+    ] = None,
+) -> None:
+    """Read-only proof that the newest complete local bundle has exact S3 evidence."""
+
+    settings = _config(config)
+    replication = settings.s3_replication
+    if replication is None:
+        if if_configured and settings.publishing.mode == "review_required":
+            console.print(
+                "[yellow]S3 replication verification skipped: optional review-mode "
+                "replication is not configured.[/yellow]"
+            )
+            return
+        _fail("S3 replication is not configured; set s3_replication in the configuration")
+    age_hours = max_age_hours or replication.max_age_hours
+    try:
+        verified = verify_latest_state_bundle_replication(
+            bundle_directory=replication.bundle_directory,
+            receipt_directory=replication.receipt_directory,
+            bucket=replication.bucket,
+            expected_bucket_owner=replication.expected_bucket_owner,
+            region=replication.region,
+            prefix=replication.prefix,
+            maximum_age=timedelta(hours=age_hours),
+            minimum_retention=timedelta(days=replication.retention_days),
+            required_after=required_after,
+        )
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    console.print("[green]Verified latest complete bundle has exact S3 receipt evidence.[/green]")
+    console.print(f"Local bundle: {verified.bundle_path}", markup=False)
+    console.print(f"Local record: {verified.record_path}", markup=False)
 
 
 @state_app.command(name="gc-workspaces")
@@ -1329,6 +1449,19 @@ def _scheduled_auto_preflight(
 
     if settings.publishing.mode != "auto":
         return True
+    replication = settings.s3_replication
+    if replication is None:  # Defensive against programmatic nested-model mutation.
+        raise StateError("Automatic scheduled work requires configured S3 replication")
+    verify_latest_state_bundle_replication(
+        bundle_directory=replication.bundle_directory,
+        receipt_directory=replication.receipt_directory,
+        bucket=replication.bucket,
+        expected_bucket_owner=replication.expected_bucket_owner,
+        region=replication.region,
+        prefix=replication.prefix,
+        maximum_age=timedelta(hours=replication.max_age_hours),
+        minimum_retention=timedelta(days=replication.retention_days),
+    )
     summary = _rollout_summary(settings, store, github)
     switch_enabled = auto_publish_opt_in_enabled(settings.publishing)
     if switch_enabled and summary.overall_gate_passed:

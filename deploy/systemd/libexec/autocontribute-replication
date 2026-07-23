@@ -1,0 +1,43 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+umask 077
+
+readonly executable="${AUTOCONTRIBUTE_EXECUTABLE:-/opt/autocontribute/current/.venv/bin/autocontribute}"
+readonly config="${AUTOCONTRIBUTE_CONFIG:-/etc/autocontribute/autocontribute.yml}"
+readonly credential_directory="${CREDENTIALS_DIRECTORY:-}"
+
+if [[ ! -x "$executable" || ! -r "$config" ]]; then
+  printf 'Autocontribute replication prerequisites are unavailable\n' >&2
+  exit 1
+fi
+"$executable" deployment verify-systemd-assets
+if [[ -z "$credential_directory" || ! -d "$credential_directory" || \
+      -L "$credential_directory" ]]; then
+  printf 'Autocontribute replication credentials are not configured\n' >&2
+  exit 1
+fi
+
+unset AWS_CONFIG_FILE AWS_CONTAINER_AUTHORIZATION_TOKEN \
+  AWS_CONTAINER_CREDENTIALS_FULL_URI AWS_CONTAINER_CREDENTIALS_RELATIVE_URI \
+  AWS_PROFILE AWS_ROLE_ARN AWS_SHARED_CREDENTIALS_FILE AWS_WEB_IDENTITY_TOKEN_FILE
+export AWS_EC2_METADATA_DISABLED=true
+
+for credential_name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+  credential_path="$credential_directory/$credential_name"
+  if [[ ! -f "$credential_path" || -L "$credential_path" ]]; then
+    printf 'A required AWS replication credential is unavailable\n' >&2
+    exit 1
+  fi
+  credential_value="$(<"$credential_path")"
+  if [[ -z "$credential_value" || "$credential_value" == *$'\n'* ]]; then
+    printf 'A required AWS replication credential is empty or multiline\n' >&2
+    exit 1
+  fi
+  printf -v "$credential_name" '%s' "$credential_value"
+  export "${credential_name?}"
+  unset credential_path credential_value
+done
+unset credential_name
+
+exec "$executable" state replicate-next-s3 --config "$config"

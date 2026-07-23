@@ -9,7 +9,12 @@ import pytest
 
 import autocontribute.doctor as doctor
 from autocontribute.config import AutocontributeConfig, SandboxConfig
-from autocontribute.exceptions import CircuitBreakerTrigger, GitHubSafetyError, PolicyError
+from autocontribute.exceptions import (
+    CircuitBreakerTrigger,
+    GitHubSafetyError,
+    PolicyError,
+    StateError,
+)
 from autocontribute.github import GitHubClient
 from autocontribute.store import RunStore
 
@@ -59,6 +64,15 @@ def _auto_config() -> AutocontributeConfig:
                 "repository_cooldown_days": 7,
             },
             "budget": {"max_model_cost_usd_per_run": "1"},
+            "s3_replication": {
+                "bundle_directory": "/var/backups/autocontribute",
+                "receipt_directory": "/var/backups/autocontribute/receipts",
+                "scratch_directory": "/var/backups/autocontribute/replication-scratch",
+                "bucket": "autocontribute-backup",
+                "expected_bucket_owner": "123456789012",
+                "region": "ca-central-1",
+                "prefix": "production/test",
+            },
         }
     )
 
@@ -246,6 +260,48 @@ def test_required_systemd_asset_marker_rejects_noncanonical_values(
     assert len(checks) == 1
     assert not checks[0].passed
     assert "must be exactly 1" in checks[0].detail
+
+
+def test_doctor_reports_optional_review_mode_replication_as_an_explicit_warning() -> None:
+    check = doctor._s3_replication_check(_config())
+
+    assert check.name == "latest S3 backup replication"
+    assert check.passed
+    assert check.warning
+    assert "optional" in check.detail
+
+
+def test_doctor_proves_latest_configured_replication_or_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _auto_config()
+    captured: dict[str, object] = {}
+
+    def verify(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            bundle_path=Path("autocontribute-state-current.bundle.zip"),
+            record_path=Path("autocontribute-state-current.bundle.zip.s3-replication.json"),
+        )
+
+    monkeypatch.setattr(doctor, "verify_latest_state_bundle_replication", verify)
+    passed = doctor._s3_replication_check(config)
+
+    assert passed.passed
+    assert not passed.warning
+    assert captured["maximum_age"] == doctor.timedelta(hours=48)
+    assert captured["minimum_retention"] == doctor.timedelta(days=90)
+    assert "current.bundle.zip" in passed.detail
+
+    monkeypatch.setattr(
+        doctor,
+        "verify_latest_state_bundle_replication",
+        lambda **_kwargs: (_ for _ in ()).throw(StateError("exact receipt is missing")),
+    )
+    failed = doctor._s3_replication_check(config)
+
+    assert not failed.passed
+    assert "exact receipt is missing" in failed.detail
 
 
 def test_active_breaker_skips_billed_model_and_github_probes(

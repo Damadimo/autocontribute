@@ -45,6 +45,7 @@ from autocontribute.domain import (
 from autocontribute.exceptions import (
     AutocontributeError,
     CircuitBreakerTrigger,
+    ModelTimeoutError,
     PolicyError,
     RepositoryError,
     StateError,
@@ -1168,20 +1169,36 @@ class Orchestrator:
                 max_output_tokens=output_limit,
                 timeout_seconds=timeout_seconds,
             )
-        except Exception:
+        except Exception as exc:
             self._assert_run_lease_owned()
             elapsed = max(0.0, self._clock() - started)
+            event = "model.call.failed"
+            failure_details = {
+                "role": role,
+                "call": str(manifest.model_calls),
+                "elapsed_seconds": str(elapsed),
+                "reservation_retained": "true",
+            }
+            if isinstance(exc, ModelTimeoutError):
+                event = "model.call.timed_out"
+                failure_details.update(
+                    {
+                        "deadline_kind": "absolute_monotonic",
+                        "deadline_seconds": str(exc.timeout_seconds),
+                        "worker_elapsed_seconds": str(exc.elapsed_seconds),
+                        "term_sent": str(exc.term_sent).lower(),
+                        "kill_sent": str(exc.kill_sent).lower(),
+                        "child_exit_code": (
+                            "unknown" if exc.child_exit_code is None else str(exc.child_exit_code)
+                        ),
+                    }
+                )
             manifest.model_seconds += elapsed
             self._assert_run_lease_owned()
             self.store.save(
                 manifest,
-                event="model.call.failed",
-                details={
-                    "role": role,
-                    "call": str(manifest.model_calls),
-                    "elapsed_seconds": str(elapsed),
-                    "reservation_retained": "true",
-                },
+                event=event,
+                details=failure_details,
             )
             raise
 

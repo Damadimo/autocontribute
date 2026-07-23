@@ -61,11 +61,21 @@ skips or rejects a candidate. Reconciliation deliberately precedes `doctor`: an 
 the persistent breaker, but that breaker must not prevent a later scheduler invocation from safely
 observing or compensating the already-authorized publication.
 
+Every production model request runs in a fresh private process group with a minimal environment and
+without GitHub credentials. Its configured timeout is an application-owned absolute monotonic
+deadline covering startup, the provider request, and bounded JSON IPC. A late worker is terminated
+with `SIGTERM`, escalated to `SIGKILL` after a short grace period, and reaped. The failed call retains
+its conservative budget reservation and records `model.call.timed_out` when it belongs to the
+contribution run; it cannot produce a completed call artifact or silently keep a scheduled job alive
+past that deadline.
+
 On an operator-managed worker configured for auto mode, the scheduled path also computes the
-combined production rollout gate before it creates a new run. If either the fixed expert cohort or
-the fixed upstream-outcome cohort is blocked--including a pending or failed prior automatic pull
-request--the invocation exits before run creation, discovery, or any model/API billing. Read-only
-reconciliation of an already-authorized interrupted publication still runs first.
+combined production rollout gate before it creates a new run. First it requires the newest complete
+state bundle to have fresh exact immutable S3 receipt evidence under the configured
+`s3_replication.max_age_hours`; missing or stale evidence fails closed. If either the fixed expert
+cohort or the fixed upstream-outcome cohort is blocked--including a pending or failed prior automatic
+pull request--the invocation exits before run creation, discovery, or any model/API billing.
+Read-only reconciliation of an already-authorized interrupted publication still runs first.
 
 The first run cannot be a scheduled event: schedules have no `bootstrap_state` input, and a cache
 miss fails closed. Use bootstrap only for the first-ever lineage. If an established cache is missing
@@ -488,6 +498,9 @@ an operator-managed, non-ephemeral deployment with a persistent storage volume a
 the live SQLite database, `runs/`, and `evaluations/`. Its safety decisions depend on durable
 duplicate history, leases, publication reservations, lifecycle snapshots, circuit-breaker state, and
 ledger-anchored evaluation records; an evictable runner cache is not an acceptable source of truth.
+The configuration validator also rejects `publishing.mode: auto` without a complete
+`s3_replication` policy. Local/manual review mode may omit it, but that exception does not authorize
+an automatic or durable production scheduler.
 
 First configure the final single-repository pilot shape below while keeping
 `publishing.mode: review_required`. Model identities, repository scope, publication safety settings,
@@ -533,6 +546,18 @@ publishing:
   max_open_pull_requests: 1
   max_new_pull_requests_per_day: 1
   repository_cooldown_days: 7
+
+s3_replication:
+  bundle_directory: /var/backups/autocontribute
+  receipt_directory: /var/backups/autocontribute/receipts
+  scratch_directory: /var/backups/autocontribute/replication-scratch
+  bucket: your-object-lock-bucket
+  expected_bucket_owner: "123456789012"
+  region: ca-central-1
+  prefix: production/worker-1
+  retention_days: 90
+  timeout_seconds: 21600
+  max_age_hours: 48
 ```
 
 The expected response ID and explicit immutable-identity attestation are mandatory for every role in
@@ -554,6 +579,15 @@ Set that variable only in the durable worker's runtime environment and schedule 
 mode synchronizes it again immediately before publication. Keep the included hosted workflow in
 review mode for evidence collection or disable it to avoid two schedulers operating the same
 identity.
+
+For the packaged systemd path, bootstrap the S3 boundary before enabling scheduled work: create a
+complete bundle, let the separately credentialed replication service upload and read back both exact
+immutable versions, and verify the latest receipt. The worker requires evidence no older than 36
+hours; after its first attempt, the newest bundle and receipt must also postdate the prior
+`worker-attempt` marker. The health service repeats that check. The backup service triggers
+replication immediately, and the `*:37 UTC` replication timer retries pending bundles hourly. See
+[Immutable S3 backup replication](s3-backup-replication.md) and
+[Operator-managed systemd deployment](systemd-deployment.md).
 
 Configuration rejects automatic mode unless exactly one repository is explicitly allowlisted, owner
 discovery is disabled, each PR is created as a draft and then moved to ready-for-review only after its
