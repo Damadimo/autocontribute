@@ -39,6 +39,9 @@ libexec_created=0
 source_mode="git"
 source_root=""
 requested_source_root=""
+opt_identity=""
+opt_original_mode=""
+opt_mode_hardened=0
 
 fail() {
   printf 'Ubuntu deployment/recovery acceptance failed: %s\n' "$1" >&2
@@ -50,6 +53,40 @@ require_absent() {
   if sudo test -e "$path" || sudo test -L "$path"; then
     fail "refusing to use a host with an existing production path: $path"
   fi
+}
+
+mountpoint_status() {
+  local path="$1"
+  local path_state=""
+
+  # Normalize only an ENOENT observed by an isolated root lstat. Other lookup
+  # errors and a failed probe remain inspection failures rather than being
+  # mistaken for an unmounted, absent path.
+  if ! path_state="$(
+    sudo --non-interactive /usr/bin/env -i PATH="$clean_path" \
+      /usr/bin/python3 -I -S - "$path" <<'PY'
+import os
+import sys
+
+try:
+    os.lstat(sys.argv[1])
+except FileNotFoundError:
+    print("absent")
+except OSError as exc:
+    print(f"mountpoint path inspection failed: {exc}", file=sys.stderr)
+    raise SystemExit(1) from exc
+else:
+    print("present")
+PY
+  )"; then
+    return 1
+  fi
+  case "$path_state" in
+    absent) return 32 ;;
+    present) ;;
+    *) return 1 ;;
+  esac
+  sudo --non-interactive mountpoint --quiet -- "$path"
 }
 
 remove_marked_tree() {
@@ -73,6 +110,9 @@ cleanup() {
   local backup_mount_status=0
   local cleanup_failed=0
   local backup_backing=""
+  local current_opt_identity=""
+  local current_opt_mode=""
+  local managed_opt_cleanup_failed=0
   local path
   local state_mount_status=0
   local state_backing=""
@@ -90,7 +130,7 @@ cleanup() {
     done
   fi
 
-  sudo mountpoint --quiet -- "$backup_root"
+  mountpoint_status "$backup_root"
   backup_mount_status=$?
   if [[ "$backup_mount_status" -eq 0 ]]; then
     actual_backup_source="$(
@@ -124,7 +164,7 @@ cleanup() {
     backup_mounted=1
     cleanup_failed=1
   fi
-  sudo mountpoint --quiet -- "$state_root"
+  mountpoint_status "$state_root"
   state_mount_status=$?
   if [[ "$state_mount_status" -eq 0 ]]; then
     actual_state_source="$(
@@ -234,7 +274,7 @@ cleanup() {
     remove_marked_tree "$config_root" || cleanup_failed=1
   fi
   if [[ "$backup_root_created" -eq 1 ]]; then
-    sudo mountpoint --quiet -- "$backup_root"
+    mountpoint_status "$backup_root"
     backup_mount_status=$?
     if [[ "$backup_mounted" -ne 0 || "$backup_mount_status" -eq 0 ]]; then
       printf 'Refusing to remove a mounted acceptance backup root\n' >&2
@@ -247,7 +287,7 @@ cleanup() {
     fi
   fi
   if [[ "$runtime_root_created" -eq 1 ]]; then
-    sudo mountpoint --quiet -- "$state_root"
+    mountpoint_status "$state_root"
     state_mount_status=$?
     if [[ "$state_mounted" -ne 0 || "$state_mount_status" -eq 0 ]]; then
       printf 'Refusing to remove a service home containing mounted acceptance state\n' >&2
@@ -277,11 +317,50 @@ cleanup() {
     if sudo test -f "${application_root}/.autocontribute-acceptance" && \
       [[ "$(sudo /bin/cat -- "${application_root}/.autocontribute-acceptance")" == \
         "$acceptance_marker" ]]; then
-      sudo /bin/rm -f -- "${application_root}/.autocontribute-acceptance" || cleanup_failed=1
-      sudo rmdir -- "$application_root" >/dev/null 2>&1 || cleanup_failed=1
+      if ! sudo /bin/rm -f -- "${application_root}/.autocontribute-acceptance"; then
+        cleanup_failed=1
+        managed_opt_cleanup_failed=1
+      fi
+      if ! sudo rmdir -- "$application_root" >/dev/null 2>&1; then
+        cleanup_failed=1
+        managed_opt_cleanup_failed=1
+      fi
     else
       printf 'Refusing to clean an unmarked application root\n' >&2
       cleanup_failed=1
+      managed_opt_cleanup_failed=1
+    fi
+  fi
+
+  if [[ "$opt_mode_hardened" -eq 1 ]]; then
+    if [[ "$managed_opt_cleanup_failed" -ne 0 ]]; then
+      printf 'Refusing to restore /opt mode after managed application cleanup failed\n' >&2
+      cleanup_failed=1
+    elif sudo test -e "$application_root" || sudo test -L "$application_root"; then
+      printf 'Refusing to restore /opt mode while managed application paths remain\n' >&2
+      cleanup_failed=1
+    elif ! sudo test -d /opt || sudo test -L /opt; then
+      printf 'Refusing to restore mode on an unsafe /opt path\n' >&2
+      cleanup_failed=1
+    else
+      current_opt_identity="$(
+        sudo stat --format='%d:%i:%u:%g' -- /opt 2>/dev/null
+      )"
+      if [[ -z "$opt_identity" || "$current_opt_identity" != "$opt_identity" ]]; then
+        printf 'Refusing to restore mode on a changed /opt directory\n' >&2
+        cleanup_failed=1
+      elif ! sudo chmod "$opt_original_mode" -- /opt; then
+        printf 'Could not restore the original /opt mode\n' >&2
+        cleanup_failed=1
+      else
+        current_opt_mode="$(sudo stat --format='%a' -- /opt 2>/dev/null)"
+        if [[ "$current_opt_mode" != "$opt_original_mode" ]]; then
+          printf 'The original /opt mode was not restored exactly\n' >&2
+          cleanup_failed=1
+        else
+          opt_mode_hardened=0
+        fi
+      fi
     fi
   fi
 
@@ -433,6 +512,29 @@ for managed_directory in /etc/systemd/system /usr/local/libexec; do
   [[ -z "$existing_path" ]] || fail "existing managed path: $existing_path"
 done
 unset existing_path managed_directory
+
+if ! sudo test -d /opt || sudo test -L /opt || \
+  [[ "$(sudo readlink --canonicalize-existing -- /opt 2>/dev/null)" != /opt ]]; then
+  fail "/opt must be one real directory"
+fi
+opt_identity="$(sudo stat --format='%d:%i:%u:%g' -- /opt)" || \
+  fail "could not record the /opt directory identity"
+[[ "$opt_identity" =~ ^[0-9]+:[0-9]+:0:0$ ]] || fail "/opt must be owned by root:root"
+opt_original_mode="$(sudo stat --format='%a' -- /opt)" || \
+  fail "could not record the original /opt mode"
+[[ "$opt_original_mode" =~ ^[0-7]{1,4}$ ]] || fail "/opt has an invalid mode"
+sudo chmod go-w -- /opt
+opt_mode_hardened=1
+opt_hardened_mode="$(sudo stat --format='%a' -- /opt)" || \
+  fail "could not verify the hardened /opt mode"
+[[ "$opt_hardened_mode" =~ ^[0-7]{1,4}$ ]] || fail "/opt has an invalid hardened mode"
+(( (8#$opt_hardened_mode & 8#022) == 0 )) || \
+  fail "/opt remained writable by group or other users"
+[[ "$(sudo stat --format='%d:%i:%u:%g' -- /opt)" == "$opt_identity" ]] || \
+  fail "/opt changed while its mode was hardened"
+unset opt_hardened_mode
+# Close the pre-hardening creation window before root creates anything below /opt.
+require_absent "$application_root"
 
 temporary_base="${RUNNER_TEMP:-/tmp}"
 [[ -d "$temporary_base" && ! -L "$temporary_base" ]] || \
