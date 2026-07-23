@@ -15,24 +15,27 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Final, cast
 
 from autocontribute.domain import (
     ALLOWED_TRANSITIONS,
+    IssueCandidate,
     RunManifest,
     RunStatus,
     utc_now,
 )
 from autocontribute.exceptions import CircuitBreakerTrigger, StateError
 from autocontribute.github_origin import canonical_api_origin
+from autocontribute.issue_revision import compute_issue_revision
 from autocontribute.lifecycle import (
     PullRequestLifecycleSnapshot,
     parse_lifecycle_snapshot_json,
     parse_pull_request_url,
 )
 
-CURRENT_SCHEMA_VERSION: Final = 6
+CURRENT_SCHEMA_VERSION: Final = 7
 _MAX_GENERATION: Final = 2**63 - 1
 _MAX_ACTIVE_CIRCUIT_BREAKER_TRIGGERS: Final = 10_000
 _MAX_LIFECYCLE_SNAPSHOT_BYTES: Final = 2_000_000
@@ -56,10 +59,14 @@ _V3_RUN_COLUMNS: Final = {
     "updated_at",
     "manifest_json",
 }
-_RUN_COLUMNS: Final = {
+_V4_RUN_COLUMNS: Final = {
     *_V3_RUN_COLUMNS,
     "event_count",
     "event_head_hash",
+}
+_RUN_COLUMNS: Final = {
+    *_V4_RUN_COLUMNS,
+    "issue_revision",
 }
 _EVENT_COLUMNS: Final = {
     "id",
@@ -146,10 +153,14 @@ _V2_REQUIRED_INDEXES: Final = {
     "lifecycle_snapshots_run_idx",
     "circuit_breaker_events_epoch_idx",
 }
-_REQUIRED_INDEXES: Final = {
+_V6_REQUIRED_INDEXES: Final = {
     *_V2_REQUIRED_INDEXES,
     "publication_reservations_reserved_at_idx",
     "publication_reservations_repository_idx",
+}
+_REQUIRED_INDEXES: Final = {
+    *_V6_REQUIRED_INDEXES,
+    "runs_candidate_revision_idx",
 }
 
 # A completed local run can still represent an active upstream contribution. In particular, an
@@ -159,6 +170,13 @@ _CANDIDATE_RELEASED_STATUSES: Final = frozenset(
         RunStatus.SKIPPED,
         RunStatus.REJECTED,
         RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    }
+)
+_CANDIDATE_SUPPRESSED_STATUSES: Final = frozenset(
+    {
+        RunStatus.SKIPPED,
+        RunStatus.REJECTED,
         RunStatus.CANCELLED,
     }
 )
@@ -734,6 +752,20 @@ def _normalized_schema_sql(value: str | None) -> str | None:
     return "".join(normalized)
 
 
+class CandidateAttemptState(StrEnum):
+    AVAILABLE = "available"
+    ACTIVE = "active"
+    SUPPRESSED = "suppressed"
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateAttemptDisposition:
+    state: CandidateAttemptState
+    issue_revision: str
+    prior_run_id: str | None = None
+    prior_status: RunStatus | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class Lease:
     name: str
@@ -971,7 +1003,7 @@ class RunStore:
                 )
             if version == 1 and "schema_metadata" not in self._table_names(connection):
                 self._adopt_legacy_schema(connection)
-            if version in {2, 3, 4, 5}:
+            if version in {2, 3, 4, 5, 6}:
                 # Validate the complete source schema before executing migration SQL. This
                 # prevents unexpected views or triggers from participating in the migration,
                 # even though a later validation would ultimately roll the transaction back.
@@ -989,6 +1021,8 @@ class RunStore:
                     self._migrate_4_to_5(connection)
                 elif version == 5:
                     self._migrate_5_to_6(connection)
+                elif version == 6:
+                    self._migrate_6_to_7(connection)
                 else:  # pragma: no cover - guarded by the supported-version checks
                     raise StateError(f"No state migration is available from schema {version}")
                 version += 1
@@ -1446,6 +1480,79 @@ class RunStore:
             raise StateError("State schema changed while migration was in progress")
 
     @staticmethod
+    def _migrate_6_to_7(connection: sqlite3.Connection) -> None:
+        """Bind candidate rows to a stable digest of their complete issue evidence."""
+
+        connection.execute(
+            """
+            ALTER TABLE runs ADD COLUMN issue_revision TEXT CHECK(
+                issue_revision IS NULL OR (
+                    length(issue_revision) = 64
+                    AND issue_revision NOT GLOB '*[^0-9a-f]*'
+                )
+            )
+            """
+        )
+        rows = connection.execute(
+            """
+            SELECT run_id, status, repository, issue_number, manifest_json
+            FROM runs ORDER BY run_id
+            """
+        ).fetchall()
+        if len(rows) > _MAX_RUN_CORPUS:
+            raise StateError("Run corpus exceeds the supported issue-revision migration bound")
+        for row in rows:
+            try:
+                run_id = _lease_identity(row["run_id"], field="stored run id")
+            except (TypeError, ValueError) as exc:
+                raise StateError("Issue-revision migration found an invalid run ID") from exc
+            try:
+                manifest = RunManifest.model_validate_json(row["manifest_json"])
+            except (TypeError, ValueError) as exc:
+                raise StateError(f"Run {run_id} contains an invalid manifest") from exc
+            status = _stored_run_status(row["status"], run_id=run_id)
+            if manifest.run_id != run_id or manifest.status != status:
+                raise StateError(f"Run {run_id} manifest disagrees with its state row")
+            candidate = manifest.candidate
+            if candidate is None:
+                if row["issue_number"] is not None:
+                    raise StateError(f"Run {run_id} has issue identity without a candidate")
+                continue
+            if row["repository"] != candidate.repository or row["issue_number"] != candidate.number:
+                raise StateError(f"Run {run_id} candidate disagrees with its state row")
+            try:
+                revision = compute_issue_revision(candidate)
+            except (TypeError, ValueError) as exc:
+                raise StateError(f"Run {run_id} has invalid issue revision evidence") from exc
+            updated = connection.execute(
+                """
+                UPDATE runs SET issue_revision = ?
+                WHERE run_id = ? AND issue_revision IS NULL
+                """,
+                (revision, run_id),
+            )
+            if updated.rowcount != 1:
+                raise StateError(f"Run {run_id} changed during issue-revision migration")
+
+        connection.execute(
+            """
+            CREATE INDEX runs_candidate_revision_idx
+            ON runs(repository, issue_number, issue_revision, status)
+            """
+        )
+        migrated_at = utc_now().isoformat()
+        connection.execute(
+            """
+            UPDATE schema_metadata
+            SET schema_version = 7, migrated_at = ?
+            WHERE singleton = 1 AND schema_version = 6
+            """,
+            (migrated_at,),
+        )
+        if connection.execute("SELECT changes()").fetchone()[0] != 1:
+            raise StateError("State schema changed while migration was in progress")
+
+    @staticmethod
     def _schema_manifest(
         connection: sqlite3.Connection,
     ) -> tuple[tuple[str, str, str, str | None], ...]:
@@ -1477,7 +1584,7 @@ class RunStore:
     def _expected_schema_manifest(
         cls, version: int
     ) -> tuple[tuple[str, str, str, str | None], ...]:
-        if version not in {2, 3, 4, 5, CURRENT_SCHEMA_VERSION}:
+        if version not in {2, 3, 4, 5, 6, CURRENT_SCHEMA_VERSION}:
             raise StateError(f"No canonical schema manifest exists for state version {version}")
         expected = sqlite3.connect(":memory:")
         expected.row_factory = sqlite3.Row
@@ -1493,6 +1600,8 @@ class RunStore:
                 cls._migrate_4_to_5(expected)
             if version >= 6:
                 cls._migrate_5_to_6(expected)
+            if version >= 7:
+                cls._migrate_6_to_7(expected)
             return cls._schema_manifest(expected)
         finally:
             expected.close()
@@ -1503,7 +1612,13 @@ class RunStore:
     ) -> None:
         expected = {
             "schema_metadata": _METADATA_COLUMNS,
-            "runs": _RUN_COLUMNS if expected_version >= 4 else _V3_RUN_COLUMNS,
+            "runs": (
+                _RUN_COLUMNS
+                if expected_version >= 7
+                else _V4_RUN_COLUMNS
+                if expected_version >= 4
+                else _V3_RUN_COLUMNS
+            ),
             "events": _EVENT_COLUMNS,
             "leases": _LEASE_COLUMNS,
             "lifecycle_snapshots": _LIFECYCLE_SNAPSHOT_COLUMNS,
@@ -1513,6 +1628,8 @@ class RunStore:
         required_indexes = _V2_REQUIRED_INDEXES
         if expected_version >= 3:
             expected["publication_reservations"] = _PUBLICATION_RESERVATION_COLUMNS
+            required_indexes = _V6_REQUIRED_INDEXES
+        if expected_version >= 7:
             required_indexes = _REQUIRED_INDEXES
         if expected_version >= 4:
             expected["lease_generations"] = _LEASE_GENERATION_COLUMNS
@@ -1554,6 +1671,8 @@ class RunStore:
                 connection,
                 require_current_rollout_cursors=False,
             )
+        if expected_version >= 7:
+            _verify_issue_revision_evidence(connection)
 
     @classmethod
     def _validate_current_schema(cls, connection: sqlite3.Connection) -> None:
@@ -1564,10 +1683,10 @@ class RunStore:
         version = cls._detect_schema_version(connection)
         if version == 0:
             raise StateError("State database contains missing or unsupported tables")
-        if version not in {2, 3, 4, 5, CURRENT_SCHEMA_VERSION}:
+        if version not in {2, 3, 4, 5, 6, CURRENT_SCHEMA_VERSION}:
             raise StateError(
                 f"State snapshot schema {version} cannot be restored; expected version 2, 3, 4, "
-                f"5, or {CURRENT_SCHEMA_VERSION}"
+                f"5, 6, or {CURRENT_SCHEMA_VERSION}"
             )
         cls._validate_schema_version(connection, expected_version=version)
 
@@ -1970,6 +2089,16 @@ class RunStore:
         return manifests
 
     def save(self, manifest: RunManifest, *, event: str, details: dict[str, str]) -> None:
+        candidate = manifest.candidate
+        issue_revision = compute_issue_revision(candidate) if candidate is not None else None
+        event_details = dict(details)
+        if event == "candidate.selected":
+            if candidate is None or issue_revision is None:
+                raise StateError("Candidate selection cannot be saved without issue evidence")
+            supplied_revision = event_details.get("issue_revision")
+            if supplied_revision is not None and supplied_revision != issue_revision:
+                raise StateError("Candidate selection event has a mismatched issue revision")
+            event_details["issue_revision"] = issue_revision
         expected_updated_at = manifest.updated_at
         expected_utc = _aware_utc(expected_updated_at, field="manifest updated_at")
         saved_at = _aware_utc(utc_now(), field="run save time")
@@ -1979,7 +2108,6 @@ class RunStore:
             except OverflowError as exc:
                 raise StateError("Run update timestamp exhausted its supported range") from exc
         manifest.updated_at = saved_at
-        candidate = manifest.candidate
         manifest_json = manifest.model_dump_json()
         try:
             with self._connection() as connection:
@@ -1987,31 +2115,36 @@ class RunStore:
                     """
                     UPDATE runs
                     SET status = ?, repository = ?, issue_number = ?, updated_at = ?,
-                        manifest_json = ?
+                        issue_revision = ?, manifest_json = ?
                     WHERE run_id = ? AND updated_at = ?
+                        AND (issue_revision IS NULL OR issue_revision = ?)
                     """,
                     (
                         manifest.status.value,
                         candidate.repository if candidate else None,
                         candidate.number if candidate else None,
                         manifest.updated_at.isoformat(),
+                        issue_revision,
                         manifest_json,
                         manifest.run_id,
                         expected_updated_at.isoformat(),
+                        issue_revision,
                     ),
                 )
                 if result.rowcount != 1:
-                    if (
-                        connection.execute(
-                            "SELECT 1 FROM runs WHERE run_id = ?", (manifest.run_id,)
-                        ).fetchone()
-                        is None
-                    ):
+                    current = connection.execute(
+                        "SELECT issue_revision FROM runs WHERE run_id = ?", (manifest.run_id,)
+                    ).fetchone()
+                    if current is None:
                         raise StateError(f"Unknown run: {manifest.run_id}")
+                    if current["issue_revision"] not in {None, issue_revision}:
+                        raise StateError(
+                            f"Run {manifest.run_id} candidate evidence changed after selection"
+                        )
                     raise StateError(
                         f"Run {manifest.run_id} changed while this manifest was being saved"
                     )
-                self._append_event(connection, manifest.run_id, event, details)
+                self._append_event(connection, manifest.run_id, event, event_details)
                 _mark_manifest_artifact_sync(
                     connection,
                     run_id=manifest.run_id,
@@ -2411,6 +2544,74 @@ class RunStore:
         with self._connection() as connection:
             row = connection.execute(query, (repository, issue_number, *released)).fetchone()
         return row is not None
+
+    def candidate_attempt_disposition(
+        self,
+        issue: IssueCandidate,
+    ) -> CandidateAttemptDisposition:
+        """Classify whether current issue evidence may start a new contribution attempt.
+
+        Active work wins regardless of revision.  Otherwise, an unchanged conservative terminal
+        outcome is suppressed, while failed attempts and semantically changed issues are available.
+        Every row used for the decision is rebound to its manifest and stored revision first.
+        """
+
+        if not isinstance(issue, IssueCandidate):
+            raise TypeError("candidate disposition requires an IssueCandidate")
+        repository = _repository_identity(issue.repository)
+        if isinstance(issue.number, bool) or not isinstance(issue.number, int) or issue.number < 1:
+            raise ValueError("candidate issue number must be a positive integer")
+        revision = compute_issue_revision(issue)
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            rows = connection.execute(
+                """
+                SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
+                FROM runs
+                WHERE repository = ? COLLATE NOCASE AND issue_number = ?
+                ORDER BY run_id ASC LIMIT ?
+                """,
+                (repository, issue.number, _MAX_RUN_CORPUS + 1),
+            ).fetchall()
+            if len(rows) > _MAX_RUN_CORPUS:
+                raise StateError("Candidate attempt history exceeds the supported integrity bound")
+            attempts = [_verified_issue_revision_row(row) for row in rows]
+
+        active = next(
+            (
+                (run_id, status)
+                for run_id, status, _ in attempts
+                if status not in _CANDIDATE_RELEASED_STATUSES
+            ),
+            None,
+        )
+        if active is not None:
+            return CandidateAttemptDisposition(
+                state=CandidateAttemptState.ACTIVE,
+                issue_revision=revision,
+                prior_run_id=active[0],
+                prior_status=active[1],
+            )
+
+        suppressed = next(
+            (
+                (run_id, status)
+                for run_id, status, stored_revision in attempts
+                if status in _CANDIDATE_SUPPRESSED_STATUSES and stored_revision == revision
+            ),
+            None,
+        )
+        if suppressed is not None:
+            return CandidateAttemptDisposition(
+                state=CandidateAttemptState.SUPPRESSED,
+                issue_revision=revision,
+                prior_run_id=suppressed[0],
+                prior_status=suppressed[1],
+            )
+        return CandidateAttemptDisposition(
+            state=CandidateAttemptState.AVAILABLE,
+            issue_revision=revision,
+        )
 
     def begin_publication(
         self,
@@ -4333,6 +4534,67 @@ def _verify_manifest_artifact_sync(connection: sqlite3.Connection) -> None:
             )
 
 
+def _verified_issue_revision_row(
+    row: sqlite3.Row,
+) -> tuple[str, RunStatus, str | None]:
+    """Validate one run row and return its revision-bound candidate attempt identity."""
+
+    try:
+        run_id = _lease_identity(row["run_id"], field="stored run id")
+    except (TypeError, ValueError) as exc:
+        raise StateError("Issue-revision evidence contains an invalid run ID") from exc
+    status = _stored_run_status(row["status"], run_id=run_id)
+    manifest_json = row["manifest_json"]
+    if not isinstance(manifest_json, str):
+        raise StateError(f"Run {run_id} contains an invalid manifest")
+    try:
+        manifest = RunManifest.model_validate_json(manifest_json)
+    except (TypeError, ValueError) as exc:
+        raise StateError(f"Run {run_id} contains an invalid manifest") from exc
+    if manifest.run_id != run_id or manifest.status != status:
+        raise StateError(f"Run {run_id} manifest disagrees with its state row")
+
+    candidate = manifest.candidate
+    stored_revision = row["issue_revision"]
+    if candidate is None:
+        if row["issue_number"] is not None or stored_revision is not None:
+            raise StateError(f"Run {run_id} has issue identity without a candidate")
+        # Historical publication-only rows can carry a repository reservation without ever
+        # having selected an issue, so repository alone deliberately remains valid here.
+        return run_id, status, None
+
+    if row["repository"] != candidate.repository or row["issue_number"] != candidate.number:
+        raise StateError(f"Run {run_id} candidate disagrees with its state row")
+    try:
+        expected_revision = compute_issue_revision(candidate)
+    except (TypeError, ValueError) as exc:
+        raise StateError(f"Run {run_id} has invalid issue revision evidence") from exc
+    try:
+        revision = _stored_event_hash(
+            stored_revision,
+            field=f"run {run_id} issue revision",
+        )
+    except StateError as exc:
+        raise StateError(f"Run {run_id} has invalid issue revision evidence") from exc
+    if revision != expected_revision:
+        raise StateError(f"Run {run_id} issue revision disagrees with its manifest")
+    return run_id, status, revision
+
+
+def _verify_issue_revision_evidence(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
+        FROM runs ORDER BY run_id LIMIT ?
+        """,
+        (_MAX_RUN_CORPUS + 1,),
+    ).fetchall()
+    if len(rows) > _MAX_RUN_CORPUS:
+        raise StateError("Run corpus exceeds the supported issue-revision integrity bound")
+    for row in rows:
+        _verified_issue_revision_row(row)
+
+
 def _verified_event_heads(
     run_rows: builtins.list[sqlite3.Row],
     event_rows: builtins.list[sqlite3.Row],
@@ -5881,6 +6143,8 @@ def _fsync_directory(directory: Path) -> None:
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
     "RECOVERABLE_IN_FLIGHT_STATUSES",
+    "CandidateAttemptDisposition",
+    "CandidateAttemptState",
     "CircuitBreakerStatus",
     "Lease",
     "LifecycleSnapshot",
