@@ -21,10 +21,10 @@ github:
 models:
   scout: &staging_model
     provider: openai
-    model: gpt-5.6
+    model: gpt-5.5
     api_key_env: OPENAI_API_KEY
     reasoning_effort: high
-    reasoning_mode: standard
+    reasoning_mode: null
     max_input_tokens: 500000
     max_output_tokens: 40000
     timeout_seconds: 900
@@ -33,11 +33,17 @@ models:
       input_usd_per_million_tokens: 10
       cached_input_usd_per_million_tokens: 10
       cache_write_usd_per_million_tokens: 10
-      output_usd_per_million_tokens: 100
+      output_usd_per_million_tokens: 45
   builder: *staging_model
   critic:
     <<: *staging_model
-    reasoning_mode: pro
+    model: gpt-5.5-pro
+    reasoning_mode: null
+    pricing:
+      input_usd_per_million_tokens: 30
+      cached_input_usd_per_million_tokens: 30
+      cache_write_usd_per_million_tokens: 30
+      output_usd_per_million_tokens: 180
 
 sandbox:
   backend: docker
