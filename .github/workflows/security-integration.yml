@@ -1,6 +1,11 @@
 name: Security integration
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
   schedule:
     - cron: "43 6 * * 1"
@@ -9,12 +14,118 @@ permissions:
   contents: read
 
 concurrency:
-  group: security-integration-${{ github.ref }}
+  group: security-integration-${{ github.event_name }}-${{ github.sha }}
   cancel-in-progress: false
 
 jobs:
+  classify-security-changes:
+    name: Classify security integration changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run_live: ${{ steps.classify.outputs.run_live }}
+    steps:
+      - name: Check out complete source history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify the complete local diff
+        id: classify
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -Eeuo pipefail
+
+          is_full_sha() {
+            [[ "$1" =~ ^[0-9a-f]{40}$ ]]
+          }
+
+          commit_exists() {
+            git cat-file -e "${1}^{commit}" 2>/dev/null
+          }
+
+          run_live=true
+          reason=event_requires_live
+          diff_base=""
+          diff_head=""
+
+          case "$EVENT_NAME" in
+            pull_request)
+              base_sha="$PULL_REQUEST_BASE_SHA"
+              head_sha="$PULL_REQUEST_HEAD_SHA"
+              if ! is_full_sha "$base_sha" || ! is_full_sha "$head_sha"; then
+                reason=invalid_pull_request_sha
+              elif ! commit_exists "$base_sha" || ! commit_exists "$head_sha"; then
+                reason=missing_pull_request_commit
+              elif ! merge_base="$(git merge-base "$base_sha" "$head_sha" 2>/dev/null)"; then
+                reason=missing_pull_request_merge_base
+              elif ! is_full_sha "$merge_base" || ! commit_exists "$merge_base"; then
+                reason=invalid_pull_request_merge_base
+              else
+                diff_base="$merge_base"
+                diff_head="$head_sha"
+              fi
+              ;;
+            push)
+              # Always test main, even when the immediate push contains only
+              # documentation. SHA-keyed concurrency prevents a different tree
+              # from displacing this run while it is pending.
+              reason=push_requires_live
+              ;;
+            merge_group)
+              reason=merge_group_requires_live
+              ;;
+          esac
+
+          if [[ -n "$diff_base" && -n "$diff_head" ]]; then
+            changed_paths_file="$(mktemp \
+              "${RUNNER_TEMP}/security-integration-paths.XXXXXX")"
+            trap 'rm -f -- "$changed_paths_file"' EXIT
+            if ! git diff --no-renames --name-only -z \
+              "$diff_base" "$diff_head" -- >"$changed_paths_file"; then
+              reason=diff_failed
+            elif [[ ! -s "$changed_paths_file" ]]; then
+              reason=empty_diff
+            else
+              run_live=false
+              reason=documentation_only
+              while IFS= read -r -d '' changed_path; do
+                case "$changed_path" in
+                  docs/* | README.md | CONTRIBUTING.md | SECURITY.md | LICENSE)
+                    ;;
+                  *)
+                    run_live=true
+                    reason=security_relevant_changes
+                    break
+                    ;;
+                esac
+              done <"$changed_paths_file"
+            fi
+          fi
+
+          printf 'Security integration classification: run_live=%s reason=%s\n' \
+            "$run_live" "$reason"
+          {
+            printf 'run_live=%s\n' "$run_live"
+            printf 'reason=%s\n' "$reason"
+          } >>"$GITHUB_OUTPUT"
+
   live-docker-isolation:
     name: Live Docker isolation (${{ matrix.docker_mode }})
+    needs: classify-security-changes
+    if: >-
+      ${{
+        !cancelled() &&
+        (
+          needs.classify-security-changes.result != 'success' ||
+          needs.classify-security-changes.outputs.run_live != 'false'
+        )
+      }}
     strategy:
       fail-fast: false
       matrix:
@@ -66,6 +177,8 @@ jobs:
           rootful_socket=/var/run/docker.sock
           docker_apt_key=/etc/apt/keyrings/autocontribute-rootless-docker.asc
           docker_apt_source=/etc/apt/sources.list.d/autocontribute-rootless-docker.list
+          smoke_environment=/opt/autocontribute/smoke/.venv
+          smoke_test=/opt/autocontribute/smoke/tests/test_sandbox_live.py
           data_image=""
           loop_device=""
           service_uid=""
@@ -170,15 +283,13 @@ jobs:
                 /usr/local/libexec/autocontribute-rootless-docker \
                 /usr/local/libexec/autocontribute-rootless-docker-check \
                 /usr/local/libexec/autocontribute-rootless-dockerd \
-                /opt/autocontribute/current/.venv/bin/autocontribute \
                 "$docker_apt_source" \
                 "$docker_apt_key"
               sudo rmdir --ignore-fail-on-non-empty \
-                /etc/autocontribute \
-                /opt/autocontribute/current/.venv/bin \
-                /opt/autocontribute/current/.venv \
-                /opt/autocontribute/current \
-                /opt/autocontribute 2>/dev/null || true
+                /etc/autocontribute 2>/dev/null || true
+              if ! sudo rm -rf -- /opt/autocontribute; then
+                cleanup_failed=1
+              fi
             fi
             if [[ "$manager_drop_in_preflight_complete" -eq 1 ]]; then
               sudo rm -f -- "$manager_drop_in"
@@ -311,6 +422,36 @@ jobs:
           service_gid="$(id --group "$account")"
           [[ "$service_uid" =~ ^[1-9][0-9]*$ ]]
           [[ "$service_gid" =~ ^[1-9][0-9]*$ ]]
+
+          sudo install -d -o root -g root -m 0755 \
+            /opt/autocontribute/smoke \
+            /opt/autocontribute/smoke/tests
+          sudo install -o root -g root -m 0644 \
+            "$GITHUB_WORKSPACE/tests/test_sandbox_live.py" "$smoke_test"
+          sudo env \
+            UV_PROJECT_ENVIRONMENT="$smoke_environment" \
+            UV_CACHE_DIR="${RUNNER_TEMP}/autocontribute-root-uv-cache" \
+            "$(command -v uv)" sync \
+              --project "$GITHUB_WORKSPACE" \
+              --python /usr/bin/python3 --no-python-downloads \
+              --locked --extra dev --no-editable
+          sudo chown -R root:root /opt/autocontribute/smoke
+          sudo chmod -R go-w /opt/autocontribute/smoke
+          sudo test ! -L "$smoke_environment"
+          sudo test -x "$smoke_environment/bin/python"
+          test "$(readlink -f "$smoke_environment/bin/python")" = \
+            "$(readlink -f /usr/bin/python3)"
+          sudo test -x "$smoke_environment/bin/autocontribute"
+          sudo test -x "$smoke_environment/bin/pytest"
+          cmp --silent "$GITHUB_WORKSPACE/tests/test_sandbox_live.py" \
+            "$smoke_test"
+          test -z "$(sudo find /opt/autocontribute/smoke -xdev \
+            \( -type f -o -type d \) -perm /022 -print -quit)"
+          sudo -u "$account" env --chdir=/opt/autocontribute/smoke \
+            HOME="$service_home" \
+            "$smoke_environment/bin/python" -c \
+              'import autocontribute; import autocontribute.cli'
+
           manager_drop_in_directory="/etc/systemd/system/user@${service_uid}.service.d"
           manager_drop_in="${manager_drop_in_directory}/50-autocontribute.conf"
           if sudo test -e "$manager_drop_in_directory" || \
@@ -693,12 +834,12 @@ jobs:
               "$runtime" "$docker_socket" "$rootful_socket"
 
           service_env=(
-            sudo -u "$account" env
+            sudo -u "$account" env --chdir=/opt/autocontribute/smoke
             "HOME=$service_home"
             "TMPDIR=$service_home/tmp"
             "XDG_RUNTIME_DIR=$runtime"
             "DOCKER_HOST=unix://$docker_socket"
-            "PATH=$GITHUB_WORKSPACE/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+            "PATH=$smoke_environment/bin:/usr/local/bin:/usr/bin:/bin"
           )
 
           proxy_pid_before="$(sudo systemctl show "$system_unit" \
@@ -734,9 +875,9 @@ jobs:
               "$runtime" "$docker_socket" "$rootful_socket"
           "${service_env[@]}" docker info >/dev/null
 
-          "${service_env[@]}" "$GITHUB_WORKSPACE/.venv/bin/python" -c \
+          "${service_env[@]}" "$smoke_environment/bin/python" -c \
             'import autocontribute; import autocontribute.cli'
-          "${service_env[@]}" "$GITHUB_WORKSPACE/.venv/bin/autocontribute" \
+          "${service_env[@]}" "$smoke_environment/bin/autocontribute" \
             --help >/dev/null
           git_smoke="$service_home/tmp/git-smoke"
           "${service_env[@]}" install -d -m 0700 "$git_smoke"
@@ -755,7 +896,7 @@ jobs:
             "0:${service_gid}:750"
           sudo test ! -e "$service_home/.gitconfig"
 
-          mode="$("${service_env[@]}" "$GITHUB_WORKSPACE/.venv/bin/python" -c \
+          mode="$("${service_env[@]}" "$smoke_environment/bin/python" -c \
             'from autocontribute.sandbox import detect_docker_daemon_mode; print(detect_docker_daemon_mode())')"
           test "$mode" = rootless
           test "$("${service_env[@]}" docker info \
@@ -771,9 +912,49 @@ jobs:
             "$("${service_env[@]}" docker version --format '{{.Server.Version}}')"
           printf 'Rootless Docker cgroup driver: %s\n' "$cgroup_driver"
 
-          image="$("$GITHUB_WORKSPACE/.venv/bin/python" -c \
+          image="$("$smoke_environment/bin/python" -c \
             'from autocontribute.config import SandboxConfig; print(SandboxConfig().image)')"
           "${service_env[@]}" docker pull "$image"
           "${service_env[@]}" env AUTOCONTRIBUTE_RUN_DOCKER_TESTS=1 \
-            "$GITHUB_WORKSPACE/.venv/bin/pytest" \
-              -q -p no:cacheprovider tests/test_sandbox_live.py
+            "$smoke_environment/bin/pytest" \
+              -q -p no:cacheprovider "$smoke_test"
+
+  security-integration-gate:
+    name: Security integration gate
+    needs: [classify-security-changes, live-docker-isolation]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Enforce the security integration result
+        shell: bash
+        env:
+          CLASSIFIER_RESULT: ${{ needs.classify-security-changes.result }}
+          RUN_LIVE: ${{ needs.classify-security-changes.outputs.run_live }}
+          LIVE_RESULT: ${{ needs.live-docker-isolation.result }}
+        run: |
+          set -euo pipefail
+
+          if [[
+            "$CLASSIFIER_RESULT" == success &&
+            "$RUN_LIVE" == false &&
+            "$LIVE_RESULT" == skipped
+          ]]; then
+            printf '%s\n' 'Security integration safely skipped for documentation-only changes.'
+            exit 0
+          fi
+
+          if [[
+            "$CLASSIFIER_RESULT" == success &&
+            "$RUN_LIVE" == true &&
+            "$LIVE_RESULT" == success
+          ]]; then
+            printf '%s\n' 'Live security integration passed.'
+            exit 0
+          fi
+
+          printf '%s\n' \
+            'Security integration did not satisfy the fail-closed result contract.' >&2
+          printf 'classifier=%s run_live=%s live=%s\n' \
+            "$CLASSIFIER_RESULT" "$RUN_LIVE" "$LIVE_RESULT" >&2
+          exit 1

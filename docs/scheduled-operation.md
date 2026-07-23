@@ -15,10 +15,23 @@ The included workflow runs at 09:17 and 21:17 UTC. It is inert until the reposit
    budget must not exceed 180 minutes; the four-hour job timeout reserves the remaining hour for
    preflight and fail-closed state finalization.
 3. Protect the control repository's default branch before storing any hosted credential. Require pull
-   requests and passing CI, apply the rule to administrators where supported, and block force pushes
-   and deletion. If the account plan cannot enforce these controls for the repository, keep hosted
-   secrets and the schedule disabled; use a trusted persistent worker or move a sanitized control
-   repository to a visibility/plan that supports protection.
+   requests, passing CI, and the exact **Security integration gate** check; apply the rule to
+   administrators where supported, require at least one trusted approval for every pull request, and
+   block force pushes and deletion. Require code-owner review for `.github/workflows/` and
+   `.github/CODEOWNERS`, dismiss stale approvals after new commits, and require approval of the most
+   recent reviewable push. Ensure two distinct trusted identities can author and approve control-plane
+   changes: a code owner cannot approve their own pull request. Add another trusted collaborator, or
+   have a separately controlled bot author workflow changes for the owner to review; do not use an
+   administrator bypass as the normal path. Require branches to be up to date with `main`, or use a
+   merge queue; the security workflow runs its full matrix for `merge_group` candidates. A same-named
+   check can be defined by pull-request workflow content, so the check name is not a trust boundary by
+   itself; use required-workflow governance as well when the account supports it. Require only the
+   stable aggregate security check, not its rootful or rootless matrix jobs, because the matrix is
+   deliberately skipped for documentation-only pull requests. GitHub Free does not provide branch
+   protection for a private repository: make the control repository public or upgrade its plan before
+   treating this as an enforceable production gate. Until the account plan can enforce these controls,
+   keep hosted secrets and the schedule disabled; use a trusted persistent worker or move a sanitized
+   control repository to a visibility/plan that supports protection.
 4. Add `OPENAI_API_KEY` and `AUTOCONTRIBUTE_GITHUB_TOKEN` as GitHub Actions secrets. Prefer an expiring
    GitHub App user token in hosted systems. This prepare-only workflow needs only the read permissions
    required for discovery and lifecycle polling. Provision a separate, short-lived write-capable

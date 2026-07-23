@@ -430,9 +430,17 @@ must be at least seven days old when the PR is created.
 Release artifacts are built without isolation only after CI installs the exactly pinned Hatchling
 backend from that lockfile, so packaging does not perform a second, unrecorded dependency resolution.
 
-The test suite never creates a real public PR. A weekly security workflow exercises Docker isolation
-without credentials. Live GitHub/provider shadow runs are manual opt-ins and restricted to an
-operator-owned fixture repository; see [Staging](docs/staging.md).
+The test suite never creates a real public PR. A credential-free security workflow exercises Docker
+isolation weekly, on manual dispatch, on pull requests and merge-queue candidates, and after pushes to
+`main`. Main pushes and merge-queue candidates always run both Docker modes so the newest integrated
+tree is tested. Concurrency is keyed to the event and immutable workflow commit, so a re-run of an
+older tree cannot displace a newer pending run. On pull requests, a full local-diff classifier skips
+the live matrix only for a narrow set of documentation-only changes and otherwise fails closed to
+running both modes. Configure its stable **Security integration gate** job as a required branch check,
+require a trusted approval for every pull request, and require code-owner review for workflow changes;
+the check name alone does not bind a pull request to trusted workflow logic. Live GitHub/provider
+shadow runs are manual opt-ins and restricted to an operator-owned fixture repository; see
+[Staging](docs/staging.md).
 
 ## License
 

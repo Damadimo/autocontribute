@@ -23,10 +23,23 @@ credentials, private code, personal data, or other non-public material in the fi
    Keep the fixture's 11-command budget: it covers one baseline reproduction and the five-command
    deduplicated validation suite both before and after the single bounded critic-repair pass.
 3. Protect the control repository's default branch before storing any hosted credential. Require pull
-   requests and passing CI, apply the rule to administrators where supported, and block force pushes
-   and deletion. If the account plan cannot enforce these controls for the repository, keep hosted
-   secrets and staging disabled; run the shadow check from a trusted worker or move a sanitized control
-   repository to a visibility/plan that supports protection.
+   requests, passing CI, and the exact **Security integration gate** check; apply the rule to
+   administrators where supported, require at least one trusted approval for every pull request, and
+   block force pushes and deletion. Require code-owner review for `.github/workflows/` and
+   `.github/CODEOWNERS`, dismiss stale approvals after new commits, and require approval of the most
+   recent reviewable push. Ensure two distinct trusted identities can author and approve control-plane
+   changes: a code owner cannot approve their own pull request. Add another trusted collaborator, or
+   have a separately controlled bot author workflow changes for the owner to review; do not use an
+   administrator bypass as the normal path. Require branches to be up to date with `main`, or use a
+   merge queue; the security workflow runs its full matrix for `merge_group` candidates. A same-named
+   check can be defined by pull-request workflow content, so the check name is not a trust boundary by
+   itself; use required-workflow governance as well when the account supports it. Require only the
+   stable aggregate security check, not its rootful or rootless matrix jobs, because the matrix is
+   deliberately skipped for documentation-only pull requests. GitHub Free does not provide branch
+   protection for a private repository: make the control repository public or upgrade its plan before
+   treating this as an enforceable production gate. Until the account plan can enforce these controls,
+   keep hosted secrets and staging disabled; run the shadow check from a trusted worker or move a
+   sanitized control repository to a visibility/plan that supports protection.
 4. Add `OPENAI_API_KEY` and a read-only `AUTOCONTRIBUTE_STAGING_GITHUB_TOKEN` as repository secrets.
    Use a dedicated provider project. The target token must be either an expiring fine-grained PAT or a
    GitHub App **user access token** because preflight identifies its account with `GET /user`; a plain
@@ -141,9 +154,27 @@ verified snapshot is restored: a fresh ephemeral database cannot preserve or dem
 stop.
 
 The separate **Security integration** workflow runs repository-controlled commands against both
-rootful and rootless Docker daemons each week. It verifies numeric identity and host file ownership,
-effective cgroup v2 resource limits, host-environment and network denial, zero Linux capabilities,
-no-new-privileges, and read-only container-root and Git-metadata mounts. This hosted regression check
-does not replace deployed-host verification of the dedicated rootless socket, systemd delegation,
-private runtime paths, or the service account's inability to reach the rootful host socket; the
-packaged preflight and deployment procedure remain authoritative for those host-specific boundaries.
+rootful and rootless Docker daemons on its weekly schedule, on manual dispatch, on pull requests and
+merge-queue candidates, and after pushes to `main`. Every main push and `merge_group` candidate
+requires the live matrix. The non-cancelling concurrency group includes the event name and immutable
+workflow commit. GitHub can therefore supersede only a pending run for the same event and tree; an old
+manual re-run or another commit cannot displace a newer pending main run.
+
+For pull requests, a cheap classifier reads the complete local Git diff rather than GitHub's
+path-filter result, which can inspect only the first 300 changed files. It skips the live matrix only
+when every changed path is under `docs/` or is exactly `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, or
+`LICENSE`. Renames are considered as a deletion plus an addition, so moving runtime material into an
+allowed documentation path still runs the matrix. Invalid or unavailable event SHAs, a missing merge
+base, a diff error, an unsupported event, or any other classification uncertainty also runs both live
+modes.
+
+The always-present **Security integration gate** job accepts either a successful live matrix or a
+classifier-confirmed documentation-only pull-request skip. Use that stable job name as the required
+branch check, together with trusted code-owner review of workflow changes; trigger-level path filters
+would omit it entirely and can leave a required check pending. The live tests verify numeric identity
+and host file ownership, effective cgroup v2 resource limits,
+host-environment and network denial, zero Linux capabilities, no-new-privileges, and read-only
+container-root and Git-metadata mounts. This hosted regression check does not replace deployed-host
+verification of the dedicated rootless socket, systemd delegation, private runtime paths, or the
+service account's inability to reach the rootful host socket; the packaged preflight and deployment
+procedure remain authoritative for those host-specific boundaries.

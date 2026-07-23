@@ -1,0 +1,4 @@
+# Keep pull-request-controlled automation under trusted review. Branch protection
+# must require code-owner approval and dismiss it after later workflow changes.
+/.github/workflows/ @Damadimo
+/.github/CODEOWNERS @Damadimo
