@@ -2,7 +2,8 @@
 Description=Run Autocontribute deployment preflight
 Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
 Wants=network-online.target
-After=network-online.target
+Requires=autocontribute-rootless-docker.service
+After=network-online.target autocontribute-rootless-docker.service
 RequiresMountsFor=/var/lib/autocontribute/state/workspaces
 RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute
 RequiresMountsFor=/var/lib/autocontribute/docker
@@ -19,11 +20,13 @@ Environment=HOME=/var/lib/autocontribute
 Environment=TMPDIR=/var/lib/autocontribute/tmp
 Environment=NO_COLOR=1
 Environment=PYTHONUNBUFFERED=1
+Environment=AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS=1
 Environment="AUTOCONTRIBUTE_CREDENTIAL_NAMES=OPENAI_API_KEY AUTOCONTRIBUTE_GITHUB_TOKEN"
 LoadCredentialEncrypted=OPENAI_API_KEY:/etc/autocontribute/credentials/OPENAI_API_KEY.cred
 LoadCredentialEncrypted=AUTOCONTRIBUTE_GITHUB_TOKEN:/etc/autocontribute/credentials/AUTOCONTRIBUTE_GITHUB_TOKEN.cred
 
 ExecStartPre=/usr/bin/test -x /opt/autocontribute/current/.venv/bin/autocontribute
+ExecStartPre=/opt/autocontribute/current/.venv/bin/autocontribute deployment verify-systemd-assets
 ExecStartPre=/usr/bin/test -r /etc/autocontribute/autocontribute.yml
 ExecStartPre=/usr/bin/test -d /var/lib/autocontribute/state
 ExecStartPre=/usr/bin/test -d /var/lib/autocontribute/state/workspaces
@@ -44,7 +47,7 @@ PrivateDevices=yes
 PrivateTmp=yes
 ProtectClock=yes
 ProtectControlGroups=yes
-ProtectHome=read-only
+ProtectHome=yes
 ProtectHostname=yes
 ProtectKernelLogs=yes
 ProtectKernelModules=yes

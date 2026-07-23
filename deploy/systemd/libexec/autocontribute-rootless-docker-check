@@ -3,16 +3,24 @@ set -euo pipefail
 
 umask 077
 
+readonly operation="${1:-}"
 readonly runtime_directory="${1:-}"
 readonly docker_socket="${2:-}"
 readonly rootful_docker_socket="${3:-}"
+readonly unit_name="autocontribute-rootless-docker.service"
+readonly expected_fragment="/etc/systemd/system/autocontribute-rootless-docker.service"
+readonly legacy_rootless_socket="/run/user/$UID/docker.sock"
 
 fail() {
   printf '%s\n' "$1" >&2
   exit 1
 }
 
-if [[
+if [[ "$operation" == --unit-only ]]; then
+  if [[ $# -ne 1 ]]; then
+    fail 'Autocontribute rootless Docker check received invalid paths'
+  fi
+elif [[
   $# -ne 3 || -z "$runtime_directory" ||
   "$docker_socket" != "$runtime_directory/docker.sock" ||
   -z "$rootful_docker_socket"
@@ -34,6 +42,65 @@ for service_group_name in $service_group_names; do
 done
 unset service_group_name
 
+unit_property() {
+  local property="$1"
+  local value
+  if ! value="$(
+    timeout --kill-after=5s 30s \
+      systemctl show "$unit_name" \
+      --property="$property" --value \
+      2>/dev/null
+  )"; then
+    fail 'Autocontribute could not inspect the rootless Docker system unit'
+  fi
+  if [[ ( "$property" != DropInPaths && -z "$value" ) || "$value" == *$'\n'* ]]; then
+    fail 'Autocontribute rootless Docker system unit has an ambiguous property'
+  fi
+  printf '%s' "$value"
+}
+
+load_state="$(unit_property LoadState)"
+need_daemon_reload="$(unit_property NeedDaemonReload)"
+fragment_path="$(unit_property FragmentPath)"
+dropin_paths="$(unit_property DropInPaths)"
+readonly load_state need_daemon_reload fragment_path dropin_paths
+if [[ "$load_state" != loaded ]]; then
+  fail 'Autocontribute rootless Docker system unit is not loaded'
+fi
+if [[ "$need_daemon_reload" != no ]]; then
+  fail 'Autocontribute rootless Docker system unit requires a daemon reload'
+fi
+if [[ "$fragment_path" != "$expected_fragment" ]]; then
+  fail 'Autocontribute rootless Docker system unit has an unexpected fragment'
+fi
+if [[ -n "$dropin_paths" ]]; then
+  fail 'Autocontribute rootless Docker system unit has an unexpected effective drop-in'
+fi
+if [[ ! -f "$fragment_path" || -L "$fragment_path" ]]; then
+  fail 'Autocontribute rootless Docker system unit fragment is unavailable or unsafe'
+fi
+fragment_owner="$(stat --format=%u -- "$fragment_path")" || \
+  fail 'Autocontribute could not inspect the rootless Docker system unit fragment'
+fragment_group="$(stat --format=%g -- "$fragment_path")" || \
+  fail 'Autocontribute could not inspect the rootless Docker system unit fragment'
+fragment_mode="$(stat --format=%a -- "$fragment_path")" || \
+  fail 'Autocontribute could not inspect the rootless Docker system unit fragment'
+readonly fragment_owner fragment_group fragment_mode
+if [[ "$fragment_owner" != 0 || "$fragment_group" != 0 || "$fragment_mode" != 644 ]]; then
+  fail 'Autocontribute rootless Docker system unit fragment has unsafe ownership or permissions'
+fi
+
+if [[ "$operation" == --unit-only ]]; then
+  exit 0
+fi
+
+active_state="$(unit_property ActiveState)"
+sub_state="$(unit_property SubState)"
+readonly active_state sub_state
+if [[ "$active_state" != active || "$sub_state" != running ]]; then
+  fail 'Autocontribute rootless Docker system unit is not running'
+fi
+
 if [[ ! -d "$runtime_directory" || -L "$runtime_directory" ]]; then
   fail 'Autocontribute rootless Docker runtime directory is unavailable'
 fi
@@ -50,6 +117,10 @@ fi
 
 if [[ ! -S "$docker_socket" || -L "$docker_socket" ]]; then
   fail 'Autocontribute rootless Docker socket is unavailable'
+fi
+if [[ "$legacy_rootless_socket" != "$docker_socket" ]] && \
+  [[ -S "$legacy_rootless_socket" || -L "$legacy_rootless_socket" ]]; then
+  fail 'Autocontribute found a legacy rootless Docker socket outside the managed runtime'
 fi
 docker_socket_owner="$(stat --format=%u -- "$docker_socket")" || \
   fail 'Autocontribute could not inspect the Docker socket'

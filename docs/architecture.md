@@ -170,8 +170,8 @@ hash chain; only the latest valid judgment is effective, while every predecessor
 Each orchestrated run records its deployment fingerprint in both the manifest and its first
 hash-chained creation event. The evaluation gate selects the earliest 100 runs whose immutable
 creation evidence matches the current package source, interpreter, installed dependency closure,
-packaged build/lock manifest, attested exact response-model, and material-configuration fingerprint,
-so a changed runtime or
+packaged build/lock manifest, release-bound systemd deployment-asset manifest, attested exact
+response-model, and material-configuration fingerprint, so a changed runtime or
 model deployment cannot inherit an older deployment's calibration. Evaluation hashes, subject hashes, and
 verdict and revision metadata are anchored in each run's hash-chained SQLite event ledger, so an
 added, edited, deleted, duplicated, renamed, non-consecutive, predecessor-mismatched, or artifact-
@@ -196,6 +196,8 @@ before auto is usable.
 The build/lock component is a required, schema-validated `_build_identity.json` shipped inside the
 package. CI verifies its `pyproject.toml` and `uv.lock` SHA-256 values before building, so source and
 wheel installs use the same explicit identity without searching or trusting unrelated ancestor files.
+The runtime component also hashes the schema-validated `_systemd_assets.json`, so changing any
+release-bound operator deployment asset starts a new cohort.
 An online SQLite snapshot captures committed WAL pages and verifies integrity, the exact v6 schema,
 and every event chain against its durable count/head anchor, but it does not include either
 directory. `state backup --complete` additionally copies both directories, validates their run

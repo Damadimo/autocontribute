@@ -8,7 +8,7 @@ readonly config="${AUTOCONTRIBUTE_CONFIG:-/etc/autocontribute/autocontribute.yml
 readonly credential_names="${AUTOCONTRIBUTE_CREDENTIAL_NAMES:-}"
 readonly credential_directory="${CREDENTIALS_DIRECTORY:-}"
 readonly operation="${1:-run}"
-readonly runtime_directory="/run/user/$UID"
+readonly runtime_directory="/run/autocontribute"
 readonly docker_socket="$runtime_directory/docker.sock"
 readonly rootful_docker_socket="/var/run/docker.sock"
 readonly rootless_docker_check="/usr/local/libexec/autocontribute-rootless-docker-check"
@@ -32,6 +32,7 @@ if [[ ! -x "$executable" ]]; then
   printf 'Autocontribute executable is unavailable\n' >&2
   exit 1
 fi
+"$executable" deployment verify-systemd-assets
 if [[ ! -r "$config" ]]; then
   printf 'Autocontribute configuration is unavailable\n' >&2
   exit 1
@@ -83,7 +84,7 @@ for credential_name in $credential_names; do
     exit 1
   fi
   case "$credential_name" in
-    AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH | AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT | AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT | AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT | BASH* | CDPATH | DOCKER_* | ENV | GIT_* | HOME | IFS | LD_* | PATH | PYTHON* | SHELL | XDG_*)
+    AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH | AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT | AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT | AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT | AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS | BASH* | CDPATH | DOCKER_* | ENV | GIT_* | HOME | IFS | LD_* | PATH | PYTHON* | SHELL | XDG_*)
       printf 'An Autocontribute credential uses a reserved environment name\n' >&2
       exit 1
       ;;

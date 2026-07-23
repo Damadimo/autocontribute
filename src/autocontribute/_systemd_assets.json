@@ -1,0 +1,167 @@
+{
+  "project": "autocontribute",
+  "schema_version": 1,
+  "assets": [
+    {
+      "source_path": "deploy/systemd/autocontribute-backup.service",
+      "installed_path": "/etc/systemd/system/autocontribute-backup.service",
+      "sha256": "0e1c9f06fcf35904f1518408e24921b4b18ce762b0c45209e25e1edc86bd1c0a",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute-backup.timer",
+      "installed_path": "/etc/systemd/system/autocontribute-backup.timer",
+      "sha256": "d013cbcbd9e0e93470d09677c0e2fbdbf63a118b5b8c8f151d936e1b6bbde83b",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute-doctor.service",
+      "installed_path": "/etc/systemd/system/autocontribute-doctor.service",
+      "sha256": "9bf9e64af2d85821437afedc58d784c56c89edb345fa1f58ee7aedfc2938944c",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute-failure@.service",
+      "installed_path": "/etc/systemd/system/autocontribute-failure@.service",
+      "sha256": "ecb9a3bdd227932afbb17f2820998059f7d79e0be5170b41da91459ad5c491ff",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute-health.service",
+      "installed_path": "/etc/systemd/system/autocontribute-health.service",
+      "sha256": "f69ae898011bc1fb51c0db38d46a11f7f413aafc741ffbb376745eb2c998922c",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute-health.timer",
+      "installed_path": "/etc/systemd/system/autocontribute-health.timer",
+      "sha256": "58b05246086d46f9e3fc7f3538794dee510f2554b3fa85b386db38eb15be90e2",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute-rootless-docker.service",
+      "installed_path": "/etc/systemd/system/autocontribute-rootless-docker.service",
+      "sha256": "e5af60afa337f177674f63dfccda4e9f206918ca04db0e39299e48282ffcc386",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute-user-manager.conf",
+      "installed_path": "/etc/systemd/system/user@{autocontribute_uid}.service.d/50-autocontribute.conf",
+      "sha256": "5c7a98c352ce21304114ef7a587c29028820be175e3ea39644f9ba8c28248663",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute-worker.service",
+      "installed_path": "/etc/systemd/system/autocontribute-worker.service",
+      "sha256": "565bb244ab184fa9adb4b1d79fc2c30bfdf5ed991439683b26514428e9fd02bd",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute-worker.timer",
+      "installed_path": "/etc/systemd/system/autocontribute-worker.timer",
+      "sha256": "55842d8e15248c399366af2408c86cc67fcd0d97850663a7d355d618d55c08c7",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute.journald.conf.example",
+      "installed_path": null,
+      "sha256": "08dc6776c9f65d5ee68050c672f6105373206b481a469b7c223f2b0cc82cf282",
+      "mode": "0644",
+      "required": false
+    },
+    {
+      "source_path": "deploy/systemd/autocontribute.tmpfiles.conf",
+      "installed_path": "/etc/tmpfiles.d/autocontribute.conf",
+      "sha256": "93478efe2a7a48d2966f051acbd7f4f8a6cdcb15de57cdf625639ec9bdc89717",
+      "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-backup",
+      "installed_path": "/usr/local/libexec/autocontribute-backup",
+      "sha256": "90ade2e8da4755a809789f74943d320384c8f5ece78a1c0c65aaf2243dcd63ad",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-docker-data-check",
+      "installed_path": "/usr/local/libexec/autocontribute-docker-data-check",
+      "sha256": "f7c38c3d90edcb7b96dade18b7d2add228952abafaa61832a9de3b57bb9f9601",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-healthcheck",
+      "installed_path": "/usr/local/libexec/autocontribute-healthcheck",
+      "sha256": "49ec1e011946b291cf3f45fd8d6b508f182e1d57606236c4b73b79930928e9ec",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-record-failure",
+      "installed_path": "/usr/local/libexec/autocontribute-record-failure",
+      "sha256": "9cd4f239dbbf1ead85ae803ada0b20ee6c9604e8b694f05680c775527f0e7634",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-rootless-docker",
+      "installed_path": "/usr/local/libexec/autocontribute-rootless-docker",
+      "sha256": "c324054ceaf528a10545c87713e1412c59982bdd9eec18bbc62f1b87b9d90772",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-rootless-docker-check",
+      "installed_path": "/usr/local/libexec/autocontribute-rootless-docker-check",
+      "sha256": "19d09b2f9d5d01a2f9fb6a0dbd925d0776bb2356aa7603d993a637cc6ffafc40",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-rootless-dockerd",
+      "installed_path": "/usr/local/libexec/autocontribute-rootless-dockerd",
+      "sha256": "d7b0694c22572fd375e03580844d56a2c7906202634b2ab7e53dd2888d3b2777",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-storage-capacity-check",
+      "installed_path": "/usr/local/libexec/autocontribute-storage-capacity-check",
+      "sha256": "d2d92d94cfea59add12da5ed17fabdebdd77643ddead097aae4317b0fa7cf7fb",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-worker",
+      "installed_path": "/usr/local/libexec/autocontribute-worker",
+      "sha256": "28fdf3f3565e234c53d5e7d472f27518c4f4dfff706e67dd85e5c797107f5a3a",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-workspace-quota-check",
+      "installed_path": "/usr/local/libexec/autocontribute-workspace-quota-check",
+      "sha256": "47f258c716b498eb740feef1d4b5db8897fa97cd28f3ceb733402eca9bea0ba1",
+      "mode": "0755",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/user/autocontribute-rootless-docker-daemon.service",
+      "installed_path": "/etc/systemd/user/autocontribute-rootless-docker-daemon.service",
+      "sha256": "3bd3bb29cf75b1668aeb12bc864ae39494aa2c6ae6449986b41c72e9c6532b47",
+      "mode": "0644",
+      "required": true
+    }
+  ]
+}

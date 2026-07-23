@@ -27,7 +27,7 @@ from autocontribute.config import (
     validate_model_identifier,
 )
 from autocontribute.deployment import compute_deployment_fingerprint
-from autocontribute.exceptions import SandboxError
+from autocontribute.exceptions import AutocontributeError, SandboxError
 from autocontribute.github import GitHubClient
 from autocontribute.providers import create_provider
 from autocontribute.redaction import redact_text
@@ -40,6 +40,7 @@ from autocontribute.sandbox import (
     docker_container_identity,
 )
 from autocontribute.store import RunStore
+from autocontribute.systemd_assets import verify_installed_systemd_assets
 from autocontribute.upstream_outcomes import UpstreamPublicationScope
 
 _DETAIL_LIMIT = 500
@@ -149,7 +150,6 @@ def run_doctor(
     store: RunStore | None = None,
 ) -> list[DoctorCheck]:
     """Run bounded preflight probes without changing a repository or GitHub state."""
-
     secret_env_names = tuple(
         sorted(
             {
@@ -166,10 +166,35 @@ def run_doctor(
     names_token = _DOCTOR_SECRET_ENV_NAMES.set(secret_env_names)
     values_token = _DOCTOR_SECRET_VALUES.set(secret_values)
     try:
-        return _run_doctor(config, store=store)
+        deployment_check = _required_systemd_asset_check()
+        if deployment_check is not None and not deployment_check.passed:
+            return [deployment_check]
+        checks = _run_doctor(config, store=store)
+        return ([deployment_check] if deployment_check is not None else []) + checks
     finally:
         _DOCTOR_SECRET_VALUES.reset(values_token)
         _DOCTOR_SECRET_ENV_NAMES.reset(names_token)
+
+
+def _required_systemd_asset_check() -> DoctorCheck | None:
+    marker = os.environ.get("AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS")
+    if marker is None:
+        return None
+    if marker != "1":
+        return DoctorCheck(
+            "systemd deployment assets",
+            False,
+            "AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS must be exactly 1",
+        )
+    try:
+        result = verify_installed_systemd_assets()
+    except (AutocontributeError, OSError, ValueError) as exc:
+        return DoctorCheck("systemd deployment assets", False, _safe_detail(str(exc)))
+    return DoctorCheck(
+        "systemd deployment assets",
+        True,
+        (f"{result.checked_assets} release-bound files match manifest {result.manifest_sha256}"),
+    )
 
 
 def _run_doctor(

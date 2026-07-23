@@ -241,6 +241,19 @@ def test_runtime_digest_changes_with_python_interpreter(
     assert runtime_environment_digest() != first
 
 
+def test_runtime_digest_changes_with_packaged_systemd_asset_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = runtime_environment_digest()
+    monkeypatch.setattr(
+        deployment,
+        "packaged_systemd_asset_manifest_digest",
+        lambda: "f" * 64,
+    )
+
+    assert runtime_environment_digest() != first
+
+
 def test_run_deployment_validation_fails_closed_for_missing_or_stale_identity() -> None:
     config = AutocontributeConfig()
     current = compute_deployment_fingerprint(config)

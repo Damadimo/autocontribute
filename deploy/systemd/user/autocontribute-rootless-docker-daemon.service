@@ -1,0 +1,36 @@
+[Unit]
+Description=Autocontribute dedicated rootless Docker daemon
+Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
+
+[Service]
+Type=notify
+NotifyAccess=all
+WorkingDirectory=/var/lib/autocontribute
+UMask=0077
+
+Environment=HOME=/var/lib/autocontribute
+Environment=XDG_RUNTIME_DIR=/run/autocontribute
+Environment=DOCKER_HOST=unix:///run/autocontribute/docker.sock
+Environment=TMPDIR=/var/lib/autocontribute/tmp
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+
+ExecStartPre=/usr/bin/test -x /opt/autocontribute/current/.venv/bin/autocontribute
+ExecStartPre=/opt/autocontribute/current/.venv/bin/autocontribute deployment verify-systemd-assets
+ExecStartPre=/usr/local/libexec/autocontribute-docker-data-check --mount-only /var/lib/autocontribute/docker
+ExecStart=/usr/local/libexec/autocontribute-rootless-dockerd
+ExecReload=/bin/kill -s HUP $MAINPID
+
+Restart=no
+TimeoutStartSec=2m
+TimeoutStopSec=90s
+KillMode=mixed
+Delegate=yes
+TasksMax=infinity
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+SystemCallArchitectures=native
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autocontribute-rootless-dockerd

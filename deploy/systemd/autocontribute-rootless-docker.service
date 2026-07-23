@@ -1,37 +1,38 @@
 [Unit]
-Description=Create a verified complete Autocontribute state backup
+Description=Supervise the Autocontribute rootless Docker daemon
 Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
+Wants=network-online.target
+After=network-online.target systemd-user-sessions.service
+RequiresMountsFor=/var/lib/autocontribute/docker
 OnFailure=autocontribute-failure@%n.service
-StartLimitIntervalSec=8h
-StartLimitBurst=2
-RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute
+StartLimitIntervalSec=5m
+StartLimitBurst=6
 
 [Service]
-Type=oneshot
+Type=notify
+NotifyAccess=all
 User=autocontribute
 Group=autocontribute
 WorkingDirectory=/var/lib/autocontribute
 UMask=0077
 
 Environment=HOME=/var/lib/autocontribute
-Environment=TMPDIR=/var/backups/autocontribute
-Environment=NO_COLOR=1
-Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 
+RuntimeDirectory=autocontribute
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=restart
 ExecStartPre=/usr/bin/test -x /opt/autocontribute/current/.venv/bin/autocontribute
 ExecStartPre=/opt/autocontribute/current/.venv/bin/autocontribute deployment verify-systemd-assets
-ExecStartPre=/usr/bin/test -r /etc/autocontribute/autocontribute.yml
-ExecStartPre=/usr/bin/test -d /var/lib/autocontribute/state
-ExecStartPre=/usr/bin/test -d /var/backups/autocontribute
-ExecStart=/usr/bin/flock --exclusive --timeout 21600 /var/lib/autocontribute/operation.lock /usr/local/libexec/autocontribute-backup
-ExecStartPost=/usr/bin/touch /var/lib/autocontribute/health/backup-success
+ExecStartPre=/usr/local/libexec/autocontribute-rootless-docker-check --unit-only
+ExecStart=/usr/local/libexec/autocontribute-rootless-docker
+ExecReload=/usr/local/libexec/autocontribute-rootless-docker --reload
 
-TimeoutStartSec=7h
-TimeoutStopSec=2m
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=15m
+TimeoutStopSec=3m
 KillMode=control-group
-Restart=no
-Nice=10
-IOSchedulingClass=idle
 
 NoNewPrivileges=yes
 CapabilityBoundingSet=
@@ -41,7 +42,7 @@ PrivateNetwork=yes
 PrivateTmp=yes
 ProtectClock=yes
 ProtectControlGroups=yes
-ProtectHome=yes
+ProtectHome=read-only
 ProtectHostname=yes
 ProtectKernelLogs=yes
 ProtectKernelModules=yes
@@ -57,9 +58,11 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 KeyringMode=private
-ReadOnlyPaths=/etc/autocontribute /opt/autocontribute
-ReadWritePaths=/var/backups/autocontribute /var/lib/autocontribute
+ReadOnlyPaths=/etc/autocontribute /opt/autocontribute /var/lib/autocontribute/docker
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=autocontribute-backup
+SyslogIdentifier=autocontribute-rootless-docker
+
+[Install]
+WantedBy=multi-user.target

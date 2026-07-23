@@ -44,76 +44,203 @@ jobs:
         env:
           AUTOCONTRIBUTE_RUN_DOCKER_TESTS: "1"
         run: uv run pytest -q tests/test_sandbox_live.py
-      - name: Exercise live rootless Docker isolation
+      - name: Exercise live rootless Docker production topology
         if: matrix.docker_mode == 'rootless'
         env:
           AUTOCONTRIBUTE_RUN_DOCKER_TESTS: "1"
         run: |
           set -Eeuo pipefail
 
-          daemon_pid=""
-          daemon_unit="autocontribute-rootless-docker-ci.service"
-          delegate_drop_in="/etc/systemd/system/user@.service.d/autocontribute-ci-delegate.conf"
-          delegate_installed=0
-          linger_was_enabled=1
-          user_manager_was_active=1
+          account=autocontribute
+          service_home=/var/lib/autocontribute
+          system_unit=autocontribute-rootless-docker.service
+          user_unit=autocontribute-rootless-docker-daemon.service
+          system_fragment=/etc/systemd/system/autocontribute-rootless-docker.service
+          user_fragment=/etc/systemd/user/autocontribute-rootless-docker-daemon.service
+          manager_drop_in=""
+          manager_drop_in_directory=""
+          expected_unit_path=/etc/systemd/user:/run/systemd/user:/usr/local/lib/systemd/user:/usr/lib/systemd/user
+          expected_manager_unit_path='/etc/systemd/user /run/systemd/user /usr/local/lib/systemd/user /usr/lib/systemd/user'
+          runtime=/run/autocontribute
+          docker_socket=/run/autocontribute/docker.sock
+          rootful_socket=/var/run/docker.sock
           docker_apt_key=/etc/apt/keyrings/autocontribute-rootless-docker.asc
           docker_apt_source=/etc/apt/sources.list.d/autocontribute-rootless-docker.list
-          rootless_error() {
-            status=$?
-            printf 'Rootless Docker integration failed at script line %s\n' \
-              "${BASH_LINENO[0]:-unknown}" >&2
-            exit "$status"
-          }
+          data_image=""
+          loop_device=""
+          service_uid=""
+          service_gid=""
+          smoke_root=""
+          account_created=0
+          data_mounted=0
+          fixture_preflight_complete=0
+          manager_drop_in_preflight_complete=0
+          service_home_created=0
+          topology_installed=0
+
           show_rootless_diagnostics() {
-            sed -n '1,200p' "${RUNNER_TEMP}/rootless-dockerd.log" 2>/dev/null || true
-            if [[ -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
-              systemctl --user --no-pager --full status "$daemon_unit" || true
+            sudo systemctl --no-pager --full status "$system_unit" 2>/dev/null || true
+            sudo journalctl --no-pager -n 200 -u "$system_unit" 2>/dev/null || true
+            if [[ -n "$service_uid" ]] && \
+               sudo test -S "/run/user/${service_uid}/bus"; then
+              sudo -u "$account" env \
+                HOME="$service_home" \
+                XDG_RUNTIME_DIR="/run/user/${service_uid}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${service_uid}/bus" \
+                systemctl --user --no-pager --full status "$user_unit" \
+                2>/dev/null || true
+              sudo -u "$account" env \
+                HOME="$service_home" \
+                XDG_RUNTIME_DIR="/run/user/${service_uid}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${service_uid}/bus" \
+                journalctl --user --no-pager -n 200 -u "$user_unit" \
+                2>/dev/null || true
             fi
           }
+
+          rootless_error() {
+            local exit_status=$?
+            printf 'Rootless Docker production-topology integration failed at line %s\n' \
+              "${BASH_LINENO[0]:-unknown}" >&2
+            show_rootless_diagnostics
+            exit "$exit_status"
+          }
+
           cleanup_rootless_job() {
-            trap - ERR
+            local exit_status=$?
+            local cleanup_failed=0
+            local mount_detached=1
+            trap - ERR EXIT
             set +e
-            if [[ -n "${XDG_RUNTIME_DIR:-}" && -S "${XDG_RUNTIME_DIR}/bus" ]]; then
-              systemctl --user stop --no-block "$daemon_unit" 2>/dev/null || true
-              for _cleanup_attempt in $(seq 1 20); do
-                daemon_state="$(
-                  systemctl --user show "$daemon_unit" --property=ActiveState --value \
-                    2>/dev/null || true
-                )"
-                if [[ "$daemon_state" != active && "$daemon_state" != activating && \
-                      "$daemon_state" != deactivating ]]; then
-                  break
-                fi
-                sleep 0.5
-              done
-              if [[ "$daemon_state" == active || "$daemon_state" == activating || \
-                    "$daemon_state" == deactivating ]]; then
-                systemctl --user kill --kill-whom=all --signal=KILL "$daemon_unit" \
+
+            if [[ "$topology_installed" -eq 1 ]]; then
+              if ! sudo systemctl stop "$system_unit" 2>/dev/null; then
+                sudo systemctl kill --kill-whom=all --signal=KILL "$system_unit" \
                   2>/dev/null || true
-              fi
-              systemctl --user reset-failed "$daemon_unit" 2>/dev/null || true
-            fi
-            if [[ "$delegate_installed" -eq 1 ]]; then
-              sudo rm -f -- "$delegate_drop_in"
-              sudo systemctl daemon-reload
-              if [[ "$user_manager_was_active" -eq 1 ]]; then
-                sudo systemctl restart "user@${service_uid}.service" 2>/dev/null || true
-              else
-                sudo systemctl stop "user@${service_uid}.service" 2>/dev/null || true
+                cleanup_failed=1
               fi
             fi
-            if [[ "$linger_was_enabled" -eq 0 ]]; then
+            if [[ -n "$service_uid" ]]; then
+              if sudo test -S "/run/user/${service_uid}/bus"; then
+                sudo -u "$account" env \
+                  HOME="$service_home" \
+                  XDG_RUNTIME_DIR="/run/user/${service_uid}" \
+                  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${service_uid}/bus" \
+                  systemctl --user stop "$user_unit" 2>/dev/null || true
+              fi
+              sudo systemctl stop "user@${service_uid}.service" 2>/dev/null || true
+            fi
+            if [[ "$account_created" -eq 1 ]]; then
               sudo loginctl disable-linger "$account" 2>/dev/null || true
             fi
-            sudo rm -f -- "$docker_apt_source" "$docker_apt_key"
+
+            if [[ "$data_mounted" -eq 1 ]] && \
+               sudo mountpoint --quiet -- "$service_home/docker"; then
+              if sudo umount -- "$service_home/docker"; then
+                data_mounted=0
+              else
+                printf '%s\n' 'Failed to unmount the live rootless Docker data root' >&2
+                cleanup_failed=1
+                mount_detached=0
+              fi
+            fi
+            if [[ "$mount_detached" -eq 1 && -n "$loop_device" ]]; then
+              if sudo losetup --detach "$loop_device"; then
+                loop_device=""
+              else
+                printf '%s\n' 'Failed to detach the live rootless Docker loop device' >&2
+                cleanup_failed=1
+                mount_detached=0
+              fi
+            fi
+
+            if [[ "$fixture_preflight_complete" -eq 1 ]]; then
+              sudo rm -f -- \
+                /etc/systemd/system/autocontribute-failure@.service \
+                "$system_fragment" \
+                "$user_fragment" \
+                /etc/autocontribute/rootless-docker-daemon.json \
+                /usr/local/libexec/autocontribute-docker-data-check \
+                /usr/local/libexec/autocontribute-record-failure \
+                /usr/local/libexec/autocontribute-rootless-docker \
+                /usr/local/libexec/autocontribute-rootless-docker-check \
+                /usr/local/libexec/autocontribute-rootless-dockerd \
+                /opt/autocontribute/current/.venv/bin/autocontribute \
+                "$docker_apt_source" \
+                "$docker_apt_key"
+              sudo rmdir --ignore-fail-on-non-empty \
+                /etc/autocontribute \
+                /opt/autocontribute/current/.venv/bin \
+                /opt/autocontribute/current/.venv \
+                /opt/autocontribute/current \
+                /opt/autocontribute 2>/dev/null || true
+            fi
+            if [[ "$manager_drop_in_preflight_complete" -eq 1 ]]; then
+              sudo rm -f -- "$manager_drop_in"
+              sudo rmdir --ignore-fail-on-non-empty \
+                "$manager_drop_in_directory" 2>/dev/null || true
+            fi
+            sudo systemctl daemon-reload 2>/dev/null || cleanup_failed=1
+
+            if [[ "$account_created" -eq 1 ]]; then
+              sudo userdel "$account" 2>/dev/null || cleanup_failed=1
+              account_created=0
+            fi
+            if [[ "$mount_detached" -eq 1 && \
+                  "$service_home_created" -eq 1 && -d "$service_home" ]]; then
+              sudo rm -rf -- "$service_home"
+              service_home_created=0
+            fi
+            if [[ "$mount_detached" -eq 1 && -n "$data_image" ]]; then
+              rm -f -- "$data_image" || cleanup_failed=1
+            fi
+            if [[ "$mount_detached" -eq 1 && -n "$smoke_root" && -d "$smoke_root" ]]; then
+              rmdir -- "$smoke_root" 2>/dev/null || cleanup_failed=1
+            fi
+            if [[ "$exit_status" -eq 0 && "$cleanup_failed" -ne 0 ]]; then
+              exit_status=1
+            fi
+            exit "$exit_status"
           }
           trap rootless_error ERR
           trap cleanup_rootless_job EXIT
 
+          test "$(cat /proc/1/comm)" = systemd
+          test "$(stat --file-system --format=%T /sys/fs/cgroup)" = cgroup2fs
+          if getent passwd "$account" >/dev/null || getent group "$account" >/dev/null; then
+            printf '%s\n' 'The production-topology fixture account already exists' >&2
+            exit 1
+          fi
+          for fixture_path in \
+            "$service_home" \
+            "$system_fragment" \
+            "$user_fragment" \
+            /etc/systemd/system/autocontribute-failure@.service \
+            /etc/systemd/system/user@.service.d/50-autocontribute.conf \
+            /etc/autocontribute \
+            /etc/autocontribute/rootless-docker-daemon.json \
+            /usr/local/libexec/autocontribute-docker-data-check \
+            /usr/local/libexec/autocontribute-record-failure \
+            /usr/local/libexec/autocontribute-rootless-docker \
+            /usr/local/libexec/autocontribute-rootless-docker-check \
+            /usr/local/libexec/autocontribute-rootless-dockerd \
+            "$docker_apt_key" \
+            "$docker_apt_source" \
+            /opt/autocontribute \
+            /opt/autocontribute/current/.venv/bin/autocontribute; do
+            if sudo test -e "$fixture_path" || sudo test -L "$fixture_path"; then
+              printf 'Production-topology fixture path already exists: %s\n' \
+                "$fixture_path" >&2
+              exit 1
+            fi
+          done
+          unset fixture_path
+          fixture_preflight_complete=1
+
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            ca-certificates curl dbus-user-session fuse-overlayfs gnupg slirp4netns uidmap
+            ca-certificates curl dbus-user-session e2fsprogs fuse-overlayfs \
+            gnupg slirp4netns uidmap
 
           docker_package_version="$(
             dpkg-query --show --showformat='${Version}' docker-ce 2>/dev/null
@@ -160,13 +287,11 @@ jobs:
           installed_extras_version="$(
             dpkg-query --show --showformat='${Version}' docker-ce-rootless-extras
           )"
-          if [[ "$installed_extras_version" != "$docker_package_version" ]]; then
-            printf 'Rootless extras version does not match Docker Engine\n' >&2
-            exit 1
-          fi
+          test "$installed_extras_version" = "$docker_package_version"
           for command_name in \
-            docker dockerd-rootless.sh fuse-overlayfs newgidmap newuidmap \
-            rootlesskit setsid slirp4netns; do
+            docker dockerd-rootless.sh fallocate findmnt fuse-overlayfs losetup \
+            mkfs.ext4 mount mountpoint newgidmap newuidmap rootlesskit setsid \
+            slirp4netns umount; do
             if ! command -v "$command_name" >/dev/null; then
               printf 'Required rootless command is unavailable: %s\n' "$command_name" >&2
               exit 1
@@ -174,9 +299,25 @@ jobs:
           done
           unset command_name
 
-          account="$(id --user --name)"
+          sudo useradd --system --user-group --no-create-home --home-dir "$service_home" \
+            --shell /usr/sbin/nologin "$account"
+          account_created=1
+          service_uid="$(id --user "$account")"
+          service_gid="$(id --group "$account")"
+          [[ "$service_uid" =~ ^[1-9][0-9]*$ ]]
+          [[ "$service_gid" =~ ^[1-9][0-9]*$ ]]
+          manager_drop_in_directory="/etc/systemd/system/user@${service_uid}.service.d"
+          manager_drop_in="${manager_drop_in_directory}/50-autocontribute.conf"
+          if sudo test -e "$manager_drop_in_directory" || \
+             sudo test -L "$manager_drop_in_directory"; then
+            printf 'Production-topology fixture path already exists: %s\n' \
+              "$manager_drop_in_directory" >&2
+            exit 1
+          fi
+          manager_drop_in_preflight_complete=1
+
           subordinate_range="$(
-            AUTOCONTRIBUTE_ACCOUNT="$account" uv run --frozen python - <<'PY'
+            AUTOCONTRIBUTE_ACCOUNT="$account" python3 - <<'PY'
           import os
           from pathlib import Path
 
@@ -223,7 +364,7 @@ jobs:
               --add-subgids "${range_start}-${range_end}" \
               "$account"
           elif [[ "$range_action" != existing ]]; then
-            printf '%s\n' 'invalid subordinate-range selection' >&2
+            printf '%s\n' 'Invalid subordinate-range selection' >&2
             exit 1
           fi
           for subordinate_file in /etc/subuid /etc/subgid; do
@@ -232,158 +373,321 @@ jobs:
                END { exit found != 1 }' \
               "$subordinate_file"
           done
+          unset subordinate_file
 
           sudo systemctl stop docker.service docker.socket
           if sudo systemctl is-active --quiet docker.service || \
              sudo systemctl is-active --quiet docker.socket; then
-            printf 'Rootful Docker units remained active after shutdown\n' >&2
+            printf '%s\n' 'Rootful Docker units remained active after shutdown' >&2
             exit 1
           fi
-          if docker --host unix:///var/run/docker.sock info >/dev/null 2>&1; then
-            printf 'Rootful Docker remained reachable after shutdown\n' >&2
+          if docker --host unix://$rootful_socket info >/dev/null 2>&1; then
+            printf '%s\n' 'Rootful Docker remained reachable after shutdown' >&2
             exit 1
           fi
-          sudo rm -f -- /var/run/docker.sock
-          sudo test ! -e /var/run/docker.sock
+          sudo rm -f -- "$rootful_socket"
+          sudo test ! -e "$rootful_socket"
 
-          service_uid="$(id --user)"
-          service_gid="$(id --group)"
-          test "$(stat --file-system --format=%T /sys/fs/cgroup)" = cgroup2fs
+          sudo install -d -o root -g "$account" -m 0750 "$service_home"
+          service_home_created=1
+          sudo install -d -o "$account" -g "$account" -m 0700 \
+            "$service_home/tmp" "$service_home/health"
+          sudo install -d -o "$account" -g "$account" -m 0710 \
+            "$service_home/docker"
+          test "$(stat --format=%u:%g:%a "$service_home")" = \
+            "0:${service_gid}:750"
 
-          if ! sudo systemctl is-active --quiet "user@${service_uid}.service"; then
-            user_manager_was_active=0
-          fi
-          if [[ "$(loginctl show-user "$account" --property=Linger --value)" != yes ]]; then
-            linger_was_enabled=0
-            sudo loginctl enable-linger "$account"
-          fi
-          sudo install -d -m 0755 /etc/systemd/system/user@.service.d
-          sudo test ! -e "$delegate_drop_in"
+          smoke_root="$(mktemp --directory \
+            "${RUNNER_TEMP}/autocontribute-rootless-topology.XXXXXX")"
+          smoke_root="$(realpath "$smoke_root")"
+          data_image="${smoke_root}/docker.ext4"
+          fallocate --length 4G "$data_image"
+          loop_device="$(sudo losetup --find --show "$data_image")"
+          [[ "$loop_device" =~ ^/dev/loop[0-9]+$ ]]
+          sudo mkfs.ext4 -q -m 0 -N 131072 "$loop_device"
+          sudo mount -t ext4 -o nodev,nosuid -- \
+            "$loop_device" "$service_home/docker"
+          data_mounted=1
+          sudo chown "$account:$account" "$service_home/docker"
+          sudo chmod 0710 "$service_home/docker"
+          test "$(sudo stat --format=%u:%g:%a "$service_home/docker")" = \
+            "${service_uid}:${service_gid}:710"
+          home_entries_before="$(sudo find "$service_home" \
+            -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+          test "$home_entries_before" = $'docker\nhealth\ntmp'
+
+          sudo install -d -o root -g "$account" -m 0750 /etc/autocontribute
           printf '%s\n' \
-            '[Service]' \
-            'Delegate=cpu cpuset io memory pids' \
-            | sudo tee "$delegate_drop_in" >/dev/null
-          sudo chmod 0644 "$delegate_drop_in"
-          delegate_installed=1
+            '{' \
+            '  "storage-driver": "fuse-overlayfs"' \
+            '}' \
+            | sudo install -o root -g "$account" -m 0640 \
+                /dev/stdin /etc/autocontribute/rootless-docker-daemon.json
+          sudo python3 -m json.tool \
+            /etc/autocontribute/rootless-docker-daemon.json >/dev/null
+
+          sudo install -d -o root -g root -m 0755 \
+            /usr/local/libexec \
+            "$manager_drop_in_directory" \
+            /etc/systemd/user \
+            /opt/autocontribute/current/.venv/bin
+          sudo install -o root -g root -m 0755 \
+            deploy/systemd/libexec/autocontribute-docker-data-check \
+            deploy/systemd/libexec/autocontribute-record-failure \
+            deploy/systemd/libexec/autocontribute-rootless-docker \
+            deploy/systemd/libexec/autocontribute-rootless-docker-check \
+            deploy/systemd/libexec/autocontribute-rootless-dockerd \
+            /usr/local/libexec/
+          sudo install -o root -g root -m 0755 \
+            /usr/bin/true /opt/autocontribute/current/.venv/bin/autocontribute
+          sudo install -o root -g root -m 0644 \
+            deploy/systemd/autocontribute-failure@.service \
+            deploy/systemd/autocontribute-rootless-docker.service \
+            /etc/systemd/system/
+          sudo install -o root -g root -m 0644 \
+            deploy/systemd/user/autocontribute-rootless-docker-daemon.service \
+            "$user_fragment"
+          sudo install -o root -g root -m 0644 \
+            deploy/systemd/autocontribute-user-manager.conf \
+            "$manager_drop_in"
+          topology_installed=1
+
+          cmp --silent deploy/systemd/autocontribute-rootless-docker.service \
+            "$system_fragment"
+          cmp --silent \
+            deploy/systemd/user/autocontribute-rootless-docker-daemon.service \
+            "$user_fragment"
+          cmp --silent deploy/systemd/autocontribute-user-manager.conf \
+            "$manager_drop_in"
+          test "$(stat --format=%U:%G:%a "$system_fragment")" = root:root:644
+          test "$(stat --format=%U:%G:%a "$user_fragment")" = root:root:644
+          test "$(stat --format=%U:%G:%a "$manager_drop_in")" = root:root:644
+
+          sudo loginctl enable-linger "$account"
           sudo systemctl daemon-reload
           sudo systemctl restart "user@${service_uid}.service"
-
-          runtime="/run/user/${service_uid}"
-          if [[ -L "$runtime" ]]; then
-            printf '%s\n' 'rootless runtime directory must not be a symlink' >&2
-            exit 1
-          fi
-          test -d "$runtime"
-          test "$(stat --format=%u "$runtime")" = "$service_uid"
-          test "$(stat --format=%g "$runtime")" = "$service_gid"
-          test "$(stat --format=%a "$runtime")" = 700
-
-          export XDG_RUNTIME_DIR="$runtime"
-          export DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime}/bus"
+          user_runtime="/run/user/${service_uid}"
+          user_bus="${user_runtime}/bus"
           user_manager_ready=0
-          for _attempt in $(seq 1 20); do
-            if [[ -S "${runtime}/bus" ]] && systemctl --user show-environment >/dev/null 2>&1; then
+          for _attempt in $(seq 1 40); do
+            if sudo test -S "$user_bus" && \
+               sudo -u "$account" env \
+                 HOME="$service_home" \
+                 XDG_RUNTIME_DIR="$user_runtime" \
+                 DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus" \
+                 systemctl --user show-environment >/dev/null 2>&1; then
               user_manager_ready=1
               break
             fi
             sleep 0.5
           done
           test "$user_manager_ready" -eq 1
-          test "$(stat --format=%u "${runtime}/bus")" = "$service_uid"
-          test "$(stat --format=%g "${runtime}/bus")" = "$service_gid"
+          test "$(stat --format=%u:%g:%a "$user_runtime")" = \
+            "${service_uid}:${service_gid}:700"
+          test "$(sudo stat --format=%u:%g "$user_bus")" = \
+            "${service_uid}:${service_gid}"
 
-          user_manager_cgroup="$(
-            sudo systemctl show "user@${service_uid}.service" \
-              --property=ControlGroup --value
-          )"
-          [[ "$user_manager_cgroup" == /* ]]
-          user_manager_cgroup_path="/sys/fs/cgroup${user_manager_cgroup}"
-          test -f "${user_manager_cgroup_path}/cgroup.controllers"
+          manager_unit="user@${service_uid}.service"
+          manager_drop_ins="$(sudo systemctl show "$manager_unit" \
+            --property=DropInPaths --value)"
+          read -r -a manager_drop_in_paths <<<"$manager_drop_ins"
+          expected_manager_drop_ins=(
+            /usr/lib/systemd/system/user@.service.d/10-login-barrier.conf
+            "$manager_drop_in"
+            /usr/lib/systemd/system/user@.service.d/timeout.conf
+          )
+          test "${#manager_drop_in_paths[@]}" -eq \
+            "${#expected_manager_drop_ins[@]}"
+          for expected_manager_drop_in in "${expected_manager_drop_ins[@]}"; do
+            manager_drop_in_count=0
+            for manager_drop_in_path in "${manager_drop_in_paths[@]}"; do
+              if [[ "$manager_drop_in_path" == "$expected_manager_drop_in" ]]; then
+                manager_drop_in_count=$((manager_drop_in_count + 1))
+              fi
+            done
+            test "$manager_drop_in_count" -eq 1
+            test "$(stat --format=%U:%G:%a "$expected_manager_drop_in")" = \
+              root:root:644
+          done
+          unset expected_manager_drop_in manager_drop_in_count manager_drop_in_path
+          test "$(sudo systemctl show "$manager_unit" \
+            --property=Delegate --value)" = yes
+          test "$(sudo systemctl show "$manager_unit" \
+            --property=Transient --value)" = no
+          test "$(sudo systemctl show "$manager_unit" \
+            --property=FragmentPath --value)" = \
+            /usr/lib/systemd/system/user@.service
+          test "$(stat --format=%U:%G:%a \
+            /usr/lib/systemd/system/user@.service)" = root:root:644
+          test "$(sudo systemctl show "$manager_unit" \
+            --property=Environment --value)" = \
+            "SYSTEMD_UNIT_PATH=$expected_unit_path"
+          manager_cgroup="$(sudo systemctl show "$manager_unit" \
+            --property=ControlGroup --value)"
+          test "$manager_cgroup" = \
+            "/user.slice/user-${service_uid}.slice/user@${service_uid}.service"
           for controller in cpu cpuset io memory pids; do
             grep --word-regexp --quiet "$controller" \
-              "${user_manager_cgroup_path}/cgroup.controllers"
+              "/sys/fs/cgroup${manager_cgroup}/cgroup.controllers"
           done
           unset controller
 
-          rootless_state="${RUNNER_TEMP}/autocontribute-rootless-docker"
-          data_root="${rootless_state}/data"
-          exec_root="${rootless_state}/exec"
-          install -d -m 0700 "$rootless_state" "$data_root" "$exec_root"
-          data_root="$(readlink --canonicalize "$data_root")"
-          exec_root="$(readlink --canonicalize "$exec_root")"
-          export DOCKER_HOST="unix://${runtime}/docker.sock"
-          unset DOCKER_CONTEXT DOCKER_CERT_PATH DOCKER_TLS_VERIFY
+          user_systemctl=(
+            sudo -u "$account" env
+            "HOME=$service_home"
+            "XDG_RUNTIME_DIR=$user_runtime"
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=$user_bus"
+            systemctl --user
+          )
+          "${user_systemctl[@]}" daemon-reload
+          manager_effective_unit_path="$("${user_systemctl[@]}" show \
+            --property=UnitPath --value)"
+          test "$manager_effective_unit_path" = "$expected_manager_unit_path"
+          test "$("${user_systemctl[@]}" show "$user_unit" \
+            --property=FragmentPath --value)" = "$user_fragment"
+          test -z "$("${user_systemctl[@]}" show "$user_unit" \
+            --property=DropInPaths --value)"
+          test "$("${user_systemctl[@]}" show "$user_unit" \
+            --property=Transient --value)" = no
 
-          rootless_daemon="$(command -v dockerd-rootless.sh)"
-          systemd-run --user \
-              --unit="$daemon_unit" \
-              --collect \
-              --property=Type=exec \
-              --property=Delegate=yes \
-              --property=KillMode=mixed \
-              --property=TimeoutStopSec=10s \
-              --property="StandardOutput=append:${RUNNER_TEMP}/rootless-dockerd.log" \
-              --property="StandardError=append:${RUNNER_TEMP}/rootless-dockerd.log" \
-              --setenv="DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" \
-              --setenv="DOCKER_HOST=$DOCKER_HOST" \
-              --setenv="HOME=$HOME" \
-              --setenv="PATH=$PATH" \
-              --setenv="RUNNER_TRACKING_ID=" \
-              --setenv="XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" \
-              "$rootless_daemon" \
-              --data-root="$data_root" \
-              --exec-root="$exec_root" \
-              --host="$DOCKER_HOST" \
-              --pidfile="${rootless_state}/docker.pid" \
-              --storage-driver=fuse-overlayfs
-          daemon_pid="$(
-            systemctl --user show "$daemon_unit" --property=MainPID --value
-          )"
-          [[ "$daemon_pid" =~ ^[1-9][0-9]*$ ]]
+          manager_pid_before="$(sudo systemctl show "$manager_unit" \
+            --property=MainPID --value)"
+          [[ "$manager_pid_before" =~ ^[1-9][0-9]*$ ]]
+          bus_response="$(sudo -u "$account" env \
+            HOME="$service_home" \
+            XDG_RUNTIME_DIR="$user_runtime" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus" \
+            busctl --user --no-pager call \
+              org.freedesktop.DBus /org/freedesktop/DBus \
+              org.freedesktop.DBus GetConnectionUnixProcessID \
+              s org.freedesktop.systemd1)"
+          read -r bus_signature bus_pid bus_extra <<<"$bus_response"
+          test "$bus_signature" = u
+          test "$bus_pid" = "$manager_pid_before"
+          test -z "$bus_extra"
+          test "$(sudo systemctl show "$manager_unit" \
+            --property=MainPID --value)" = "$manager_pid_before"
+          sudo -u "$account" test -r "/proc/${manager_pid_before}/status"
+          sudo -u "$account" test -r "/proc/${manager_pid_before}/cgroup"
+          sudo -u "$account" test -r "/proc/${manager_pid_before}/environ"
+          printf 'Rootless user-manager fragment: %s\n' \
+            /usr/lib/systemd/system/user@.service
+          printf 'Rootless user-manager drop-ins: %s\n' "$manager_drop_ins"
+          printf 'Rootless user-manager UnitPath: %s\n' \
+            "$manager_effective_unit_path"
+          printf 'Rootless user-manager stable PID: %s\n' "$manager_pid_before"
 
-          daemon_cgroup="$(
-            systemctl --user show "$daemon_unit" --property=ControlGroup --value
-          )"
-          [[ "$daemon_cgroup" == /* ]]
-          daemon_cgroup_path="/sys/fs/cgroup${daemon_cgroup}"
-          test -f "${daemon_cgroup_path}/cgroup.controllers"
-          for controller in cpu cpuset io memory pids; do
-            grep --word-regexp --quiet "$controller" \
-              "${daemon_cgroup_path}/cgroup.controllers"
-          done
-          unset controller
+          sudo systemctl start "$system_unit"
+          sudo systemctl is-active --quiet "$system_unit"
+          test "$(sudo systemctl show "$system_unit" \
+            --property=SubState --value)" = running
+          test "$(sudo systemctl show "$system_unit" \
+            --property=FragmentPath --value)" = "$system_fragment"
+          test -z "$(sudo systemctl show "$system_unit" \
+            --property=DropInPaths --value)"
+          "${user_systemctl[@]}" is-active --quiet "$user_unit"
+          test "$("${user_systemctl[@]}" show "$user_unit" \
+            --property=SubState --value)" = running
+          test "$("${user_systemctl[@]}" show "$user_unit" \
+            --property=FragmentPath --value)" = "$user_fragment"
+          test -z "$("${user_systemctl[@]}" show "$user_unit" \
+            --property=DropInPaths --value)"
+          test "$("${user_systemctl[@]}" show "$user_unit" \
+            --property=Transient --value)" = no
 
-          ready=0
-          for _attempt in $(seq 1 60); do
-            if ! systemctl --user is-active --quiet "$daemon_unit"; then
-              show_rootless_diagnostics
-              exit 1
-            fi
-            if docker info >/dev/null 2>&1; then
-              ready=1
-              break
-            fi
-            sleep 1
-          done
-          if [ "$ready" -ne 1 ]; then
-            show_rootless_diagnostics
-            exit 1
-          fi
-          mode="$(
-            uv run python -c \
-              'from autocontribute.sandbox import detect_docker_daemon_mode; print(detect_docker_daemon_mode())'
-          )"
+          test -d "$runtime"
+          test ! -L "$runtime"
+          test "$(stat --format=%u:%g:%a "$runtime")" = \
+            "${service_uid}:${service_gid}:700"
+          sudo test -S "$docker_socket"
+          sudo test ! -L "$docker_socket"
+          test "$(sudo stat --format=%u:%g "$docker_socket")" = \
+            "${service_uid}:${service_gid}"
+          sudo test ! -e "/run/user/${service_uid}/docker.sock"
+          sudo -u "$account" env \
+            HOME="$service_home" \
+            XDG_RUNTIME_DIR="$runtime" \
+            DOCKER_HOST="unix://$docker_socket" \
+            /usr/local/libexec/autocontribute-rootless-docker-check \
+              "$runtime" "$docker_socket" "$rootful_socket"
+
+          service_env=(
+            sudo -u "$account" env
+            "HOME=$service_home"
+            "TMPDIR=$service_home/tmp"
+            "XDG_RUNTIME_DIR=$runtime"
+            "DOCKER_HOST=unix://$docker_socket"
+            "PATH=$GITHUB_WORKSPACE/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+          )
+
+          proxy_pid_before="$(sudo systemctl show "$system_unit" \
+            --property=MainPID --value)"
+          daemon_pid_before="$("${user_systemctl[@]}" show "$user_unit" \
+            --property=MainPID --value)"
+          [[ "$proxy_pid_before" =~ ^[1-9][0-9]*$ ]]
+          [[ "$daemon_pid_before" =~ ^[1-9][0-9]*$ ]]
+          sudo systemctl reload "$system_unit"
+          sudo systemctl is-active --quiet "$system_unit"
+          test "$(sudo systemctl show "$system_unit" \
+            --property=SubState --value)" = running
+          test "$(sudo systemctl show "$system_unit" \
+            --property=MainPID --value)" = "$proxy_pid_before"
+          test "$(sudo systemctl show "$manager_unit" \
+            --property=MainPID --value)" = "$manager_pid_before"
+          "${user_systemctl[@]}" is-active --quiet "$user_unit"
+          test "$("${user_systemctl[@]}" show "$user_unit" \
+            --property=SubState --value)" = running
+          test "$("${user_systemctl[@]}" show "$user_unit" \
+            --property=MainPID --value)" = "$daemon_pid_before"
+          sudo test -S "$docker_socket"
+          sudo -u "$account" env \
+            HOME="$service_home" \
+            XDG_RUNTIME_DIR="$runtime" \
+            DOCKER_HOST="unix://$docker_socket" \
+            /usr/local/libexec/autocontribute-rootless-docker-check \
+              "$runtime" "$docker_socket" "$rootful_socket"
+          "${service_env[@]}" docker info >/dev/null
+
+          "${service_env[@]}" "$GITHUB_WORKSPACE/.venv/bin/python" -c \
+            'import autocontribute; import autocontribute.cli'
+          "${service_env[@]}" "$GITHUB_WORKSPACE/.venv/bin/autocontribute" \
+            --help >/dev/null
+          git_smoke="$service_home/tmp/git-smoke"
+          "${service_env[@]}" install -d -m 0700 "$git_smoke"
+          "${service_env[@]}" git init --quiet --initial-branch=main "$git_smoke"
+          "${service_env[@]}" git -C "$git_smoke" config --local \
+            user.name 'Autocontribute CI'
+          "${service_env[@]}" git -C "$git_smoke" config --local \
+            user.email autocontribute-ci@example.invalid
+          "${service_env[@]}" git -C "$git_smoke" status --short
+          test "$("${service_env[@]}" git -C "$git_smoke" config --local \
+            --get user.name)" = 'Autocontribute CI'
+          home_entries_after="$(sudo find "$service_home" \
+            -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+          test "$home_entries_after" = "$home_entries_before"
+          test "$(stat --format=%u:%g:%a "$service_home")" = \
+            "0:${service_gid}:750"
+          sudo test ! -e "$service_home/.gitconfig"
+
+          mode="$("${service_env[@]}" "$GITHUB_WORKSPACE/.venv/bin/python" -c \
+            'from autocontribute.sandbox import detect_docker_daemon_mode; print(detect_docker_daemon_mode())')"
           test "$mode" = rootless
-          test "$(docker info --format '{{.DockerRootDir}}')" = "$data_root"
-          test "$(docker info --format '{{.CgroupVersion}}')" = 2
-          cgroup_driver="$(docker info --format '{{.CgroupDriver}}')"
+          test "$("${service_env[@]}" docker info \
+            --format '{{.DockerRootDir}}')" = "$service_home/docker"
+          test "$("${service_env[@]}" docker info \
+            --format '{{.CgroupVersion}}')" = 2
+          cgroup_driver="$("${service_env[@]}" docker info \
+            --format '{{.CgroupDriver}}')"
           test -n "$cgroup_driver"
           test "$cgroup_driver" != none
-          test "$(docker version --format '{{.Client.Version}}')" = \
-            "$(docker version --format '{{.Server.Version}}')"
+          test "$("${service_env[@]}" docker version \
+            --format '{{.Client.Version}}')" = \
+            "$("${service_env[@]}" docker version --format '{{.Server.Version}}')"
           printf 'Rootless Docker cgroup driver: %s\n' "$cgroup_driver"
-          image="$(uv run python -c 'from autocontribute.config import SandboxConfig; print(SandboxConfig().image)')"
-          docker pull "$image"
-          kill -0 "$daemon_pid"
-          systemctl --user is-active --quiet "$daemon_unit"
-          uv run pytest -q tests/test_sandbox_live.py
+
+          image="$("$GITHUB_WORKSPACE/.venv/bin/python" -c \
+            'from autocontribute.config import SandboxConfig; print(SandboxConfig().image)')"
+          "${service_env[@]}" docker pull "$image"
+          "${service_env[@]}" env AUTOCONTRIBUTE_RUN_DOCKER_TESTS=1 \
+            "$GITHUB_WORKSPACE/.venv/bin/pytest" \
+              -q -p no:cacheprovider tests/test_sandbox_live.py

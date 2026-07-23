@@ -114,8 +114,9 @@ the preview and does not weaken the post-preview subject-drift check.
 Autonomous rollout remains blocked until the first 100 persisted runs with that fingerprint, ordered
 by creation timestamp and then run ID, all have an evaluable completed outcome and an anchored expert
 grade. The fingerprint covers exact package source, the Python interpreter, the installed runtime
-dependency closure and packaged build/lock manifest, and material model, budget, discovery, sandbox,
-validation, policy, quality, and publishing-safety configuration. This fixed cohort must include at
+dependency closure, packaged build/lock manifest, release-bound systemd deployment-asset manifest,
+and material model, budget, discovery, sandbox, validation, policy, quality, and publishing-safety
+configuration. This fixed cohort must include at
 least 20 prepared cases, at least 95% accept-as-is precision among prepared cases, and zero policy,
 security, or etiquette failures. Other deployments cannot contribute cases. Any material code, model,
 or configuration change requires a new 100-run calibration; later grades are still validated but

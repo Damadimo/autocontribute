@@ -20,12 +20,15 @@ Use this layout on one durable host:
 | `/opt/autocontribute/releases/<revision>` | `root:root`, not writable by the worker | Immutable application release and virtual environment |
 | `/opt/autocontribute/current` | `root:root` symlink | Atomically selected release |
 | `/etc/autocontribute/autocontribute.yml` | `root:autocontribute`, `0640` | Reviewed, non-secret policy and repository configuration |
+| `/etc/autocontribute/rootless-docker-daemon.json` | `root:autocontribute`, `0640` | Reviewed rootless-daemon configuration pinned by the launcher |
 | `/etc/autocontribute/credentials/*.cred` | `root:root`, `0600` | Encrypted systemd credentials |
+| `/var/lib/autocontribute` | `root:autocontribute`, `0750` | Non-writable service-home trust boundary |
 | `/var/lib/autocontribute/state` | `autocontribute:autocontribute`, `0700` | Live SQLite, evidence, and evaluations |
 | `/var/lib/autocontribute/state/workspaces` | `autocontribute:autocontribute`, `0700` | Dedicated capacity-limited ext4 filesystem for target repositories and validation copies |
 | `/var/lib/autocontribute/docker` | `autocontribute:autocontribute`, `0710` | Dedicated capacity-limited ext4 filesystem for rootless Docker images, layers, and metadata |
 | `/var/lib/autocontribute/tmp` | `autocontribute:autocontribute`, `0700` | Private temporary files visible to the rootless Docker daemon |
 | `/var/backups/autocontribute` | `autocontribute:autocontribute`, `0700` | Local immutable-name complete bundles awaiting off-host replication |
+| `/run/autocontribute` | `autocontribute:autocontribute`, `0700` | Proxy-owned ephemeral daemon runtime and sole Docker socket |
 
 The shared lock is `/var/lib/autocontribute/operation.lock`, outside the captured state root. It
 serializes the packaged worker, doctor, and backup services on this host. It is not a distributed
@@ -68,7 +71,7 @@ The rootless daemon's data root has an independent, dedicated boundary. The supp
 an exact, non-bind ext4 mount backed by one whole block device, mounted nowhere else, with
 `rw,nodev,nosuid`, at most 32 GiB (34,359,738,368 bytes) of addressable blocks, and at most
 1,048,576 fixed inodes. It also requires at least 1 GiB (1,073,741,824 bytes) and 16,384 inodes
-available to the service account. The rootless Docker user service checks that mount before
+available to the service account. The root-owned rootless Docker system service checks that mount before
 `dockerd` starts, so a failed mount cannot silently move image writes onto the service home
 filesystem. Before either credential-bearing service reads a credential, the wrapper also requires
 Docker's structured `DockerRootDir` value to equal `/var/lib/autocontribute/docker` exactly. The
@@ -84,7 +87,7 @@ controlling process.
 The sandbox daemon must be rootless and owned by the dedicated `autocontribute` account. Membership
 in the host `docker` group or use of `/var/run/docker.sock` would give the worker root-equivalent
 control and defeats this deployment boundary. Before either the worker or doctor reads a systemd
-credential, the wrapper verifies that `/run/user/$UID` is an unsymlinked `0700` directory owned by
+credential, the wrapper verifies that `/run/autocontribute` is an unsymlinked `0700` directory owned by
 the service identity, that its Docker socket is owned by that identity with mode `0600` or `0660`,
 and that the account cannot use the host socket. It then makes bounded daemon probes, requires one
 exact `name=rootless` element in Docker's reported `SecurityOptions`, and verifies the exact bounded
@@ -103,33 +106,46 @@ service-owned `0700` bind, and verifies the resulting file's host ownership and 
 
 ## Host prerequisites
 
-The reference units target systemd 252 or newer and a Linux distribution with:
+The supported production baseline is Ubuntu Server 24.04 LTS (Noble) on `amd64` with systemd 255.
+The supervisor deliberately binds to that release's vendor `user@.service` fragment, vendor
+drop-ins, delegated `init.scope`, and manager `UnitPath`; another systemd or distribution layout
+fails closed and is unsupported until it has a reviewed port and equivalent live integration. The
+host also requires:
 
 - Python 3.11 or 3.12, `uv`, Git, `flock`, GNU coreutils, util-linux `findmnt`, and e2fsprogs;
 - rootless Docker on cgroup v2 with systemd resource-controller delegation, including `newuidmap`,
-  `newgidmap`, and a unique subordinate UID/GID range;
+  `newgidmap`, `/usr/bin/dockerd-rootless.sh`, and a unique subordinate UID/GID range;
 - four dedicated, fully allocated (not thin-provisioned) block devices: no more than 8 GiB for
   state, 20 GiB for workspaces, 32 GiB for rootless Docker data, and 64 GiB for local backups; and
 - persistent time synchronization and outbound HTTPS for GitHub and the configured model API.
 
-Create a locked service account with a durable home. Allocate subordinate IDs that do not overlap
-another account's ranges; the numbers below are examples and must be checked against
-`/etc/subuid` and `/etc/subgid` first.
+Create a locked service account whose home path is a root-owned trust boundary. The account may
+traverse that directory through its private group, but it cannot create a replacement user-unit
+tree there. Writable state, Docker data, temporary files, and health markers are separate children
+created by the packaged tmpfiles policy. Allocate subordinate IDs that do not overlap another
+account's ranges; the numbers below are examples and must be checked against `/etc/subuid` and
+`/etc/subgid` first.
 
 ```bash
-sudo useradd --system --create-home \
+sudo useradd --system \
   --user-group \
   --home-dir /var/lib/autocontribute \
   --shell /usr/sbin/nologin autocontribute
+sudo install -d -o root -g autocontribute -m 0750 /var/lib/autocontribute
 sudo usermod --add-subuids 200000-265535 --add-subgids 200000-265535 autocontribute
 test "$(id -gn autocontribute)" = autocontribute
+test "$(stat --format=%U:%G:%a -- /var/lib/autocontribute)" = root:autocontribute:750
 getent group autocontribute
-sudo loginctl enable-linger autocontribute
 ```
 
 The explicit private user group is required by every supplied unit and tmpfiles rule. Do not add
 the account to `docker`; the runtime preflight rejects that exact group even if a separately started
-rootless daemon appears healthy.
+rootless daemon appears healthy. Do not change the home back to service ownership: the deployment
+uses `/var/lib/autocontribute/tmp` for runtime caches and never relies on a writable home root.
+Treat the account's numeric UID as immutable for the lifetime of the host. It is part of the
+instance-specific user-manager trust path and cgroup identity; changing it is not an in-place
+upgrade. Reprovision a fresh host or restore the original UID instead of trying to adopt an old
+manager or daemon under a new identity.
 
 ### Provision bounded state and local-backup filesystems
 
@@ -307,126 +323,123 @@ services' `PrivateDevices=yes`. CI runs both its writable mount-only path and it
 path against a real loop-backed ext4 filesystem inside hardened service boundaries; production
 still requires fully allocated storage.
 
-Install rootless Docker for that account using the distribution's supported procedure, but do not
-enable or start its user service yet. Rootless
-Docker can enforce the configured CPU, memory, swap, and PID limits only when cgroup v2 controllers
-are delegated through systemd; a daemon reporting cgroup driver `none` ignores those limits. On the
-dedicated host, install Docker's required user-manager delegation and restart the manager so the
-setting is effective. This template drop-in applies to every systemd user manager on the host, so do
-not install it on a shared machine without reviewing that wider delegation boundary.
+Install the distribution packages that provide rootless Docker's binaries and dependencies,
+including `dockerd-rootless.sh`, `rootlesskit`, `newuidmap`, `newgidmap`, `fuse-overlayfs`, a user
+D-Bus implementation, and the networking helpers supported by that distribution. Install binaries
+only. Never run
+`dockerd-rootless-setuptool.sh install`, its service-start path, or any equivalent setup command: it
+would create a service-owned `docker.service`, choose the conventional `/run/user/<uid>/docker.sock`,
+and bypass this release's root-owned unit and launcher. Verify the package-owned entry points without
+starting them:
 
 ```bash
-sudo install -d -m 0755 /etc/systemd/system/user@.service.d
-printf '%s\n' \
-  '[Service]' \
-  'Delegate=cpu cpuset io memory pids' \
-  | sudo tee /etc/systemd/system/user@.service.d/delegate.conf >/dev/null
-sudo chmod 0644 /etc/systemd/system/user@.service.d/delegate.conf
-sudo systemctl daemon-reload
+test -x /usr/bin/dockerd-rootless.sh
+test -x /usr/bin/rootlesskit
+test -x /usr/bin/newuidmap
+test -x /usr/bin/newgidmap
+test -x /usr/bin/fuse-overlayfs
+test "$(stat --format=%U -- /usr/bin/dockerd-rootless.sh)" = root
 ```
 
-Configure the rootless daemon before its first start. Install the mount checker from the same audited
-source revision that will supply the worker, then configure Docker's documented rootless
-`daemon.json` path. If that file already contains reviewed settings, merge the single `data-root`
-key instead of replacing them.
+Rootless Docker can enforce CPU, memory, swap, and PID limits only when cgroup v2 controllers are
+delegated through the user manager; a daemon reporting cgroup driver `none` ignores those limits.
+The release therefore supplies two distinct root-owned units:
+
+- `/etc/systemd/system/autocontribute-rootless-docker.service` is a hardened system-service proxy
+  running as `autocontribute`. It creates `/run/autocontribute`, verifies the effective user manager
+  and daemon unit, starts and continuously monitors the daemon, and stops it whenever the proxy
+  exits.
+- `/etc/systemd/user/autocontribute-rootless-docker-daemon.service` is the static user unit beneath
+  the delegated manager. It is deliberately not enabled and is started only by the system proxy.
+  Its launcher pins the config, data root, cgroup driver, and sole Unix socket on the command line.
+
+The proxy gives the user manager one aggregate 120-second readiness window; an individual probe
+cannot multiply that deadline. It waits up to 120 seconds for a daemon stop and 150 seconds for a
+daemon start, leaving 30 seconds beyond the user unit's respective 90- and 120-second limits. Its
+15-minute system-unit startup ceiling covers those operations, the batched manager/unit
+attestations, and the release preflights with several minutes of margin. Its three-minute stop
+ceiling likewise exceeds the cleanup client's 120-second wait plus ten-second kill grace.
+
+The user unit intentionally avoids systemd filesystem and namespace sandbox directives. In a user
+manager those directives introduce an outer user namespace that prevents `newuidmap` from mapping
+the account's subordinate IDs. The daemon remains unprivileged; the root-owned system proxy and
+unit/config paths provide the control boundary. Worker and doctor retain their stricter system-unit
+sandboxes and `ProtectHome=yes`, so they cannot reach the user bus below `/run/user`.
+
+Create the root-owned daemon configuration at its dedicated system path before the first start. The
+reference configuration pins the storage driver exercised by the production-topology integration;
+the launcher supplies every security-critical location explicitly. Any additional daemon option is
+an operator-owned policy change and must be reviewed offline; never add a TCP listener.
 
 ```bash
-sudo install -d -o root -g root -m 0755 /usr/local/libexec
-sudo install -o root -g root -m 0755 \
-  deploy/systemd/libexec/autocontribute-docker-data-check \
-  /usr/local/libexec/autocontribute-docker-data-check
-sudo -u autocontribute \
-  /usr/local/libexec/autocontribute-docker-data-check \
-  --mount-only /var/lib/autocontribute/docker
-sudo install -d -o root -g autocontribute -m 0750 \
-  /var/lib/autocontribute/.config/docker
-sudoedit /var/lib/autocontribute/.config/docker/daemon.json
-sudo chown root:autocontribute /var/lib/autocontribute/.config/docker/daemon.json
-sudo chmod 0640 /var/lib/autocontribute/.config/docker/daemon.json
-python3 -m json.tool \
-  /var/lib/autocontribute/.config/docker/daemon.json >/dev/null
-sudo install -d -o root -g root -m 0755 /etc/systemd/user/docker.service.d
-sudo install -o root -g root -m 0644 \
-  deploy/systemd/rootless-docker.service.d/10-autocontribute-data-root.conf \
-  /etc/systemd/user/docker.service.d/10-autocontribute-data-root.conf
+sudo install -d -o root -g autocontribute -m 0750 /etc/autocontribute
+sudoedit /etc/autocontribute/rootless-docker-daemon.json
+sudo chown root:autocontribute /etc/autocontribute/rootless-docker-daemon.json
+sudo chmod 0640 /etc/autocontribute/rootless-docker-daemon.json
+python3 -m json.tool /etc/autocontribute/rootless-docker-daemon.json >/dev/null
+test "$(stat --format=%U:%G:%a -- \
+  /etc/autocontribute/rootless-docker-daemon.json)" = root:autocontribute:640
 ```
 
-The reviewed `daemon.json` must contain this exact absolute value (alongside any other reviewed
-keys):
+Use this initial content:
 
 ```json
 {
-  "data-root": "/var/lib/autocontribute/docker"
+  "storage-driver": "fuse-overlayfs"
 }
 ```
 
-The system-wide user-service drop-in intentionally prevents any other account's rootless
-`docker.service` from starting on this dedicated host: its mount check requires the data root to be
-owned by the invoking UID and primary GID. Do not install this deployment on a shared host.
+Do not start the user manager or daemon yet. The release installation below first installs and
+attests the root-owned user unit and the exact
+`/etc/systemd/system/user@<uid>.service.d/50-autocontribute.conf` manager drop-in for the resolved
+`autocontribute` UID. That drop-in delegates
+`cpu`, `cpuset`, `io`, `memory`, and `pids`, and replaces the manager's lookup path with exactly:
 
-Start the account's user manager explicitly and verify its private bus before enabling the Docker
-user service. This does not require changing the account's login shell:
-
-```bash
-autocontribute_uid="$(id -u autocontribute)"
-sudo systemctl restart "user@${autocontribute_uid}.service"
-test -S "/run/user/${autocontribute_uid}/bus"
-test "$(stat -c %u "/run/user/${autocontribute_uid}/bus")" = "$autocontribute_uid"
-sudo -u autocontribute env \
-  HOME=/var/lib/autocontribute \
-  XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
-  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${autocontribute_uid}/bus" \
-  systemctl --user daemon-reload
-sudo -u autocontribute env \
-  HOME=/var/lib/autocontribute \
-  XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
-  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${autocontribute_uid}/bus" \
-  systemctl --user show-environment >/dev/null
-sudo -u autocontribute env \
-  HOME=/var/lib/autocontribute \
-  XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
-  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${autocontribute_uid}/bus" \
-  systemctl --user enable --now docker.service
-sudo -u autocontribute env \
-  HOME=/var/lib/autocontribute \
-  XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
-  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${autocontribute_uid}/bus" \
-  DOCKER_HOST="unix:///run/user/${autocontribute_uid}/docker.sock" \
-  docker info --format \
-    'root={{json .DockerRootDir}} security={{json .SecurityOptions}} cgroup={{.CgroupVersion}}/{{.CgroupDriver}}'
-unset autocontribute_uid
+```text
+/etc/systemd/user:/run/systemd/user:/usr/local/lib/systemd/user:/usr/lib/systemd/user
 ```
 
-Confirm that the smoke test reports the exact configured data root, cgroup v2 with a driver other
-than `none`, and one exact `name=rootless` security option; `doctor` later proves the configured
-limits inside a real container. The packaged services repeat the ownership, permission, mount,
-capacity, group, host-socket, exact rootless-security-option, and exact `DockerRootDir` checks on
-every invocation before the wrapper reads any file in the encrypted credential directory. Rootless
-Docker commonly creates a `0660` socket; this remains private because its owning runtime directory
-must be exactly `0700`.
+There is intentionally no trailing colon and no home-owned unit directory. The drop-in is
+instance-specific: never install it at the template-wide `user@.service.d` path, which would alter
+every account's manager. Linger is enabled later only to keep this account's delegated manager and
+cgroup scopes available after boot; it does not enable the daemon user unit. The system proxy
+remains the only daemon lifecycle entry point.
 
-Pre-pull every digest-pinned sandbox image as this user. Never use a tag in production. The service
-sets `TMPDIR=/var/lib/autocontribute/tmp` because Docker's daemon must see the CID files created by
-the client; systemd's private `/tmp` mount is deliberately not used for those files.
+The later smoke test must report `/var/lib/autocontribute/docker`, cgroup v2 with the `systemd`
+driver, and one exact `name=rootless` security option. `doctor` then proves the configured limits
+inside a real container. The packaged services repeat the ownership, permission, mount, capacity,
+group, host-socket, security-option, and `DockerRootDir` checks before reading an encrypted
+credential. The only supported socket is `/run/autocontribute/docker.sock`; any legacy
+`/run/user/<uid>/docker.sock` path makes startup fail closed.
 
 ## Install an immutable release
 
 Place an audited checkout or artifact in a new, never-reused directory below
 `/opt/autocontribute/releases/`. Verify its full commit and build provenance before installation,
-then install exactly the checked-in lock:
+then install exactly the checked-in lock. Do not select the release with `current` yet:
 
 ```bash
+set -Eeuo pipefail
+release=/opt/autocontribute/releases/FULL_COMMIT
 sudo uv sync \
-  --project /opt/autocontribute/releases/FULL_COMMIT \
+  --project "$release" \
   --frozen --no-dev
-sudo chown -R root:root /opt/autocontribute/releases/FULL_COMMIT
-sudo chmod -R go-w /opt/autocontribute/releases/FULL_COMMIT
-sudo ln -s releases/FULL_COMMIT /opt/autocontribute/.current.next
-sudo mv -Tf /opt/autocontribute/.current.next /opt/autocontribute/current
+sudo chown -R root:root "$release"
+sudo chmod -R go-w "$release"
+sudo "$release/.venv/bin/autocontribute" \
+  deployment verify-systemd-assets --source-root "$release"
 ```
 
-Do not repoint `current` while any Autocontribute unit is active. Python may import files lazily, so
-changing a release underneath a live process is not an atomic application upgrade.
+Run this source verification before installing any file from `deploy/systemd`. It binds the selected
+Python package to the complete checked-out deployment inventory and rejects missing, extra,
+symlinked, non-regular, incorrectly mode-set, or content-mismatched assets. The manifest contains 23
+source assets: 22 have mandatory production paths and the journald example is deliberately
+source-bound but optional to install because retention is host policy.
+
+Keep `release` set for the installation steps below. Do not repoint `current` while any
+Autocontribute unit is active, and do not repoint it before the new deployment assets have passed
+host verification. Python may import files lazily, so changing a release underneath a live process
+is not an atomic application upgrade.
 
 ## Install configuration and encrypted credentials
 
@@ -537,18 +550,307 @@ Never inspect a credential with a command that writes the decrypted value to the
 
 ## Install and validate the units
 
-From the audited source tree:
+Use the verified immutable release, not another checkout. These steps apply to first installation and
+every upgrade. Before replacing an installed asset, disable all three timers and stop worker,
+backup, doctor, health, and the system rootless-Docker proxy. Stopping the proxy synchronously stops
+the daemon user unit. On a migration from an older deployment, also stop any generic
+`docker.service` while the old user manager is still reachable. Then stop the user manager itself so
+no user unit can execute during the trust-path replacement. First-install commands skip units that
+do not exist.
 
 ```bash
-sudo install -o root -g root -m 0644 deploy/systemd/*.service /etc/systemd/system/
-sudo install -o root -g root -m 0644 deploy/systemd/*.timer /etc/systemd/system/
-sudo install -o root -g root -m 0755 deploy/systemd/libexec/* /usr/local/libexec/
-sudo install -o root -g root -m 0644 \
-  deploy/systemd/autocontribute.tmpfiles.conf \
-  /etc/tmpfiles.d/autocontribute.conf
+set -Eeuo pipefail
+release=/opt/autocontribute/releases/FULL_COMMIT
+autocontribute_uid="$(id -u autocontribute)"
+if [[ ! "$autocontribute_uid" =~ ^[1-9][0-9]*$ ]]; then
+  printf '%s\n' 'The Autocontribute service UID must be a nonzero numeric UID' >&2
+  exit 1
+fi
+manager_uids=("$autocontribute_uid")
+stale_manager_policy=0
+shopt -s nullglob
+for manager_policy in \
+  /etc/systemd/system/user@[0-9]*.service.d/50-autocontribute.conf
+do
+  manager_uid="${manager_policy#/etc/systemd/system/user@}"
+  manager_uid="${manager_uid%.service.d/50-autocontribute.conf}"
+  if [[ ! "$manager_uid" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'Unsafe Autocontribute user-manager policy path: %s\n' \
+      "$manager_policy" >&2
+    exit 1
+  fi
+  manager_uids+=("$manager_uid")
+  if [[ "$manager_uid" != "$autocontribute_uid" ]]; then
+    stale_manager_policy=1
+  fi
+done
+shopt -u nullglob
+mapfile -t manager_uids < <(
+  printf '%s\n' "${manager_uids[@]}" | LC_ALL=C sort -u
+)
+unset manager_policy manager_uid
+
+for unit in \
+  autocontribute-worker.timer \
+  autocontribute-backup.timer \
+  autocontribute-health.timer
+do
+  if sudo systemctl cat "$unit" >/dev/null 2>&1; then
+    sudo systemctl disable --now "$unit"
+    test "$(sudo systemctl show --property=ActiveState --value "$unit")" = inactive
+  fi
+done
+for unit in \
+  autocontribute-worker.service \
+  autocontribute-backup.service \
+  autocontribute-doctor.service \
+  autocontribute-health.service \
+  autocontribute-rootless-docker.service
+do
+  if sudo systemctl cat "$unit" >/dev/null 2>&1; then
+    sudo systemctl stop "$unit"
+    test "$(sudo systemctl show --property=ActiveState --value "$unit")" = inactive
+  fi
+done
+active_units="$(sudo systemctl list-units \
+  --state=active,activating,deactivating,reloading \
+  --no-legend --plain --no-pager \
+  'autocontribute-*.service' 'autocontribute-*.timer')"
+test -z "$active_units"
+unset active_units
+if sudo test -S "/run/user/${autocontribute_uid}/bus"; then
+  for unit in docker.service autocontribute-rootless-docker-daemon.service; do
+    if sudo -u autocontribute env \
+      HOME=/var/lib/autocontribute \
+      XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${autocontribute_uid}/bus" \
+      systemctl --user cat "$unit" >/dev/null 2>&1
+    then
+      sudo -u autocontribute env \
+        HOME=/var/lib/autocontribute \
+        XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${autocontribute_uid}/bus" \
+        systemctl --user stop "$unit"
+    fi
+  done
+fi
+for manager_uid in "${manager_uids[@]}"; do
+  sudo systemctl stop "user@${manager_uid}.service"
+  test "$(sudo systemctl show --property=ActiveState --value \
+    "user@${manager_uid}.service")" = inactive
+done
+unset manager_uid
+if [[ "$stale_manager_policy" -ne 0 ]]; then
+  printf '%s\n' \
+    'A stale Autocontribute user-manager UID was quiesced; restore the immutable service UID or reprovision the host' >&2
+  exit 1
+fi
+unset manager_uids stale_manager_policy
+```
+
+Before continuing, archive and remove every retired generic or home-owned unit path reported by
+`deployment verify-systemd-assets`. In particular, neither `/etc/systemd/user/docker.service` nor
+its drop-in directory may remain, and the service home must contain no `docker.service` or
+`autocontribute-rootless-docker-daemon.service` below `.config/systemd/user` or
+`.local/share/systemd/user`. Also remove the superseded generic
+`/etc/systemd/system/user@.service.d/delegate.conf`. Preserve anything needed for audit in a
+root-only archive outside all systemd lookup paths; do not copy settings forward implicitly.
+Any numeric `user@<old-uid>.service.d/50-autocontribute.conf` is evidence of an unsupported service
+UID change. The quiescence block stops that old manager and then aborts; do not remove the evidence
+and continue under the new UID.
+
+Keep every service stopped throughout the following replacement window. Stage each file beside its
+final path and rename it over that path; do not copy the whole tree directly into live locations.
+Each rename is atomic on its destination filesystem. A host crash can still leave a mixed release,
+which is why the complete installed set is verified before anything is restarted.
+
+```bash
+set -Eeuo pipefail
+release=/opt/autocontribute/releases/FULL_COMMIT
+autocontribute_uid="$(id -u autocontribute)"
+if [[ ! "$autocontribute_uid" =~ ^[1-9][0-9]*$ ]]; then
+  printf '%s\n' 'The Autocontribute service UID must be a nonzero numeric UID' >&2
+  exit 1
+fi
+
+sudo install -d -o root -g root -m 0755 \
+  /etc/systemd/system \
+  /etc/systemd/user \
+  /etc/tmpfiles.d \
+  /usr/local/libexec
+manager_dropin_directory="/etc/systemd/system/user@${autocontribute_uid}.service.d"
+sudo install -d -o root -g root -m 0755 "$manager_dropin_directory"
+
+for source in \
+  "$release"/deploy/systemd/*.service \
+  "$release"/deploy/systemd/*.timer
+do
+  destination="/etc/systemd/system/${source##*/}"
+  sudo install -o root -g root -m 0644 -- "$source" "${destination}.next"
+  sudo mv -Tf -- "${destination}.next" "$destination"
+done
+for source in "$release"/deploy/systemd/libexec/*
+do
+  destination="/usr/local/libexec/${source##*/}"
+  sudo install -o root -g root -m 0755 -- "$source" "${destination}.next"
+  sudo mv -Tf -- "${destination}.next" "$destination"
+done
+
+destination=/etc/tmpfiles.d/autocontribute.conf
+sudo install -o root -g root -m 0644 -- \
+  "$release/deploy/systemd/autocontribute.tmpfiles.conf" \
+  "${destination}.next"
+sudo mv -Tf -- "${destination}.next" "$destination"
+
+destination="$manager_dropin_directory/50-autocontribute.conf"
+sudo install -o root -g root -m 0644 -- \
+  "$release/deploy/systemd/autocontribute-user-manager.conf" \
+  "${destination}.next"
+sudo mv -Tf -- "${destination}.next" "$destination"
+
+destination=/etc/systemd/user/autocontribute-rootless-docker-daemon.service
+sudo install -o root -g root -m 0644 -- \
+  "$release/deploy/systemd/user/autocontribute-rootless-docker-daemon.service" \
+  "${destination}.next"
+sudo mv -Tf -- "${destination}.next" "$destination"
+
+sudo "$release/.venv/bin/autocontribute" deployment verify-systemd-assets
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/autocontribute.conf
 sudo systemctl daemon-reload
+sudo loginctl enable-linger autocontribute
+sudo systemctl restart "user@${autocontribute_uid}.service"
+user_systemctl=(
+  sudo -u autocontribute env
+  HOME=/var/lib/autocontribute
+  XDG_RUNTIME_DIR="/run/user/${autocontribute_uid}"
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${autocontribute_uid}/bus"
+  systemctl --user --no-pager
+)
+"${user_systemctl[@]}" daemon-reload
+
+for unit in \
+  autocontribute-worker.service \
+  autocontribute-worker.timer \
+  autocontribute-backup.service \
+  autocontribute-backup.timer \
+  autocontribute-doctor.service \
+  autocontribute-health.service \
+  autocontribute-health.timer \
+  autocontribute-rootless-docker.service \
+  'autocontribute-failure@.service'
+do
+  test "$(sudo systemctl show --property=NeedDaemonReload --value "$unit")" = no
+done
+manager_dropins="$(sudo systemctl show "user@${autocontribute_uid}.service" \
+  --property=DropInPaths --value)"
+expected_manager_dropin_count=0
+for manager_dropin in $manager_dropins; do
+  case "$manager_dropin" in
+    "$manager_dropin_directory/50-autocontribute.conf")
+      expected_manager_dropin_count=$((expected_manager_dropin_count + 1))
+      ;;
+    /usr/lib/systemd/system/user@.service.d/*.conf) ;;
+    *) exit 1 ;;
+  esac
+  test "$(stat --format=%U:%G:%a -- "$manager_dropin")" = root:root:644
+done
+test "$expected_manager_dropin_count" = 1
+test "$(sudo systemctl show "user@${autocontribute_uid}.service" \
+  --property=FragmentPath --value)" = /usr/lib/systemd/system/user@.service
+test "$(sudo systemctl show "user@${autocontribute_uid}.service" \
+  --property=Transient --value)" = no
+test "$(sudo systemctl show "user@${autocontribute_uid}.service" \
+  --property=Delegate --value)" = yes
+test "$(sudo systemctl show "user@${autocontribute_uid}.service" \
+  --property=ControlGroup --value)" = \
+  "/user.slice/user-${autocontribute_uid}.slice/user@${autocontribute_uid}.service"
+test "$(sudo systemctl show "user@${autocontribute_uid}.service" \
+  --property=Environment --value)" = \
+  'SYSTEMD_UNIT_PATH=/etc/systemd/user:/run/systemd/user:/usr/local/lib/systemd/user:/usr/lib/systemd/user'
+test "$("${user_systemctl[@]}" show --property=UnitPath --value)" = \
+  '/etc/systemd/user /run/systemd/user /usr/local/lib/systemd/user /usr/lib/systemd/user'
+test "$("${user_systemctl[@]}" show \
+  autocontribute-rootless-docker-daemon.service \
+  --property=FragmentPath --value)" = \
+  /etc/systemd/user/autocontribute-rootless-docker-daemon.service
+test -z "$("${user_systemctl[@]}" show \
+  autocontribute-rootless-docker-daemon.service \
+  --property=DropInPaths --value)"
+test "$("${user_systemctl[@]}" show \
+  autocontribute-rootless-docker-daemon.service \
+  --property=NeedDaemonReload --value)" = no
+test "$("${user_systemctl[@]}" show \
+  autocontribute-rootless-docker-daemon.service \
+  --property=Transient --value)" = no
+test "$("${user_systemctl[@]}" show \
+  autocontribute-rootless-docker-daemon.service \
+  --property=ActiveState --value)" = inactive
+sudo -u autocontribute \
+  /usr/local/libexec/autocontribute-rootless-docker-check --unit-only
+
+sudo ln -s releases/FULL_COMMIT \
+  /opt/autocontribute/.current.FULL_COMMIT.next
+sudo mv -Tf \
+  /opt/autocontribute/.current.FULL_COMMIT.next \
+  /opt/autocontribute/current
+test "$(readlink -f /opt/autocontribute/current)" = "$release"
+sudo /opt/autocontribute/current/.venv/bin/autocontribute \
+  deployment verify-systemd-assets
+
+sudo systemctl enable --now autocontribute-rootless-docker.service
+test "$(sudo systemctl show autocontribute-rootless-docker.service \
+  --property=ActiveState --value)" = active
+test "$(sudo systemctl show autocontribute-rootless-docker.service \
+  --property=SubState --value)" = running
+test "$("${user_systemctl[@]}" show \
+  autocontribute-rootless-docker-daemon.service \
+  --property=ActiveState --value)" = active
+test "$("${user_systemctl[@]}" show \
+  autocontribute-rootless-docker-daemon.service \
+  --property=SubState --value)" = running
+sudo -u autocontribute env \
+  HOME=/var/lib/autocontribute \
+  XDG_RUNTIME_DIR=/run/autocontribute \
+  DOCKER_HOST=unix:///run/autocontribute/docker.sock \
+  docker info --format \
+    'root={{json .DockerRootDir}} security={{json .SecurityOptions}} cgroup={{.CgroupVersion}}/{{.CgroupDriver}}'
+unset user_systemctl
+unset expected_manager_dropin_count manager_dropin manager_dropins
+unset manager_dropin_directory
+unset autocontribute_uid
+unset release
 ```
+
+Confirm that the Docker smoke test reports `/var/lib/autocontribute/docker`, cgroup v2 with the
+`systemd` driver, and exactly one `name=rootless` security option. Pre-pull every digest-pinned
+sandbox image as the `autocontribute` user before doctor; never use a tag in production. The service
+sets `TMPDIR=/var/lib/autocontribute/tmp` because Docker's daemon must see the CID files created by
+the client; systemd's private `/tmp` mount is deliberately not used for those files.
+
+The installed verifier checks all 22 mandatory paths against the manifest shipped by the selected
+Python release. It requires exact path, SHA-256 content, mode, and `root:root` ownership and rejects
+symlinks and non-regular files. The user-manager drop-in directory and root-owned user-unit inventory
+are exact: an unreviewed second manager drop-in, a home-owned replacement, or a retired generic
+Docker unit is a verification failure. Consequently, a partial copy, a mixture of old and new
+assets, or a stale helper fails closed before `current` is switched and again before an operational
+service can run. Worker, backup, doctor, health, the system proxy, and the daemon user unit execute
+the same verifier as a fixed pre-start check. The
+failure recorder intentionally does not: it remains available through `OnFailure=` to record an
+asset-mismatch failure and emit its journal alert.
+
+The system proxy requires the user manager to be the active `user@<uid>.service` process beneath its
+exact delegated cgroup. It binds the user-bus owner PID back to that system unit, checks the process
+identity, executable, environment, controllers, and the manager's actual ordered `UnitPath`, and
+requires the daemon to be a non-transient unit loaded from the exact root-owned fragment with no
+drop-ins or pending reload. It repeats those checks for the lifetime of the daemon. Worker and doctor
+independently require the exact active system proxy, private runtime directory and socket, rootless
+security option, and bounded data root before they read credentials.
+
+The attestation covers the checked-in base units, not the effective configuration assembled from
+unit drop-ins. The documented root-owned `40-provider-credentials.conf` and
+`50-auto-publish.conf` drop-ins remain allowed but are not content-attested. Review them separately,
+keep their directories root-owned and non-writable by the service account, compare the worker and
+doctor copies as instructed, and inspect `systemctl cat` output after every change.
 
 Run `systemd-tmpfiles` only while all four filesystems are mounted so their filesystem roots receive
 the required ownership and mode. Worker, doctor, backup, and health declare `RequiresMountsFor=` for
@@ -557,15 +859,17 @@ data mounts. Their wrappers still repeat exact mount and capacity verification a
 an accidentally unmounted directory on a parent filesystem is rejected rather than used as a
 fallback. The worker and backup additionally bind the Python store to the preflight-verified state
 root, so changing `storage.path` cannot redirect writes around these checks. The separately installed
-rootless Docker drop-in performs the data-mount check before the daemon itself starts.
+rootless Docker daemon user unit performs the data-mount check before the daemon itself starts.
 
 Validate the installed files on the target host. `systemd-analyze security` is advisory; review
 every relaxation instead of chasing a score that breaks rootless Docker or durable state.
-CI also parses every packaged unit with systemd 255 on Ubuntu 24.04 and fails on parser warnings.
-It performs an offline security assessment of every service, with an exposure ceiling of 4.0 for
-the networked worker and doctor and 3.0 for the private-network backup, health, and failure units.
-These are regression ceilings, not a substitute for reviewing the full report or validating the
-installed units against the target host's systemd version.
+CI also parses all nine system units and the protected user unit with systemd 255 on Ubuntu 24.04
+and fails on parser warnings. It performs an offline security assessment of the six system services,
+with an exposure ceiling of 4.0 for the networked worker and doctor and 3.0 for the private-network
+backup, health, failure, and rootless-Docker proxy units. The user daemon is deliberately assessed
+separately because namespace-style sandbox directives would break subordinate-ID mapping. These are
+regression ceilings, not a substitute for reviewing the full report or validating the installed
+units against the target host's systemd version.
 
 ```bash
 sudo systemd-analyze verify \
@@ -576,7 +880,14 @@ sudo systemd-analyze verify \
   autocontribute-doctor.service \
   autocontribute-health.service \
   autocontribute-health.timer \
+  autocontribute-rootless-docker.service \
   'autocontribute-failure@.service'
+sudo -u autocontribute env \
+  HOME=/var/lib/autocontribute \
+  XDG_RUNTIME_DIR="/run/user/$(id -u autocontribute)" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u autocontribute)/bus" \
+  SYSTEMD_UNIT_PATH=/etc/systemd/user:/run/systemd/user:/usr/local/lib/systemd/user:/usr/lib/systemd/user \
+  systemd-analyze --user verify autocontribute-rootless-docker-daemon.service
 sudo systemd-analyze calendar '*-*-* 09,21:17:00 UTC'
 sudo systemd-analyze calendar '*-*-* 03:17:00 UTC'
 sudo systemd-analyze security autocontribute-worker.service
@@ -587,7 +898,10 @@ as documented for `autocontribute doctor`:
 
 ```bash
 sudo systemctl start autocontribute-doctor.service
-sudo systemctl status autocontribute-doctor.service
+test "$(sudo systemctl show --property=Result --value \
+  autocontribute-doctor.service)" = success
+test "$(sudo systemctl show --property=ExecMainStatus --value \
+  autocontribute-doctor.service)" = 0
 sudo journalctl -u autocontribute-doctor.service --since today
 ```
 
@@ -682,7 +996,9 @@ Journald retention is host-wide, not per unit. The example
 `deploy/systemd/autocontribute.journald.conf.example` keeps a bounded persistent journal for 30 days.
 Review its capacity and compliance impact before installing it as a drop-in under
 `/etc/systemd/journald.conf.d/`; restart journald only under the host's normal change procedure.
-Keep longer-lived evidence in verified state bundles, not by making the journal unbounded.
+The source verifier binds this example to the release, but the installed verifier deliberately has
+no mandatory journald path and does not attest an operator-installed copy. Keep longer-lived evidence
+in verified state bundles, not by making the journal unbounded.
 
 Inspect the durable safety state after every alert and before any resume:
 
@@ -710,11 +1026,31 @@ verified upstream `merged_as_is` history; a failed member is not replaceable. Co
 scoped decision with `autocontribute rollout report`, perform a successful recovery drill, and
 review the automatic pilot constraints in [Scheduled operation](scheduled-operation.md).
 
-Only then change `publishing.mode` to `auto`, provision the narrowly scoped publication credential,
-and install the same root-owned opt-in drop-in for both services. The doctor makes no repository or
-GitHub writes and cannot publish, although opening the store can migrate or repair local durable
-state; it needs the opt-in only so its automatic-publication kill-switch check validates the exact
-environment that the worker will receive.
+Only then quiesce automatic scheduling before changing the final configuration. Disabling the timer
+does not stop an already triggered worker. If the worker-inactivity assertion fails, reconcile it and
+let it reach a safe terminal boundary before continuing; do not edit auto-mode configuration while
+it is running.
+
+```bash
+set -Eeuo pipefail
+sudo systemctl disable --now autocontribute-worker.timer
+test "$(sudo systemctl show --property=ActiveState --value \
+  autocontribute-worker.timer)" = inactive
+test "$(sudo systemctl show --property=ActiveState --value \
+  autocontribute-worker.service)" = inactive
+active_units="$(sudo systemctl list-units \
+  --state=active,activating,deactivating,reloading \
+  --no-legend --plain --no-pager \
+  autocontribute-worker.service autocontribute-worker.timer)"
+test -z "$active_units"
+unset active_units
+```
+
+With the worker proven inactive, change `publishing.mode` to `auto`, provision the narrowly scoped
+publication credential, and install the same root-owned opt-in drop-in for both services. The doctor
+makes no repository or GitHub writes and cannot publish, although opening the store can migrate or
+repair local durable state; it needs the opt-in only so its automatic-publication kill-switch check
+validates the exact environment that the worker will receive.
 
 ```bash
 sudo install -d -o root -g root -m 0755 \
@@ -740,8 +1076,9 @@ sudo systemctl daemon-reload
 ```
 
 Run the doctor service and a manual worker under observation, create and replicate a new complete
-backup, and only then re-enable the worker timer. The opt-in is intentionally absent from the
-checked-in unit, so installing the bundle alone can never enable GitHub writes.
+backup, and only then re-enable the worker timer with `sudo systemctl enable --now
+autocontribute-worker.timer`. The opt-in is intentionally absent from the checked-in unit, so
+installing the bundle alone can never enable GitHub writes.
 
 ## Kill switch and incident response
 
@@ -930,22 +1267,49 @@ because its archive checksum passes.
 
 ## Upgrade and rollback
 
-Before an upgrade:
+Treat the application, nine system units, ten helpers, tmpfiles policy, instance-specific user-
+manager drop-in, and protected daemon user unit as one release. An upgrade is complete only when the
+new release's packaged manifest verifies all 22 installed assets. Use this order:
 
-1. Disable and stop all three timers, then wait for the worker, backup, doctor, and health services
-   to become inactive.
-2. Create and replicate a verified complete bundle with the currently installed release.
-3. Install the new release in a new root-owned directory; never modify the old directory in place.
-4. Atomically repoint `current`, run the doctor service, and create a new complete backup before
-   enabling timers.
-5. Re-review the deployment fingerprint. A material code, dependency, interpreter, model, or policy
-   change starts a new evaluation cohort and cannot inherit an automatic-publication gate.
+1. Disable all three timers. Reconcile any in-flight publication, let the worker reach a safe
+   boundary, and create and replicate a verified complete bundle with the currently selected
+   release. Stop worker, backup, doctor, and health, wait for every failure-recorder instance to
+   finish, then stop the system rootless-Docker proxy. The proxy stops the daemon user unit. Stop the
+   `autocontribute` user manager before replacing its unit or manager drop-in.
+2. Install the new application into a new, never-reused, root-owned release directory. Do not modify
+   the old release in place and leave `current` pointing to it. Run the new release executable's
+   `deployment verify-systemd-assets --source-root NEW_RELEASE` check before copying any deployment
+   asset.
+3. Follow **Install and validate the units** with `release=NEW_RELEASE`: stage and rename each base
+   unit, helper, tmpfiles file, user unit, and resolved-UID manager drop-in at its final filesystem,
+   then verify all
+   installed paths with `NEW_RELEASE/.venv/bin/autocontribute deployment verify-systemd-assets`.
+   Keep every service stopped if any replacement or verification fails.
+4. Reload the system manager, restart the lingering `autocontribute` user manager so the delegated
+   instance policy is present in its process environment, and reload that manager. Require
+   `NeedDaemonReload=no` for every packaged system unit and
+   `autocontribute-rootless-docker-daemon.service`, and re-run the exact manager/UnitPath checks.
+   Only then atomically repoint `current` and repeat installed verification through the new
+   executable.
+5. Start the system rootless-Docker proxy, run doctor, and fix every failure. Create and replicate a new
+   complete backup before re-enabling any timer. Re-review the deployment fingerprint: a material
+   code, dependency, interpreter, model, deployment-asset, or policy change starts a new evaluation
+   cohort and cannot inherit an automatic-publication gate. Re-enable timers only after these checks
+   and any required observed manual worker run succeed.
+
+Per-file rename prevents a reader from seeing a partially written individual file; it does not make
+the 22-file set atomic. Quiescence prevents that intermediate set from executing, and manifest
+verification detects any interrupted, stale, or mixed installation. Never work around a mismatch by
+starting an old `current` against new assets. Either finish the new installation, or reinstall the
+complete old asset set from its verified immutable release, reload both managers, prove no reload is
+pending, and reverify it before resuming the old release.
 
 Database migrations are offline and one-way. Never restart an old binary against state opened by a
 newer release. A safe rollback therefore restores the pre-upgrade bundle into an absent state root
-with the old release; it does not merely repoint `current` over the new state. Preserve the new state
-under a separate quarantine path for investigation, and do not roll back across an ambiguous or
-in-flight publication until its exact remote state is reconciled.
+with the old release and its complete manifest-matched deployment assets; it does not merely repoint
+`current` over the new state. Preserve the new state under a separate quarantine path for
+investigation, and do not roll back across an ambiguous or in-flight publication until its exact
+remote state is reconciled.
 
 After recovery or rollback, keep automatic publication disabled until the restored lineage,
 upstream PRs, reservations, lifecycle observations, breaker state, and evaluation corpus have all

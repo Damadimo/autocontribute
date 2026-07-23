@@ -57,11 +57,32 @@ jobs:
             exit 1
           fi
       - name: Make packaged helpers available to executable validation
+        shell: bash
         run: |
+          set -euo pipefail
           sudo install -d -o root -g root -m 0755 /usr/local/libexec
           sudo install -o root -g root -m 0755 \
             deploy/systemd/libexec/* \
             /usr/local/libexec/
+          sudo install -d -o root -g root -m 0755 \
+            /opt/autocontribute/current/.venv/bin
+          sudo install -o root -g root -m 0755 \
+            /usr/bin/true \
+            /opt/autocontribute/current/.venv/bin/autocontribute
+          if [[ ! -x /usr/bin/dockerd-rootless.sh ]]; then
+            sudo install -o root -g root -m 0755 \
+              /usr/bin/true /usr/bin/dockerd-rootless.sh
+          fi
+          manager_uid="$(id --user)"
+          manager_drop_in_directory="/etc/systemd/system/user@${manager_uid}.service.d"
+          sudo install -d -o root -g root -m 0755 \
+            /etc/systemd/user "$manager_drop_in_directory"
+          sudo install -o root -g root -m 0644 \
+            deploy/systemd/user/autocontribute-rootless-docker-daemon.service \
+            /etc/systemd/user/autocontribute-rootless-docker-daemon.service
+          sudo install -o root -g root -m 0644 \
+            deploy/systemd/autocontribute-user-manager.conf \
+            "$manager_drop_in_directory/50-autocontribute.conf"
       - name: Exercise bounded workspace preflight in a hardened service
         shell: bash
         run: |
@@ -431,7 +452,7 @@ jobs:
             --property="ReadOnlyPaths=$docker_data_mount" \
             /usr/local/libexec/autocontribute-docker-data-check \
             --read-only-health "$docker_data_mount"
-      - name: Verify system and timer units
+      - name: Verify system, timer, and protected user units
         shell: bash
         env:
           SYSTEMD_LOG_COLOR: "0"
@@ -443,14 +464,54 @@ jobs:
               \( -name '*.service' -o -name '*.timer' \) \
               -print | sort
           )
-          if [[ "${#units[@]}" -ne 8 ]]; then
-            echo "Expected exactly eight packaged systemd units" >&2
+          if [[ "${#units[@]}" -ne 9 ]]; then
+            echo "Expected exactly nine packaged systemd system units" >&2
             exit 1
           fi
           systemd-analyze verify \
             --man=no \
             --recursive-errors=no \
             "${units[@]}"
+
+          mapfile -t user_units < <(
+            find deploy/systemd/user -maxdepth 1 -type f \
+              \( -name '*.service' -o -name '*.timer' \) \
+              -print | sort
+          )
+          if [[ "${#user_units[@]}" -ne 1 ]]; then
+            echo "Expected exactly one protected rootless Docker user unit" >&2
+            exit 1
+          fi
+          test "${user_units[0]}" = \
+            deploy/systemd/user/autocontribute-rootless-docker-daemon.service
+          test "$(stat --format=%U:%G:%a \
+            /etc/systemd/user/autocontribute-rootless-docker-daemon.service)" = root:root:644
+          manager_uid="$(id --user)"
+          manager_drop_in="/etc/systemd/system/user@${manager_uid}.service.d/50-autocontribute.conf"
+          test "$(stat --format=%U:%G:%a \
+            "$manager_drop_in")" = root:root:644
+          test ! -e /etc/systemd/system/user@.service.d/50-autocontribute.conf
+          cmp --silent \
+            deploy/systemd/user/autocontribute-rootless-docker-daemon.service \
+            /etc/systemd/user/autocontribute-rootless-docker-daemon.service
+          cmp --silent \
+            deploy/systemd/autocontribute-user-manager.conf \
+            "$manager_drop_in"
+          for vendor_drop_in in \
+            /usr/lib/systemd/system/user@.service.d/10-login-barrier.conf \
+            /usr/lib/systemd/system/user@.service.d/timeout.conf; do
+            test "$(stat --format=%U:%G:%a "$vendor_drop_in")" = root:root:644
+          done
+          unset vendor_drop_in
+          SYSTEMD_UNIT_PATH=/etc/systemd/user:/run/systemd/user:/usr/local/lib/systemd/user:/usr/lib/systemd/user \
+            systemd-analyze --user verify \
+              --man=no \
+              --recursive-errors=no \
+              "${user_units[@]}"
+          systemd-analyze verify \
+            --man=no \
+            --recursive-errors=no \
+            "user@${manager_uid}.service"
       - name: Enforce service hardening exposure ceilings
         shell: bash
         env:
@@ -459,9 +520,12 @@ jobs:
         run: |
           set -euo pipefail
           # systemd expresses its 0.0-10.0 score as tenths in --threshold (0-100).
+          # The nested rootless daemon intentionally needs namespaces and networking; its safety
+          # is exercised by the live cgroup/isolation job. This table covers system services only.
           declare -Ar exposure_ceiling=(
             [autocontribute-worker.service]=40
             [autocontribute-doctor.service]=40
+            [autocontribute-rootless-docker.service]=30
             [autocontribute-backup.service]=30
             [autocontribute-health.service]=30
             [autocontribute-failure@.service]=30
@@ -540,6 +604,89 @@ jobs:
         run: >-
           uv build --sdist --no-sources --no-build-isolation --offline
           --python .venv/bin/python --clear
+      - name: Verify source distribution systemd assets
+        run: |
+          .venv/bin/python - <<'PY'
+          import json
+          import tarfile
+          from pathlib import Path, PurePosixPath
+
+          archives = sorted(Path("dist").glob("autocontribute-*.tar.gz"))
+          if len(archives) != 1:
+              raise SystemExit(f"expected one source distribution, found {len(archives)}")
+
+          manifest_path = Path("src/autocontribute/_systemd_assets.json")
+          manifest_bytes = manifest_path.read_bytes()
+          manifest = json.loads(manifest_bytes)
+          assets = manifest.get("assets")
+          if not isinstance(assets, list) or len(assets) != 23:
+              raise SystemExit("source systemd asset manifest must contain exactly 23 assets")
+          expected = {
+              asset["source_path"]: int(asset["mode"], 8)
+              for asset in assets
+          }
+          if len(expected) != len(assets):
+              raise SystemExit("source systemd asset manifest contains duplicate paths")
+
+          with tarfile.open(archives[0], mode="r:gz") as archive:
+              members = archive.getmembers()
+              roots = {
+                  PurePosixPath(member.name).parts[0]
+                  for member in members
+                  if PurePosixPath(member.name).parts
+              }
+              if len(roots) != 1:
+                  raise SystemExit("source distribution must contain one top-level directory")
+              root = roots.pop()
+              member_by_name = {member.name: member for member in members}
+              if len(member_by_name) != len(members):
+                  raise SystemExit("source distribution contains duplicate archive members")
+
+              archive_manifest_name = f"{root}/{manifest_path.as_posix()}"
+              archive_manifest = member_by_name.get(archive_manifest_name)
+              if archive_manifest is None or not archive_manifest.isfile():
+                  raise SystemExit("source distribution omits the systemd asset manifest")
+              extracted_manifest = archive.extractfile(archive_manifest)
+              if extracted_manifest is None or extracted_manifest.read() != manifest_bytes:
+                  raise SystemExit("source distribution systemd manifest differs from source")
+
+              prefix = f"{root}/deploy/systemd/"
+              unsafe_assets = sorted(
+                  member.name.removeprefix(f"{root}/")
+                  for member in members
+                  if member.name.startswith(prefix)
+                  and not member.isdir()
+                  and not member.isfile()
+              )
+              if unsafe_assets:
+                  raise SystemExit(
+                      f"source distribution contains non-regular systemd assets: "
+                      f"{unsafe_assets}"
+                  )
+              archived_assets = {
+                  member.name.removeprefix(f"{root}/")
+                  for member in members
+                  if member.isfile() and member.name.startswith(prefix)
+              }
+              if archived_assets != set(expected):
+                  missing = sorted(set(expected) - archived_assets)
+                  extra = sorted(archived_assets - set(expected))
+                  raise SystemExit(
+                      f"source distribution systemd inventory differs: "
+                      f"missing={missing}, extra={extra}"
+                  )
+              for source_path, expected_mode in expected.items():
+                  member = member_by_name[f"{root}/{source_path}"]
+                  extracted = archive.extractfile(member)
+                  if extracted is None or extracted.read() != Path(source_path).read_bytes():
+                      raise SystemExit(
+                          f"source distribution asset differs from source: {source_path}"
+                      )
+                  if member.mode != expected_mode:
+                      raise SystemExit(
+                          f"source distribution asset mode differs: {source_path}"
+                      )
+          PY
       - name: Build wheel from source distribution
         run: >-
           uv build dist/autocontribute-*.tar.gz --wheel --out-dir dist/wheel
@@ -561,16 +708,29 @@ jobs:
           import autocontribute.deployment as deployment
 
           installed_manifest = Path(deployment.__file__).with_name("_build_identity.json")
+          installed_systemd_manifest = Path(deployment.__file__).with_name(
+              "_systemd_assets.json"
+          )
           source_manifest = (
               Path(os.environ["GITHUB_WORKSPACE"])
               / "src"
               / "autocontribute"
               / "_build_identity.json"
           )
+          source_systemd_manifest = (
+              Path(os.environ["GITHUB_WORKSPACE"])
+              / "src"
+              / "autocontribute"
+              / "_systemd_assets.json"
+          )
           if installed_manifest.read_bytes() != source_manifest.read_bytes():
               raise SystemExit("wheel build identity differs from source")
+          if installed_systemd_manifest.read_bytes() != source_systemd_manifest.read_bytes():
+              raise SystemExit("wheel systemd asset manifest differs from source")
           if len(deployment.packaged_build_identity_digest()) != 64:
               raise SystemExit("wheel build identity digest is invalid")
+          if len(deployment.packaged_systemd_asset_manifest_digest()) != 64:
+              raise SystemExit("wheel systemd asset manifest digest is invalid")
           if len(deployment.runtime_environment_digest()) != 64:
               raise SystemExit("wheel runtime identity digest is invalid")
           PY

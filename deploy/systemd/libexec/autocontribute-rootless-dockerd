@@ -1,0 +1,149 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+umask 007
+
+readonly daemon=/usr/bin/dockerd-rootless.sh
+readonly daemon_account=autocontribute
+readonly daemon_config=/etc/autocontribute/rootless-docker-daemon.json
+readonly config_directory=/etc/autocontribute
+readonly data_root=/var/lib/autocontribute/docker
+readonly runtime_directory=/run/autocontribute
+readonly docker_socket="$runtime_directory/docker.sock"
+readonly docker_host="unix://$docker_socket"
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+if [[ $# -ne 0 ]]; then
+  fail 'Autocontribute rootless dockerd launcher received unexpected arguments'
+fi
+if [[ "$UID" == 0 || "$(id --user --name)" != "$daemon_account" ]]; then
+  fail 'Autocontribute rootless dockerd launcher has an invalid identity'
+fi
+
+service_uid="$(id --user)" || fail 'Autocontribute could not resolve the Docker service UID'
+service_gid="$(id --group)" || fail 'Autocontribute could not resolve the Docker service GID'
+readonly service_uid service_gid
+if [[ ! "$service_uid" =~ ^[1-9][0-9]*$ || ! "$service_gid" =~ ^[1-9][0-9]*$ ]]; then
+  fail 'Autocontribute rootless dockerd launcher has an invalid identity'
+fi
+if [[ ! -x "$daemon" ]]; then
+  fail 'Autocontribute rootless Docker executable is unavailable'
+fi
+daemon_resolved="$(readlink --canonicalize-existing -- "$daemon")" || \
+  fail 'Autocontribute could not resolve the rootless Docker executable'
+daemon_owner="$(stat --format=%u -- "$daemon_resolved")" || \
+  fail 'Autocontribute could not inspect the rootless Docker executable'
+daemon_group="$(stat --format=%g -- "$daemon_resolved")" || \
+  fail 'Autocontribute could not inspect the rootless Docker executable'
+daemon_mode="$(stat --format=%a -- "$daemon_resolved")" || \
+  fail 'Autocontribute could not inspect the rootless Docker executable'
+readonly daemon_resolved daemon_owner daemon_group daemon_mode
+if [[
+  ! -f "$daemon_resolved" ||
+  ! -x "$daemon_resolved" ||
+  "$daemon_owner" != 0 ||
+  "$daemon_group" != 0 ||
+  ! "$daemon_mode" =~ ^[0-7]{3,4}$
+]] || (( (8#$daemon_mode & 8#022) != 0 )); then
+  fail 'Autocontribute rootless Docker executable has unsafe metadata'
+fi
+if [[ ! -f "$daemon_config" || -L "$daemon_config" ]]; then
+  fail 'Autocontribute rootless Docker configuration is unavailable or unsafe'
+fi
+if [[ ! -d "$config_directory" || -L "$config_directory" ]]; then
+  fail 'Autocontribute rootless Docker configuration directory is unavailable or unsafe'
+fi
+
+config_resolved="$(readlink --canonicalize-existing -- "$daemon_config")" || \
+  fail 'Autocontribute could not resolve the rootless Docker configuration'
+config_owner="$(stat --format=%u -- "$daemon_config")" || \
+  fail 'Autocontribute could not inspect the rootless Docker configuration'
+config_group="$(stat --format=%g -- "$daemon_config")" || \
+  fail 'Autocontribute could not inspect the rootless Docker configuration'
+config_mode="$(stat --format=%a -- "$daemon_config")" || \
+  fail 'Autocontribute could not inspect the rootless Docker configuration'
+config_directory_owner="$(stat --format=%u -- "$config_directory")" || \
+  fail 'Autocontribute could not inspect the rootless Docker configuration directory'
+config_directory_group="$(stat --format=%g -- "$config_directory")" || \
+  fail 'Autocontribute could not inspect the rootless Docker configuration directory'
+config_directory_mode="$(stat --format=%a -- "$config_directory")" || \
+  fail 'Autocontribute could not inspect the rootless Docker configuration directory'
+readonly \
+  config_resolved config_owner config_group config_mode \
+  config_directory_owner config_directory_group config_directory_mode
+if [[
+  "$config_resolved" != "$daemon_config" ||
+  "$config_owner" != 0 ||
+  "$config_group" != "$service_gid" ||
+  "$config_mode" != 640 ||
+  "$config_directory_owner" != 0 ||
+  "$config_directory_group" != "$service_gid" ||
+  "$config_directory_mode" != 750
+]]; then
+  fail 'Autocontribute rootless Docker configuration has unsafe ownership or permissions'
+fi
+if [[ ! -d "$runtime_directory" || -L "$runtime_directory" ]]; then
+  fail 'Autocontribute rootless Docker runtime directory is unavailable or unsafe'
+fi
+runtime_owner="$(stat --format=%u -- "$runtime_directory")" || \
+  fail 'Autocontribute could not inspect the rootless Docker runtime directory'
+runtime_group="$(stat --format=%g -- "$runtime_directory")" || \
+  fail 'Autocontribute could not inspect the rootless Docker runtime directory'
+runtime_mode="$(stat --format=%a -- "$runtime_directory")" || \
+  fail 'Autocontribute could not inspect the rootless Docker runtime directory'
+readonly runtime_owner runtime_group runtime_mode
+if [[
+  "$runtime_owner" != "$service_uid" ||
+  "$runtime_group" != "$service_gid" ||
+  "$runtime_mode" != 700
+]]; then
+  fail 'Autocontribute rootless Docker runtime directory has unsafe metadata'
+fi
+if [[ -e "$docker_socket" || -L "$docker_socket" ]]; then
+  fail 'Autocontribute rootless Docker socket path is already occupied'
+fi
+
+readonly user_runtime_directory="/run/user/${service_uid}"
+readonly user_bus="$user_runtime_directory/bus"
+if [[ ! -d "$user_runtime_directory" || -L "$user_runtime_directory" ]]; then
+  fail 'Autocontribute rootless Docker user-manager runtime is unavailable or unsafe'
+fi
+if [[ ! -S "$user_bus" || -L "$user_bus" ]]; then
+  fail 'Autocontribute rootless Docker user-manager bus is unavailable or unsafe'
+fi
+user_runtime_owner="$(stat --format=%u -- "$user_runtime_directory")" || \
+  fail 'Autocontribute could not inspect the Docker user-manager runtime'
+user_runtime_group="$(stat --format=%g -- "$user_runtime_directory")" || \
+  fail 'Autocontribute could not inspect the Docker user-manager runtime'
+user_runtime_mode="$(stat --format=%a -- "$user_runtime_directory")" || \
+  fail 'Autocontribute could not inspect the Docker user-manager runtime'
+bus_owner="$(stat --format=%u -- "$user_bus")" || \
+  fail 'Autocontribute could not inspect the Docker user-manager bus'
+bus_group="$(stat --format=%g -- "$user_bus")" || \
+  fail 'Autocontribute could not inspect the Docker user-manager bus'
+readonly \
+  user_runtime_owner user_runtime_group user_runtime_mode \
+  bus_owner bus_group
+if [[
+  "$user_runtime_owner" != "$service_uid" ||
+  "$user_runtime_group" != "$service_gid" ||
+  "$user_runtime_mode" != 700 ||
+  "$bus_owner" != "$service_uid" ||
+  "$bus_group" != "$service_gid"
+]]; then
+  fail 'Autocontribute rootless Docker user-manager bus has unsafe metadata'
+fi
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus"
+export XDG_RUNTIME_DIR="$runtime_directory"
+export DOCKER_HOST="$docker_host"
+unset DOCKER_CONTEXT DOCKER_CERT_PATH DOCKER_TLS_VERIFY
+
+exec "$daemon" \
+  --config-file="$daemon_config" \
+  --data-root="$data_root" \
+  --exec-opt=native.cgroupdriver=systemd \
+  --host="$docker_host"

@@ -59,6 +59,10 @@ from autocontribute.publication import Publisher, approve_run, build_approval_re
 from autocontribute.reporting import render_approval_review, render_run_report
 from autocontribute.rollout import RolloutGate, RolloutSummary
 from autocontribute.store import RunStore
+from autocontribute.systemd_assets import (
+    verify_installed_systemd_assets,
+    verify_source_systemd_assets,
+)
 from autocontribute.upstream_outcomes import UpstreamPublicationScope
 from autocontribute.workspace_gc import WorkspaceGCReport, collect_terminal_workspaces
 
@@ -93,6 +97,10 @@ policy_app = typer.Typer(
     help="Inspect immutable repository policy and create scoped legal attestations.",
     no_args_is_help=True,
 )
+deployment_app = typer.Typer(
+    help="Verify release-bound production deployment assets.",
+    no_args_is_help=True,
+)
 app.add_typer(runs_app, name="runs")
 app.add_typer(config_app, name="config")
 app.add_typer(evaluation_app, name="eval")
@@ -101,6 +109,7 @@ app.add_typer(state_app, name="state")
 app.add_typer(lifecycle_app, name="lifecycle")
 app.add_typer(safety_app, name="safety")
 app.add_typer(policy_app, name="policy")
+app.add_typer(deployment_app, name="deployment")
 
 console = Console()
 DEFAULT_CONFIG = Path("autocontribute.yml")
@@ -155,6 +164,35 @@ def doctor(
     console.print(table)
     if any(not check.passed for check in checks):
         raise typer.Exit(1)
+
+
+@deployment_app.command(name="verify-systemd-assets")
+def verify_systemd_deployment_assets(
+    source_root: Annotated[
+        Path | None,
+        typer.Option(
+            "--source-root",
+            help=(
+                "Verify an immutable release checkout before installation; omit to verify the "
+                "exact production host paths."
+            ),
+        ),
+    ] = None,
+) -> None:
+    """Fail unless every systemd deployment asset matches this Python release."""
+
+    try:
+        if source_root is None:
+            result = verify_installed_systemd_assets()
+        else:
+            result = verify_source_systemd_assets(source_root)
+    except (AutocontributeError, OSError, ValueError) as exc:
+        _fail(str(exc))
+    console.print(
+        "[green]Verified[/green] "
+        f"{result.checked_assets} {result.scope} systemd deployment asset(s) "
+        f"against manifest {result.manifest_sha256}."
+    )
 
 
 @app.command()

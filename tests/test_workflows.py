@@ -521,6 +521,26 @@ def test_ci_audits_workflows_shell_and_complete_history_for_secrets() -> None:
     assert secret_scan["run"] == '"$(go env GOPATH)/bin/gitleaks" git --redact --verbose .'
 
 
+def test_ci_verifies_complete_systemd_assets_in_source_distribution() -> None:
+    document = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    steps = document["jobs"]["package"]["steps"]
+    build_sdist = next(step for step in steps if step["name"] == "Build source distribution")
+    verify_sdist = next(
+        step for step in steps if step["name"] == "Verify source distribution systemd assets"
+    )
+    build_wheel = next(
+        step for step in steps if step["name"] == "Build wheel from source distribution"
+    )
+    script = verify_sdist["run"]
+
+    assert steps.index(build_sdist) < steps.index(verify_sdist) < steps.index(build_wheel)
+    assert "len(assets) != 23" in script
+    assert "source distribution contains non-regular systemd assets" in script
+    assert "archived_assets != set(expected)" in script
+    assert "extracted.read() != Path(source_path).read_bytes()" in script
+    assert "member.mode != expected_mode" in script
+
+
 def test_ci_exercises_workspace_quota_preflight_on_a_real_hardened_mount() -> None:
     document = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
     job = document["jobs"]["systemd-deployment"]
@@ -620,7 +640,9 @@ def test_security_integration_exercises_rootful_and_rootless_resource_boundaries
     )
     job = document["jobs"]["live-docker-isolation"]
     rootless = next(
-        step for step in job["steps"] if step["name"] == "Exercise live rootless Docker isolation"
+        step
+        for step in job["steps"]
+        if step["name"] == "Exercise live rootless Docker production topology"
     )
     rootful = next(
         step for step in job["steps"] if step["name"] == "Exercise live rootful Docker isolation"
@@ -643,18 +665,60 @@ def test_security_integration_exercises_rootful_and_rootless_resource_boundaries
     assert "no shared subordinate UID/GID range is available" in script
     assert "sudo systemctl stop docker.service docker.socket" in script
     assert "Rootful Docker remained reachable after shutdown" in script
-    assert "sudo rm -f -- /var/run/docker.sock" in script
-    assert 'runtime="/run/user/${service_uid}"' in script
-    assert "sudo loginctl enable-linger" in script
-    assert "Delegate=cpu cpuset io memory pids" in script
+    assert 'sudo rm -f -- "$rootful_socket"' in script
+    assert 'user_runtime="/run/user/${service_uid}"' in script
+    assert 'sudo loginctl enable-linger "$account"' in script
+    assert 'manager_drop_in_directory="/etc/systemd/system/user@${service_uid}.service.d"' in script
+    assert "/etc/systemd/system/user@.service.d/50-autocontribute.conf" in script
+    assert '"storage-driver": "fuse-overlayfs"' in script
     assert 'sudo systemctl restart "user@${service_uid}.service"' in script
-    assert 'DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime}/bus"' in script
+    assert 'DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus"' in script
     assert "systemctl --user show-environment" in script
-    assert "systemd-run --user" in script
-    assert "--property=Delegate=yes" in script
-    assert '--data-root="$data_root"' in script
-    assert '--exec-root="$exec_root"' in script
+    assert 'test "$manager_effective_unit_path" = "$expected_manager_unit_path"' in script
+    assert 'sudo systemctl start "$system_unit"' in script
+    assert '"${user_systemctl[@]}" is-active --quiet "$user_unit"' in script
+    assert 'proxy_pid_before="$(sudo systemctl show "$system_unit"' in script
+    assert 'daemon_pid_before="$("${user_systemctl[@]}" show "$user_unit"' in script
+    reload_command = 'sudo systemctl reload "$system_unit"'
+    docker_probe = '"${service_env[@]}" docker info >/dev/null'
+    assert script.count(reload_command) == 1
+    assert '--property=MainPID --value)" = "$proxy_pid_before"' in script
+    assert '--property=MainPID --value)" = "$manager_pid_before"' in script
+    assert '--property=MainPID --value)" = "$daemon_pid_before"' in script
+    assert script.count('"$runtime" "$docker_socket" "$rootful_socket"') == 2
+    reload_index = script.index(reload_command)
+    docker_probe_index = script.index(docker_probe)
+    post_reload = script[reload_index : docker_probe_index + len(docker_probe)]
+    assert script.index('sudo systemctl start "$system_unit"') < reload_index
+    assert reload_index < docker_probe_index
+    assert 'sudo systemctl is-active --quiet "$system_unit"' in post_reload
+    assert '"${user_systemctl[@]}" is-active --quiet "$user_unit"' in post_reload
+    assert post_reload.count('--property=SubState --value)" = running') == 2
+    assert "/usr/local/libexec/autocontribute-rootless-docker-check" in post_reload
+    assert '"$runtime" "$docker_socket" "$rootful_socket"' in post_reload
     assert 'test "$cgroup_driver" != none' in script
     assert "cleanup_rootless_job" in script
     assert "--signal=KILL" in script
-    assert "uv run pytest -q tests/test_sandbox_live.py" in script
+    assert "fixture_preflight_complete=0" in script
+    assert "manager_drop_in_preflight_complete=0" in script
+    assert "service_home_created=0" in script
+    cleanup = script[
+        script.index("cleanup_rootless_job()") : script.index("trap rootless_error ERR")
+    ]
+    assert 'if [[ "$fixture_preflight_complete" -eq 1 ]]; then' in cleanup
+    assert 'if [[ "$manager_drop_in_preflight_complete" -eq 1 ]]; then' in cleanup
+    assert '"$service_home_created" -eq 1' in cleanup
+    assert 'sudo rm -f -- "$docker_apt_source" "$docker_apt_key"' not in cleanup
+    preflight = script[script.index("trap cleanup_rootless_job EXIT") :]
+    fixture_collision = preflight.index("Production-topology fixture path already exists")
+    assert fixture_collision < preflight.index("fixture_preflight_complete=1")
+    manager_collision = preflight.index(
+        "Production-topology fixture path already exists",
+        fixture_collision + 1,
+    )
+    assert manager_collision < preflight.index("manager_drop_in_preflight_complete=1")
+    assert preflight.index(
+        'sudo install -d -o root -g "$account" -m 0750 "$service_home"'
+    ) < preflight.index("service_home_created=1")
+    assert '"$GITHUB_WORKSPACE/.venv/bin/pytest"' in script
+    assert "-q -p no:cacheprovider tests/test_sandbox_live.py" in script

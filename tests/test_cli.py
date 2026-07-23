@@ -1885,3 +1885,46 @@ def test_lifecycle_sync_command_reports_bounded_summary(tmp_path: Path, monkeypa
 
     assert result.exit_code == 0, result.output
     assert "Lifecycle sync: 0 PR(s), 0 new snapshot(s), 0 safety signal(s)" in result.output
+
+
+def test_deployment_asset_command_verifies_a_source_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        cli,
+        "verify_source_systemd_assets",
+        lambda root: (
+            calls.append(root)
+            or SimpleNamespace(
+                checked_assets=23,
+                scope="source",
+                manifest_sha256="a" * 64,
+            )
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        ["deployment", "verify-systemd-assets", "--source-root", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [tmp_path]
+    assert "Verified 23 source systemd deployment asset(s)" in result.output
+
+
+def test_deployment_asset_command_reports_installed_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "verify_installed_systemd_assets",
+        lambda: (_ for _ in ()).throw(StateError("installed assets differ")),
+    )
+
+    result = runner.invoke(app, ["deployment", "verify-systemd-assets"])
+
+    assert result.exit_code == 1
+    assert "installed assets differ" in result.output

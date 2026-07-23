@@ -1,0 +1,555 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+umask 077
+
+readonly operation="${1:-}"
+readonly daemon_account=autocontribute
+readonly daemon_unit=autocontribute-rootless-docker-daemon.service
+readonly expected_fragment=/etc/systemd/user/autocontribute-rootless-docker-daemon.service
+readonly expected_manager_fragment=/usr/lib/systemd/system/user@.service
+readonly expected_vendor_dropin_directory=/usr/lib/systemd/system/user@.service.d
+readonly expected_unit_path=/etc/systemd/user:/run/systemd/user:/usr/local/lib/systemd/user:/usr/lib/systemd/user
+readonly expected_manager_unit_path='/etc/systemd/user /run/systemd/user /usr/local/lib/systemd/user /usr/lib/systemd/user'
+readonly manager_readiness_timeout_seconds=120
+readonly manager_readiness_probe_seconds=5
+readonly manager_readiness_kill_grace_seconds=2
+readonly daemon_stop_client_timeout_seconds=120
+readonly daemon_start_client_timeout_seconds=150
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+if [[ $# -gt 1 || ( -n "$operation" && "$operation" != --reload ) ]]; then
+  fail 'Autocontribute rootless Docker supervisor received invalid arguments'
+fi
+if [[ "$UID" == 0 || "$(id --user --name)" != "$daemon_account" ]]; then
+  fail 'Autocontribute rootless Docker supervisor has an invalid identity'
+fi
+
+service_uid="$(id --user)" || fail 'Autocontribute could not resolve the Docker service UID'
+service_gid="$(id --group)" || fail 'Autocontribute could not resolve the Docker service GID'
+readonly service_uid service_gid
+if [[ ! "$service_uid" =~ ^[1-9][0-9]*$ || ! "$service_gid" =~ ^[1-9][0-9]*$ ]]; then
+  fail 'Autocontribute rootless Docker supervisor has an invalid identity'
+fi
+readonly user_runtime_directory="/run/user/$service_uid"
+readonly user_bus="$user_runtime_directory/bus"
+readonly legacy_docker_socket="$user_runtime_directory/docker.sock"
+readonly service_home=/var/lib/autocontribute
+readonly user_manager_unit="user@${service_uid}.service"
+readonly expected_manager_dropin="/etc/systemd/system/user@${service_uid}.service.d/50-autocontribute.conf"
+readonly expected_user_manager_cgroup="/user.slice/user-${service_uid}.slice/user@${service_uid}.service"
+export XDG_RUNTIME_DIR="$user_runtime_directory"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus"
+
+if [[ ! -d "$service_home" || -L "$service_home" ]]; then
+  fail 'Autocontribute service home is unavailable or unsafe'
+fi
+home_owner="$(stat --format=%u -- "$service_home")" || \
+  fail 'Autocontribute could not inspect the service home'
+home_group="$(stat --format=%g -- "$service_home")" || \
+  fail 'Autocontribute could not inspect the service home'
+home_mode="$(stat --format=%a -- "$service_home")" || \
+  fail 'Autocontribute could not inspect the service home'
+readonly home_owner home_group home_mode
+if [[ "$home_owner" != 0 || "$home_group" != "$service_gid" || "$home_mode" != 750 ]]; then
+  fail 'Autocontribute service home has unsafe ownership or permissions'
+fi
+
+user_manager_ready=0
+manager_readiness_deadline=$((SECONDS + manager_readiness_timeout_seconds))
+while (( SECONDS < manager_readiness_deadline )); do
+  manager_readiness_remaining=$((manager_readiness_deadline - SECONDS))
+  if (( manager_readiness_remaining <= manager_readiness_kill_grace_seconds )); then
+    break
+  fi
+  manager_readiness_probe_timeout=$manager_readiness_probe_seconds
+  if ((
+    manager_readiness_probe_timeout + manager_readiness_kill_grace_seconds >
+      manager_readiness_remaining
+  )); then
+    manager_readiness_probe_timeout=$((
+      manager_readiness_remaining - manager_readiness_kill_grace_seconds
+    ))
+  fi
+  if [[ -d "$user_runtime_directory" && ! -L "$user_runtime_directory" && \
+        -S "$user_bus" && ! -L "$user_bus" ]] && \
+    timeout \
+      --kill-after="${manager_readiness_kill_grace_seconds}s" \
+      "${manager_readiness_probe_timeout}s" \
+      systemctl --user show-environment >/dev/null 2>&1; then
+    user_manager_ready=1
+    break
+  fi
+  if (( SECONDS < manager_readiness_deadline )); then
+    sleep 1
+  fi
+done
+if [[ "$user_manager_ready" -ne 1 ]]; then
+  fail 'Autocontribute rootless Docker user manager is unavailable'
+fi
+unset \
+  manager_readiness_deadline manager_readiness_probe_timeout \
+  manager_readiness_remaining user_manager_ready
+
+runtime_owner="$(stat --format=%u -- "$user_runtime_directory")" || \
+  fail 'Autocontribute could not inspect the Docker user-manager runtime directory'
+runtime_group="$(stat --format=%g -- "$user_runtime_directory")" || \
+  fail 'Autocontribute could not inspect the Docker user-manager runtime directory'
+runtime_mode="$(stat --format=%a -- "$user_runtime_directory")" || \
+  fail 'Autocontribute could not inspect the Docker user-manager runtime directory'
+bus_owner="$(stat --format=%u -- "$user_bus")" || \
+  fail 'Autocontribute could not inspect the Docker user-manager bus'
+bus_group="$(stat --format=%g -- "$user_bus")" || \
+  fail 'Autocontribute could not inspect the Docker user-manager bus'
+readonly runtime_owner runtime_group runtime_mode bus_owner bus_group
+if [[
+  "$runtime_owner" != "$service_uid" ||
+  "$runtime_group" != "$service_gid" ||
+  "$runtime_mode" != 700 ||
+  "$bus_owner" != "$service_uid" ||
+  "$bus_group" != "$service_gid"
+]]; then
+  fail 'Autocontribute rootless Docker user-manager runtime has unsafe metadata'
+fi
+
+system_property() {
+  local unit="$1"
+  local property="$2"
+  local value
+  if ! value="$(
+    timeout --kill-after=2s 10s \
+      systemctl show "$unit" --property="$property" --value 2>/dev/null
+  )"; then
+    fail 'Autocontribute could not inspect Docker user-manager delegation'
+  fi
+  if [[ -z "$value" || "$value" == *$'\n'* ]]; then
+    fail 'Autocontribute Docker user-manager delegation is ambiguous'
+  fi
+  printf '%s' "$value"
+}
+
+manager_unit_properties() {
+  local value
+  if ! value="$(
+    timeout --kill-after=2s 10s \
+      systemctl show "$user_manager_unit" --no-pager \
+        --property=ActiveState \
+        --property=SubState \
+        --property=LoadState \
+        --property=NeedDaemonReload \
+        --property=DropInPaths \
+        --property=Delegate \
+        --property=Transient \
+        --property=ControlGroup \
+        --property=Environment \
+        --property=FragmentPath \
+        --property=MainPID \
+        2>/dev/null
+  )"; then
+    fail 'Autocontribute could not inspect Docker user-manager delegation'
+  fi
+  if [[ -z "$value" ]]; then
+    fail 'Autocontribute Docker user-manager delegation is ambiguous'
+  fi
+  printf '%s' "$value"
+}
+
+manager_property() {
+  local property="$1"
+  local value
+  if ! value="$(
+    timeout --kill-after=2s 10s \
+      systemctl --user --no-pager show --property="$property" --value 2>/dev/null
+  )"; then
+    fail 'Autocontribute could not inspect the effective Docker user manager'
+  fi
+  if [[ -z "$value" || "$value" == *$'\n'* ]]; then
+    fail 'Autocontribute effective Docker user-manager policy is ambiguous'
+  fi
+  printf '%s' "$value"
+}
+
+verify_user_manager() {
+  local active_state='' sub_state='' load_state='' need_daemon_reload='' dropin_paths=''
+  local delegate='' transient='' control_group='' environment='' main_pid_before=''
+  local main_pid_after=''
+  local manager_unit_path manager_properties manager_property_name manager_property_value
+  local seen_manager_properties='' manager_property_count=0
+  local fragment_path fragment_resolved fragment_owner fragment_group fragment_mode
+  local manager_dropin_path manager_dropin_directory dropin_owner dropin_group dropin_mode
+  local dropin_resolved
+  local expected_dropin_count
+  local bus_response bus_signature bus_pid bus_extra
+  local status_uid status_gid uid_real uid_effective uid_saved uid_filesystem uid_extra
+  local gid_real gid_effective gid_saved gid_filesystem gid_extra
+  local proc_cgroup manager_executable executable_owner executable_group executable_mode
+  local manager_environment_count manager_environment_entry
+  local controller_file controller_values required_controller controller_count controller_value
+
+  manager_properties="$(manager_unit_properties)"
+  while IFS='=' read -r manager_property_name manager_property_value; do
+    case "$manager_property_name" in
+      ActiveState|SubState|LoadState|NeedDaemonReload|DropInPaths|Delegate|Transient|\
+        ControlGroup|Environment|FragmentPath|MainPID) ;;
+      *) fail 'Autocontribute Docker user-manager delegation is ambiguous' ;;
+    esac
+    if [[ " $seen_manager_properties " == *" $manager_property_name "* ]]; then
+      fail 'Autocontribute Docker user-manager delegation is ambiguous'
+    fi
+    seen_manager_properties="$seen_manager_properties $manager_property_name"
+    manager_property_count=$((manager_property_count + 1))
+    case "$manager_property_name" in
+      ActiveState) active_state="$manager_property_value" ;;
+      SubState) sub_state="$manager_property_value" ;;
+      LoadState) load_state="$manager_property_value" ;;
+      NeedDaemonReload) need_daemon_reload="$manager_property_value" ;;
+      DropInPaths) dropin_paths="$manager_property_value" ;;
+      Delegate) delegate="$manager_property_value" ;;
+      Transient) transient="$manager_property_value" ;;
+      ControlGroup) control_group="$manager_property_value" ;;
+      Environment) environment="$manager_property_value" ;;
+      FragmentPath) fragment_path="$manager_property_value" ;;
+      MainPID) main_pid_before="$manager_property_value" ;;
+    esac
+  done <<< "$manager_properties"
+  if [[ "$manager_property_count" -ne 11 ]]; then
+    fail 'Autocontribute Docker user-manager delegation is ambiguous'
+  fi
+  manager_unit_path="$(manager_property UnitPath)"
+  if [[
+    "$active_state" != active ||
+    "$sub_state" != running ||
+    "$load_state" != loaded ||
+    "$need_daemon_reload" != no ||
+    "$delegate" != yes ||
+    "$transient" != no ||
+    "$control_group" != "$expected_user_manager_cgroup" ||
+    "$environment" != "SYSTEMD_UNIT_PATH=$expected_unit_path" ||
+    "$fragment_path" != "$expected_manager_fragment" ||
+    "$manager_unit_path" != "$expected_manager_unit_path" ||
+    ! "$main_pid_before" =~ ^[1-9][0-9]*$
+  ]]; then
+    fail 'Autocontribute Docker user manager is not safely delegated'
+  fi
+
+  if [[ ! -f "$fragment_path" || -L "$fragment_path" ]]; then
+    fail 'Autocontribute Docker user-manager fragment is unavailable or unsafe'
+  fi
+  fragment_resolved="$(readlink --canonicalize-existing -- "$fragment_path")" || \
+    fail 'Autocontribute could not resolve the Docker user-manager fragment'
+  fragment_owner="$(stat --format=%u -- "$fragment_path")" || \
+    fail 'Autocontribute could not inspect the Docker user-manager fragment'
+  fragment_group="$(stat --format=%g -- "$fragment_path")" || \
+    fail 'Autocontribute could not inspect the Docker user-manager fragment'
+  fragment_mode="$(stat --format=%a -- "$fragment_path")" || \
+    fail 'Autocontribute could not inspect the Docker user-manager fragment'
+  if [[
+    "$fragment_resolved" != "$fragment_path" ||
+    "$fragment_owner" != 0 ||
+    "$fragment_group" != 0 ||
+    "$fragment_mode" != 644
+  ]]; then
+    fail 'Autocontribute Docker user-manager fragment has unsafe metadata'
+  fi
+
+  expected_dropin_count=0
+  for manager_dropin_path in $dropin_paths; do
+    if [[ "$manager_dropin_path" == "$expected_manager_dropin" ]]; then
+      expected_dropin_count=$((expected_dropin_count + 1))
+    else
+      manager_dropin_directory="${manager_dropin_path%/*}"
+      if [[ "$manager_dropin_directory" != "$expected_vendor_dropin_directory" ]]; then
+        fail 'Autocontribute Docker user manager has an unexpected effective drop-in'
+      fi
+    fi
+    if [[ ! -f "$manager_dropin_path" || -L "$manager_dropin_path" ]]; then
+      fail 'Autocontribute Docker user-manager drop-in is unavailable or unsafe'
+    fi
+    dropin_resolved="$(readlink --canonicalize-existing -- "$manager_dropin_path")" || \
+      fail 'Autocontribute could not resolve a Docker user-manager drop-in'
+    dropin_owner="$(stat --format=%u -- "$manager_dropin_path")" || \
+      fail 'Autocontribute could not inspect a Docker user-manager drop-in'
+    dropin_group="$(stat --format=%g -- "$manager_dropin_path")" || \
+      fail 'Autocontribute could not inspect a Docker user-manager drop-in'
+    dropin_mode="$(stat --format=%a -- "$manager_dropin_path")" || \
+      fail 'Autocontribute could not inspect a Docker user-manager drop-in'
+    if [[
+      "$dropin_resolved" != "$manager_dropin_path" ||
+      "$dropin_owner" != 0 ||
+      "$dropin_group" != 0 ||
+      "$dropin_mode" != 644
+    ]]; then
+      fail 'Autocontribute Docker user-manager drop-in has unsafe metadata'
+    fi
+  done
+  if [[ "$expected_dropin_count" -ne 1 ]]; then
+    fail 'Autocontribute Docker user manager omitted its protected drop-in'
+  fi
+
+  if ! bus_response="$(
+    timeout --kill-after=2s 10s \
+      busctl --user --no-pager call \
+        org.freedesktop.DBus /org/freedesktop/DBus \
+        org.freedesktop.DBus GetConnectionUnixProcessID s org.freedesktop.systemd1 \
+        2>/dev/null
+  )"; then
+    fail 'Autocontribute could not bind the Docker user-manager bus to its process'
+  fi
+  read -r bus_signature bus_pid bus_extra <<< "$bus_response"
+  main_pid_after="$(system_property "$user_manager_unit" MainPID)"
+  if [[
+    "$bus_signature" != u ||
+    "$bus_pid" != "$main_pid_before" ||
+    -n "$bus_extra" ||
+    "$main_pid_after" != "$main_pid_before"
+  ]]; then
+    fail 'Autocontribute Docker user-manager bus has an unexpected owner'
+  fi
+
+  if [[
+    ! -r "/proc/$main_pid_before/status" ||
+    ! -r "/proc/$main_pid_before/cgroup" ||
+    ! -r "/proc/$main_pid_before/environ"
+  ]]; then
+    fail 'Autocontribute Docker user-manager process metadata is unavailable'
+  fi
+  status_uid="$(sed -n 's/^Uid:[[:space:]]*//p' "/proc/$main_pid_before/status")" || \
+    fail 'Autocontribute could not inspect the Docker user-manager process identity'
+  status_gid="$(sed -n 's/^Gid:[[:space:]]*//p' "/proc/$main_pid_before/status")" || \
+    fail 'Autocontribute could not inspect the Docker user-manager process identity'
+  read -r uid_real uid_effective uid_saved uid_filesystem uid_extra <<< "$status_uid"
+  read -r gid_real gid_effective gid_saved gid_filesystem gid_extra <<< "$status_gid"
+  if [[
+    "$uid_real" != "$service_uid" ||
+    "$uid_effective" != "$service_uid" ||
+    "$uid_saved" != "$service_uid" ||
+    "$uid_filesystem" != "$service_uid" ||
+    -n "$uid_extra" ||
+    "$gid_real" != "$service_gid" ||
+    "$gid_effective" != "$service_gid" ||
+    "$gid_saved" != "$service_gid" ||
+    "$gid_filesystem" != "$service_gid" ||
+    -n "$gid_extra"
+  ]]; then
+    fail 'Autocontribute Docker user-manager process has an unexpected identity'
+  fi
+
+  proc_cgroup="$(<"/proc/$main_pid_before/cgroup")" || \
+    fail 'Autocontribute could not inspect the Docker user-manager process cgroup'
+  if [[ "$proc_cgroup" != "0::${expected_user_manager_cgroup}/init.scope" ]]; then
+    fail 'Autocontribute Docker user-manager process has an unexpected cgroup'
+  fi
+  manager_executable="$(readlink --canonicalize-existing -- "/proc/$main_pid_before/exe")" || \
+    fail 'Autocontribute could not resolve the Docker user-manager executable'
+  executable_owner="$(stat --format=%u -- "$manager_executable")" || \
+    fail 'Autocontribute could not inspect the Docker user-manager executable'
+  executable_group="$(stat --format=%g -- "$manager_executable")" || \
+    fail 'Autocontribute could not inspect the Docker user-manager executable'
+  executable_mode="$(stat --format=%a -- "$manager_executable")" || \
+    fail 'Autocontribute could not inspect the Docker user-manager executable'
+  if [[
+    ! -f "$manager_executable" ||
+    ! -x "$manager_executable" ||
+    "$executable_owner" != 0 ||
+    "$executable_group" != 0 ||
+    ! "$executable_mode" =~ ^[0-7]{3,4}$
+  ]] || (( (8#$executable_mode & 8#022) != 0 )); then
+    fail 'Autocontribute Docker user-manager executable has unsafe metadata'
+  fi
+
+  manager_environment_count=0
+  while IFS= read -r -d '' manager_environment_entry; do
+    if [[ "$manager_environment_entry" == SYSTEMD_UNIT_PATH=* ]]; then
+      manager_environment_count=$((manager_environment_count + 1))
+      if [[ "$manager_environment_entry" != "SYSTEMD_UNIT_PATH=$expected_unit_path" ]]; then
+        fail 'Autocontribute Docker user-manager process has an unsafe unit path'
+      fi
+    fi
+  done < "/proc/$main_pid_before/environ"
+  if [[ "$manager_environment_count" -ne 1 ]]; then
+    fail 'Autocontribute Docker user-manager process has an ambiguous unit path'
+  fi
+  if [[ "$(system_property "$user_manager_unit" MainPID)" != "$main_pid_before" ]]; then
+    fail 'Autocontribute Docker user manager changed during verification'
+  fi
+
+  controller_file="/sys/fs/cgroup${expected_user_manager_cgroup}/cgroup.controllers"
+  if [[ ! -f "$controller_file" || -L "$controller_file" ]]; then
+    fail 'Autocontribute Docker user-manager controllers are unavailable'
+  fi
+  controller_values="$(<"$controller_file")" || \
+    fail 'Autocontribute could not inspect Docker user-manager controllers'
+  for required_controller in cpu cpuset io memory pids; do
+    controller_count=0
+    for controller_value in $controller_values; do
+      if [[ "$controller_value" == "$required_controller" ]]; then
+        controller_count=$((controller_count + 1))
+      fi
+    done
+    if [[ "$controller_count" -ne 1 ]]; then
+      fail 'Autocontribute Docker user-manager controller delegation is incomplete'
+    fi
+  done
+}
+
+user_unit_properties() {
+  local value
+  if ! value="$(
+    timeout --kill-after=2s 10s \
+      systemctl --user show "$daemon_unit" --no-pager "$@" 2>/dev/null
+  )"; then
+    fail 'Autocontribute could not inspect the rootless Docker user unit'
+  fi
+  if [[ -z "$value" ]]; then
+    fail 'Autocontribute rootless Docker user unit has an ambiguous property'
+  fi
+  printf '%s' "$value"
+}
+
+verify_user_unit() {
+  local load_state='' need_daemon_reload='' fragment_path='' dropin_paths='' transient=''
+  local unit_properties property_name property_value seen_properties='' property_count=0
+  local fragment_owner fragment_group fragment_mode
+  unit_properties="$(
+    user_unit_properties \
+      --property=LoadState \
+      --property=NeedDaemonReload \
+      --property=FragmentPath \
+      --property=DropInPaths \
+      --property=Transient
+  )"
+  while IFS='=' read -r property_name property_value; do
+    case "$property_name" in
+      LoadState|NeedDaemonReload|FragmentPath|DropInPaths|Transient) ;;
+      *) fail 'Autocontribute rootless Docker user unit has an ambiguous property' ;;
+    esac
+    if [[ " $seen_properties " == *" $property_name "* ]]; then
+      fail 'Autocontribute rootless Docker user unit has an ambiguous property'
+    fi
+    seen_properties="$seen_properties $property_name"
+    property_count=$((property_count + 1))
+    case "$property_name" in
+      LoadState) load_state="$property_value" ;;
+      NeedDaemonReload) need_daemon_reload="$property_value" ;;
+      FragmentPath) fragment_path="$property_value" ;;
+      DropInPaths) dropin_paths="$property_value" ;;
+      Transient) transient="$property_value" ;;
+    esac
+  done <<< "$unit_properties"
+  if [[ "$property_count" -ne 5 ]]; then
+    fail 'Autocontribute rootless Docker user unit has an ambiguous property'
+  fi
+  if [[
+    "$load_state" != loaded ||
+    "$need_daemon_reload" != no ||
+    "$transient" != no
+  ]]; then
+    fail 'Autocontribute rootless Docker user unit is not safely loaded'
+  fi
+  if [[ "$fragment_path" != "$expected_fragment" || -n "$dropin_paths" ]]; then
+    fail 'Autocontribute rootless Docker user unit has unexpected effective policy'
+  fi
+  if [[ ! -f "$fragment_path" || -L "$fragment_path" ]]; then
+    fail 'Autocontribute rootless Docker user unit fragment is unavailable or unsafe'
+  fi
+  fragment_owner="$(stat --format=%u -- "$fragment_path")" || \
+    fail 'Autocontribute could not inspect the rootless Docker user unit fragment'
+  fragment_group="$(stat --format=%g -- "$fragment_path")" || \
+    fail 'Autocontribute could not inspect the rootless Docker user unit fragment'
+  fragment_mode="$(stat --format=%a -- "$fragment_path")" || \
+    fail 'Autocontribute could not inspect the rootless Docker user unit fragment'
+  if [[ "$fragment_owner" != 0 || "$fragment_group" != 0 || "$fragment_mode" != 644 ]]; then
+    fail 'Autocontribute rootless Docker user unit fragment has unsafe metadata'
+  fi
+}
+
+verify_legacy_socket_absent() {
+  if [[ -e "$legacy_docker_socket" || -L "$legacy_docker_socket" ]]; then
+    fail 'Autocontribute found a legacy Docker socket outside the managed runtime'
+  fi
+}
+
+verify_daemon_running() {
+  local active_state='' sub_state=''
+  local unit_properties property_name property_value seen_properties='' property_count=0
+  unit_properties="$(
+    user_unit_properties \
+      --property=ActiveState \
+      --property=SubState
+  )"
+  while IFS='=' read -r property_name property_value; do
+    case "$property_name" in
+      ActiveState|SubState) ;;
+      *) fail 'Autocontribute rootless Docker user unit has an ambiguous property' ;;
+    esac
+    if [[ " $seen_properties " == *" $property_name "* ]]; then
+      fail 'Autocontribute rootless Docker user unit has an ambiguous property'
+    fi
+    seen_properties="$seen_properties $property_name"
+    property_count=$((property_count + 1))
+    case "$property_name" in
+      ActiveState) active_state="$property_value" ;;
+      SubState) sub_state="$property_value" ;;
+    esac
+  done <<< "$unit_properties"
+  if [[ "$property_count" -ne 2 ]]; then
+    fail 'Autocontribute rootless Docker user unit has an ambiguous property'
+  fi
+  if [[ "$active_state" != active || "$sub_state" != running ]]; then
+    fail 'Autocontribute rootless Docker user unit is not running'
+  fi
+  verify_legacy_socket_absent
+}
+
+verify_user_manager
+verify_user_unit
+if [[ "$operation" == --reload ]]; then
+  timeout --kill-after=5s 30s systemctl --user reload "$daemon_unit" || \
+    fail 'Autocontribute could not reload the rootless Docker user unit'
+  verify_user_manager
+  verify_user_unit
+  verify_daemon_running
+  exit 0
+fi
+
+stop_daemon() {
+  local status=$?
+  local stop_status
+  trap - EXIT TERM INT
+  set +e
+  timeout --kill-after=10s "${daemon_stop_client_timeout_seconds}s" \
+    systemctl --user stop "$daemon_unit"
+  stop_status=$?
+  if [[ "$status" -eq 0 && "$stop_status" -ne 0 ]]; then
+    status="$stop_status"
+  fi
+  exit "$status"
+}
+trap stop_daemon EXIT
+trap 'exit 0' TERM INT
+
+timeout --kill-after=10s "${daemon_stop_client_timeout_seconds}s" \
+  systemctl --user stop "$daemon_unit" || \
+  fail 'Autocontribute could not quiesce the rootless Docker user unit'
+timeout --kill-after=5s 30s systemctl --user reset-failed "$daemon_unit" || \
+  fail 'Autocontribute could not reset the rootless Docker user unit'
+verify_user_manager
+verify_user_unit
+verify_legacy_socket_absent
+timeout --kill-after=10s "${daemon_start_client_timeout_seconds}s" \
+  systemctl --user start "$daemon_unit" || \
+  fail 'Autocontribute could not start the rootless Docker user unit'
+verify_user_unit
+verify_daemon_running
+systemd-notify --ready --pid=parent \
+  --status='Root-owned rootless Docker user unit is active and monitored'
+
+while sleep 30; do
+  verify_user_manager
+  verify_user_unit
+  verify_daemon_running
+done

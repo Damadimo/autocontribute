@@ -281,9 +281,10 @@ separate conservative check for externally created and open pull requests.
 Automatic publication also remains locked until the first 100 runs for the current deployment
 fingerprint, in persisted creation-time order with run ID as the tie-breaker, all have completed
 outcomes and anchored expert reviews. The fingerprint binds the cohort to the exact packaged Python
-source, Python interpreter, installed runtime dependency closure, and the packaged build/lock manifest,
-plus material model, budget, discovery, sandbox, validation, policy, quality, and publishing safety
-settings. That fixed cohort must contain at least 20 prepared cases, at least 95% accept-as-is
+source, Python interpreter, installed runtime dependency closure, packaged build/lock manifest, and
+release-bound systemd deployment-asset manifest, plus material model, budget, discovery, sandbox,
+validation, policy, quality, and publishing safety settings. That fixed cohort must contain at least
+20 prepared cases, at least 95% accept-as-is
 precision, and zero policy, security, or etiquette failures. Runs or reviews from another deployment
 cannot fill the cohort. Any material code, model, or configuration change starts a new calibration
 cohort; later favorable reviews cannot replace a missing or unfavorable member. That expert gate is
@@ -297,8 +298,10 @@ Configuration and environment opt-ins remain independently required.
 
 The build/lock identity comes from the validated `_build_identity.json` packaged beside the Python
 modules. CI requires its SHA-256 values to match this project's `pyproject.toml` and `uv.lock`, and the
-same manifest ships in editable-source and wheel installs. Runtime identity never searches parent
-directories, so an unrelated ancestor project cannot silently change or impersonate a cohort.
+same manifest ships in editable-source and wheel installs. Runtime identity also binds the validated
+`_systemd_assets.json` that attests the complete operator-managed deployment bundle. It never
+searches parent directories, so an unrelated ancestor project cannot silently change or impersonate
+a cohort.
 
 `autocontribute eval record` prints every field and its content hash before requiring an explicit
 reviewer attestation; `--yes` supplies that attestation non-interactively but still prints the preview

@@ -155,8 +155,9 @@ row, so deleting a negative grade and its tail event cannot turn the remaining p
 shorter chain. The rollout gate uses only the
 first 100 runs for the current deployment fingerprint in deterministic creation-time/run-ID order and
 requires all 100 grades. That fingerprint binds exact package source, Python interpreter, installed
-runtime dependency closure and the packaged build/lock manifest to the material model, budget,
-discovery, sandbox, validation, policy, quality, and publishing-safety configuration. Evidence from
+runtime dependency closure, packaged build/lock manifest, and release-bound systemd deployment-asset
+manifest to the material model, budget, discovery, sandbox, validation, policy, quality, and
+publishing-safety configuration. Evidence from
 another fingerprint never unlocks automatic publication; a material code, model, or configuration
 change requires a fresh calibration cohort. A usable backup or migration must therefore preserve the
 verified SQLite snapshot, run bundles, and evaluation directory from the same generation. The

@@ -13,6 +13,7 @@ if [[ ! -x "$executable" || ! -r "$config" ]]; then
   printf 'Autocontribute backup prerequisites are unavailable\n' >&2
   exit 1
 fi
+"$executable" deployment verify-systemd-assets
 if [[ ! -d "$backup_directory" || -L "$backup_directory" || ! -w "$backup_directory" ]]; then
   printf 'Autocontribute backup directory is unavailable or unsafe\n' >&2
   exit 1

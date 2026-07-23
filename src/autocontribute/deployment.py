@@ -16,6 +16,7 @@ from packaging.requirements import InvalidRequirement, Requirement
 
 from autocontribute.config import AutocontributeConfig
 from autocontribute.exceptions import PolicyError
+from autocontribute.systemd_assets import packaged_systemd_asset_manifest_digest
 
 _DEPLOYMENT_DOMAIN: Final = b"autocontribute.deployment.v1\x00"
 _SOURCE_DOMAIN: Final = b"autocontribute.package-source.v1\x00"
@@ -113,7 +114,7 @@ def runtime_environment_digest() -> str:
             pending.append(requirement.name)
 
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "python": {
             "build": sys.version,
             "byte_order": sys.byteorder,
@@ -126,6 +127,7 @@ def runtime_environment_digest() -> str:
         },
         "dependencies": dependency_versions,
         "packaged_build_identity_sha256": packaged_build_identity_digest(),
+        "packaged_systemd_assets_sha256": packaged_systemd_asset_manifest_digest(),
     }
     encoded = json.dumps(
         payload,
@@ -263,6 +265,7 @@ __all__ = [
     "compute_deployment_fingerprint",
     "package_source_digest",
     "packaged_build_identity_digest",
+    "packaged_systemd_asset_manifest_digest",
     "runtime_environment_digest",
     "validate_deployment_fingerprint",
 ]
