@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    # Re-evaluate the locked dependency snapshot and hosted baselines even without a source push.
+    - cron: "23 5 * * 1"
 
 permissions:
   contents: read
@@ -35,6 +39,39 @@ jobs:
           "$(go env GOPATH)/bin/actionlint" -shellcheck "$(command -v shellcheck)"
       - name: Scan complete history for secrets
         run: '"$(go env GOPATH)/bin/gitleaks" git --redact --verbose .'
+
+  dependency-and-sast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.30"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Audit the locked runtime dependency graph
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv export \
+            --locked \
+            --no-dev \
+            --no-emit-project \
+            --format requirements-txt \
+            | uvx --from pip-audit==2.9.0 pip-audit \
+              --requirement /dev/stdin \
+              --disable-pip \
+              --progress-spinner off
+      - name: Scan Python sources for medium and high confidence security findings
+        run: >-
+          uvx --from bandit==1.8.6 bandit
+          --quiet --recursive src
+          --severity-level medium --confidence-level medium
 
   systemd-deployment:
     # Require the reviewed systemd major and let parser or scoring changes fail the checked-in
@@ -551,6 +588,25 @@ jobs:
               --no-pager \
               "$service_path"
           done
+
+  ubuntu-deployment-recovery:
+    name: Ubuntu 24.04 deployment/recovery acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.30"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Exercise installed backup and recovery
+        shell: bash
+        run: tests/acceptance/ubuntu_24_04_deployment_recovery.sh
 
   test:
     strategy:

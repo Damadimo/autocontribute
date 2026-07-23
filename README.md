@@ -320,6 +320,9 @@ durable event anchor. Preserve all three parts of the corpus as one generation: 
 `autocontribute state backup --complete` to verify those parts into one checksummed bundle, and
 `state restore --complete` to promote that bundle into an absent storage root. The backward-compatible commands
 without `--complete` intentionally handle only the SQLite snapshot.
+For an independently read-back, compliance-locked AWS S3 version and an immutable off-host receipt,
+use `state replicate-s3` after bundle creation; see
+[Immutable S3 backup replication](docs/s3-backup-replication.md).
 
 An automatic publisher binds both exact validated evaluation and upstream-outcome corpus cursors,
 plus their deployment and publishing scope, in a non-expiring SQLite hold in the same transaction
@@ -412,7 +415,8 @@ working on the agent itself.
 
 Design details live in [Architecture](docs/architecture.md), [Quality policy](docs/quality-policy.md),
 [Staging](docs/staging.md), [Scheduled operation](docs/scheduled-operation.md), and the
-[operator-managed systemd deployment](docs/systemd-deployment.md).
+[operator-managed systemd deployment](docs/systemd-deployment.md). The signed, reproducible artifact
+process and independent verification commands are documented in [Releases](docs/releases.md).
 
 ## Development
 
@@ -429,6 +433,12 @@ that RFC 3339 cutoff, regenerate `uv.lock`, and refresh `_build_identity.json`, 
 must be at least seven days old when the PR is created.
 Release artifacts are built without isolation only after CI installs the exactly pinned Hatchling
 backend from that lockfile, so packaging does not perform a second, unrecorded dependency resolution.
+Signed stable-version tags also run the environment-protected release workflow. It requires two
+byte-identical clean-tree builds, audits the hash-locked runtime closure, verifies the wheel and its
+source-distribution deployment assets, emits a runtime-only CycloneDX SBOM, and publishes keyless
+Sigstore signatures plus GitHub SLSA provenance. The workflow requires a public repository, a
+GitHub-verified signed annotated tag, and a second trusted reviewer on the `release` environment; see
+[Releases](docs/releases.md) before tagging.
 
 The test suite never creates a real public PR. A credential-free security workflow exercises Docker
 isolation weekly, on manual dispatch, on pull requests and merge-queue candidates, and after pushes to

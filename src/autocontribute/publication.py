@@ -3813,7 +3813,10 @@ def _git(
 def _git_environment() -> dict[str, str]:
     return {
         "PATH": os.environ.get("PATH", ""),
-        "HOME": os.environ.get("HOME", "/tmp"),
+        # Git's global and system configuration are disabled below.  Keep the fallback outside
+        # shared temporary storage as an additional defence if a future Git invocation consults
+        # HOME for a non-configuration file.
+        "HOME": os.environ.get("HOME", "/nonexistent"),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "GIT_CONFIG_NOSYSTEM": "1",

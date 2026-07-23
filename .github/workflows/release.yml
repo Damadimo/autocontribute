@@ -1,0 +1,693 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Reproducible signed release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: release
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out complete tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.30"
+          python-version: "3.12.12"
+          enable-cache: false
+      - name: Verify signed release source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tags must use canonical stable semantic versions" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" != "refs/tags/$TAG_NAME" ]]; then
+            echo "Release workflow was not invoked for the exact tag" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ||
+                "$(git rev-list --max-count=1 "$TAG_NAME")" != "$GITHUB_SHA" ||
+                "$(git cat-file -t "refs/tags/$TAG_NAME")" != "tag" ]]; then
+            echo "The checked-out commit is not the exact annotated release tag target" >&2
+            exit 1
+          fi
+
+          project_version="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          print(project["project"]["version"])
+          PY
+          )"
+          dependency_cutoff="$(python - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          print(project["tool"]["uv"]["exclude-newer"])
+          PY
+          )"
+          if [[ "v$project_version" != "$TAG_NAME" ]]; then
+            echo "Release tag does not exactly match project.version" >&2
+            exit 1
+          fi
+          if [[ ! "$dependency_cutoff" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+            echo "Dependency snapshot cutoff is not a canonical UTC timestamp" >&2
+            exit 1
+          fi
+
+          repository_json="$(gh api "repos/$GITHUB_REPOSITORY")"
+          visibility="$(jq -r .visibility <<<"$repository_json")"
+          default_branch="$(jq -r .default_branch <<<"$repository_json")"
+          if [[ "$visibility" != "public" ]]; then
+            echo "Public GitHub visibility is required for publicly verifiable provenance" >&2
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/remotes/origin/$default_branch" ||
+             ! git merge-base --is-ancestor "$GITHUB_SHA" "refs/remotes/origin/$default_branch"; then
+            echo "Release commit is not part of the current default-branch history" >&2
+            exit 1
+          fi
+
+          require_hosted_gate() {
+            local workflow_file="$1"
+            local workflow_name="$2"
+            local required_job="$3"
+            local expected_path=".github/workflows/$workflow_file"
+            local runs_json=""
+            local run_identity=""
+            local run_id=""
+            local run_attempt=""
+            local run_url=""
+            local jobs_json=""
+
+            if ! runs_json="$(gh api --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_file/runs" \
+              -f branch="$default_branch" \
+              -f event=push \
+              -f status=completed \
+              -f head_sha="$GITHUB_SHA" \
+              -f per_page=100)"; then
+              echo "Could not inspect hosted $workflow_name runs" >&2
+              return 1
+            fi
+            if ! run_identity="$(jq -er \
+              --arg commit "$GITHUB_SHA" \
+              --arg branch "$default_branch" \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg workflow_name "$workflow_name" \
+              --arg workflow_path "$expected_path" '
+                [
+                  .workflow_runs[]
+                  | select(
+                      .head_sha == $commit
+                      and .head_branch == $branch
+                      and .event == "push"
+                      and .status == "completed"
+                      and .conclusion == "success"
+                      and .name == $workflow_name
+                      and .path == $workflow_path
+                      and .repository.full_name == $repository
+                      and .head_repository.full_name == $repository
+                    )
+                ]
+                | if length == 0 then
+                    error("no exact successful hosted workflow run")
+                  else
+                    max_by([.run_attempt, .id])
+                  end
+                | [.id, .run_attempt, .html_url]
+                | @tsv
+              ' <<<"$runs_json")"; then
+              echo "$workflow_name has no completed successful push run for $GITHUB_SHA" >&2
+              return 1
+            fi
+            IFS=$'\t' read -r run_id run_attempt run_url <<<"$run_identity"
+            if [[ ! "$run_id" =~ ^[1-9][0-9]*$ ||
+                  ! "$run_attempt" =~ ^[1-9][0-9]*$ ||
+                  ! "$run_url" =~ ^https://github\.com/ ]]; then
+              echo "$workflow_name returned an invalid hosted run identity" >&2
+              return 1
+            fi
+            if ! jobs_json="$(gh api --method GET \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs" \
+              -f filter=latest \
+              -f per_page=100)"; then
+              echo "Could not inspect hosted $workflow_name jobs" >&2
+              return 1
+            fi
+            if ! jq -e \
+              --arg commit "$GITHUB_SHA" \
+              --arg required_job "$required_job" \
+              --argjson run_id "$run_id" \
+              --argjson run_attempt "$run_attempt" '
+                . as $response
+                | [.jobs[] | select(.name == $required_job)] as $required
+                | $response.total_count == ($response.jobs | length)
+                  and $response.total_count <= 100
+                  and ($required | length) == 1
+                  and $required[0].run_id == $run_id
+                  and $required[0].run_attempt == $run_attempt
+                  and $required[0].head_sha == $commit
+                  and $required[0].status == "completed"
+                  and $required[0].conclusion == "success"
+              ' <<<"$jobs_json" >/dev/null; then
+              echo "$workflow_name did not complete exact required job: $required_job" >&2
+              return 1
+            fi
+            printf 'Verified hosted gate: %s (%s)\n' "$required_job" "$run_url"
+          }
+
+          require_hosted_gate \
+            ci.yml \
+            CI \
+            "Ubuntu 24.04 deployment/recovery acceptance"
+          require_hosted_gate \
+            security-integration.yml \
+            "Security integration" \
+            "Security integration gate"
+
+          tag_ref_json="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG_NAME")"
+          tag_object_type="$(jq -r .object.type <<<"$tag_ref_json")"
+          tag_object_sha="$(jq -r .object.sha <<<"$tag_ref_json")"
+          if [[ "$tag_object_type" != "tag" || ! "$tag_object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Release ref must point to an annotated tag object" >&2
+            exit 1
+          fi
+          tag_json="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha")"
+          tag_target_type="$(jq -r .object.type <<<"$tag_json")"
+          tag_target_sha="$(jq -r .object.sha <<<"$tag_json")"
+          tag_verified="$(jq -r .verification.verified <<<"$tag_json")"
+          tag_verification_reason="$(jq -r .verification.reason <<<"$tag_json")"
+          if [[ "$tag_target_type" != "commit" || "$tag_target_sha" != "$GITHUB_SHA" ||
+                "$tag_verified" != "true" || "$tag_verification_reason" != "valid" ]]; then
+            echo "Release tag is not a valid GitHub-verified signature over this commit" >&2
+            exit 1
+          fi
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A GitHub Release already exists for this immutable version" >&2
+            exit 1
+          fi
+
+          source_date_epoch="$(git show --no-patch --format=%ct "$GITHUB_SHA")"
+          if [[ ! "$source_date_epoch" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Release commit has an invalid source timestamp" >&2
+            exit 1
+          fi
+          {
+            printf 'RELEASE_VERSION=%s\n' "$project_version"
+            printf 'SOURCE_DATE_EPOCH=%s\n' "$source_date_epoch"
+            printf 'UV_EXCLUDE_NEWER=%s\n' "$dependency_cutoff"
+          } >>"$GITHUB_ENV"
+      - name: Install locked build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync \
+            --locked \
+            --extra dev \
+            --no-cache \
+            --no-install-project \
+            --no-sources
+          .venv/bin/python tests/test_packaging.py
+          git diff --exit-code -- .
+      - name: Build twice from clean source archives
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          build_root="$RUNNER_TEMP/autocontribute-release-build"
+          release_root="$GITHUB_WORKSPACE/release"
+          mkdir -p "$release_root"
+          for build_id in first second; do
+            source_root="$build_root/source-$build_id"
+            sdist_root="$build_root/output-$build_id/sdist"
+            wheel_root="$build_root/output-$build_id/wheel"
+            mkdir -p "$source_root" "$sdist_root" "$wheel_root"
+            git archive --format=tar "$GITHUB_SHA" | tar -xf - -C "$source_root"
+            uv build "$source_root" \
+              --sdist \
+              --no-sources \
+              --no-build-isolation \
+              --offline \
+              --no-create-gitignore \
+              --python "$GITHUB_WORKSPACE/.venv/bin/python" \
+              --out-dir "$sdist_root"
+            uv build "$sdist_root/autocontribute-${RELEASE_VERSION}.tar.gz" \
+              --wheel \
+              --no-build-isolation \
+              --offline \
+              --no-create-gitignore \
+              --python "$GITHUB_WORKSPACE/.venv/bin/python" \
+              --out-dir "$wheel_root"
+          done
+
+          first_sdist="$build_root/output-first/sdist/autocontribute-${RELEASE_VERSION}.tar.gz"
+          second_sdist="$build_root/output-second/sdist/autocontribute-${RELEASE_VERSION}.tar.gz"
+          first_wheel="$build_root/output-first/wheel/autocontribute-${RELEASE_VERSION}-py3-none-any.whl"
+          second_wheel="$build_root/output-second/wheel/autocontribute-${RELEASE_VERSION}-py3-none-any.whl"
+          for artifact in "$first_sdist" "$second_sdist" "$first_wheel" "$second_wheel"; do
+            if [[ -L "$artifact" || ! -f "$artifact" ]]; then
+              echo "Expected regular build artifact is missing: $artifact" >&2
+              exit 1
+            fi
+          done
+          if [[ "$(find "$build_root/output-first" -type f | wc -l)" -ne 2 ||
+                "$(find "$build_root/output-second" -type f | wc -l)" -ne 2 ]]; then
+            echo "A build emitted an unexpected artifact inventory" >&2
+            exit 1
+          fi
+          cmp --silent "$first_sdist" "$second_sdist"
+          cmp --silent "$first_wheel" "$second_wheel"
+          install -m 0644 "$first_sdist" "$first_wheel" "$release_root/"
+      - name: Verify exact wheel and locked runtime closure
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          runtime_requirements="$RUNNER_TEMP/autocontribute-runtime-requirements.txt"
+          runtime_environment="$RUNNER_TEMP/autocontribute-release-environment"
+          uv export \
+            --locked \
+            --no-dev \
+            --no-emit-project \
+            --format requirements.txt \
+            --output-file "$runtime_requirements" \
+            --quiet
+          uv venv \
+            --no-project \
+            --python 3.12.12 \
+            "$runtime_environment"
+          uv pip install \
+            --python "$runtime_environment/bin/python" \
+            --require-hashes \
+            --no-cache \
+            --requirement "$runtime_requirements"
+          uv pip install \
+            --python "$runtime_environment/bin/python" \
+            --no-cache \
+            --no-deps \
+            "release/autocontribute-${RELEASE_VERSION}-py3-none-any.whl"
+          uv pip check --python "$runtime_environment/bin/python"
+
+          cd "$RUNNER_TEMP"
+          installed_version="$("$runtime_environment/bin/autocontribute" version)"
+          test "$installed_version" = "$RELEASE_VERSION"
+          "$runtime_environment/bin/autocontribute" --help >/dev/null
+          "$runtime_environment/bin/python" - <<'PY'
+          import os
+          from importlib.metadata import version
+          from pathlib import Path
+
+          import autocontribute.deployment as deployment
+
+          expected_version = os.environ["RELEASE_VERSION"]
+          if version("autocontribute") != expected_version:
+              raise SystemExit("installed wheel metadata has the wrong version")
+          installed_root = Path(deployment.__file__).parent
+          source_root = Path(os.environ["GITHUB_WORKSPACE"]) / "src" / "autocontribute"
+          for manifest_name in ("_build_identity.json", "_systemd_assets.json"):
+              if (installed_root / manifest_name).read_bytes() != (
+                  source_root / manifest_name
+              ).read_bytes():
+                  raise SystemExit(f"installed {manifest_name} differs from signed source")
+          if len(deployment.packaged_build_identity_digest()) != 64:
+              raise SystemExit("installed build identity digest is invalid")
+          if len(deployment.packaged_systemd_asset_manifest_digest()) != 64:
+              raise SystemExit("installed systemd asset digest is invalid")
+          PY
+          sdist_archive="$GITHUB_WORKSPACE/release/autocontribute-${RELEASE_VERSION}.tar.gz"
+          sdist_extract="$RUNNER_TEMP/autocontribute-release-sdist"
+          mkdir -m 0700 "$sdist_extract"
+          "$runtime_environment/bin/python" \
+            - "$sdist_archive" "$sdist_extract" "$RELEASE_VERSION" <<'PY'
+          import sys
+          import tarfile
+          from pathlib import Path, PurePosixPath
+
+          archive_path = Path(sys.argv[1])
+          extract_root = Path(sys.argv[2])
+          expected_root_name = f"autocontribute-{sys.argv[3]}"
+          if archive_path.is_symlink() or not archive_path.is_file():
+              raise SystemExit("source distribution is not a regular file")
+          if extract_root.is_symlink() or not extract_root.is_dir():
+              raise SystemExit("source distribution extraction root is unsafe")
+          with tarfile.open(archive_path, mode="r:gz") as archive:
+              members = archive.getmembers()
+              if not members or len(members) > 4096:
+                  raise SystemExit("source distribution member count is unsafe")
+              member_names: set[str] = set()
+              aggregate_size = 0
+              roots: set[str] = set()
+              for member in members:
+                  path = PurePosixPath(member.name)
+                  if (
+                      member.name != path.as_posix()
+                      or path.is_absolute()
+                      or not path.parts
+                      or any(part in {"", ".", ".."} for part in path.parts)
+                  ):
+                      raise SystemExit("source distribution contains an unsafe path")
+                  if member.name in member_names:
+                      raise SystemExit("source distribution contains duplicate members")
+                  member_names.add(member.name)
+                  roots.add(path.parts[0])
+                  if not member.isdir() and not member.isfile():
+                      raise SystemExit("source distribution contains a link or special member")
+                  if member.size < 0 or member.size > 2 * 1024 * 1024:
+                      raise SystemExit("source distribution member is too large")
+                  aggregate_size += member.size
+              if roots != {expected_root_name}:
+                  raise SystemExit("source distribution does not have one exact version root")
+              if aggregate_size > 32 * 1024 * 1024:
+                  raise SystemExit("source distribution expanded size is too large")
+              archive.extractall(extract_root, filter="data")
+          extracted_root = extract_root / expected_root_name
+          if extracted_root.is_symlink() or not extracted_root.is_dir():
+              raise SystemExit("source distribution root was not extracted safely")
+          PY
+          extracted_root="$sdist_extract/autocontribute-${RELEASE_VERSION}"
+          cmp --silent \
+            "$GITHUB_WORKSPACE/pyproject.toml" \
+            "$extracted_root/pyproject.toml"
+          cmp --silent \
+            "$GITHUB_WORKSPACE/uv.lock" \
+            "$extracted_root/uv.lock"
+          cmp --silent \
+            "$GITHUB_WORKSPACE/src/autocontribute/_build_identity.json" \
+            "$extracted_root/src/autocontribute/_build_identity.json"
+          "$runtime_environment/bin/autocontribute" \
+            deployment verify-systemd-assets \
+            --source-root "$extracted_root"
+      - name: Exercise deployment and recovery from exact sdist
+        shell: bash
+        run: |
+          set -euo pipefail
+          extracted_root="$RUNNER_TEMP/autocontribute-release-sdist/autocontribute-${RELEASE_VERSION}"
+          if [[ -L "$extracted_root" || ! -d "$extracted_root" ]]; then
+            echo "The verified source distribution root is unavailable" >&2
+            exit 1
+          fi
+          env \
+            -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+            -u ACTIONS_ID_TOKEN_REQUEST_URL \
+            -u GH_TOKEN \
+            -u GITHUB_TOKEN \
+            tests/acceptance/ubuntu_24_04_deployment_recovery.sh \
+              --source-root "$extracted_root"
+      - name: Audit locked runtime vulnerabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          audit_requirements="$RUNNER_TEMP/autocontribute-audit-requirements.txt"
+          uv export \
+            --locked \
+            --no-dev \
+            --no-emit-project \
+            --format requirements.txt \
+            --output-file "$audit_requirements" \
+            --quiet
+          uvx --no-cache --from pip-audit==2.9.0 pip-audit \
+            --requirement "$audit_requirements" \
+            --disable-pip \
+            --strict \
+            --progress-spinner off \
+            | tee "$RUNNER_TEMP/autocontribute-pip-audit.txt"
+      - name: Generate reproducible CycloneDX SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sbom_first="$RUNNER_TEMP/autocontribute-first.cdx.json"
+          sbom_second="$RUNNER_TEMP/autocontribute-second.cdx.json"
+          for sbom_path in "$sbom_first" "$sbom_second"; do
+            uv export \
+              --locked \
+              --no-dev \
+              --format cyclonedx1.5 \
+              --output-file "$sbom_path" \
+              --quiet
+          done
+          python - "$sbom_first" "$sbom_second" <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          import uuid
+          from datetime import UTC, datetime
+          from pathlib import Path
+
+          version = os.environ["RELEASE_VERSION"]
+          commit = os.environ["GITHUB_SHA"]
+          repository = os.environ["GITHUB_REPOSITORY"]
+          release_root = Path(os.environ["GITHUB_WORKSPACE"]) / "release"
+          sdist = release_root / f"autocontribute-{version}.tar.gz"
+          wheel = release_root / f"autocontribute-{version}-py3-none-any.whl"
+          source_timestamp = datetime.fromtimestamp(
+              int(os.environ["SOURCE_DATE_EPOCH"]), UTC
+          ).isoformat(timespec="seconds").replace("+00:00", "Z")
+          artifact_properties = [
+              {
+                  "name": "autocontribute:artifact:sdist:sha256",
+                  "value": hashlib.sha256(sdist.read_bytes()).hexdigest(),
+              },
+              {
+                  "name": "autocontribute:artifact:wheel:sha256",
+                  "value": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+              },
+              {"name": "autocontribute:source:git_commit", "value": commit},
+          ]
+          forbidden_development_components = {
+              "coverage",
+              "hatchling",
+              "mypy",
+              "pathspec",
+              "pluggy",
+              "pytest",
+              "pytest-cov",
+              "respx",
+              "ruff",
+              "trove-classifiers",
+              "types-pyyaml",
+          }
+
+          for raw_path in sys.argv[1:]:
+              path = Path(raw_path)
+              document = json.loads(path.read_text(encoding="utf-8"))
+              if document.get("bomFormat") != "CycloneDX" or document.get(
+                  "specVersion"
+              ) != "1.5":
+                  raise SystemExit("uv did not emit CycloneDX 1.5")
+              metadata = document.get("metadata")
+              if not isinstance(metadata, dict):
+                  raise SystemExit("SBOM metadata is missing")
+              component = metadata.get("component")
+              if not isinstance(component, dict) or component.get("name") != "autocontribute":
+                  raise SystemExit("SBOM project component is missing")
+              if component.get("version") != version:
+                  raise SystemExit("SBOM project version differs from the release")
+              components = document.get("components")
+              dependencies = document.get("dependencies")
+              if not isinstance(components, list) or not isinstance(dependencies, list):
+                  raise SystemExit("SBOM dependency inventory is incomplete")
+              component_names = {item.get("name") for item in components}
+              if component_names & forbidden_development_components:
+                  raise SystemExit("SBOM includes development-only dependencies")
+              if any(
+                  not isinstance(item.get("purl"), str)
+                  or not item["purl"].startswith("pkg:pypi/")
+                  for item in components
+              ):
+                  raise SystemExit("SBOM dependency lacks a PyPI package URL")
+              references = {component.get("bom-ref")} | {
+                  item.get("bom-ref") for item in components
+              }
+              dependency_references = {item.get("ref") for item in dependencies}
+              if None in references or dependency_references != references:
+                  raise SystemExit("SBOM dependency graph does not cover every component")
+              if any(
+                  not set(item.get("dependsOn", [])) <= references for item in dependencies
+              ):
+                  raise SystemExit("SBOM dependency graph contains a dangling reference")
+
+              existing_properties = component.setdefault("properties", [])
+              existing_names = {item.get("name") for item in existing_properties}
+              if existing_names & {item["name"] for item in artifact_properties}:
+                  raise SystemExit("SBOM already contains a release binding property")
+              existing_properties.extend(artifact_properties)
+              existing_properties.sort(key=lambda item: (item["name"], item["value"]))
+              metadata["timestamp"] = source_timestamp
+              document["serialNumber"] = "urn:uuid:" + str(
+                  uuid.uuid5(
+                      uuid.NAMESPACE_URL,
+                      f"https://github.com/{repository}/commit/{commit}#cyclonedx-1.5",
+                  )
+              )
+              path.write_text(
+                  json.dumps(document, indent=2, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+          PY
+          cmp --silent "$sbom_first" "$sbom_second"
+          install -m 0644 \
+            "$sbom_first" \
+            "release/autocontribute-${RELEASE_VERSION}.cdx.json"
+      - name: Create and verify subject checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sdist="autocontribute-${RELEASE_VERSION}.tar.gz"
+          wheel="autocontribute-${RELEASE_VERSION}-py3-none-any.whl"
+          sbom="autocontribute-${RELEASE_VERSION}.cdx.json"
+          for subject in "$sdist" "$wheel" "$sbom"; do
+            if [[ -L "$subject" || ! -f "$subject" ]]; then
+              echo "Release subject is not a regular file: $subject" >&2
+              exit 1
+            fi
+          done
+          sha256sum "$sdist" "$wheel" "$sbom" >SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - name: Keyless-sign and verify release subjects
+        uses: sigstore/gh-action-sigstore-python@5b79a39c381910c090341a2c9b0bf022c8b387e1 # v3.4.0
+        with:
+          inputs: |
+            release/*.tar.gz
+            release/*.whl
+            release/*.cdx.json
+            release/SHA256SUMS
+          verify: true
+          verify-cert-identity: https://github.com/${{ github.repository }}/.github/workflows/release.yml@${{ github.ref }}
+          verify-oidc-issuer: https://token.actions.githubusercontent.com
+          upload-signing-artifacts: false
+          release-signing-artifacts: false
+      - name: Attest release build provenance
+        id: provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-checksums: release/SHA256SUMS
+      - name: Seal release asset inventory
+        shell: bash
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          provenance="autocontribute-${RELEASE_VERSION}.provenance.sigstore.json"
+          if [[ -L "$PROVENANCE_BUNDLE" || ! -f "$PROVENANCE_BUNDLE" ]]; then
+            echo "GitHub provenance action did not produce a regular bundle" >&2
+            exit 1
+          fi
+          install -m 0644 "$PROVENANCE_BUNDLE" "release/$provenance"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          version = os.environ["RELEASE_VERSION"]
+          root = Path("release")
+          subjects = {
+              f"autocontribute-{version}.tar.gz",
+              f"autocontribute-{version}-py3-none-any.whl",
+              f"autocontribute-{version}.cdx.json",
+              "SHA256SUMS",
+          }
+          expected = subjects | {f"{name}.sigstore.json" for name in subjects} | {
+              f"autocontribute-{version}.provenance.sigstore.json"
+          }
+          actual = {entry.name for entry in root.iterdir()}
+          if actual != expected:
+              raise SystemExit(
+                  f"release inventory differs: missing={sorted(expected - actual)}, "
+                  f"extra={sorted(actual - expected)}"
+              )
+          if any(entry.is_symlink() or not entry.is_file() for entry in root.iterdir()):
+              raise SystemExit("release inventory contains a non-regular file")
+          PY
+      - name: Retain exact release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ github.ref_name }}
+          path: release/
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+      - name: Stage verify and publish immutable-version GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mapfile -d '' release_assets < <(
+            find release -mindepth 1 -maxdepth 1 -type f -print0 | sort -z
+          )
+          if [[ "${#release_assets[@]}" -ne 9 ]]; then
+            echo "Refusing to publish an incomplete release asset set" >&2
+            exit 1
+          fi
+          gh release create "$TAG_NAME" "${release_assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --fail-on-no-commits \
+            --generate-notes \
+            --draft \
+            --title "$TAG_NAME"
+
+          downloaded_root="$(mktemp -d "$RUNNER_TEMP/release-download.XXXXXX")"
+          gh release download "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$downloaded_root"
+          mapfile -d '' downloaded_assets < <(
+            find "$downloaded_root" -mindepth 1 -maxdepth 1 -print0 | sort -z
+          )
+          if [[ "${#downloaded_assets[@]}" -ne "${#release_assets[@]}" ]]; then
+            echo "Downloaded draft release has an unexpected asset inventory" >&2
+            exit 1
+          fi
+          for asset_index in "${!release_assets[@]}"; do
+            local_asset="${release_assets[$asset_index]}"
+            downloaded_asset="${downloaded_assets[$asset_index]}"
+            local_name="${local_asset#release/}"
+            downloaded_name="${downloaded_asset##*/}"
+            if [[ -L "$downloaded_asset" || ! -f "$downloaded_asset" ]]; then
+              echo "Published release is missing an exact regular asset" >&2
+              exit 1
+            fi
+            if [[ "$downloaded_name" != "$local_name" ]]; then
+              echo "Downloaded draft release asset inventory differs" >&2
+              exit 1
+            fi
+            cmp --silent "$local_asset" "$downloaded_asset"
+          done
+          gh release edit "$TAG_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft=false \
+            --latest

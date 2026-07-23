@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from rich.text import Text
 
 from autocontribute import __version__
 from autocontribute.backup import create_state_bundle, restore_state_bundle
+from autocontribute.backup_replication import replicate_state_bundle_to_s3
 from autocontribute.config import (
     CLA_ATTESTATION_STATEMENT,
     DCO_ATTESTATION_STATEMENT,
@@ -839,6 +841,109 @@ def restore_state(
         _fail(str(exc))
     kind = "complete state" if complete else "state"
     console.print(f"[green]Verified {kind} restored:[/green] {restored}")
+
+
+@state_app.command(name="replicate-s3")
+def replicate_state_s3(
+    input_path: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            "-i",
+            help="Verified complete state bundle to replicate and read back.",
+        ),
+    ],
+    bucket: Annotated[
+        str,
+        typer.Option(help="Dedicated AWS S3 Object Lock bucket name."),
+    ],
+    region: Annotated[
+        str,
+        typer.Option(help="AWS region containing the backup bucket."),
+    ],
+    expected_bucket_owner: Annotated[
+        str,
+        typer.Option(
+            "--expected-bucket-owner",
+            help="Exact 12-digit AWS account ID that must own the backup bucket.",
+        ),
+    ],
+    scratch_directory: Annotated[
+        Path,
+        typer.Option(
+            "--scratch-directory",
+            help="Pre-existing trusted directory with capacity for verified read-back.",
+        ),
+    ],
+    prefix: Annotated[
+        str,
+        typer.Option(help="Object-key prefix reserved for this deployment."),
+    ] = "autocontribute",
+    retention_days: Annotated[
+        int,
+        typer.Option(
+            "--retention-days",
+            min=30,
+            max=3_650,
+            help="Compliance-mode retention applied to both bundle and receipt.",
+        ),
+    ] = 90,
+    record_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--record-output",
+            help="Exclusive local locator for the immutable off-host receipt version.",
+        ),
+    ] = None,
+    timeout_seconds: Annotated[
+        float,
+        typer.Option(
+            min=10,
+            max=86_400,
+            help="Per-request timeout for large bundle upload and read-back.",
+        ),
+    ] = 21_600,
+) -> None:
+    """Compliance-lock a complete bundle in S3, read it back, and persist its receipt."""
+
+    access_key_id = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret_access_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    if not access_key_id or not secret_access_key:
+        _fail(
+            "AWS S3 replication credentials are missing; set AWS_ACCESS_KEY_ID and "
+            "AWS_SECRET_ACCESS_KEY"
+        )
+    assert access_key_id is not None and secret_access_key is not None
+    destination = record_output or input_path.with_name(f"{input_path.name}.s3-replication.json")
+    try:
+        record = replicate_state_bundle_to_s3(
+            input_path,
+            bucket=bucket,
+            expected_bucket_owner=expected_bucket_owner,
+            region=region,
+            prefix=prefix,
+            retain_until=datetime.now(UTC) + timedelta(days=retention_days),
+            scratch_directory=scratch_directory,
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            session_token=os.environ.get("AWS_SESSION_TOKEN"),
+            record_destination=destination,
+            timeout_seconds=timeout_seconds,
+        )
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    console.print("[green]Verified immutable S3 backup replica and receipt.[/green]")
+    console.print(
+        f"Bundle: s3://{record.receipt.bundle.bucket}/{record.receipt.bundle.key} "
+        f"(version {record.receipt.bundle.version_id})",
+        markup=False,
+    )
+    console.print(
+        f"Receipt: s3://{record.receipt_object.bucket}/{record.receipt_object.key} "
+        f"(version {record.receipt_object.version_id})",
+        markup=False,
+    )
+    console.print(f"Local record: {destination}", markup=False)
 
 
 @state_app.command(name="gc-workspaces")

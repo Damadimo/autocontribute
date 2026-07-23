@@ -1208,10 +1208,12 @@ Local deletion is an operator action, never a timer action. Before removing one 
    compare it to the receipt once more, and only then delete that exact file.
 
 If the provider cannot return the original bytes for independent hashing, has no immutable version
-identity, or has not acknowledged retention, do not delete the local generation. This project does
-not yet ship a provider-specific replication/receipt protocol, so it cannot safely automate local
-retention. The fixed backup reserve turns missing acknowledgement into a visible fail-closed stop
-instead of silently discarding the last trustworthy recovery point.
+identity, or has not acknowledged retention, do not delete the local generation. The AWS S3
+provider-specific replication/receipt protocol is available through `state replicate-s3`; it
+compliance-locks and independently reads back both the exact bundle version and its receipt. See
+[Immutable S3 backup replication](s3-backup-replication.md). It deliberately does not automate
+local retention. The fixed backup reserve turns missing acknowledgement into a visible fail-closed
+stop instead of silently discarding the last trustworthy recovery point.
 
 At least once per release, restore a copied bundle into a fresh path on a non-production host using
 the same packaged version and configuration except for `storage.path`. The restore target must not

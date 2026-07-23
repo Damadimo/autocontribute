@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import autocontribute.publication as publication_module
 from autocontribute.config import (
     CLA_ATTESTATION_STATEMENT,
     DCO_ATTESTATION_STATEMENT,
@@ -76,7 +77,7 @@ def _git(repository: Path, *arguments: str) -> str:
     # attribution hooks. Publication uses the same isolated configuration boundary in production.
     environment = {
         "PATH": os.environ.get("PATH", ""),
-        "HOME": os.environ.get("HOME", "/tmp"),
+        "HOME": os.environ.get("HOME", "/nonexistent"),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -93,6 +94,21 @@ def _git(repository: Path, *arguments: str) -> str:
     )
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
+
+
+def test_publication_git_environment_has_a_non_shared_fallback_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.setenv("AUTOCONTRIBUTE_GITHUB_TOKEN", "must-not-be-inherited")
+
+    environment = publication_module._git_environment()
+
+    assert environment["HOME"] == "/nonexistent"
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_CONFIG_GLOBAL"] == "/dev/null"
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+    assert "AUTOCONTRIBUTE_GITHUB_TOKEN" not in environment
 
 
 class _FixtureEligibilityGitHub:

@@ -2869,6 +2869,8 @@ class RunStore:
         recoverable = tuple(sorted(status.value for status in RECOVERABLE_IN_FLIGHT_STATUSES))
         placeholders = ",".join("?" for _ in recoverable)
         query = (
+            # The interpolated text contains only one placeholder per member of the internal,
+            # fixed RunStatus set; every value remains a bound SQLite parameter.
             "SELECT run_id, status FROM runs "
             f"WHERE status IN ({placeholders}) AND updated_at < ? "
             "ORDER BY updated_at ASC, run_id ASC LIMIT ?"
@@ -2925,12 +2927,16 @@ class RunStore:
         placeholders = ",".join("?" for _ in recoverable)
         recovered_at = utc_now()
         recovered: builtins.list[RunManifest] = []
+        # Only placeholder tokens are interpolated; all status values remain bound parameters.
+        recovery_query = (
+            "SELECT run_id, status, updated_at, manifest_json FROM runs "
+            f"WHERE status IN ({placeholders}) AND updated_at < ? "
+            "ORDER BY updated_at ASC, run_id ASC LIMIT ?"
+        )
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
-                "SELECT run_id, status, updated_at, manifest_json FROM runs "
-                f"WHERE status IN ({placeholders}) AND updated_at < ? "
-                "ORDER BY updated_at ASC, run_id ASC LIMIT ?",
+                recovery_query,
                 (*recoverable, cutoff.isoformat(), limit),
             ).fetchall()
             for row in rows:
@@ -4900,9 +4906,14 @@ def _publication_evidence_from_connection(
     dict[str, _PublicationGateEvidence],
 ]:
     placeholders = ",".join("?" for _ in _PUBLICATION_EVIDENCE_EVENT_TYPES)
-    rows = connection.execute(
+    # The event inventory is an internal constant; interpolation only chooses the number of bound
+    # parameter placeholders.
+    evidence_query = (
         "SELECT id, run_id, event_type, details_json FROM events "
-        f"WHERE event_type IN ({placeholders}) ORDER BY id LIMIT ?",
+        f"WHERE event_type IN ({placeholders}) ORDER BY id LIMIT ?"
+    )
+    rows = connection.execute(
+        evidence_query,
         (*_PUBLICATION_EVIDENCE_EVENT_TYPES, _MAX_PUBLICATION_EVIDENCE_EVENTS + 1),
     ).fetchall()
     if len(rows) > _MAX_PUBLICATION_EVIDENCE_EVENTS:
@@ -5112,12 +5123,15 @@ def _bounded_publication_rows(
         (_MAX_RUN_CORPUS + 1,),
     ).fetchall()
     outcome_projection = _publication_gate_outcome_projection(connection)
+    # The projection helper returns one of two hard-coded SQL fragments after inspecting the
+    # schema.  No stored or operator-controlled value is interpolated into this statement.
+    hold_query = (
+        "SELECT run_id, deployment_fingerprint, corpus_cursor, "
+        f"{outcome_projection}, held_at "
+        "FROM publication_gate_holds ORDER BY run_id LIMIT ?"
+    )
     hold_rows = connection.execute(
-        f"""
-        SELECT run_id, deployment_fingerprint, corpus_cursor,
-               {outcome_projection}, held_at
-        FROM publication_gate_holds ORDER BY run_id LIMIT ?
-        """,
+        hold_query,
         (_MAX_RUN_CORPUS + 1,),
     ).fetchall()
     if len(reservation_rows) > _MAX_RUN_CORPUS:
@@ -5402,12 +5416,14 @@ def _publication_gate_hold_from_row(row: sqlite3.Row) -> PublicationGateHold:
 
 def _verify_publication_gate_holds(connection: sqlite3.Connection) -> None:
     outcome_projection = _publication_gate_outcome_projection(connection)
+    # The projection is selected from two hard-coded fragments by schema introspection.
+    hold_query = (
+        "SELECT run_id, deployment_fingerprint, corpus_cursor, "
+        f"{outcome_projection}, held_at "
+        "FROM publication_gate_holds ORDER BY run_id LIMIT ?"
+    )
     rows = connection.execute(
-        f"""
-        SELECT run_id, deployment_fingerprint, corpus_cursor,
-               {outcome_projection}, held_at
-        FROM publication_gate_holds ORDER BY run_id LIMIT ?
-        """,
+        hold_query,
         (_MAX_RUN_CORPUS + 1,),
     ).fetchall()
     if len(rows) > _MAX_RUN_CORPUS:

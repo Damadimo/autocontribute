@@ -614,6 +614,51 @@ def test_ci_audits_workflows_shell_and_complete_history_for_secrets() -> None:
     assert secret_scan["run"] == '"$(go env GOPATH)/bin/gitleaks" git --redact --verbose .'
 
 
+def test_ci_audits_locked_dependencies_and_runs_static_security_analysis() -> None:
+    document = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    triggers = document.get("on", document[True])
+    job = document["jobs"]["dependency-and-sast"]
+    steps = job["steps"]
+    checkout = next(
+        step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    setup_uv = next(
+        step for step in steps if str(step.get("uses", "")).startswith("astral-sh/setup-uv@")
+    )
+    dependency_audit = next(
+        step for step in steps if step.get("name") == "Audit the locked runtime dependency graph"
+    )
+    static_analysis = next(
+        step
+        for step in steps
+        if step.get("name")
+        == "Scan Python sources for medium and high confidence security findings"
+    )
+
+    assert triggers == {
+        "push": {"branches": ["main"]},
+        "pull_request": None,
+        "workflow_dispatch": None,
+        "schedule": [{"cron": "23 5 * * 1"}],
+    }
+    assert job["timeout-minutes"] == 10
+    assert checkout["with"] == {"persist-credentials": False}
+    assert setup_uv["with"] == {
+        "version": "0.9.30",
+        "python-version": "3.12",
+        "enable-cache": True,
+    }
+    assert "set -euo pipefail" in dependency_audit["run"]
+    assert "uv export" in dependency_audit["run"]
+    assert "--locked" in dependency_audit["run"]
+    assert "--no-dev" in dependency_audit["run"]
+    assert "pip-audit==2.9.0" in dependency_audit["run"]
+    assert "--disable-pip" in dependency_audit["run"]
+    assert "bandit==1.8.6" in static_analysis["run"]
+    assert "--severity-level medium" in static_analysis["run"]
+    assert "--confidence-level medium" in static_analysis["run"]
+
+
 def test_ci_verifies_complete_systemd_assets_in_source_distribution() -> None:
     document = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
     steps = document["jobs"]["package"]["steps"]
