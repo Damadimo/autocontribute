@@ -96,7 +96,7 @@
     {
       "source_path": "deploy/systemd/libexec/autocontribute-docker-data-check",
       "installed_path": "/usr/local/libexec/autocontribute-docker-data-check",
-      "sha256": "f7c38c3d90edcb7b96dade18b7d2add228952abafaa61832a9de3b57bb9f9601",
+      "sha256": "6e110e9d2abee5028e35de87de680a4890790b2c04a5e6e0178d95567fb791b8",
       "mode": "0755",
       "required": true
     },
@@ -117,7 +117,7 @@
     {
       "source_path": "deploy/systemd/libexec/autocontribute-rootless-docker",
       "installed_path": "/usr/local/libexec/autocontribute-rootless-docker",
-      "sha256": "c324054ceaf528a10545c87713e1412c59982bdd9eec18bbc62f1b87b9d90772",
+      "sha256": "96e318ff468e6ca870bb96e8f74be06c206599d0900967360fbe2295e725693a",
       "mode": "0755",
       "required": true
     },

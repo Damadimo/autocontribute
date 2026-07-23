@@ -60,6 +60,7 @@ if [[ "$home_owner" != 0 || "$home_group" != "$service_gid" || "$home_mode" != 7
 fi
 
 user_manager_ready=0
+manager_readiness_bus_response=
 manager_readiness_deadline=$((SECONDS + manager_readiness_timeout_seconds))
 while (( SECONDS < manager_readiness_deadline )); do
   manager_readiness_remaining=$((manager_readiness_deadline - SECONDS))
@@ -81,8 +82,41 @@ while (( SECONDS < manager_readiness_deadline )); do
       --kill-after="${manager_readiness_kill_grace_seconds}s" \
       "${manager_readiness_probe_timeout}s" \
       systemctl --user show-environment >/dev/null 2>&1; then
-    user_manager_ready=1
-    break
+    manager_readiness_remaining=$((manager_readiness_deadline - SECONDS))
+    if (( manager_readiness_remaining > manager_readiness_kill_grace_seconds )); then
+      manager_readiness_probe_timeout=$manager_readiness_probe_seconds
+      if ((
+        manager_readiness_probe_timeout + manager_readiness_kill_grace_seconds >
+          manager_readiness_remaining
+      )); then
+        manager_readiness_probe_timeout=$((
+          manager_readiness_remaining - manager_readiness_kill_grace_seconds
+        ))
+      fi
+      if manager_readiness_bus_response="$(
+        timeout \
+          --kill-after="${manager_readiness_kill_grace_seconds}s" \
+          "${manager_readiness_probe_timeout}s" \
+          busctl --user --no-pager call \
+            org.freedesktop.DBus /org/freedesktop/DBus \
+            org.freedesktop.DBus GetConnectionUnixProcessID \
+            s org.freedesktop.systemd1 \
+            2>/dev/null
+      )"; then
+        if [[ "$manager_readiness_bus_response" != *$'\n'* ]] && \
+          read -r \
+          manager_readiness_bus_signature \
+          manager_readiness_bus_pid \
+          manager_readiness_bus_extra <<< "$manager_readiness_bus_response" && [[
+          "$manager_readiness_bus_signature" == u &&
+          "$manager_readiness_bus_pid" =~ ^[1-9][0-9]*$ &&
+          -z "$manager_readiness_bus_extra"
+        ]]; then
+          user_manager_ready=1
+          break
+        fi
+      fi
+    fi
   fi
   if (( SECONDS < manager_readiness_deadline )); then
     sleep 1
@@ -92,6 +126,8 @@ if [[ "$user_manager_ready" -ne 1 ]]; then
   fail 'Autocontribute rootless Docker user manager is unavailable'
 fi
 unset \
+  manager_readiness_bus_extra manager_readiness_bus_pid \
+  manager_readiness_bus_response manager_readiness_bus_signature \
   manager_readiness_deadline manager_readiness_probe_timeout \
   manager_readiness_remaining user_manager_ready
 
@@ -302,6 +338,7 @@ verify_user_manager() {
   read -r bus_signature bus_pid bus_extra <<< "$bus_response"
   main_pid_after="$(system_property "$user_manager_unit" MainPID)"
   if [[
+    "$bus_response" == *$'\n'* ||
     "$bus_signature" != u ||
     "$bus_pid" != "$main_pid_before" ||
     -n "$bus_extra" ||

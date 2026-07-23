@@ -674,6 +674,21 @@ def test_security_integration_exercises_rootful_and_rootless_resource_boundaries
     assert 'sudo systemctl restart "user@${service_uid}.service"' in script
     assert 'DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus"' in script
     assert "systemctl --user show-environment" in script
+    readiness_loop = script[
+        script.index("user_manager_ready=0") : script.index('test "$user_manager_ready" -eq 1')
+    ]
+    assert "user_manager_readiness_timeout_seconds=20" in readiness_loop
+    assert "while (( SECONDS < user_manager_readiness_deadline ))" in readiness_loop
+    assert readiness_loop.count('--kill-after="${user_manager_readiness_kill_grace_seconds}s"') == 2
+    assert readiness_loop.count('"${user_manager_readiness_probe_timeout}s"') == 2
+    readiness_assignment = readiness_loop.index("user_manager_ready=1")
+    ownership_probe = readiness_loop.index("org.freedesktop.DBus GetConnectionUnixProcessID")
+    ownership_target = readiness_loop.index("s org.freedesktop.systemd1", ownership_probe)
+    assert ownership_probe < ownership_target < readiness_assignment
+    assert (
+        '[[ "$user_manager_owner" =~ ^u[[:space:]][1-9][0-9]*$ ]]'
+        in readiness_loop[:readiness_assignment]
+    )
     assert 'test "$manager_effective_unit_path" = "$expected_manager_unit_path"' in script
     assert 'sudo systemctl start "$system_unit"' in script
     assert '"${user_systemctl[@]}" is-active --quiet "$user_unit"' in script

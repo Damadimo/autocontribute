@@ -128,7 +128,7 @@ fi
 
 if [[ "$check_mode" != --mount-only ]]; then
   effective_mount_row="$(
-    findmnt --noheadings --raw --target "$docker_data_root" \
+    findmnt --noheadings --raw --uniq --target "$docker_data_root" \
       --output TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN
   )" || fail 'Autocontribute could not resolve the effective Docker data-root service view'
   readonly effective_mount_row

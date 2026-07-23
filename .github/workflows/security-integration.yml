@@ -469,19 +469,91 @@ jobs:
           user_runtime="/run/user/${service_uid}"
           user_bus="${user_runtime}/bus"
           user_manager_ready=0
-          for _attempt in $(seq 1 40); do
+          user_manager_readiness_timeout_seconds=20
+          user_manager_readiness_probe_seconds=3
+          user_manager_readiness_kill_grace_seconds=1
+          user_manager_readiness_deadline=$((
+            SECONDS + user_manager_readiness_timeout_seconds
+          ))
+          while (( SECONDS < user_manager_readiness_deadline )); do
+            user_manager_readiness_remaining=$((
+              user_manager_readiness_deadline - SECONDS
+            ))
+            if ((
+              user_manager_readiness_remaining <=
+                user_manager_readiness_kill_grace_seconds
+            )); then
+              break
+            fi
+            user_manager_readiness_probe_timeout=$user_manager_readiness_probe_seconds
+            if ((
+              user_manager_readiness_probe_timeout +
+                  user_manager_readiness_kill_grace_seconds >
+                user_manager_readiness_remaining
+            )); then
+              user_manager_readiness_probe_timeout=$((
+                user_manager_readiness_remaining -
+                  user_manager_readiness_kill_grace_seconds
+              ))
+            fi
             if sudo test -S "$user_bus" && \
+               timeout \
+                 --kill-after="${user_manager_readiness_kill_grace_seconds}s" \
+                 "${user_manager_readiness_probe_timeout}s" \
                sudo -u "$account" env \
                  HOME="$service_home" \
                  XDG_RUNTIME_DIR="$user_runtime" \
                  DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus" \
                  systemctl --user show-environment >/dev/null 2>&1; then
-              user_manager_ready=1
-              break
+              user_manager_readiness_remaining=$((
+                user_manager_readiness_deadline - SECONDS
+              ))
+              if ((
+                user_manager_readiness_remaining >
+                  user_manager_readiness_kill_grace_seconds
+              )); then
+                user_manager_readiness_probe_timeout=$user_manager_readiness_probe_seconds
+                if ((
+                  user_manager_readiness_probe_timeout +
+                      user_manager_readiness_kill_grace_seconds >
+                    user_manager_readiness_remaining
+                )); then
+                  user_manager_readiness_probe_timeout=$((
+                    user_manager_readiness_remaining -
+                      user_manager_readiness_kill_grace_seconds
+                  ))
+                fi
+                if user_manager_owner="$(
+                  timeout \
+                    --kill-after="${user_manager_readiness_kill_grace_seconds}s" \
+                    "${user_manager_readiness_probe_timeout}s" \
+                    sudo -u "$account" env \
+                      HOME="$service_home" \
+                      XDG_RUNTIME_DIR="$user_runtime" \
+                      DBUS_SESSION_BUS_ADDRESS="unix:path=$user_bus" \
+                      busctl --user --no-pager call \
+                        org.freedesktop.DBus /org/freedesktop/DBus \
+                        org.freedesktop.DBus GetConnectionUnixProcessID \
+                        s org.freedesktop.systemd1 \
+                        2>/dev/null
+                )" && [[ "$user_manager_owner" =~ ^u[[:space:]][1-9][0-9]*$ ]]; then
+                  user_manager_ready=1
+                  break
+                fi
+              fi
             fi
-            sleep 0.5
+            if (( SECONDS < user_manager_readiness_deadline )); then
+              sleep 0.5
+            fi
           done
           test "$user_manager_ready" -eq 1
+          unset \
+            user_manager_owner user_manager_readiness_deadline \
+            user_manager_readiness_kill_grace_seconds \
+            user_manager_readiness_probe_seconds \
+            user_manager_readiness_probe_timeout \
+            user_manager_readiness_remaining \
+            user_manager_readiness_timeout_seconds user_manager_ready
           test "$(stat --format=%u:%g:%a "$user_runtime")" = \
             "${service_uid}:${service_gid}:700"
           test "$(sudo stat --format=%u:%g "$user_bus")" = \

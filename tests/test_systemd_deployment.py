@@ -321,6 +321,8 @@ def _run_rootless_supervisor_reload(
     manager_main_pid: str = "4242",
     manager_failure_property: str = "",
     bus_response: str | None = None,
+    bus_first_response: str = "u 4242",
+    bus_first_exit: int = 0,
     bus_exit: int = 0,
     process_uid: int | None = None,
     process_gid: int | None = None,
@@ -572,6 +574,11 @@ printf 'busctl %s\n' "$*" >> "$TEST_SYSTEMCTL_CALLS"
 [ "$7" = 'GetConnectionUnixProcessID' ]
 [ "$8" = 's' ]
 [ "$9" = 'org.freedesktop.systemd1' ]
+if [ ! -e "$TEST_BUS_FIRST_CALL_MARKER" ]; then
+  : > "$TEST_BUS_FIRST_CALL_MARKER"
+  printf '%s\n' "$TEST_BUS_FIRST_RESPONSE"
+  exit "$TEST_BUS_FIRST_EXIT"
+fi
 printf '%s\n' "$TEST_BUS_RESPONSE"
 exit "$TEST_BUS_EXIT"
 """,
@@ -696,6 +703,9 @@ esac
         **os.environ,
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "TEST_BUS_EXIT": str(bus_exit),
+        "TEST_BUS_FIRST_CALL_MARKER": os.fspath(case_directory / "bus-first-call"),
+        "TEST_BUS_FIRST_EXIT": str(bus_first_exit),
+        "TEST_BUS_FIRST_RESPONSE": bus_first_response,
         "TEST_BUS_GROUP": str(gid if bus_group is None else bus_group),
         "TEST_BUS_OWNER": str(uid if bus_owner is None else bus_owner),
         "TEST_BUS_RESPONSE": (f"u {manager_main_pid}" if bus_response is None else bus_response),
@@ -1263,10 +1273,11 @@ if [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--mountpoint' ];
   [ "$5" = '--output' ]
   [ "$6" = 'TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN' ]
   printf '%s' "$TEST_MOUNT_ROWS"
-elif [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--target' ]; then
-  [ "$4" = "$TEST_DOCKER_DATA_ROOT" ]
-  [ "$5" = '--output' ]
-  [ "$6" = 'TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN' ]
+elif [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--uniq' ]; then
+  [ "$4" = '--target' ]
+  [ "$5" = "$TEST_DOCKER_DATA_ROOT" ]
+  [ "$6" = '--output' ]
+  [ "$7" = 'TARGET,FSTYPE,FSROOT,OPTIONS,MAJ:MIN' ]
   printf '%s' "$TEST_EFFECTIVE_MOUNT_ROW"
 elif [ "$1" = '--noheadings' ] && [ "$2" = '--raw' ] && [ "$3" = '--output' ]; then
   [ "$4" = 'MAJ:MIN,TARGET' ]
@@ -2277,10 +2288,36 @@ def test_rootless_docker_supervisor_reload_accepts_exact_delegated_policy(
     assert "show user@" in calls
     assert "--user show autocontribute-rootless-docker-daemon.service" in calls
     assert "--user reload autocontribute-rootless-docker-daemon.service" in calls
-    assert calls.count("busctl --user --no-pager call") == 2
+    assert calls.count("busctl --user --no-pager call") == 3
     assert calls.count("--property=MainPID") == 6
     assert calls.count("--property=Transient") == 4
     assert calls.count("--property=ActiveState") == 3
+
+
+def test_rootless_docker_supervisor_retries_transient_bus_readiness_failure(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_rootless_supervisor_reload(
+        tmp_path / "transient-bus-readiness-failure",
+        bus_first_exit=1,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.count("--user show-environment") == 2
+    assert calls.count("busctl --user --no-pager call") == 4
+
+
+def test_rootless_docker_supervisor_retries_malformed_bus_readiness_response(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_rootless_supervisor_reload(
+        tmp_path / "malformed-bus-readiness-response",
+        bus_first_response="u 4242\njunk",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.count("--user show-environment") == 2
+    assert calls.count("busctl --user --no-pager call") == 4
 
 
 def test_rootless_docker_supervisor_bounds_manager_readiness_as_one_deadline(
@@ -2295,6 +2332,23 @@ def test_rootless_docker_supervisor_bounds_manager_readiness_as_one_deadline(
     assert result.returncode != 0
     assert "user manager is unavailable" in result.stderr
     assert calls.count("--user show-environment") <= 2
+    assert "show user@" not in calls
+
+
+def test_rootless_docker_supervisor_bounds_bus_readiness_as_one_deadline(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_rootless_supervisor_reload(
+        tmp_path / "manager-bus-not-ready",
+        bus_first_exit=1,
+        bus_exit=1,
+        manager_readiness_timeout_seconds=3,
+    )
+
+    assert result.returncode != 0
+    assert "user manager is unavailable" in result.stderr
+    assert calls.count("--user show-environment") <= 2
+    assert calls.count("busctl --user --no-pager call") <= 2
     assert "show user@" not in calls
 
 
@@ -2414,6 +2468,11 @@ def test_rootless_docker_supervisor_bounds_manager_readiness_as_one_deadline(
         (
             "manager-bus-owner",
             {"bus_response": "u 9999"},
+            "user-manager bus has an unexpected owner",
+        ),
+        (
+            "manager-bus-multiline-owner",
+            {"bus_response": "u 4242\njunk"},
             "user-manager bus has an unexpected owner",
         ),
         (
@@ -3074,7 +3133,7 @@ def test_rootless_docker_supervisor_monitors_only_the_attested_user_unit() -> No
     assert "manager_unit_properties" in supervisor
     assert "user_unit_properties" in supervisor
     assert "manager_property UnitPath" in supervisor
-    assert "GetConnectionUnixProcessID" in supervisor
+    assert supervisor.count("GetConnectionUnixProcessID") == 2
     assert '"/proc/$main_pid_before/status"' in supervisor
     assert '"/proc/$main_pid_before/cgroup"' in supervisor
     assert '"/proc/$main_pid_before/environ"' in supervisor
