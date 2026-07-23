@@ -89,9 +89,46 @@ PY
   sudo --non-interactive mountpoint --quiet -- "$path"
 }
 
+mounted_path_at_or_below() {
+  local root="$1"
+
+  /usr/bin/findmnt --list --noheadings --raw --output TARGET | \
+    /usr/bin/awk -v root="$root" \
+      '$0 == root || index($0, root "/") == 1 { print }'
+}
+
 remove_marked_tree() {
   local root="$1"
   local marker_path="${root}/.autocontribute-acceptance"
+  local root_canonical=""
+  local root_identity=""
+  local current_root_identity=""
+  local mounted_path=""
+  if ! sudo test -d "$root" || sudo test -L "$root"; then
+    printf 'Refusing to clean an aliased or non-directory path: %s\n' "$root" >&2
+    return 1
+  fi
+  if ! root_canonical="$(sudo readlink --canonicalize-existing -- "$root")" || \
+    [[ "$root_canonical" != "$root" ]]; then
+    printf 'Refusing to clean a non-canonical path: %s\n' "$root" >&2
+    return 1
+  fi
+  if ! root_identity="$(sudo stat --format='%d:%i' -- "$root")" || \
+    [[ ! "$root_identity" =~ ^[0-9]+:[0-9]+$ ]]; then
+    printf 'Refusing to clean a path whose identity could not be recorded: %s\n' \
+      "$root" >&2
+    return 1
+  fi
+  if ! mounted_path="$(mounted_path_at_or_below "$root")"; then
+    printf 'Refusing to clean a path whose mount state could not be inspected: %s\n' \
+      "$root" >&2
+    return 1
+  fi
+  if [[ -n "$mounted_path" ]]; then
+    printf 'Refusing to clean a path containing a mount: %s (%s)\n' \
+      "$root" "$mounted_path" >&2
+    return 1
+  fi
   if ! sudo test -f "$marker_path"; then
     printf 'Refusing to clean an unmarked acceptance path: %s\n' "$root" >&2
     return 1
@@ -100,7 +137,24 @@ remove_marked_tree() {
     printf 'Refusing to clean an acceptance path with the wrong marker: %s\n' "$root" >&2
     return 1
   fi
-  sudo /bin/rm -rf -- "$root"
+  if ! mounted_path="$(mounted_path_at_or_below "$root")"; then
+    printf 'Refusing to clean a path whose mount state could not be re-inspected: %s\n' \
+      "$root" >&2
+    return 1
+  fi
+  if [[ -n "$mounted_path" ]]; then
+    printf 'Refusing to clean a path that acquired a mount: %s (%s)\n' \
+      "$root" "$mounted_path" >&2
+    return 1
+  fi
+  if ! root_canonical="$(sudo readlink --canonicalize-existing -- "$root")" || \
+    [[ "$root_canonical" != "$root" ]] || \
+    ! current_root_identity="$(sudo stat --format='%d:%i' -- "$root")" || \
+    [[ "$current_root_identity" != "$root_identity" ]]; then
+    printf 'Refusing to clean a path whose identity changed: %s\n' "$root" >&2
+    return 1
+  fi
+  sudo /bin/rm -rf --one-file-system -- "$root"
 }
 
 cleanup() {
@@ -380,7 +434,7 @@ cleanup() {
             "$smoke_root" >&2
           cleanup_failed=1
         else
-          /bin/rm -rf -- "$smoke_root" || cleanup_failed=1
+          remove_marked_tree "$smoke_root" || cleanup_failed=1
         fi
         ;;
       *)
@@ -544,6 +598,7 @@ smoke_root="$(mktemp --directory "${temporary_base}/autocontribute-deployment-re
 smoke_root="$(readlink --canonicalize-existing "$smoke_root")"
 acceptance_marker="$(/bin/cat /proc/sys/kernel/random/uuid)"
 printf '%s\n' "$acceptance_marker" >"${smoke_root}/marker"
+printf '%s\n' "$acceptance_marker" >"${smoke_root}/.autocontribute-acceptance"
 
 sudo useradd \
   --system \
@@ -582,16 +637,144 @@ else
   tar --create --file=- --directory "$source_root" . | \
     tar --extract --file=- --directory "$release"
 fi
+require_absent "${release}/.venv"
+unsafe_source_path="$(
+  find "$release" -xdev ! \( -type d -o -type f \) -print -quit
+)" || fail "could not inspect immutable release source types"
+[[ -z "$unsafe_source_path" ]] || \
+  fail "immutable release source contains an unsafe entry: $unsafe_source_path"
+unsafe_source_path="$(
+  find "$release" -xdev -type f -links +1 -print -quit
+)" || fail "could not inspect immutable release source links"
+[[ -z "$unsafe_source_path" ]] || \
+  fail "immutable release source contains a multiply linked file: $unsafe_source_path"
+unset unsafe_source_path
+release_directory_identity="$(stat --format='%d:%i' -- "$release")" || \
+  fail "could not record the immutable release identity"
+[[ "$release_directory_identity" =~ ^[0-9]+:[0-9]+$ ]] || \
+  fail "the immutable release identity is invalid"
+nested_release_mount="$(mounted_path_at_or_below "$release")" || \
+  fail "could not inspect immutable release mounts"
+[[ -z "$nested_release_mount" ]] || \
+  fail "immutable release contains a mounted subtree: $nested_release_mount"
+unset nested_release_mount
 
-uv sync \
+UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="${release}/.venv" uv sync \
   --project "$release" \
   --frozen \
   --no-dev \
+  --no-editable \
+  --no-config \
+  --no-python-downloads \
   --python /usr/bin/python3
-sudo chown -R root:root "$release"
-sudo chmod -R go-w "$release"
+[[ "$(readlink --canonicalize-existing -- "$release" 2>/dev/null)" == "$release" && \
+  "$(stat --format='%d:%i' -- "$release")" == "$release_directory_identity" ]] || \
+  fail "immutable release identity changed during dependency installation"
+nested_release_mount="$(mounted_path_at_or_below "$release")" || \
+  fail "could not re-inspect immutable release mounts after dependency installation"
+[[ -z "$nested_release_mount" ]] || \
+  fail "immutable release acquired a mount during dependency installation: $nested_release_mount"
+unset nested_release_mount
+sudo find "$release" -xdev -exec chown -h root:root -- {} +
+sudo find "$release" -xdev ! -type l -exec chmod u=rwX,go=rX -- {} +
+sudo chmod 0600 -- "${release}/.autocontribute-acceptance"
+[[ "$(sudo readlink --canonicalize-existing -- "$release" 2>/dev/null)" == "$release" && \
+  "$(sudo stat --format='%d:%i' -- "$release")" == "$release_directory_identity" ]] || \
+  fail "immutable release identity changed during permission normalization"
+nested_release_mount="$(mounted_path_at_or_below "$release")" || \
+  fail "could not re-inspect immutable release mounts after permission normalization"
+[[ -z "$nested_release_mount" ]] || \
+  fail "immutable release acquired a mount during permission normalization: $nested_release_mount"
+unset nested_release_mount release_directory_identity
 
-sudo "${release}/.venv/bin/autocontribute" \
+unsafe_release_path="$(
+  sudo find "$release" -xdev \( ! -uid 0 -o ! -gid 0 \) -print -quit
+)" || fail "could not inspect immutable release ownership"
+[[ -z "$unsafe_release_path" ]] || \
+  fail "immutable release ownership is unsafe: $unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev ! -type l -perm /7022 -print -quit
+)" || fail "could not inspect immutable release permissions"
+[[ -z "$unsafe_release_path" ]] || \
+  fail "immutable release permissions are unsafe: $unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev -type d ! -perm -0555 -print -quit
+)" || fail "could not inspect immutable release directories"
+[[ -z "$unsafe_release_path" ]] || \
+  fail "immutable release directory is not runtime-readable: $unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev -type f \
+    ! -path "${release}/.autocontribute-acceptance" \
+    ! -perm -0444 -print -quit
+)" || fail "could not inspect immutable release files"
+[[ -z "$unsafe_release_path" ]] || \
+  fail "immutable release file is not runtime-readable: $unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev \
+    ! \( -type d -o -type f -o -type l \) -print -quit
+)" || fail "could not inspect immutable release file types"
+[[ -z "$unsafe_release_path" ]] || \
+  fail "immutable release contains an unsafe file type: $unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev -type f -links +1 -print -quit
+)" || fail "could not inspect immutable release file links"
+[[ -z "$unsafe_release_path" ]] || \
+  fail "immutable release contains a multiply linked file: $unsafe_release_path"
+unset unsafe_release_path
+[[ "$(sudo stat --format='%a' -- "${release}/.autocontribute-acceptance")" == 600 ]] || \
+  fail "immutable release cleanup marker mode is unsafe"
+if ! sudo test -d "${release}/.venv" || sudo test -L "${release}/.venv" || \
+  [[ "$(sudo readlink --canonicalize-existing -- "${release}/.venv" 2>/dev/null)" != \
+    "${release}/.venv" ]]; then
+  fail "immutable release virtual environment is aliased or unsafe"
+fi
+if ! sudo test -d "${release}/.venv/bin" || sudo test -L "${release}/.venv/bin" || \
+  [[ "$(sudo readlink --canonicalize-existing -- "${release}/.venv/bin" 2>/dev/null)" != \
+    "${release}/.venv/bin" ]]; then
+  fail "immutable release executable directory is aliased or unsafe"
+fi
+if ! sudo test -f "${release}/.venv/bin/autocontribute" || \
+  sudo test -L "${release}/.venv/bin/autocontribute" || \
+  ! sudo test -x "${release}/.venv/bin/autocontribute" || \
+  [[ "$(sudo readlink --canonicalize-existing -- \
+    "${release}/.venv/bin/autocontribute" 2>/dev/null)" != \
+    "${release}/.venv/bin/autocontribute" ]]; then
+  fail "immutable release entrypoint is aliased or unsafe"
+fi
+system_python="$(readlink --canonicalize-existing -- /usr/bin/python3)" || \
+  fail "could not resolve the system Python interpreter"
+venv_python="$(
+  sudo readlink --canonicalize-existing -- "${release}/.venv/bin/python"
+)" || fail "could not resolve the release Python interpreter"
+[[ "$venv_python" == "$system_python" ]] || \
+  fail "immutable release Python does not resolve to the pinned system interpreter"
+unset system_python venv_python
+
+sudo -u "$service_account" /usr/bin/env -i \
+  PATH="$clean_path" \
+  PYTHONNOUSERSITE=1 \
+  "${release}/.venv/bin/python" -I - "$release" "$service_uid" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+release = Path(sys.argv[1]).resolve(strict=True)
+venv = release / ".venv"
+if os.getuid() != int(sys.argv[2]):
+    raise SystemExit("release import probe did not run as the service identity")
+
+from autocontribute import store
+
+module = Path(store.__file__).resolve(strict=True)
+try:
+    module.relative_to(venv)
+except ValueError as exc:
+    raise SystemExit("release import did not use the installed immutable package") from exc
+PY
+sudo -u "$service_account" /usr/bin/env -i \
+  PATH="$clean_path" \
+  PYTHONNOUSERSITE=1 \
+  "${release}/.venv/bin/autocontribute" \
   deployment verify-systemd-assets --source-root "$release"
 
 mapfile -d '' -t system_units < <(

@@ -2898,6 +2898,232 @@ def test_tmpfiles_keeps_state_private_and_docs_cover_safe_recovery() -> None:
     assert "AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT" not in guide
 
 
+def test_docs_install_a_noneditable_release_readable_by_the_service_identity(
+    tmp_path: Path,
+) -> None:
+    guide = (ROOT / "docs" / "systemd-deployment.md").read_text(encoding="utf-8")
+    section_start = guide.index("## Install an immutable release")
+    code_fence = guide.index("```bash\n", section_start)
+    code_start = code_fence + len("```bash\n")
+    code_end = guide.index("\n```", code_start)
+    prose = guide[section_start:code_fence]
+    script = guide[code_start:code_end]
+
+    syntax = subprocess.run(
+        ["bash", "-n"],
+        input=script,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert syntax.returncode == 0, syntax.stderr
+
+    uv_validation = script.index("uv_binary=/usr/local/bin/uv")
+    ancestry = script.index('for trusted_directory in /opt "$application_root" "$releases_root"')
+    canonical_release = script.index(
+        'test "$(sudo readlink --canonicalize-existing -- "$release")" = "$release"',
+        ancestry,
+    )
+    identity = script.index(
+        'release_identity="$(sudo stat --format=\'%d:%i\' -- "$release")"',
+        canonical_release,
+    )
+    mount_check = script.index('release_mount="$(release_mount_at_or_below)"', identity)
+    initial_source_ownership = script.index('unsafe_source_path="$(', mount_check)
+    absent_venv = script.index('preexisting_venv="$(', initial_source_ownership)
+    source_types = script.index(
+        'sudo find "$release" -xdev ! \\( -type d -o -type f \\)',
+        absent_venv,
+    )
+    source_links = script.index(
+        'sudo find "$release" -xdev -type f -links +1',
+        source_types,
+    )
+    ownership = script.index(
+        'sudo find "$release" -xdev -exec chown -h root:root -- {} +',
+        source_links,
+    )
+    normalization = script.index(
+        'sudo find "$release" -xdev ! -type l -exec chmod u=rwX,go=rX -- {} +',
+        ownership,
+    )
+    hardened_identity = script.index(
+        'test "$(sudo stat --format=\'%d:%i\' -- "$release")" = "$release_identity"',
+        normalization,
+    )
+    hardened_mount_check = script.index(
+        'release_mount="$(release_mount_at_or_below)"',
+        hardened_identity,
+    )
+    hardened_postconditions = script.index('unsafe_release_path="$(', hardened_mount_check)
+    repeated_absent_venv = script.index('preexisting_venv="$(', hardened_postconditions)
+    repeated_source_types = script.index(
+        'sudo find "$release" -xdev ! \\( -type d -o -type f \\)',
+        repeated_absent_venv,
+    )
+    repeated_source_links = script.index(
+        'sudo find "$release" -xdev -type f -links +1',
+        repeated_source_types,
+    )
+    sync_environment = script.index("sudo /usr/bin/env -i", repeated_source_links)
+    link_mode = script.index("UV_LINK_MODE=copy", sync_environment)
+    project_environment = script.index(
+        'UV_PROJECT_ENVIRONMENT="$release/.venv"',
+        link_mode,
+    )
+    sync = script.index('"$uv_binary" sync', project_environment)
+    no_editable = script.index("--frozen --no-dev --no-editable", sync)
+    isolated_config = script.index("--no-config --no-python-downloads", no_editable)
+    pinned_python = script.index("--python /usr/bin/python3", isolated_config)
+    post_sync_identity = script.index(
+        'test "$(sudo stat --format=\'%d:%i\' -- "$release")" = "$release_identity"',
+        pinned_python,
+    )
+    post_sync_mount = script.index(
+        'release_mount="$(release_mount_at_or_below)"',
+        post_sync_identity,
+    )
+    installed_ownership = script.index(
+        'sudo find "$release" -xdev -exec chown -h root:root -- {} +',
+        post_sync_mount,
+    )
+    installed_normalization = script.index(
+        'sudo find "$release" -xdev ! -type l -exec chmod u=rwX,go=rX -- {} +',
+        installed_ownership,
+    )
+    identity_recheck = script.index(
+        'test "$(sudo stat --format=\'%d:%i\' -- "$release")" = "$release_identity"',
+        installed_normalization,
+    )
+    installed_mount_check = script.index(
+        'release_mount="$(release_mount_at_or_below)"',
+        identity_recheck,
+    )
+    installed_types = script.index(
+        'sudo find "$release" -xdev ! \\( -type d -o -type f -o -type l \\)',
+        installed_mount_check,
+    )
+    installed_links = script.index(
+        'sudo find "$release" -xdev -type f -links +1',
+        installed_types,
+    )
+    venv_identity = script.index('sudo test ! -L "$release/.venv"', installed_links)
+    bin_identity = script.index('sudo test ! -L "$release/.venv/bin"', venv_identity)
+    entrypoint_identity = script.index(
+        'sudo test ! -L "$release/.venv/bin/autocontribute"',
+        bin_identity,
+    )
+    pinned_venv_python = script.index('test "$venv_python" = "$system_python"', entrypoint_identity)
+    service_import = script.index(
+        "sudo -u autocontribute /usr/bin/env -i",
+        pinned_venv_python,
+    )
+    uid_check = script.index("if os.getuid()", service_import)
+    application_import = script.index("from autocontribute import store", uid_check)
+    service_verifier = script.index(
+        "sudo -u autocontribute /usr/bin/env -i",
+        application_import,
+    )
+
+    assert (
+        uv_validation
+        < ancestry
+        < canonical_release
+        < identity
+        < mount_check
+        < initial_source_ownership
+        < absent_venv
+        < source_types
+        < source_links
+        < ownership
+        < normalization
+        < hardened_identity
+        < hardened_mount_check
+        < hardened_postconditions
+        < repeated_absent_venv
+        < repeated_source_types
+        < repeated_source_links
+        < sync_environment
+        < link_mode
+        < project_environment
+        < sync
+        < no_editable
+        < isolated_config
+        < pinned_python
+        < post_sync_identity
+        < post_sync_mount
+        < installed_ownership
+        < installed_normalization
+        < identity_recheck
+        < installed_mount_check
+        < installed_types
+        < installed_links
+        < venv_identity
+        < bin_identity
+        < entrypoint_identity
+        < pinned_venv_python
+        < service_import
+        < uid_check
+        < application_import
+        < service_verifier
+    )
+    assert "sanitized, provenance-attested" in prose
+    assert "Never deploy a working checkout" in prose
+    assert "complete file inventory" in prose
+    assert 'sudo chown -R -h root:root -- "$release"' not in script
+    assert 'sudo chmod -R u=rwX,go=rX -- "$release"' not in script
+    assert script.count('release_mount="$(release_mount_at_or_below)"') >= 4
+    assert script.count('find "$release" -xdev -mindepth 1 -maxdepth 1') >= 2
+    assert script.count("-name .venv -print -quit") >= 2
+    assert script.count('find "$release" -xdev -type f -links +1') >= 3
+    assert "-name .git -o -name .env -o -name '.env.*' -o -name uv.toml" in script
+    assert '"$uv_binary" --version' in script
+    assert ')" = "uv 0.9.30"' in script
+    assert "PYTHONNOUSERSITE=1" in script
+    assert '"$release/.venv/bin/python" -I - "$release"' in script
+    assert "module.relative_to(venv)" in script
+    assert 'sudo "$release/.venv/bin/autocontribute"' not in script
+
+    first_source_end = script.index("\nunset development_state", initial_source_ownership)
+    hardened_checks_end = script.index(
+        "\nunset development_state",
+        hardened_postconditions,
+    )
+    installed_checks_start = script.index('unsafe_release_path="$(', installed_mount_check)
+    installed_checks_end = script.index("\nunset release_mount", installed_checks_start)
+    guarded_blocks = (
+        script[initial_source_ownership:first_source_end],
+        script[hardened_postconditions:hardened_checks_end],
+        script[installed_checks_start:installed_checks_end],
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_executable(
+        fake_bin / "sudo",
+        "#!/usr/bin/env bash\n"
+        'if [[ "$FAKE_SUDO_MODE" == failure ]]; then exit 19; fi\n'
+        "printf '/unsafe\\n'\n",
+    )
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+    for mode in ("failure", "unsafe"):
+        env["FAKE_SUDO_MODE"] = mode
+        for guarded_checks in guarded_blocks:
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'set -euo pipefail\nrelease=/not-used\n{guarded_checks}\nprintf "reached\\n"',
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            assert result.returncode == 1
+            assert "reached" not in result.stdout
+
+
 def test_docs_apply_sensitive_dropins_to_both_execution_services() -> None:
     guide = (ROOT / "docs" / "systemd-deployment.md").read_text(encoding="utf-8")
     normalized_guide = " ".join(guide.split())

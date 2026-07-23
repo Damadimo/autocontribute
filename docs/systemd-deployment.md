@@ -425,19 +425,225 @@ credential. The only supported socket is `/run/autocontribute/docker.sock`; any 
 
 ## Install an immutable release
 
-Place an audited checkout or artifact in a new, never-reused directory below
-`/opt/autocontribute/releases/`. Verify its full commit and build provenance before installation,
-then install exactly the checked-in lock. Do not select the release with `current` yet:
+Extract a sanitized, provenance-attested Git archive or source distribution as `root:root`, without
+group/other write permission, into a new, never-reused directory below
+`/opt/autocontribute/releases/`. Verify its digest and complete file inventory against the
+attestation before installation. Never deploy a working checkout: `.git`, untracked files, hooks,
+local uv configuration, and dotenv files can contain credentials or alter a privileged build.
+Install the reviewed uv 0.9.30 binary at `/usr/local/bin/uv`, owned by `root:root` and mode `0755`,
+after checking its vendor digest. The build backend declared by the attested source is an explicit
+privileged trust boundary. Do not select the release with `current` yet:
 
 ```bash
 set -Eeuo pipefail
-release=/opt/autocontribute/releases/FULL_COMMIT
-sudo uv sync \
-  --project "$release" \
-  --frozen --no-dev
-sudo chown -R root:root "$release"
-sudo chmod -R go-w "$release"
-sudo "$release/.venv/bin/autocontribute" \
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+application_root=/opt/autocontribute
+releases_root="${application_root}/releases"
+release="${releases_root}/FULL_COMMIT"
+uv_binary=/usr/local/bin/uv
+sudo test -f "$uv_binary"
+sudo test ! -L "$uv_binary"
+sudo test -x "$uv_binary"
+test "$(sudo readlink --canonicalize-existing -- "$uv_binary")" = "$uv_binary"
+test "$(sudo stat --format='%u:%g' -- "$uv_binary")" = 0:0
+uv_mode="$(sudo stat --format='%a' -- "$uv_binary")" || exit 1
+[[ "$uv_mode" =~ ^[0-7]{1,4}$ ]]
+(( (8#$uv_mode & 8#7022) == 0 ))
+test "$(
+  sudo /usr/bin/env -i \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    "$uv_binary" --version
+)" = "uv 0.9.30"
+unset uv_mode
+for trusted_directory in /opt "$application_root" "$releases_root"; do
+  sudo test -d "$trusted_directory"
+  sudo test ! -L "$trusted_directory"
+  test "$(sudo readlink --canonicalize-existing -- "$trusted_directory")" = \
+    "$trusted_directory"
+  test "$(sudo stat --format='%u:%g' -- "$trusted_directory")" = 0:0
+  trusted_mode="$(sudo stat --format='%a' -- "$trusted_directory")" || exit 1
+  [[ "$trusted_mode" =~ ^[0-7]{1,4}$ ]]
+  (( (8#$trusted_mode & 8#7022) == 0 ))
+  (( (8#$trusted_mode & 8#0555) == 8#0555 ))
+  sudo -u autocontribute test -x "$trusted_directory"
+done
+unset trusted_directory trusted_mode
+sudo test -d "$release"
+sudo test ! -L "$release"
+test "$(sudo readlink --canonicalize-existing -- "$release")" = "$release"
+release_identity="$(sudo stat --format='%d:%i' -- "$release")" || exit 1
+[[ "$release_identity" =~ ^[0-9]+:[0-9]+$ ]]
+
+release_mount_at_or_below() {
+  /usr/bin/findmnt --list --noheadings --raw --output TARGET | \
+    /usr/bin/awk -v root="$release" \
+      '$0 == root || index($0, root "/") == 1 { print }'
+}
+
+release_mount="$(release_mount_at_or_below)" || exit 1
+test -z "$release_mount"
+unsafe_source_path="$(
+  sudo find "$release" -xdev \( ! -uid 0 -o ! -gid 0 \) -print -quit
+)" || exit 1
+test -z "$unsafe_source_path"
+unsafe_source_path="$(
+  sudo find "$release" -xdev ! -type l -perm /7022 -print -quit
+)" || exit 1
+test -z "$unsafe_source_path"
+preexisting_venv="$(
+  sudo find "$release" -xdev -mindepth 1 -maxdepth 1 \
+    -name .venv -print -quit
+)" || exit 1
+test -z "$preexisting_venv"
+development_state="$(
+  sudo find "$release" -xdev \
+    \( -name .git -o -name .env -o -name '.env.*' -o -name uv.toml \) \
+    -print -quit
+)" || exit 1
+test -z "$development_state"
+unsafe_source_path="$(
+  sudo find "$release" -xdev ! \( -type d -o -type f \) -print -quit
+)" || exit 1
+test -z "$unsafe_source_path"
+unsafe_source_path="$(
+  sudo find "$release" -xdev -type f -links +1 -print -quit
+)" || exit 1
+test -z "$unsafe_source_path"
+unset development_state preexisting_venv release_mount unsafe_source_path
+
+sudo find "$release" -xdev -exec chown -h root:root -- {} +
+sudo find "$release" -xdev ! -type l -exec chmod u=rwX,go=rX -- {} +
+test "$(sudo readlink --canonicalize-existing -- "$release")" = "$release"
+test "$(sudo stat --format='%d:%i' -- "$release")" = "$release_identity"
+release_mount="$(release_mount_at_or_below)" || exit 1
+test -z "$release_mount"
+unsafe_release_path="$(
+  sudo find "$release" -xdev \( ! -uid 0 -o ! -gid 0 \) -print -quit
+)" || exit 1
+test -z "$unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev ! -type l -perm /7022 -print -quit
+)" || exit 1
+test -z "$unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev -type d ! -perm -0555 -print -quit
+)" || exit 1
+test -z "$unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev -type f ! -perm -0444 -print -quit
+)" || exit 1
+test -z "$unsafe_release_path"
+preexisting_venv="$(
+  sudo find "$release" -xdev -mindepth 1 -maxdepth 1 \
+    -name .venv -print -quit
+)" || exit 1
+test -z "$preexisting_venv"
+development_state="$(
+  sudo find "$release" -xdev \
+    \( -name .git -o -name .env -o -name '.env.*' -o -name uv.toml \) \
+    -print -quit
+)" || exit 1
+test -z "$development_state"
+unsafe_source_path="$(
+  sudo find "$release" -xdev ! \( -type d -o -type f \) -print -quit
+)" || exit 1
+test -z "$unsafe_source_path"
+unsafe_source_path="$(
+  sudo find "$release" -xdev -type f -links +1 -print -quit
+)" || exit 1
+test -z "$unsafe_source_path"
+unset development_state preexisting_venv release_mount unsafe_release_path unsafe_source_path
+
+sudo /usr/bin/env -i \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  UV_LINK_MODE=copy \
+  UV_PROJECT_ENVIRONMENT="$release/.venv" \
+  "$uv_binary" sync \
+    --project "$release" \
+    --frozen --no-dev --no-editable \
+    --no-config --no-python-downloads \
+    --python /usr/bin/python3
+test "$(sudo readlink --canonicalize-existing -- "$release")" = "$release"
+test "$(sudo stat --format='%d:%i' -- "$release")" = "$release_identity"
+release_mount="$(release_mount_at_or_below)" || exit 1
+test -z "$release_mount"
+unset release_mount
+sudo find "$release" -xdev -exec chown -h root:root -- {} +
+sudo find "$release" -xdev ! -type l -exec chmod u=rwX,go=rX -- {} +
+test "$(sudo readlink --canonicalize-existing -- "$release")" = "$release"
+test "$(sudo stat --format='%d:%i' -- "$release")" = "$release_identity"
+release_mount="$(release_mount_at_or_below)" || exit 1
+test -z "$release_mount"
+unsafe_release_path="$(
+  sudo find "$release" -xdev \( ! -uid 0 -o ! -gid 0 \) -print -quit
+)" || exit 1
+test -z "$unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev ! -type l -perm /7022 -print -quit
+)" || exit 1
+test -z "$unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev -type d ! -perm -0555 -print -quit
+)" || exit 1
+test -z "$unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev -type f ! -perm -0444 -print -quit
+)" || exit 1
+test -z "$unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev ! \( -type d -o -type f -o -type l \) -print -quit
+)" || exit 1
+test -z "$unsafe_release_path"
+unsafe_release_path="$(
+  sudo find "$release" -xdev -type f -links +1 -print -quit
+)" || exit 1
+test -z "$unsafe_release_path"
+unset release_mount release_identity unsafe_release_path
+sudo test -d "$release/.venv"
+sudo test ! -L "$release/.venv"
+test "$(sudo readlink --canonicalize-existing -- "$release/.venv")" = \
+  "$release/.venv"
+sudo test -d "$release/.venv/bin"
+sudo test ! -L "$release/.venv/bin"
+test "$(sudo readlink --canonicalize-existing -- "$release/.venv/bin")" = \
+  "$release/.venv/bin"
+sudo test -f "$release/.venv/bin/autocontribute"
+sudo test ! -L "$release/.venv/bin/autocontribute"
+sudo test -x "$release/.venv/bin/autocontribute"
+test "$(sudo readlink --canonicalize-existing -- \
+  "$release/.venv/bin/autocontribute")" = "$release/.venv/bin/autocontribute"
+system_python="$(sudo readlink --canonicalize-existing -- /usr/bin/python3)" || exit 1
+venv_python="$(sudo readlink --canonicalize-existing -- \
+  "$release/.venv/bin/python")" || exit 1
+test "$venv_python" = "$system_python"
+unset system_python venv_python
+sudo -u autocontribute /usr/bin/env -i \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  PYTHONNOUSERSITE=1 \
+  "$release/.venv/bin/python" -I - "$release" <<'PY'
+import os
+import pwd
+import sys
+from pathlib import Path
+
+release = Path(sys.argv[1]).resolve(strict=True)
+venv = release / ".venv"
+if os.getuid() != pwd.getpwnam("autocontribute").pw_uid:
+    raise SystemExit("release import probe did not run as the service identity")
+
+from autocontribute import store
+
+module = Path(store.__file__).resolve(strict=True)
+try:
+    module.relative_to(venv)
+except ValueError as exc:
+    raise SystemExit("release import did not use the installed immutable package") from exc
+PY
+sudo -u autocontribute /usr/bin/env -i \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  PYTHONNOUSERSITE=1 \
+  "$release/.venv/bin/autocontribute" \
   deployment verify-systemd-assets --source-root "$release"
 ```
 
@@ -446,6 +652,22 @@ Python package to the complete checked-out deployment inventory and rejects miss
 symlinked, non-regular, incorrectly mode-set, or content-mismatched assets. The manifest contains 23
 source assets: 22 have mandatory production paths and the journald example is deliberately
 source-bound but optional to install because retention is host policy.
+
+`--no-editable` keeps runtime imports inside the installed virtual environment. `--no-config`
+prevents local or administrator uv configuration from changing the operation, and
+`--no-python-downloads` binds it to the reviewed system interpreter. The explicit mode normalization
+makes the root-owned release readable and traversable by the unprivileged service identity even when
+the administrator or `sudo` policy uses `umask 077`; it still removes every group/other write bit
+and every special mode bit. The ancestry, identity, mount, and `find` checks reject path aliases,
+parent replacement, mounted subtrees, inspection failures, unsafe ownership, modes, file types,
+development state, source symlinks, and multiply linked regular files. Source invariants are
+rechecked after ownership hardening, and mount/identity invariants are checked before every recursive
+root operation. `UV_PROJECT_ENVIRONMENT` binds installation to the checked path, while
+`UV_LINK_MODE=copy` prevents the immutable release from sharing package inodes with uv's external
+cache. The isolated service probe proves that the selected module is the installed copy beneath
+this exact virtual environment, and checks the service UID before importing it. The attested
+packaging backend already ran at the explicitly accepted privileged build boundary; no installed
+application import or CLI runs before this probe.
 
 Keep `release` set for the installation steps below. Do not repoint `current` while any
 Autocontribute unit is active, and do not repoint it before the new deployment assets have passed
