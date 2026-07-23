@@ -35,13 +35,15 @@ jobs:
       - name: Preload immutable CCCL sandbox
         env:
           SANDBOX_IMAGE: >-
-            rapidsai/devcontainers@sha256:bf29a9a555e214c27deb0b8a952837de225d7fde94071fc61ec3a343e13ce641
+            rapidsai/devcontainers@sha256:b710ddb1a2013969fa972c682eafd21284d6d1891f00ce128ddca3c4634de952
         run: docker pull "$SANDBOX_IMAGE"
       - name: Run baseline debugger checks inside the production sandbox boundary
         env:
           SANDBOX_IMAGE: >-
-            rapidsai/devcontainers@sha256:bf29a9a555e214c27deb0b8a952837de225d7fde94071fc61ec3a343e13ce641
+            rapidsai/devcontainers@sha256:b710ddb1a2013969fa972c682eafd21284d6d1891f00ce128ddca3c4634de952
         run: |
+          # The quoted payload is expanded by the nested /bin/sh inside the container.
+          # shellcheck disable=SC2016
           timeout --signal=TERM --kill-after=5s 600s docker run --rm \
             --pull=never \
             --network=none \
@@ -82,13 +84,39 @@ jobs:
              command -v clang-format >/dev/null;
              git diff --check &&
              python -m compileall -q libcudacxx/share/libcudacxx libcudacxx/test/debugging &&
+             python -c "from enum import StrEnum" &&
              find libcudacxx/test/debugging -type f -name "*.cu" -exec clang-format --dry-run --Werror {} + &&
              /usr/local/cuda/bin/nvcc --version &&
              /usr/local/cuda/bin/cuda-gdb --version &&
              lldb --version &&
+             real_lldb="$(command -v lldb)" &&
+             printf "%s\n" \
+               "#!/bin/sh" \
+               "exec \"$real_lldb\" -o \"settings set target.disable-aslr false\" \"\$@\"" \
+               >/tmp/autocontribute-lldb &&
+             chmod 500 /tmp/autocontribute-lldb &&
+             mkdir -p /tmp/autocontribute-catch2 &&
+             printf "%s\n" \
+               "cmake_minimum_required(VERSION 3.21)" \
+               "project(AutocontributeCatch2Stub LANGUAGES NONE)" \
+               "add_library(Catch2 INTERFACE)" \
+               "add_library(Catch2::Catch2 ALIAS Catch2)" \
+               >/tmp/autocontribute-catch2/CMakeLists.txt &&
+             mkdir -p /tmp/autocontribute-dlpack/include &&
+             printf "%s\n" \
+               "cmake_minimum_required(VERSION 3.21)" \
+               "project(AutocontributeDlpackStub LANGUAGES NONE)" \
+               "add_library(dlpack INTERFACE)" \
+               "add_library(dlpack::dlpack ALIAS dlpack)" \
+               "target_include_directories(dlpack INTERFACE \"\${CMAKE_CURRENT_SOURCE_DIR}/include\")" \
+               >/tmp/autocontribute-dlpack/CMakeLists.txt &&
              cmake --preset libcudacxx \
                -DCMAKE_CUDA_ARCHITECTURES=75-virtual \
+               -DCCCL_ENABLE_CUDA_SMOKE_TESTS=OFF \
+               -DFETCHCONTENT_SOURCE_DIR_CATCH2=/tmp/autocontribute-catch2 \
+               -DFETCHCONTENT_SOURCE_DIR_DLPACK=/tmp/autocontribute-dlpack \
                -DLIBCUDACXX_GDB=/usr/local/cuda/bin/cuda-gdb \
+               -DLIBCUDACXX_LLDB=/tmp/autocontribute-lldb \
                -DLIBCUDACXX_ENABLE_GDB_TESTING=ON \
                -DLIBCUDACXX_ENABLE_LLDB_TESTING=ON &&
              cmake --build --preset libcudacxx --target help >/tmp/autocontribute-target-help &&
