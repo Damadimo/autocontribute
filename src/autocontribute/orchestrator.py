@@ -51,7 +51,12 @@ from autocontribute.exceptions import (
     StateError,
 )
 from autocontribute.github import GitHubClient
-from autocontribute.pr_template import select_pull_request_template, validate_pull_request_template
+from autocontribute.pr_template import (
+    complete_pull_request_template_tasks,
+    select_pull_request_template,
+    validate_pull_request_template,
+    validate_pull_request_template_draft,
+)
 from autocontribute.preparation import (
     compute_preparation_config_fingerprint,
     compute_preparation_fingerprint,
@@ -616,7 +621,7 @@ class Orchestrator:
             [*context_paths, *(edit.path for edit in proposal.edits)],
         )
         validate_publication_text(manifest)
-        validate_pull_request_template(proposal.pull_request_body, guidance)
+        validate_pull_request_template_draft(proposal.pull_request_body, guidance)
         self._assert_operational()
         workspace.apply_edits(proposal.edits)
         self._stop_for_secret_findings(manifest, workspace, workspace.diff())
@@ -827,6 +832,10 @@ class Orchestrator:
             )
             return manifest
 
+        assert manifest.proposal is not None
+        validate_publication_text(manifest)
+        validate_pull_request_template(manifest.proposal.pull_request_body, guidance)
+
         manifest.preparation_config_fingerprint = compute_preparation_config_fingerprint(
             self.config,
             repository=repository.full_name,
@@ -853,6 +862,15 @@ class Orchestrator:
     ) -> CriticReview:
         assert manifest.candidate is not None and manifest.plan is not None
         assert manifest.proposal is not None
+        if commands and all(result.passed for result in commands):
+            completed_body = complete_pull_request_template_tasks(
+                manifest.proposal.pull_request_body,
+                guidance,
+            )
+            manifest.proposal = manifest.proposal.model_copy(
+                update={"pull_request_body": completed_body}
+            )
+            validate_publication_text(manifest)
         affected_paths, _ = self._expanded_context_paths(
             workspace,
             issue=manifest.candidate,
@@ -930,7 +948,7 @@ class Orchestrator:
             [*context_paths, *(edit.path for edit in proposal.edits)],
         )
         validate_publication_text(manifest)
-        validate_pull_request_template(proposal.pull_request_body, guidance)
+        validate_pull_request_template_draft(proposal.pull_request_body, guidance)
         self._assert_operational()
         workspace.apply_edits(proposal.edits)
         self._stop_for_secret_findings(manifest, workspace, workspace.diff())

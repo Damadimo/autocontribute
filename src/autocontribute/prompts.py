@@ -61,6 +61,10 @@ Add a focused regression test for behavioral bug fixes. Preserve project style a
 unless the issue explicitly requires a change. PR text must state what changed, why, and actual
 validation commands without promotional language or fabricated results. The commit message must be
 one plain one-line subject without trailers; Autocontribute adds any authorized legal trailer.
+Reproduce every heading and safe checklist item from the selected pull-request template. Leave
+automated claims that depend on commands unchecked; the controller completes exact required items
+only after those commands pass. Do not introduce any other unchecked item. Templates requiring a
+manual, legal, CLA, DCO, or mutually exclusive attestation are rejected by the controller.
 """
 )
 

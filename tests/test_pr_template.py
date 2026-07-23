@@ -2,8 +2,10 @@ import pytest
 
 from autocontribute.exceptions import PolicyError
 from autocontribute.pr_template import (
+    complete_pull_request_template_tasks,
     select_pull_request_template,
     validate_pull_request_template,
+    validate_pull_request_template_draft,
 )
 
 
@@ -50,6 +52,46 @@ def test_template_headings_and_checklist_must_be_completed() -> None:
             "# Summary\n\nDone.\n\n# Validation\n\n- [ ] Tests added and passing\n",
             guidance,
         )
+
+
+def test_draft_defers_only_exact_required_template_tasks() -> None:
+    guidance = {
+        ".github/PULL_REQUEST_TEMPLATE.md": (
+            "# Summary\n\n# Validation\n\n- [ ] Tests pass\n- [ ] Lint passes\n"
+        )
+    }
+    draft = (
+        "# Summary\n\nFix the boundary.\n\n# Validation\n\n- [ ] Tests pass\n- [x] Lint passes\n"
+    )
+
+    validate_pull_request_template_draft(draft, guidance)
+    with pytest.raises(PolicyError, match="missing checklist item"):
+        validate_pull_request_template_draft(
+            "# Summary\n\nDone.\n\n# Validation\n\n- [ ] Tests pass\n",
+            guidance,
+        )
+    with pytest.raises(PolicyError, match="not required"):
+        validate_pull_request_template_draft(
+            draft + "- [ ] Run something later\n",
+            guidance,
+        )
+
+
+def test_completion_checks_only_visible_exact_required_tasks() -> None:
+    guidance = {"PULL_REQUEST_TEMPLATE.md": "# Validation\n\n- [ ] Tests pass\n"}
+    draft = (
+        "# Validation\n\n"
+        "<!-- - [ ] Tests pass -->\n"
+        "```markdown\n- [ ] Tests pass\n```\n"
+        "- [ ] Tests pass\n"
+    )
+
+    completed = complete_pull_request_template_tasks(draft, guidance)
+
+    assert "<!-- - [ ] Tests pass -->" in completed
+    assert "```markdown\n- [ ] Tests pass\n```" in completed
+    assert completed.endswith("- [x] Tests pass\n")
+    validate_pull_request_template(completed, guidance)
 
 
 def test_every_normalized_template_checklist_item_must_be_completed() -> None:

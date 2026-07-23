@@ -68,11 +68,63 @@ def select_pull_request_template(guidance: Mapping[str, str]) -> tuple[str, str]
 def validate_pull_request_template(body: str, guidance: Mapping[str, str]) -> None:
     """Fail closed when a proposed body omits visible template structure.
 
-    The agent never auto-checks attestations. It must return a body containing every visible
-    template heading, every normalized checklist item in its completed form, and no unresolved task
-    or common visible placeholder.
+    The final body must contain every visible template heading, every normalized checklist item in
+    its completed form, and no unresolved task or common visible placeholder. Legal, manual, and
+    ambiguous attestations are never completed automatically.
     """
 
+    _validate_pull_request_template(body, guidance, allow_deferred_tasks=False)
+
+
+def validate_pull_request_template_draft(body: str, guidance: Mapping[str, str]) -> None:
+    """Validate a proposed final body before its automated checks have run.
+
+    Required safe template tasks may remain unchecked at this stage. Their text must already be
+    present, while legal/manual attestations, ambiguous choices, missing structure, placeholders,
+    and unrelated incomplete tasks still fail closed.
+    """
+
+    _validate_pull_request_template(body, guidance, allow_deferred_tasks=True)
+
+
+def complete_pull_request_template_tasks(body: str, guidance: Mapping[str, str]) -> str:
+    """Complete exact required template tasks after deterministic validation has passed.
+
+    Callers own the evidence gate. This function changes only visible unchecked tasks whose
+    normalized text and multiplicity match the selected safe template, then applies the strict
+    final validator. Hidden comments, fenced examples, and extra tasks are never changed.
+    """
+
+    validate_pull_request_template_draft(body, guidance)
+    selected = select_pull_request_template(guidance)
+    if selected is None:
+        return body
+    _, template = selected
+    expected_tasks = list(_TASK.finditer(visible_markdown(template)))
+    remaining = Counter(_normalize(match.group("text")) for match in expected_tasks)
+    actual_tasks = list(_TASK.finditer(_visible_markdown_mask(body)))
+    for match in actual_tasks:
+        item = _normalize(match.group("text"))
+        if match.group("state").casefold() == "x" and remaining[item] > 0:
+            remaining[item] -= 1
+
+    completed = list(body)
+    for match in actual_tasks:
+        item = _normalize(match.group("text"))
+        if match.group("state") == " " and remaining[item] > 0:
+            completed[match.start("state")] = "x"
+            remaining[item] -= 1
+    result = "".join(completed)
+    validate_pull_request_template(result, guidance)
+    return result
+
+
+def _validate_pull_request_template(
+    body: str,
+    guidance: Mapping[str, str],
+    *,
+    allow_deferred_tasks: bool,
+) -> None:
     selected = select_pull_request_template(guidance)
     if selected is None:
         return
@@ -95,9 +147,40 @@ def validate_pull_request_template(body: str, guidance: Mapping[str, str]) -> No
     actual_tasks = list(_TASK.finditer(visible_body))
     if expected_tasks and not actual_tasks:
         raise PolicyError(f"Pull-request body omits the checklist required by {path}")
+    expected_items = Counter(_normalize(match.group("text")) for match in expected_tasks)
+    if allow_deferred_tasks:
+        actual_items = Counter(_normalize(match.group("text")) for match in actual_tasks)
+        missing_items = list((expected_items - actual_items).elements())
+        if missing_items:
+            raise PolicyError(
+                f"Pull-request body has a missing checklist item from {path}: "
+                + ", ".join(missing_items)
+            )
+        remaining = expected_items.copy()
+        for match in actual_tasks:
+            item = _normalize(match.group("text"))
+            if match.group("state").casefold() == "x" and remaining[item] > 0:
+                remaining[item] -= 1
+        unexpected_incomplete: list[str] = []
+        for match in actual_tasks:
+            if match.group("state") != " ":
+                continue
+            item = _normalize(match.group("text"))
+            if remaining[item] > 0:
+                remaining[item] -= 1
+            else:
+                unexpected_incomplete.append(match.group("text").strip())
+        if unexpected_incomplete:
+            raise PolicyError(
+                f"Pull-request body contains an incomplete checklist item not required by {path}: "
+                + ", ".join(unexpected_incomplete)
+            )
+        if _UNRESOLVED.search(visible_body):
+            raise PolicyError(f"Pull-request body contains an unresolved placeholder from {path}")
+        return
+
     if any(match.group("state") == " " for match in actual_tasks):
         raise PolicyError(f"Pull-request body contains an incomplete checklist item from {path}")
-    expected_items = Counter(_normalize(match.group("text")) for match in expected_tasks)
     completed_items = Counter(
         _normalize(match.group("text"))
         for match in actual_tasks
@@ -206,8 +289,50 @@ def visible_markdown(value: str) -> str:
     return "".join(rendered)
 
 
+def _visible_markdown_mask(value: str) -> str:
+    """Mask hidden Markdown while preserving offsets into the original value."""
+
+    rendered = list(value)
+
+    def blank(start: int, end: int) -> None:
+        for index in range(start, end):
+            if rendered[index] not in {"\n", "\r"}:
+                rendered[index] = " "
+
+    for comment in re.finditer(r"<!--.*?(?:-->|$)", value, flags=re.DOTALL):
+        blank(comment.start(), comment.end())
+
+    comment_masked = "".join(rendered)
+    fence_character: str | None = None
+    fence_length = 0
+    offset = 0
+    for line in comment_masked.splitlines(keepends=True):
+        marker = re.match(r"^[ \t]{0,3}(?P<fence>`{3,}|~{3,})(?P<tail>.*)$", line)
+        if fence_character is None:
+            if marker is not None:
+                fence = marker.group("fence")
+                fence_character = fence[0]
+                fence_length = len(fence)
+                blank(offset, offset + len(line))
+        else:
+            blank(offset, offset + len(line))
+            if marker is not None:
+                fence = marker.group("fence")
+                if (
+                    fence[0] == fence_character
+                    and len(fence) >= fence_length
+                    and not marker.group("tail").strip()
+                ):
+                    fence_character = None
+                    fence_length = 0
+        offset += len(line)
+    return "".join(rendered)
+
+
 __all__ = [
+    "complete_pull_request_template_tasks",
     "select_pull_request_template",
     "validate_pull_request_template",
+    "validate_pull_request_template_draft",
     "visible_markdown",
 ]
