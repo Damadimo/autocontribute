@@ -73,6 +73,45 @@ The workflow enforces one explicit repository, disables owner-wide discovery, re
 `review_required` mode, requires draft publication configuration, and never invokes the publication
 command. It uploads the evidence bundle for expert grading.
 
+## Retry-policy staging drill
+
+Use separate synthetic issues to verify the durable retry policy before enabling any unattended
+worker:
+
+1. Let one fixture revision finish as `skipped`, `rejected`, or `cancelled`, then dispatch the same
+   unchanged issue again. The preparation run must finish as `skipped`, contain a
+   `candidate.retry_deferred` event naming the prior run/status and issue revision, and contain no
+   model-call records.
+2. Edit semantic issue evidence—for example, add a maintainer comment that clarifies acceptance
+   criteria--and dispatch it again. With no active run, the new revision must be evaluated normally;
+   it is not required to pass the eligibility gates.
+3. On a separate fixture with no earlier conservative terminal outcome for that revision, retain a
+   `failed` run and dispatch the unchanged issue again. The failure must not suppress the new
+   attempt.
+4. Retain a `ready_for_approval` fixture run, change the issue, and dispatch it again. Active work
+   must still win: the new run records `candidate.active_deferred` and makes no model calls.
+
+The zero-call assertion above applies to the `autocontribute run` preparation stage. The hosted
+workflow runs `doctor` first, and that independent preflight intentionally makes its documented
+bounded model probe. Inspect the run manifest/events rather than using the workflow's total provider
+traffic as the retry assertion.
+
+The hosted staging workflow deliberately does not expose `--retry-unchanged`. If the override itself
+must be tested, use a separate operator-managed fixture lineage on a trusted worker while hosted
+staging is disabled:
+
+```bash
+uv run autocontribute run \
+  --config autocontribute.staging.yml \
+  --issue owner/fixture#123 \
+  --retry-unchanged
+```
+
+Confirm a `candidate.retry_override` event and fresh deterministic eligibility evidence. Never add
+the override to a schedule: scheduled mode rejects both pinned issues and retry overrides, and an
+override cannot bypass active work. Do not merge a locally advanced fixture lineage back into the
+hosted lineage or resume the hosted workflow from its older parent.
+
 Staging state uses the same three-part persistence contract as production review runs: a verified
 SQLite snapshot, run bundles under `.autocontribute-staging/runs/`, and separate immutable expert
 evaluation files under `.autocontribute-staging/evaluations/`. The workflow caches and uploads all
@@ -86,14 +125,16 @@ The matching `state restore --complete` verifies and promotes SQLite, run bundle
 one generation into an absent storage root. The hosted workflow continues to use SQLite-only mode
 because its immutable cache and evidence artifact already persist all three parts together.
 
-The staging cache writes unique `autocontribute-staging-state-v6-...` keys and restores only the key
-named by the external lineage variable. Exact repository- and runner-bound v5, v4, or v3 keys already
-committed in that variable are one-way legacy inputs: the workflow checks that each snapshot matches
-its declared schema, migrates it, and saves the replacement under a v6 key. It never falls back to a stale
-prefix or accepts arbitrary legacy keys. Never use `bootstrap_state=true` or edit the variable to
-bypass a failed save, migration, or missing lineage. Although the shadow workflow never publishes,
-preserve the matching snapshot, run bundles, and evaluation records together for any later
-operator-reviewed fixture publication.
+The staging cache writes unique `autocontribute-staging-state-v7-...` keys and restores only the key
+named by the external lineage variable. Exact repository- and runner-bound v6, v5, v4, or v3 keys
+already committed in that variable are one-way legacy inputs: the workflow checks that each snapshot
+matches its declared schema, migrates it, and saves the replacement under a v7 key. The v6-to-v7
+migration transactionally verifies historical candidate rows against their manifests and backfills
+durable issue revisions; a mismatch leaves the v6 source unchanged. The workflow never falls back to
+a stale prefix or accepts arbitrary legacy keys. Never use `bootstrap_state=true` or edit the
+variable to bypass a failed save, migration, or missing lineage. Although the shadow workflow never
+publishes, preserve the matching snapshot, run bundles, and evaluation records together for any
+later operator-reviewed fixture publication.
 
 If staging is left at an `in-progress` claim, set `AUTOCONTRIBUTE_STAGING_ENABLED=false` and use
 **Recover staging hosted state** from the default branch; never rewrite

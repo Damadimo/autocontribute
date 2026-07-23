@@ -68,6 +68,13 @@ uv run autocontribute approve RUN_ID
 uv run autocontribute publish RUN_ID
 ```
 
+A normal pinned run does not repeatedly spend model budget on an unchanged issue that already ended
+as `skipped`, `rejected`, or `cancelled`. After reviewing the prior evidence, an operator can make a
+deliberate manual exception with
+`autocontribute run --issue owner/repository#123 --retry-unchanged`. The retry flag is valid only
+when paired with `--issue`. A scheduled invocation rejects both pinned issues and the retry override,
+and the override never bypasses an active run for the issue.
+
 `doctor` is an active preflight, not a purely static configuration check. It sends one bounded,
 potentially billable strict-schema request per distinct model profile (at most 1,024 output tokens
 and 60 seconds), with no model tools or repository credentials. Its GitHub probes use only `GET`
@@ -145,6 +152,22 @@ The default state machine intentionally ends many runs as `skipped` or `rejected
 becomes `ready_for_approval` only when all hard gates and the configured readiness threshold pass.
 Issue discussions are included in the evidence, and explicit work claims or maintainer stop requests
 block selection before model work.
+
+Candidate retry decisions are durable. On selection, schema v7 stores a domain-separated SHA-256
+revision of the complete canonical issue evidence, including its title, body, state, labels,
+assignees, timestamps, and full discussion, while excluding derived ranking fields. Any active run
+for an issue blocks another attempt regardless of revision. With no active run, the same revision is
+suppressed after `skipped`, `rejected`, or `cancelled`; `failed` does not itself suppress a retry, and
+a changed issue revision becomes available again. Unpinned discovery falls through active or
+suppressed candidates and keeps searching within its bounded candidate scan rather than treating the
+first duplicate as the result.
+
+Pinned active and unchanged-suppressed decisions finish as audited skips before eligibility or model
+work, with `candidate.active_deferred` or `candidate.retry_deferred` evidence naming the issue
+revision, prior run, and prior status. A deliberate manual override records
+`candidate.retry_override`, then reruns every normal deterministic gate; it does not force the issue
+to pass. These deferrals make zero model calls. Their run and event records remain part of the state
+lineage so repeated scheduler invocations cannot forget the decision.
 
 Published pull requests remain part of the safety loop. `autocontribute lifecycle sync` records an
 immutable snapshot of every locally tracked open PR and persistently stops all preparation and
@@ -364,25 +387,29 @@ Actions cache as the durability boundary for autonomous publication.
 The hosted review workflow uses `AUTOCONTRIBUTE_STATE_LINEAGE` as an external fail-closed pointer to
 one exact cache generation. It advances that pointer only after a verified snapshot is saved and
 the evidence artifact uploads, and refuses both stale prefix fallback and unfinished generations.
-It accepts the exact current v6 key or exact, repository-bound v5, v4, or v3 keys as one-way
+It accepts the exact current v7 key or exact, repository-bound v6, v5, v4, or v3 keys as one-way
 migration sources, checks that each key and snapshot schema agree, and writes every new generation
-under a v6 key. Its
+under a v7 key. Its
 explicit handoff is one-way: after state is downloaded for publication, continue on persistent
 operator-managed storage rather than restarting the hosted schedule from an older cache.
 
-The current state/cache lineage is schema v6. Restore accepts an exact canonical v6, v5, v4, v3, or
-v2 snapshot; older schemas migrate when the next command opens the store. Schema v3 introduced durable
-publication reservations; v4 added atomic per-run event anchors, persistent lease generations, and
-crash-persistent evaluation-gate holds. Schema v5 adds durable manifest-artifact synchronization and
-cross-checks reservation/hold rows against their hash-chained ledger evidence. Schema v6 adds
+The current state/cache lineage is schema v7. Restore accepts an exact canonical v7, v6, v5, v4, v3,
+or v2 snapshot; older schemas migrate when the next command opens the store. Schema v3 introduced
+durable publication reservations; v4 added atomic per-run event anchors, persistent lease
+generations, and crash-persistent evaluation-gate holds. Schema v5 adds durable manifest-artifact
+synchronization and cross-checks reservation/hold rows against their hash-chained ledger evidence.
+Schema v6 adds
 `publication_gate_holds.outcome_corpus_cursor`: every new automatic hold atomically binds both
 evaluation and outcome cursors, while migrated v2-v5 holds retain a null outcome cursor and cannot
-authorize automatic recovery. The upgrade is an offline, one-way cutover: stop all older workers
-before opening restored state with v6, never restart them against the migrated lineage, and take a
-fresh v6 backup before continuing. Never resume
+authorize automatic recovery. Schema v7 adds the durable issue-revision column and candidate lookup
+index. Its migration validates every bounded run row against its manifest and transactionally
+backfills revisions for rows that selected a candidate; malformed or mismatched evidence rolls the
+migration back. The upgrade is an offline, one-way cutover: stop all older workers before opening
+restored state with v7, never restart them against the migrated lineage, and take a fresh v7 backup
+before continuing. Never resume
 automatic publication from a stale or partial restore, because missing reservation, gate-hold,
-outcome-cursor, artifact-sync, evaluation-anchor, or lease-generation history can invalidate safety
-decisions.
+outcome-cursor, issue-revision, artifact-sync, evaluation-anchor, or lease-generation history can
+invalidate safety decisions.
 
 Autocontribute never autonomously creates issues, comments, reactions, reviews, stars, merges, or
 maintainer messages. Follow-up changes require a fresh evidence bundle and approval.

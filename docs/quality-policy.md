@@ -13,6 +13,20 @@ complete issue discussion is loaded before selection. Claimed work, maintainer s
 security-sensitive work, stale issues, broad scope, and policy conflicts are skipped before a model
 call whenever possible.
 
+The same canonical issue revision is not reconsidered indefinitely. An active run for an issue
+always blocks another attempt, including when upstream evidence changed. With no active run, an
+unchanged revision from a prior `skipped`, `rejected`, or `cancelled` run is suppressed; a prior
+`failed` run does not itself suppress another attempt, and changed issue evidence creates an
+available revision. This policy prevents repeated model spend on a stable conservative decision
+without converting infrastructure failure into a permanent quality judgment.
+
+Discovery fetches the canonical issue, applies this disposition before eligibility or model work,
+and falls through to later candidates. A pinned deferral writes the current revision, prior run ID,
+and status to the hash-chained event ledger and makes zero model calls. The manual-only
+`--issue ... --retry-unchanged` exception is an operator decision, not a quality waiver: active work
+still blocks, the override is audited, and every deterministic gate is rerun. Scheduled invocations
+cannot pin an issue or request this override.
+
 The deterministic score is:
 
 | Dimension | Weight |

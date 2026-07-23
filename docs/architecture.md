@@ -138,6 +138,28 @@ queued -> discovering -> candidate_selected -> eligibility_checked -> planning
 Normal side exits: skipped, rejected, cancelled, failed
 ```
 
+Candidate identity is revision-aware and durable. When a candidate is selected, the store computes
+a domain-separated SHA-256 digest over its canonical semantic issue evidence and writes that digest
+to both the run row and `candidate.selected` event. Repository/name, issue number and URL, state,
+title, body, author, labels, assignees, created/updated timestamps, and every structured discussion
+entry participate; derived score and score evidence do not. Subsequent saves must reproduce the
+same digest, and retry lookup validates each historical row against its manifest before trusting it.
+
+Retry classification is ordered. Any status other than the released side exits above is active and
+blocks another attempt for that issue, regardless of a newer revision or a requested override. If
+there is no active run, an equal revision from a `skipped`, `rejected`, or `cancelled` run suppresses
+automatic repetition. A `failed` run does not itself suppress its revision, and a semantic evidence
+change produces a new available revision. Discovery applies this test after fetching the canonical
+issue but before eligibility/model work. It falls through active and suppressed search results, and
+only evaluated eligible candidates consume the configured selection budget.
+
+For a pinned run, an active or suppressed decision is itself persisted as a terminal audited run.
+`candidate.active_deferred` and `candidate.retry_deferred` bind the current revision to the prior run
+ID and status, and no model is called. A manual `--issue ... --retry-unchanged` can bypass only the
+suppressed state; it records `candidate.retry_override` and then follows the normal eligibility and
+quality pipeline. Scheduled mode rejects both issue pinning and this override before run creation,
+so unattended operation cannot convert a conservative terminal decision into repeated model spend.
+
 Each run has one bounded repair opportunity. A positively recognized assertion, test,
 source-located compiler/type-checker, or linter failure may trigger `validating -> implementing ->
 validating` before the first critic call. Deterministic infrastructure failures such as timeouts,
@@ -213,7 +235,7 @@ package. CI verifies its `pyproject.toml` and `uv.lock` SHA-256 values before bu
 wheel installs use the same explicit identity without searching or trusting unrelated ancestor files.
 The runtime component also hashes the schema-validated `_systemd_assets.json`, so changing any
 release-bound operator deployment asset starts a new cohort.
-An online SQLite snapshot captures committed WAL pages and verifies integrity, the exact v6 schema,
+An online SQLite snapshot captures committed WAL pages and verifies integrity, the exact v7 schema,
 and every event chain against its durable count/head anchor, but it does not include either
 directory. `state backup --complete` additionally copies both directories, validates their run
 manifests and evaluation anchors against that snapshot, inventories every file by size and SHA-256,
@@ -243,12 +265,12 @@ descriptor-relative; an identity mismatch is restored without deletion. The coll
 symlink-resistant, rejects nested mounts, and is bounded by both retention age and an inspection
 limit. It removes only the checkout; the database, evidence bundle, and evaluation lineage remain.
 
-The current SQLite schema is v6. `state restore` accepts only exact canonical v2, v3, v4, v5, or v6 schemas,
-rejecting unexpected tables, indexes, views, and triggers as well as missing objects, and refuses to
-replace live SQLite state. A v4, v5, or v6 snapshot's complete event ledger, run anchors, and
-publication state are validated before atomic promotion. A v2 or v3 snapshot receives its exact
+The current SQLite schema is v7. `state restore` accepts only exact canonical v2, v3, v4, v5, v6, or
+v7 schemas, rejecting unexpected tables, indexes, views, and triggers as well as missing objects, and
+refuses to replace live SQLite state. A v4 or newer snapshot's complete event ledger, run anchors,
+and publication state are validated before atomic promotion. A v2 or v3 snapshot receives its exact
 historical structural and evidence validation and is promoted unchanged; the next command that
-constructs `RunStore` migrates it transactionally through v3, v4, v5, and v6. The v2-to-v3 step
+constructs `RunStore` migrates it transactionally through v3, v4, v5, v6, and v7. The v2-to-v3 step
 conservatively backfills reservations for durable `submitting` and `pr_open` runs at migration time.
 The v3-to-v4 step first verifies every legacy hash chain, then backfills event count/head anchors,
 seeds persistent generation counters from active leases, and conservatively holds the evaluation
@@ -256,12 +278,15 @@ corpus for ambiguous submitting publications. The v4-to-v5 step adds an explicit
 sync outbox and reconciles materialized reservation/hold rows with their hash-chained evidence. The
 v5-to-v6 step adds `publication_gate_holds.outcome_corpus_cursor`. New automatic holds atomically
 bind that cursor with the evaluation cursor; migrated v2-v5 holds retain a null outcome cursor and
-cannot confer automatic recovery authority. Because older schemas did not retain every
-v6 invariant after a clean release, the cutover must be offline and one-way: quiesce every older
-worker before the first v6 open and never let one resume against the migrated lineage. A stale
-restore can omit reservations, gate holds, outcome cursors, artifact-sync intent, evaluation anchors,
-event heads, or lease generations, so SQLite integrity alone does not make it a safe
-autonomous-publication recovery point.
+cannot confer automatic recovery authority. The v6-to-v7 step adds the issue-revision column and
+candidate lookup index. It validates at most the supported bounded run corpus, requires every row's
+status and candidate identity to agree with its manifest, and backfills a revision for each selected
+candidate in one transaction; invalid evidence rolls the whole migration back. Because older
+schemas did not retain every v7 invariant after a clean release, the cutover must be offline and
+one-way: quiesce every older worker before the first v7 open and never let one resume against the
+migrated lineage. A stale restore can omit reservations, gate holds, outcome cursors, issue
+revisions, artifact-sync intent, evaluation anchors, event heads, or lease generations, so SQLite
+integrity alone does not make it a safe autonomous-publication recovery point.
 
 Automatic publication computes exact cursors over the globally ordered, hash-chained evaluation
 anchors and the scoped upstream-outcome evidence. The publication reservation and both cursor holds
