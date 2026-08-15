@@ -23,6 +23,8 @@ unset AWS_CONFIG_FILE AWS_CONTAINER_AUTHORIZATION_TOKEN \
   AWS_PROFILE AWS_ROLE_ARN AWS_SHARED_CREDENTIALS_FILE AWS_WEB_IDENTITY_TOKEN_FILE
 export AWS_EC2_METADATA_DISABLED=true
 
+# An empty AWS_SESSION_TOKEN credential declares a long-lived access key that
+# issues no session token; the key pair itself must always be non-empty.
 for credential_name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
   credential_path="$credential_directory/$credential_name"
   if [[ ! -f "$credential_path" || -L "$credential_path" ]]; then
@@ -30,12 +32,20 @@ for credential_name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
     exit 1
   fi
   credential_value="$(<"$credential_path")"
-  if [[ -z "$credential_value" || "$credential_value" == *$'\n'* ]]; then
-    printf 'A required AWS replication credential is empty or multiline\n' >&2
+  if [[ "$credential_value" == *$'\n'* ]]; then
+    printf 'An AWS replication credential is multiline\n' >&2
     exit 1
   fi
-  printf -v "$credential_name" '%s' "$credential_value"
-  export "${credential_name?}"
+  if [[ -z "$credential_value" && "$credential_name" != AWS_SESSION_TOKEN ]]; then
+    printf 'A required AWS replication credential is empty\n' >&2
+    exit 1
+  fi
+  if [[ -n "$credential_value" ]]; then
+    printf -v "$credential_name" '%s' "$credential_value"
+    export "${credential_name?}"
+  else
+    unset "${credential_name?}"
+  fi
   unset credential_path credential_value
 done
 unset credential_name

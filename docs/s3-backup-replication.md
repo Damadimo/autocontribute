@@ -200,9 +200,12 @@ hourly at `*:37 UTC` (plus its fixed randomized delay), so a network or credenti
 require another state mutation or backup.
 
 Only the replication service loads the encrypted `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and
-`AWS_SESSION_TOKEN` credential files. Its wrapper rejects unsafe credential paths, unsets alternate
-AWS profile, shared-file, container, role, and web-identity discovery variables, and sets
-`AWS_EC2_METADATA_DISABLED=true` before invoking `state replicate-next-s3`. The backup remains
+`AWS_SESSION_TOKEN` credential files. As in the interactive drill above, `AWS_SESSION_TOKEN` may be
+stored as an encrypted empty value for a long-lived access key that issues no session token; the
+wrapper then leaves the variable unset instead of exporting an empty one. Its wrapper rejects
+unsafe credential paths, unsets alternate AWS profile, shared-file, container, role, and
+web-identity discovery variables, and sets `AWS_EC2_METADATA_DISABLED=true` before invoking
+`state replicate-next-s3`. The backup remains
 credential-free and private-networked. Worker and doctor receive GitHub/model credentials but no AWS
 credentials; the replication service receives the AWS triplet but no GitHub or model credential.
 

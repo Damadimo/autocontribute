@@ -761,7 +761,7 @@ printf '%s' "$autocontribute_secret" | sudo systemd-creds encrypt \
 unset autocontribute_secret
 printf '\n'
 
-read -rsp 'AWS session token: ' autocontribute_secret
+read -rsp 'AWS session token (empty only for a credential without one): ' autocontribute_secret
 printf '%s' "$autocontribute_secret" | sudo systemd-creds encrypt \
   --name=AWS_SESSION_TOKEN - \
   /etc/autocontribute/credentials/AWS_SESSION_TOKEN.cred
@@ -781,10 +781,13 @@ boundary risk, keep this account locked and dedicated to Autocontribute and its 
 The AWS triplet is loaded only by `autocontribute-replication.service`; it is never exposed to the
 worker, doctor, local backup, sandbox, or model subprocess. The replication service receives no
 GitHub or model credential. Its wrapper unsets AWS profile/shared-file, container, role, and web-
-identity discovery variables and disables EC2 instance metadata before exporting only the three
-validated credential files. Conversely, the local backup service has no credential and runs with
-`PrivateNetwork=yes`. Rotate the short-lived AWS triplet as one set and rerun replication under
-observation before relying on the next timer.
+identity discovery variables and disables EC2 instance metadata before exporting only the
+validated credential files. All three encrypted files must exist, but `AWS_SESSION_TOKEN.cred` may
+hold an empty value for a long-lived access key that issues no session token (press Enter at its
+prompt above); the wrapper then exports only the key pair and leaves `AWS_SESSION_TOKEN` unset.
+Conversely, the local backup service has no credential and runs with `PrivateNetwork=yes`. Rotate
+the AWS credential set as one unit and rerun replication under observation before relying on the
+next timer.
 
 For another API-key environment name, install the same drop-in for both the worker and doctor. Each
 unit independently defines the default encrypted credentials, so changing only one leaves the two

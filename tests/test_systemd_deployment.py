@@ -1802,6 +1802,7 @@ def test_replication_timer_service_and_helper_form_a_separate_provider_boundary(
 
     helper = (SYSTEMD / "libexec" / "autocontribute-replication").read_text(encoding="utf-8")
     assert "AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN" in helper
+    assert '"$credential_name" != AWS_SESSION_TOKEN' in helper
     assert "AWS_CONFIG_FILE AWS_CONTAINER_AUTHORIZATION_TOKEN" in helper
     assert "AWS_PROFILE AWS_ROLE_ARN AWS_SHARED_CREDENTIALS_FILE" in helper
     assert "AWS_WEB_IDENTITY_TOKEN_FILE" in helper
@@ -1890,6 +1891,137 @@ printf '%s\n' \
         *credential_values.values(),
         "true",
     ]
+
+
+def test_replication_helper_omits_an_empty_session_token(tmp_path: Path) -> None:
+    executable = tmp_path / "autocontribute"
+    config = tmp_path / "autocontribute.yml"
+    credentials = tmp_path / "credentials"
+    calls = tmp_path / "calls"
+    observed = tmp_path / "observed"
+    config.write_text("publishing:\n  mode: review_required\n", encoding="utf-8")
+    credentials.mkdir(mode=0o700)
+    for name, value in (
+        ("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE"),
+        ("AWS_SECRET_ACCESS_KEY", "long-lived-secret"),
+        ("AWS_SESSION_TOKEN", ""),
+    ):
+        path = credentials / name
+        path.write_text(value, encoding="utf-8")
+        path.chmod(0o400)
+    _write_executable(
+        executable,
+        """#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$AUTOCONTRIBUTE_TEST_CALLS"
+if [[ "$*" == "deployment verify-systemd-assets" ]]; then
+  exit 0
+fi
+[[ "$*" == "state replicate-next-s3 --config $AUTOCONTRIBUTE_TEST_CONFIG" ]]
+if /usr/bin/env | /usr/bin/grep -q '^AWS_SESSION_TOKEN='; then
+  exit 92
+fi
+printf '%s\n' \
+  "$AWS_ACCESS_KEY_ID" \
+  "$AWS_SECRET_ACCESS_KEY" \
+  "$AWS_EC2_METADATA_DISABLED" >"$AUTOCONTRIBUTE_TEST_OBSERVED"
+""",
+    )
+    environment = {
+        **os.environ,
+        "AUTOCONTRIBUTE_CONFIG": os.fspath(config),
+        "AUTOCONTRIBUTE_EXECUTABLE": os.fspath(executable),
+        "AUTOCONTRIBUTE_TEST_CALLS": os.fspath(calls),
+        "AUTOCONTRIBUTE_TEST_CONFIG": os.fspath(config),
+        "AUTOCONTRIBUTE_TEST_OBSERVED": os.fspath(observed),
+        "CREDENTIALS_DIRECTORY": os.fspath(credentials),
+        "AWS_SESSION_TOKEN": "must-be-removed",
+    }
+
+    result = subprocess.run(
+        ["bash", os.fspath(SYSTEMD / "libexec" / "autocontribute-replication")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "deployment verify-systemd-assets",
+        f"state replicate-next-s3 --config {config}",
+    ]
+    assert observed.read_text(encoding="utf-8").splitlines() == [
+        "AKIAIOSFODNN7EXAMPLE",
+        "long-lived-secret",
+        "true",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("remove-session-token", "A required AWS replication credential is unavailable"),
+        ("empty-access-key-id", "A required AWS replication credential is empty"),
+        ("empty-secret-access-key", "A required AWS replication credential is empty"),
+        ("multiline-session-token", "An AWS replication credential is multiline"),
+    ),
+)
+def test_replication_helper_rejects_invalid_credential_files(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+) -> None:
+    executable = tmp_path / "autocontribute"
+    config = tmp_path / "autocontribute.yml"
+    credentials = tmp_path / "credentials"
+    calls = tmp_path / "calls"
+    config.write_text("publishing:\n  mode: review_required\n", encoding="utf-8")
+    credentials.mkdir(mode=0o700)
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"):
+        path = credentials / name
+        path.write_text(f"rejection-{name}", encoding="utf-8")
+        path.chmod(0o600)
+    if mutation == "remove-session-token":
+        (credentials / "AWS_SESSION_TOKEN").unlink()
+    elif mutation == "empty-access-key-id":
+        (credentials / "AWS_ACCESS_KEY_ID").write_text("", encoding="utf-8")
+    elif mutation == "empty-secret-access-key":
+        (credentials / "AWS_SECRET_ACCESS_KEY").write_text("", encoding="utf-8")
+    else:
+        (credentials / "AWS_SESSION_TOKEN").write_text("line-one\nline-two", encoding="utf-8")
+    _write_executable(
+        executable,
+        """#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$*" >>"$AUTOCONTRIBUTE_TEST_CALLS"
+if [[ "$*" == "deployment verify-systemd-assets" ]]; then
+  exit 0
+fi
+exit 90
+""",
+    )
+    environment = {
+        **os.environ,
+        "AUTOCONTRIBUTE_CONFIG": os.fspath(config),
+        "AUTOCONTRIBUTE_EXECUTABLE": os.fspath(executable),
+        "AUTOCONTRIBUTE_TEST_CALLS": os.fspath(calls),
+        "CREDENTIALS_DIRECTORY": os.fspath(credentials),
+    }
+
+    result = subprocess.run(
+        ["bash", os.fspath(SYSTEMD / "libexec" / "autocontribute-replication")],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=environment,
+    )
+
+    assert result.returncode == 1
+    assert message in result.stderr
+    assert calls.read_text(encoding="utf-8").splitlines() == ["deployment verify-systemd-assets"]
 
 
 def test_workspace_quota_check_accepts_bounded_dedicated_ext4_mount(tmp_path: Path) -> None:
