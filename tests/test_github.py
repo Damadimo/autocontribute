@@ -500,17 +500,21 @@ def test_cross_origin_redirect_never_receives_authorization() -> None:
 @pytest.mark.parametrize(
     ("status_code", "message"),
     [
-        (403, "forbidden"),
+        (403, "API rate limit exceeded for user"),
         (429, "slow down"),
-        (422, "You have triggered an abuse detection mechanism"),
     ],
 )
-def test_rate_or_abuse_signal_is_persisted_before_failure(
-    tmp_path, status_code: int, message: str
+def test_exhausted_rate_limit_retries_then_fails_without_tripping_breaker(
+    tmp_path, monkeypatch, status_code: int, message: str
 ) -> None:  # type: ignore[no-untyped-def]
     store = RunStore(tmp_path / "state")
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.github._sleep", waits.append)
+    requests = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
         return httpx.Response(
             status_code,
             headers={
@@ -519,6 +523,110 @@ def test_rate_or_abuse_signal_is_persisted_before_failure(
                 "X-RateLimit-Remaining": "0",
             },
             json={"message": message},
+        )
+
+    with (
+        _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github,
+        pytest.raises(GitHubError, match="rate limited") as raised,
+    ):
+        github.authenticated_login()
+
+    assert not isinstance(raised.value, GitHubSafetyError)
+    assert requests == 4
+    assert waits == [60.0, 60.0, 60.0]
+    assert not store.circuit_breaker_status().is_tripped
+
+
+def test_rate_limit_retry_honors_wait_and_recovers(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.github._sleep", waits.append)
+    responses = iter(
+        [
+            httpx.Response(
+                429,
+                headers={"Retry-After": "3"},
+                json={"message": "slow down"},
+            ),
+            httpx.Response(200, json={"login": "octocat"}),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    with _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github:
+        assert github.authenticated_login() == "octocat"
+
+    assert waits == [3.0]
+    assert not store.circuit_breaker_status().is_tripped
+
+
+def test_excessive_rate_limit_wait_fails_fast_without_sleeping(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.github._sleep", waits.append)
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "3600"},
+            json={"message": "slow down"},
+        )
+
+    with (
+        _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github,
+        pytest.raises(GitHubError, match="rate limited"),
+    ):
+        github.authenticated_login()
+
+    assert requests == 1
+    assert waits == []
+    assert not store.circuit_breaker_status().is_tripped
+
+
+def test_permission_403_fails_without_retry_or_breaker(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    monkeypatch.setattr(
+        "autocontribute.github._sleep",
+        lambda _: pytest.fail("permission failures must not sleep"),
+    )
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(403, json={"message": "Resource not accessible by this token"})
+
+    with (
+        _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github,
+        pytest.raises(GitHubError, match="returned 403") as raised,
+    ):
+        github.authenticated_login()
+
+    assert not isinstance(raised.value, GitHubSafetyError)
+    assert requests == 1
+    assert not store.circuit_breaker_status().is_tripped
+
+
+def test_persistent_abuse_signal_is_persisted_after_honored_wait(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.github._sleep", waits.append)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            headers={
+                "Retry-After": "60",
+                "X-GitHub-Request-Id": "fixture-request",
+            },
+            json={"message": "You have triggered an abuse detection mechanism"},
         )
 
     with _client(
@@ -531,10 +639,124 @@ def test_rate_or_abuse_signal_is_persisted_before_failure(
         with pytest.raises(GitHubSafetyError):
             github.authenticated_login()
 
+    assert waits == [60.0, 60.0]
     status = store.circuit_breaker_status()
     assert status.is_tripped
-    assert status.source == "github_api:rate_or_abuse_limit"
+    assert status.source == "github_api:persistent_abuse_limit"
     assert status.trigger_hash == first_hash
+
+
+def test_transient_abuse_signal_recovers_without_tripping_breaker(
+    tmp_path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.github._sleep", waits.append)
+    responses = iter(
+        [
+            httpx.Response(
+                403,
+                headers={"Retry-After": "30"},
+                json={"message": "You have exceeded a secondary rate limit"},
+            ),
+            httpx.Response(200, json={"login": "octocat"}),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    with _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github:
+        assert github.authenticated_login() == "octocat"
+
+    assert waits == [30.0]
+    assert not store.circuit_breaker_status().is_tripped
+
+
+def test_account_suspension_trips_breaker_immediately(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    monkeypatch.setattr(
+        "autocontribute.github._sleep",
+        lambda _: pytest.fail("account suspension must not be retried"),
+    )
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            403,
+            headers={"X-GitHub-Request-Id": "fixture-request"},
+            json={"message": "Sorry. Your account was suspended."},
+        )
+
+    with (
+        _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github,
+        pytest.raises(GitHubSafetyError, match="suspended"),
+    ):
+        github.authenticated_login()
+
+    assert requests == 1
+    status = store.circuit_breaker_status()
+    assert status.is_tripped
+    assert status.source == "github_api:account_suspended"
+
+
+def test_get_retries_transient_5xx_and_recovers(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.github._sleep", waits.append)
+    responses = iter(
+        [
+            httpx.Response(502, json={"message": "bad gateway"}),
+            httpx.Response(200, json={"login": "octocat"}),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    with _client(handler) as github:
+        assert github.authenticated_login() == "octocat"
+
+    assert waits == [2.0]
+
+
+def test_mutation_is_never_retried_on_transient_5xx(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        "autocontribute.github._sleep",
+        lambda _: pytest.fail("mutations must not be retried on ambiguous failures"),
+    )
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if request.method == "GET":
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(502, json={"message": "bad gateway"})
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="returned 502"):
+        github.ensure_fork("upstream/project", "octocat")
+
+    assert requests == 2
+
+
+def test_get_retries_transport_errors_and_recovers(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.github._sleep", waits.append)
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ConnectError("connection reset")
+        return httpx.Response(200, json={"login": "octocat"})
+
+    with _client(handler) as github:
+        assert github.authenticated_login() == "octocat"
+
+    assert waits == [2.0]
 
 
 def test_existing_unrelated_repository_cannot_be_reused_as_fork() -> None:
