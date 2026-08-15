@@ -36,6 +36,9 @@ class _ExpectedAsset:
 # This inventory is deliberately duplicated in executable code. A damaged or edited manifest cannot
 # silently omit a safety helper or redirect verification to another host path.
 _EXPECTED_ASSETS: Final[dict[str, _ExpectedAsset]] = {
+    "deploy/systemd/autocontribute-alert@.service": _ExpectedAsset(
+        "/etc/systemd/system/autocontribute-alert@.service", "0644", True
+    ),
     "deploy/systemd/autocontribute-backup.service": _ExpectedAsset(
         "/etc/systemd/system/autocontribute-backup.service", "0644", True
     ),
@@ -79,6 +82,9 @@ _EXPECTED_ASSETS: Final[dict[str, _ExpectedAsset]] = {
         "/etc/systemd/system/user@{autocontribute_uid}.service.d/50-autocontribute.conf",
         "0644",
         True,
+    ),
+    "deploy/systemd/libexec/autocontribute-alert": _ExpectedAsset(
+        "/usr/local/libexec/autocontribute-alert", "0755", True
     ),
     "deploy/systemd/libexec/autocontribute-backup": _ExpectedAsset(
         "/usr/local/libexec/autocontribute-backup", "0755", True

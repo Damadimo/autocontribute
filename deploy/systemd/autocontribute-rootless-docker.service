@@ -5,6 +5,7 @@ Wants=network-online.target
 After=network-online.target systemd-user-sessions.service
 RequiresMountsFor=/var/lib/autocontribute/docker
 OnFailure=autocontribute-failure@%n.service
+OnFailure=autocontribute-alert@%n.service
 StartLimitIntervalSec=5m
 StartLimitBurst=6
 

@@ -19,6 +19,7 @@ from rich.table import Table
 from rich.text import Text
 
 from autocontribute import __version__
+from autocontribute.alerting import send_failure_alert
 from autocontribute.backup import create_state_bundle, restore_state_bundle
 from autocontribute.backup_replication import (
     prune_replicated_state_bundles,
@@ -108,6 +109,10 @@ deployment_app = typer.Typer(
     help="Verify release-bound production deployment assets.",
     no_args_is_help=True,
 )
+alert_app = typer.Typer(
+    help="Send operational failure notifications to the configured webhook.",
+    no_args_is_help=True,
+)
 app.add_typer(runs_app, name="runs")
 app.add_typer(config_app, name="config")
 app.add_typer(evaluation_app, name="eval")
@@ -117,6 +122,7 @@ app.add_typer(lifecycle_app, name="lifecycle")
 app.add_typer(safety_app, name="safety")
 app.add_typer(policy_app, name="policy")
 app.add_typer(deployment_app, name="deployment")
+app.add_typer(alert_app, name="alert")
 
 console = Console()
 DEFAULT_CONFIG = Path("autocontribute.yml")
@@ -125,6 +131,10 @@ ConfigOption = Annotated[
     typer.Option("--config", "-c", help="Path to the YAML configuration."),
 ]
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_CONTRIBUTION_STAMP_ENV = "AUTOCONTRIBUTE_CONTRIBUTION_STAMP"
+_PRODUCTIVE_SCHEDULED_STATUSES = frozenset(
+    {RunStatus.READY_FOR_APPROVAL, RunStatus.SUBMITTING, RunStatus.PR_OPEN}
+)
 
 
 @app.command()
@@ -200,6 +210,29 @@ def verify_systemd_deployment_assets(
         f"{result.checked_assets} {result.scope} systemd deployment asset(s) "
         f"against manifest {result.manifest_sha256}."
     )
+
+
+@alert_app.command(name="send")
+def alert_send(
+    unit: Annotated[
+        str,
+        typer.Option("--unit", help="Failed systemd unit name to report."),
+    ],
+    webhook_file: Annotated[
+        Path,
+        typer.Option(
+            "--webhook-file",
+            help="File containing exactly one https:// webhook URL; the URL is never printed.",
+        ),
+    ],
+) -> None:
+    """POST one unit-failure notification to the operator-configured webhook."""
+
+    try:
+        send_failure_alert(unit=unit, webhook_file=webhook_file)
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    console.print("[green]Alert delivered.[/green]")
 
 
 @app.command()
@@ -303,6 +336,8 @@ def run_once(
         if manifest.status == RunStatus.READY_FOR_APPROVAL and settings.publishing.mode == "auto":
             _sync_lifecycle(settings, store, github)
             manifest = Publisher(settings, store, github).publish(manifest.run_id)
+        if scheduled and manifest.status in _PRODUCTIVE_SCHEDULED_STATUSES:
+            _refresh_contribution_stamp()
     except (AutocontributeError, ValueError) as exc:
         _fail(str(exc))
     finally:
@@ -1694,6 +1729,30 @@ def _print_workspace_gc_report(report: WorkspaceGCReport) -> None:
         f"{report.stale_quarantines_deleted}/{report.stale_quarantines} "
         "stale quarantine(s) reclaimed."
     )
+
+
+def _refresh_contribution_stamp() -> None:
+    """Refresh the scheduler productivity stamp after a durably prepared contribution.
+
+    A stamp failure must page (exit 1) rather than pass silently: the stamp is the
+    only signal separating a productive deployment from one that runs healthily
+    without ever preparing contributions. The prepared contribution itself stays
+    durable in the run store either way.
+    """
+
+    stamp = os.environ.get(_CONTRIBUTION_STAMP_ENV)
+    if not stamp:
+        return
+    try:
+        descriptor = os.open(stamp, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise StateError("The contribution productivity stamp could not be refreshed") from exc
+    try:
+        os.utime(descriptor)
+    except OSError as exc:
+        raise StateError("The contribution productivity stamp could not be refreshed") from exc
+    finally:
+        os.close(descriptor)
 
 
 def _print_outcome(manifest: RunManifest, store: RunStore) -> None:

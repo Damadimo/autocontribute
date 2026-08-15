@@ -8,6 +8,7 @@ RequiresMountsFor=/var/lib/autocontribute/state/workspaces
 RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute
 RequiresMountsFor=/var/lib/autocontribute/docker
 OnFailure=autocontribute-failure@%n.service
+OnFailure=autocontribute-alert@%n.service
 
 [Service]
 Type=oneshot

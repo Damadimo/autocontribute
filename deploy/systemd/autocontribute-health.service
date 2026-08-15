@@ -3,6 +3,7 @@ Description=Check Autocontribute freshness and Docker storage headroom
 Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
 RequiresMountsFor=/var/lib/autocontribute/docker
 OnFailure=autocontribute-failure@%n.service
+OnFailure=autocontribute-alert@%n.service
 RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute
 
 [Service]
@@ -13,6 +14,7 @@ WorkingDirectory=/var/lib/autocontribute
 UMask=0077
 Environment=AUTOCONTRIBUTE_WORKER_MAX_AGE_SECONDS=64800
 Environment=AUTOCONTRIBUTE_BACKUP_MAX_AGE_SECONDS=129600
+Environment=AUTOCONTRIBUTE_CONTRIBUTION_MAX_AGE_SECONDS=604800
 ExecStartPre=/opt/autocontribute/current/.venv/bin/autocontribute deployment verify-systemd-assets
 ExecStartPre=/opt/autocontribute/current/.venv/bin/autocontribute state verify-latest-s3 --config /etc/autocontribute/autocontribute.yml --if-configured --max-age-hours 36
 ExecStartPre=/usr/local/libexec/autocontribute-docker-data-check --read-only-health /var/lib/autocontribute/docker

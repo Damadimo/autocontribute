@@ -1460,6 +1460,7 @@ exit "$TEST_DOCKER_EXIT"
 
 def test_systemd_bundle_contains_expected_units_and_executable_helpers() -> None:
     expected = {
+        "autocontribute-alert@.service",
         "autocontribute-backup.service",
         "autocontribute-backup.timer",
         "autocontribute-doctor.service",
@@ -1480,6 +1481,7 @@ def test_systemd_bundle_contains_expected_units_and_executable_helpers() -> None
 
     helpers = sorted((SYSTEMD / "libexec").iterdir())
     assert {path.name for path in helpers} == {
+        "autocontribute-alert",
         "autocontribute-backup",
         "autocontribute-docker-data-check",
         "autocontribute-healthcheck",
@@ -1519,6 +1521,7 @@ def test_operational_units_fail_closed_on_release_asset_mismatch() -> None:
         "autocontribute-health.service",
         "autocontribute-replication.service",
         "autocontribute-rootless-docker.service",
+        "autocontribute-alert@.service",
     ):
         unit = _directives(SYSTEMD / name)
         assert verifier in unit[("Service", "ExecStartPre")]
@@ -1554,6 +1557,7 @@ def test_operational_units_fail_closed_on_release_asset_mismatch() -> None:
         ("autocontribute-worker", ["run"]),
         ("autocontribute-backup", []),
         ("autocontribute-replication", []),
+        ("autocontribute-alert", ["autocontribute-worker.service"]),
     ],
 )
 def test_operational_helpers_abort_when_release_asset_verification_fails(
@@ -1654,7 +1658,7 @@ def test_ci_runs_real_version_controlled_systemd_validation() -> None:
     assert "systemd-analyze verify" in verify["run"]
     assert "--recursive-errors=no" in verify["run"]
     assert "autocontribute-rootless-docker-daemon.service" in verify["run"]
-    assert '"${#units[@]}" -ne 11' in verify["run"]
+    assert '"${#units[@]}" -ne 12' in verify["run"]
     assert "systemd-analyze security" in security["run"]
     assert "--offline=yes" in security["run"]
     assert "[autocontribute-worker.service]=40" in security["run"]
@@ -1663,6 +1667,7 @@ def test_ci_runs_real_version_controlled_systemd_validation() -> None:
     assert "[autocontribute-replication.service]=30" in security["run"]
     assert "[autocontribute-health.service]=30" in security["run"]
     assert "[autocontribute-failure@.service]=30" in security["run"]
+    assert "[autocontribute-alert@.service]=30" in security["run"]
 
 
 def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
@@ -1778,7 +1783,10 @@ def test_replication_timer_service_and_helper_form_a_separate_provider_boundary(
     )
     assert _one(service, "Unit", "Wants") == "network-online.target"
     assert _one(service, "Unit", "After") == "network-online.target"
-    assert _one(service, "Unit", "OnFailure") == "autocontribute-failure@%n.service"
+    assert service[("Unit", "OnFailure")] == [
+        "autocontribute-failure@%n.service",
+        "autocontribute-alert@%n.service",
+    ]
     assert _one(service, "Service", "User") == "autocontribute"
     assert _one(service, "Service", "ExecStart") == (
         "/usr/bin/flock --exclusive --timeout 21600 "
@@ -3076,6 +3084,7 @@ def test_worker_backup_and_replication_chain_shares_one_exclusive_lock() -> None
     assert worker_unit[("Unit", "OnSuccess")] == ["autocontribute-backup.service"]
     assert set(worker_unit[("Unit", "OnFailure")]) == {
         "autocontribute-failure@%n.service",
+        "autocontribute-alert@%n.service",
         "autocontribute-backup.service",
     }
     backup_directives = _directives(SYSTEMD / "autocontribute-backup.service")
@@ -3152,6 +3161,7 @@ def test_services_have_failure_signaling_and_core_hardening() -> None:
     ):
         unit = (SYSTEMD / name).read_text(encoding="utf-8")
         assert "OnFailure=autocontribute-failure@%n.service" in unit
+        assert "OnFailure=autocontribute-alert@%n.service" in unit
         assert "NoNewPrivileges=yes" in unit
         assert re.search(r"(?m)^CapabilityBoundingSet=$", unit)
         assert "ProtectSystem=strict" in unit
@@ -3165,6 +3175,120 @@ def test_services_have_failure_signaling_and_core_hardening() -> None:
     assert "last-failure" in failure
     failure_unit = _directives(SYSTEMD / "autocontribute-failure@.service")
     assert _one(failure_unit, "Service", "SyslogLevel") == "err"
+
+
+def test_alert_unit_is_webhook_gated_hardened_and_cannot_recurse() -> None:
+    alert_unit = _directives(SYSTEMD / "autocontribute-alert@.service")
+    assert _one(alert_unit, "Unit", "ConditionPathExists") == "/etc/autocontribute/alert-webhook"
+    assert _one(alert_unit, "Service", "Type") == "oneshot"
+    assert _one(alert_unit, "Service", "User") == "autocontribute"
+    assert _one(alert_unit, "Service", "Restart") == "no"
+    assert _one(alert_unit, "Service", "SyslogLevel") == "err"
+    assert (
+        _one(alert_unit, "Service", "LoadCredential")
+        == "alert-webhook:/etc/autocontribute/alert-webhook"
+    )
+    assert _one(alert_unit, "Service", "ExecStart") == "/usr/local/libexec/autocontribute-alert %i"
+
+    # Recursion guard: a failing alert may only record locally. The record-only
+    # failure@ unit has no OnFailure of its own, so the chain terminates there.
+    assert alert_unit[("Unit", "OnFailure")] == ["autocontribute-failure@%n.service"]
+    failure_unit = _directives(SYSTEMD / "autocontribute-failure@.service")
+    assert ("Unit", "OnFailure") not in failure_unit
+
+    alert_text = (SYSTEMD / "autocontribute-alert@.service").read_text(encoding="utf-8")
+    assert "PrivateNetwork" not in alert_text
+    assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in alert_text
+    assert "Wants=network-online.target" in alert_text
+    assert "After=network-online.target" in alert_text
+
+    helper = (SYSTEMD / "libexec" / "autocontribute-alert").read_text(encoding="utf-8")
+    assert '"$failed_unit" =~ ^[A-Za-z0-9@_.-]+$' in helper
+    verifier_call = '"$executable" deployment verify-systemd-assets'
+    sender_call = 'alert send --unit "$failed_unit" --webhook-file "$webhook_file"'
+    assert helper.index(verifier_call) < helper.index(sender_call)
+
+
+def test_alert_helper_validates_unit_before_forwarding_to_the_webhook_sender(
+    tmp_path: Path,
+) -> None:
+    executable = tmp_path / "autocontribute"
+    calls = tmp_path / "calls"
+    _write_executable(
+        executable,
+        """#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$AUTOCONTRIBUTE_TEST_CALLS"
+""",
+    )
+    credentials = tmp_path / "credentials"
+    credentials.mkdir()
+    webhook = credentials / "alert-webhook"
+    webhook.write_text("https://alerts.example.invalid/hook\n", encoding="utf-8")
+    environment = {
+        **os.environ,
+        "AUTOCONTRIBUTE_EXECUTABLE": os.fspath(executable),
+        "AUTOCONTRIBUTE_TEST_CALLS": os.fspath(calls),
+        "CREDENTIALS_DIRECTORY": os.fspath(credentials),
+    }
+    helper = os.fspath(SYSTEMD / "libexec" / "autocontribute-alert")
+
+    delivered = subprocess.run(
+        ["bash", helper, "autocontribute-worker.service"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=environment,
+    )
+    assert delivered.returncode == 0, delivered.stderr
+    assert calls.read_text(encoding="utf-8") == (
+        "deployment verify-systemd-assets\n"
+        f"alert send --unit autocontribute-worker.service --webhook-file {webhook}\n"
+    )
+
+    for invalid_unit in ("", "unit name", "unit;$(reboot)", "../autocontribute-worker.service"):
+        calls.write_text("", encoding="utf-8")
+        rejected = subprocess.run(
+            ["bash", helper, invalid_unit],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=environment,
+        )
+        assert rejected.returncode == 1
+        assert "invalid systemd unit name" in rejected.stderr
+        assert calls.read_text(encoding="utf-8") == ""
+
+    calls.write_text("", encoding="utf-8")
+    without_credentials = subprocess.run(
+        ["bash", helper, "autocontribute-worker.service"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={key: value for key, value in environment.items() if key != "CREDENTIALS_DIRECTORY"},
+    )
+    assert without_credentials.returncode == 1
+    assert "credential directory is unavailable" in without_credentials.stderr
+    assert calls.read_text(encoding="utf-8") == "deployment verify-systemd-assets\n"
+
+    symlinked = tmp_path / "symlinked-credentials"
+    symlinked.mkdir()
+    (symlinked / "alert-webhook").symlink_to(webhook)
+    calls.write_text("", encoding="utf-8")
+    unsafe = subprocess.run(
+        ["bash", helper, "autocontribute-worker.service"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={**environment, "CREDENTIALS_DIRECTORY": os.fspath(symlinked)},
+    )
+    assert unsafe.returncode == 1
+    assert "webhook credential is unavailable" in unsafe.stderr
+    assert calls.read_text(encoding="utf-8") == "deployment verify-systemd-assets\n"
 
 
 def test_no_unit_embeds_secret_values_or_enables_automatic_publication() -> None:
@@ -3197,6 +3321,11 @@ def test_tmpfiles_keeps_state_private_and_docs_cover_safe_recovery() -> None:
         "autocontribute autocontribute -" in tmpfiles
     )
     assert "d /var/lib/autocontribute/docker 0710 autocontribute autocontribute -" in tmpfiles
+    assert "d /var/lib/autocontribute/health 0700 autocontribute autocontribute -" in tmpfiles
+    assert (
+        "f /var/lib/autocontribute/health/contribution-prepared 0600 "
+        "autocontribute autocontribute -" in tmpfiles
+    )
 
     guide = (ROOT / "docs" / "systemd-deployment.md").read_text(encoding="utf-8")
     assert "state restore --complete" in guide
@@ -3226,6 +3355,26 @@ def test_tmpfiles_keeps_state_private_and_docs_cover_safe_recovery() -> None:
     assert "provider-specific replication/receipt protocol" in guide
     assert "AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT" not in guide
     assert "AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT" not in guide
+
+
+def test_docs_cover_outbound_alerts_and_productivity_stall_detection() -> None:
+    guide = (ROOT / "docs" / "systemd-deployment.md").read_text(encoding="utf-8")
+    normalized_guide = " ".join(guide.split())
+    assert "ConditionPathExists=/etc/autocontribute/alert-webhook" in guide
+    assert "read -rsp 'Alert webhook URL: ' autocontribute_secret" in guide
+    assert "sudo install -o root -g root -m 0600" in guide
+    assert "alerting is skipped while absent" in guide
+    assert "its error messages never contain the URL" in normalized_guide
+    assert "every alert instance is skipped cleanly until the file exists" in normalized_guide
+    assert "a broken webhook cannot recurse or mask the original failure" in normalized_guide
+    assert "The webhook is a push notification, not the system of record" in normalized_guide
+    assert "AUTOCONTRIBUTE_CONTRIBUTION_MAX_AGE_SECONDS" in guide
+    assert "default 604800 seconds" in normalized_guide
+    assert "/var/lib/autocontribute/health/contribution-prepared" in normalized_guide
+    assert "refreshes that stamp" in normalized_guide
+    assert "creates the stamp at install without ever refreshing an existing one" in (
+        normalized_guide
+    )
 
 
 def test_docs_install_a_noneditable_release_readable_by_the_service_identity(

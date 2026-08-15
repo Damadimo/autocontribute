@@ -23,6 +23,7 @@ Use this layout on one durable host:
 | `/etc/autocontribute/autocontribute.yml` | `root:autocontribute`, `0640` | Reviewed, non-secret policy and repository configuration |
 | `/etc/autocontribute/rootless-docker-daemon.json` | `root:autocontribute`, `0640` | Reviewed rootless-daemon configuration pinned by the launcher |
 | `/etc/autocontribute/credentials/*.cred` | `root:root`, `0600` | Encrypted systemd credentials |
+| `/etc/autocontribute/alert-webhook` | `root:root`, `0600`, optional | Single-line `https://` outbound failure-alert webhook URL; alerting is skipped while absent |
 | `/var/lib/autocontribute` | `root:autocontribute`, `0750` | Non-writable service-home trust boundary |
 | `/var/lib/autocontribute/state` | `autocontribute:autocontribute`, `0700` | Live SQLite, evidence, and evaluations |
 | `/var/lib/autocontribute/state/workspaces` | `autocontribute:autocontribute`, `0700` | Dedicated capacity-limited ext4 filesystem for target repositories and validation copies |
@@ -650,8 +651,8 @@ sudo -u autocontribute /usr/bin/env -i \
 
 Run this source verification before installing any file from `deploy/systemd`. It binds the selected
 Python package to the complete checked-out deployment inventory and rejects missing, extra,
-symlinked, non-regular, incorrectly mode-set, or content-mismatched assets. The manifest contains 26
-source assets: 25 have mandatory production paths and the journald example is deliberately
+symlinked, non-regular, incorrectly mode-set, or content-mismatched assets. The manifest contains 28
+source assets: 27 have mandatory production paths and the journald example is deliberately
 source-bound but optional to install because retention is host policy.
 
 `--no-editable` keeps runtime imports inside the installed virtual environment. `--no-config`
@@ -840,6 +841,31 @@ sudo systemctl daemon-reload
 Credential rotation is atomic between invocations: write a new encrypted file beside the old one,
 set its owner and mode, rename it over the old path, and start `autocontribute-doctor.service`.
 Never inspect a credential with a command that writes the decrypted value to the terminal or journal.
+
+### Optional outbound alert webhook
+
+Unit failures always record locally through `autocontribute-failure@.service`. To additionally push
+a page to an external system, install a webhook URL at `/etc/autocontribute/alert-webhook`. The
+file must contain exactly one `https://` URL line; the alert payload's message field is delivered
+as both `text` and `content`, so an unmodified Slack or Discord incoming webhook renders it
+directly. The URL embeds a bearer secret, so treat the file as a credential: enter it without
+placing it in command arguments or shell history, and keep it root-owned (the unit reads it through
+`LoadCredential=`, so the service account never needs direct access):
+
+```bash
+read -rsp 'Alert webhook URL: ' autocontribute_secret
+printf '%s\n' "$autocontribute_secret" | sudo install -o root -g root -m 0600 \
+  /dev/stdin /etc/autocontribute/alert-webhook
+unset autocontribute_secret
+printf '\n'
+```
+
+Hosts without this file need no other change: `autocontribute-alert@.service` carries
+`ConditionPathExists=/etc/autocontribute/alert-webhook`, so every alert instance is skipped cleanly
+until the file exists. Rotate by writing a new root-owned `0600` file beside the old one and
+renaming it over the path; remove the file to stop outbound alerts. The sender validates the file
+before use and its error messages never contain the URL, so a malformed or rotated-away credential
+cannot leak into the journal or into failure records.
 
 ## Install and validate the units
 
@@ -1034,7 +1060,8 @@ for unit in \
   autocontribute-health.service \
   autocontribute-health.timer \
   autocontribute-rootless-docker.service \
-  'autocontribute-failure@.service'
+  'autocontribute-failure@.service' \
+  'autocontribute-alert@.service'
 do
   test "$(sudo systemctl show --property=NeedDaemonReload --value "$unit")" = no
 done
@@ -1124,14 +1151,14 @@ sandbox image as the `autocontribute` user before doctor; never use a tag in pro
 sets `TMPDIR=/var/lib/autocontribute/tmp` because Docker's daemon must see the CID files created by
 the client; systemd's private `/tmp` mount is deliberately not used for those files.
 
-The installed verifier checks all 25 mandatory paths against the manifest shipped by the selected
+The installed verifier checks all 27 mandatory paths against the manifest shipped by the selected
 Python release. It requires exact path, SHA-256 content, mode, and `root:root` ownership and rejects
 symlinks and non-regular files. The user-manager drop-in directory and root-owned user-unit inventory
 are exact: an unreviewed second manager drop-in, a home-owned replacement, or a retired generic
 Docker unit is a verification failure. Consequently, a partial copy, a mixture of old and new
 assets, or a stale helper fails closed before `current` is switched and again before an operational
-service can run. Worker, backup, replication, doctor, health, the system proxy, and the daemon user unit execute
-the same verifier as a fixed pre-start check. The
+service can run. Worker, backup, replication, doctor, health, the alert sender, the system proxy, and the daemon user unit
+execute the same verifier as a fixed pre-start check. The
 failure recorder intentionally does not: it remains available through `OnFailure=` to record an
 asset-mismatch failure and emit its journal alert.
 
@@ -1160,10 +1187,10 @@ rootless Docker daemon user unit performs the data-mount check before the daemon
 
 Validate the installed files on the target host. `systemd-analyze security` is advisory; review
 every relaxation instead of chasing a score that breaks rootless Docker or durable state.
-CI also parses all eleven system units and the protected user unit with systemd 255 on Ubuntu 24.04
-and fails on parser warnings. It performs an offline security assessment of the seven system services,
-with an exposure ceiling of 4.0 for the networked worker and doctor and 3.0 for replication and the
-private-network backup, health, failure, and rootless-Docker proxy units. The user daemon is deliberately assessed
+CI also parses all twelve system units and the protected user unit with systemd 255 on Ubuntu 24.04
+and fails on parser warnings. It performs an offline security assessment of the eight system services,
+with an exposure ceiling of 4.0 for the networked worker and doctor and 3.0 for replication, the
+alert sender, and the private-network backup, health, failure, and rootless-Docker proxy units. The user daemon is deliberately assessed
 separately because filesystem/mount, namespace, capability, security-label, and seccomp sandbox
 directives can break subordinate-ID mapping. These are regression ceilings, not a substitute for
 reviewing the full report or validating the installed units against the target host's systemd
@@ -1181,7 +1208,8 @@ sudo systemd-analyze verify \
   autocontribute-health.service \
   autocontribute-health.timer \
   autocontribute-rootless-docker.service \
-  'autocontribute-failure@.service'
+  'autocontribute-failure@.service' \
+  'autocontribute-alert@.service'
 sudo -u autocontribute env \
   HOME=/var/lib/autocontribute \
   XDG_RUNTIME_DIR="/run/user/$(id -u autocontribute)" \
@@ -1317,6 +1345,7 @@ sudo journalctl \
   -u autocontribute-replication.service \
   -u autocontribute-health.service \
   -u 'autocontribute-failure@*' \
+  -u 'autocontribute-alert@*' \
   --since '24 hours ago'
 ```
 
@@ -1334,11 +1363,34 @@ produces an explicit skip, while a configured-but-invalid/stale block fails and 
 the block. The health service's storage checks receive read-only namespace views; the Docker check
 requires an explicit read-only layer over the same safe writable ext4 mount. The worker, doctor, and
 backup apply the corresponding writable checks before doing work, so low capacity stops new
-contributions even while a success stamp is still fresh. Every worker, backup, replication, doctor,
+contributions even while a success stamp is still fresh.
+
+The health check also detects a productivity stall: it fails when the
+`/var/lib/autocontribute/health/contribution-prepared` stamp is older than
+`AUTOCONTRIBUTE_CONTRIBUTION_MAX_AGE_SECONDS` (default 604800 seconds — 7 days). Only a scheduled
+run that durably prepares a contribution — ready for approval, submitting, or an open pull
+request — refreshes that stamp, so a worker that exits successfully every night while skipping
+every candidate still pages within a week instead of rotting silently. The tmpfiles configuration
+creates the stamp at install without ever refreshing an existing one, so a fresh host gets the full
+window before its first page and the grace never resets on upgrade. A stall page means discovery,
+eligibility, or quality gates have produced nothing durable; inspect recent run outcomes and skip
+reasons rather than touching the stamp by hand. If the deployment intentionally contributes less
+often than weekly, raise the threshold in a drop-in on `autocontribute-health.service` instead of
+accepting recurring pages.
+
+Every worker, backup, replication, doctor,
 or health failure invokes `autocontribute-failure@.service`, which writes the last failed unit and UTC time to
-`/var/lib/autocontribute/health/last-failure` and emits an error-priority journal event. Forward those
-events to the existing host alerting system, or add another `OnFailure=` target in a drop-in. An
-on-host stamp alone is not a page and is lost with the host.
+`/var/lib/autocontribute/health/last-failure` and emits an error-priority journal event. Each of
+those failures also starts `autocontribute-alert@.service` for the failed unit: on hosts with
+`/etc/autocontribute/alert-webhook` installed it POSTs a small JSON alert naming the unit, host,
+and UTC time (readable by unmodified Slack and Discord incoming webhooks) with three bounded
+delivery attempts, and on hosts without the file the instance is skipped by its path condition. A
+failed alert delivery records locally through `autocontribute-failure@.service` only — the alert
+unit is not its own alert target, so a broken webhook cannot recurse or mask the original failure,
+and delivery errors never include the webhook URL. The webhook is a push notification, not the
+system of record: keep forwarding error-priority journal events to the existing host alerting
+system as well, because a host that loses networking or dies outright cannot deliver its own page.
+An on-host stamp alone is not a page and is lost with the host.
 
 Alert on workspace and Docker-data byte or inode consumption before either reaches 75%; this
 precedes the fixed start-of-run floors on the reference filesystems. Docker data
@@ -1698,14 +1750,14 @@ breaker event and must never be treated as safe merely because its archive check
 
 ## Upgrade and rollback
 
-Treat the application, eleven system units, eleven helpers, tmpfiles policy, instance-specific user-
+Treat the application, twelve system units, twelve helpers, tmpfiles policy, instance-specific user-
 manager drop-in, and protected daemon user unit as one release. An upgrade is complete only when the
-new release's packaged manifest verifies all 25 installed assets. Use this order:
+new release's packaged manifest verifies all 27 installed assets. Use this order:
 
 1. Disable all four timers. Reconcile any in-flight publication, let the worker reach a safe
    boundary, and create and replicate a verified complete bundle with the currently selected
-   release. Stop worker, backup, replication, doctor, and health, wait for every failure-recorder instance to
-   finish, then stop the system rootless-Docker proxy. The proxy stops the daemon user unit. Stop the
+   release. Stop worker, backup, replication, doctor, and health, wait for every failure-recorder and
+   alert instance to finish, then stop the system rootless-Docker proxy. The proxy stops the daemon user unit. Stop the
    `autocontribute` user manager before replacing its unit or manager drop-in.
 2. Install the new application into a new, never-reused, root-owned release directory. Do not modify
    the old release in place and leave `current` pointing to it. Run the new release executable's
@@ -1730,7 +1782,7 @@ new release's packaged manifest verifies all 25 installed assets. Use this order
    and any required observed manual worker run succeed.
 
 Per-file rename prevents a reader from seeing a partially written individual file; it does not make
-the 25-file set atomic. Quiescence prevents that intermediate set from executing, and manifest
+the 27-file set atomic. Quiescence prevents that intermediate set from executing, and manifest
 verification detects any interrupted, stale, or mixed installation. Never work around a mismatch by
 starting an old `current` against new assets. Either finish the new installation, or reinstall the
 complete old asset set from its verified immutable release, reload both managers, prove no reload is

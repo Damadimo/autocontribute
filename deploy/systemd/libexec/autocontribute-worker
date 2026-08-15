@@ -65,6 +65,10 @@ if [[ "$operation" == run ]]; then
     printf 'Autocontribute health directory is unavailable or unsafe\n' >&2
     exit 1
   fi
+  # The Python worker refreshes this stamp only after a durably prepared
+  # contribution, so the health check can page on a healthy-but-unproductive
+  # deployment. Successful-but-skipped runs deliberately leave it untouched.
+  export AUTOCONTRIBUTE_CONTRIBUTION_STAMP="$health_directory/contribution-prepared"
   replication_check=(
     state verify-latest-s3
     --config "$config"
@@ -137,7 +141,7 @@ for credential_name in $credential_names; do
     exit 1
   fi
   case "$credential_name" in
-    AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH | AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT | AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT | AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT | AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS | BASH* | CDPATH | DOCKER_* | ENV | GIT_* | HOME | IFS | LD_* | PATH | PYTHON* | SHELL | XDG_*)
+    AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH | AUTOCONTRIBUTE_CONTRIBUTION_STAMP | AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT | AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT | AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT | AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS | BASH* | CDPATH | DOCKER_* | ENV | GIT_* | HOME | IFS | LD_* | PATH | PYTHON* | SHELL | XDG_*)
       printf 'An Autocontribute credential uses a reserved environment name\n' >&2
       exit 1
       ;;
