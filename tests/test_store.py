@@ -3761,6 +3761,41 @@ def test_publication_gate_hold_current_returns_cleanly_without_a_hold(
     )
 
 
+def test_publication_gate_hold_currency_is_scoped_to_the_calling_run(tmp_path: Path) -> None:
+    """One crashed run's drifted hold must not poison an unrelated holdless publication."""
+
+    store = RunStore(tmp_path / "state")
+    evaluated = store.create_run()
+    holder = store.create_run(deployment_fingerprint="d" * 64)
+    _reserve_gate(store, holder)
+    with store._connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        store._append_event(
+            connection,
+            evaluated.run_id,
+            "evaluation.recorded",
+            {"evaluation_hash": "a" * 64},
+        )
+    manual = store.create_run(deployment_fingerprint="d" * 64)
+
+    assert (
+        store.assert_publication_gate_hold_current(
+            manual.run_id,
+            deployment_fingerprint="d" * 64,
+            publishing_login="octocat",
+            publishing_api_origin="https://api.github.com",
+        )
+        is False
+    )
+    with pytest.raises(StateError, match="disagrees with the evaluation corpus"):
+        store.assert_publication_gate_hold_current(
+            holder.run_id,
+            deployment_fingerprint="d" * 64,
+            publishing_login="octocat",
+            publishing_api_origin="https://api.github.com",
+        )
+
+
 def test_publication_gate_hold_current_rejects_a_missing_durable_hold_row(
     tmp_path: Path,
 ) -> None:
@@ -4428,11 +4463,20 @@ def test_merged_compensation_rejects_tampered_same_run_hold(tmp_path: Path) -> N
     assert store.get(holder.run_id).status == RunStatus.SUBMITTING
 
 
-def test_pr_open_release_remains_strict_after_evaluation_cursor_drift(tmp_path: Path) -> None:
+def test_pr_open_release_succeeds_after_evaluation_cursor_drift(tmp_path: Path) -> None:
+    """Corpus drift after the held mutations completed must not wedge a finished publication.
+
+    Constructive authority is revalidated immediately before every remote mutation; a release
+    grants nothing, so it validates identity and scope and copies the hold's anchored cursors
+    into its ledger evidence verbatim.
+    """
+
     store = RunStore(tmp_path / "state")
     evaluated = store.create_run()
     holder = _publication_run(store)
     _begin_publication(store, holder)
+    hold = store.publication_gate_hold(holder.run_id)
+    assert hold is not None
     with store._connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
         store._append_event(
@@ -4441,13 +4485,24 @@ def test_pr_open_release_remains_strict_after_evaluation_cursor_drift(tmp_path: 
             "evaluation.recorded",
             {"evaluation_hash": "a" * 64},
         )
+    assert store.evaluation_corpus_cursor() != hold.corpus_cursor
 
-    with pytest.raises(StateError, match="disagrees with the evaluation corpus"):
-        store.transition(holder, RunStatus.PR_OPEN, reason="pull request created")
+    store.transition(holder, RunStatus.PR_OPEN, reason="pull request created")
 
-    assert holder.status == RunStatus.SUBMITTING
-    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
+    assert holder.status == RunStatus.PR_OPEN
+    assert store.get(holder.run_id).status == RunStatus.PR_OPEN
+    assert store.publication_gate_hold(holder.run_id) is None
+    releases = [
+        event
+        for event in store.events(holder.run_id)
+        if event["event_type"] == "publication.gate.released"
+    ]
+    assert len(releases) == 1
+    details = json.loads(releases[0]["details"])
+    assert details["outcome"] == "pr_open"
+    assert details["corpus_cursor"] == hold.corpus_cursor
+    assert details["outcome_corpus_cursor"] == hold.outcome_corpus_cursor
+    RunStore(store.root)
 
 
 def test_verified_compensation_rejects_hold_row_tampering(tmp_path: Path) -> None:

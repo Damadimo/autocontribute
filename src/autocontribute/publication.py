@@ -542,18 +542,21 @@ class Publisher:
         hold: PublicationGateHold,
         summary: RolloutSummary,
     ) -> None:
-        """Require recovery to retain the exact authority atomically held before the crash."""
+        """Require recovery to retain the hold's immutable deployment identity.
+
+        The hold's anchored cursors may lag the live corpus after a crash (for example when
+        lifecycle outcomes were observed for other runs while this publication awaited
+        recovery). Recovery re-proves current authority instead: every measured rollout gate
+        must pass on the fresh summary, whose verified-current cursors re-anchor the durable
+        hold, and each constructive mutation revalidates that hold immediately before acting.
+        """
 
         if hold.deployment_fingerprint is None or hold.outcome_corpus_cursor is None:
             raise StateError(
                 "Publication gate hold predates schema-v6 upstream-outcome authority; "
                 "automatic recovery is forbidden"
             )
-        if (
-            hold.deployment_fingerprint != summary.scope.deployment_fingerprint
-            or hold.corpus_cursor != summary.evaluation_corpus_cursor
-            or hold.outcome_corpus_cursor != summary.outcome_corpus_cursor
-        ):
+        if hold.deployment_fingerprint != summary.scope.deployment_fingerprint:
             raise StateError(
                 "Current semantic rollout authority differs from the durable publication hold"
             )
@@ -3122,13 +3125,14 @@ class Publisher:
             publication_ready_for_review=context.ready_for_review,
             max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
             repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
-            evaluation_corpus_cursor=(publication_hold.corpus_cursor if publication_hold else None),
-            evaluation_deployment_fingerprint=(
-                publication_hold.deployment_fingerprint if publication_hold else None
-            ),
-            outcome_corpus_cursor=(
-                publication_hold.outcome_corpus_cursor if publication_hold else None
-            ),
+            # Reconciliation adopts already-durable state without constructive mutations, so
+            # it must not proffer the hold's anchored cursors as current rollout authority:
+            # they may legitimately lag the live corpus after a crash. The store validates
+            # the hold's identity instead, and any remote mutation would still revalidate
+            # its own hold currency immediately before acting.
+            evaluation_corpus_cursor=None,
+            evaluation_deployment_fingerprint=None,
+            outcome_corpus_cursor=None,
         )
         assert manifest.candidate is not None
         assert manifest.branch_name is not None
