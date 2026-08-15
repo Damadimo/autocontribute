@@ -23,6 +23,7 @@ from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     ConfigurationError,
     GitHubError,
+    GitHubRequestNotSentError,
     GitHubSafetyError,
 )
 from autocontribute.github_origin import canonical_api_origin, web_origin_for_api
@@ -89,6 +90,15 @@ SafetyTriggerHandler = Callable[[CircuitBreakerTrigger], object]
 
 class _TransportFailure(GitHubError):
     """A network-level failure with no response; retriable only for reads."""
+
+
+class _RequestNotSent(_TransportFailure, GitHubRequestNotSentError):
+    """A transport failure raised before the request left this client."""
+
+
+# Connection-establishment failures happen before any request bytes reach GitHub, so even
+# a mutation that fails this way provably did not happen on the remote side.
+_NOT_SENT_TRANSPORT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,6 +437,10 @@ class GitHubClient:
     ) -> httpx.Response:
         try:
             response = self._client.request(method, path, params=params, json=json_body)
+        except _NOT_SENT_TRANSPORT_ERRORS as exc:
+            raise _RequestNotSent(
+                f"GitHub request could not be sent: {method} {path}: {exc}"
+            ) from exc
         except httpx.HTTPError as exc:
             raise _TransportFailure(f"GitHub request failed: {method} {path}: {exc}") from exc
         if response.status_code in {301, 302, 307, 308}:

@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from autocontribute.config import GitHubConfig
-from autocontribute.exceptions import GitHubError, GitHubSafetyError
+from autocontribute.exceptions import GitHubError, GitHubRequestNotSentError, GitHubSafetyError
 from autocontribute.github import GitHubClient, resolve_github_token
 from autocontribute.store import RunStore
 
@@ -753,6 +753,46 @@ def test_get_retries_transport_errors_and_recovers(monkeypatch) -> None:  # type
         assert github.authenticated_login() == "octocat"
 
     assert waits == [2.0]
+
+
+def test_mutation_connect_failure_is_classified_as_not_sent(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        "autocontribute.github._sleep",
+        lambda _: pytest.fail("not-sent mutation failures must not be retried by the client"),
+    )
+    posts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        if request.method == "GET":
+            return httpx.Response(404, json={"message": "Not Found"})
+        posts += 1
+        raise httpx.ConnectError("dns resolution failed")
+
+    with (
+        _client(handler) as github,
+        pytest.raises(GitHubRequestNotSentError, match="could not be sent"),
+    ):
+        github.ensure_fork("upstream/project", "octocat")
+
+    assert posts == 1
+
+
+def test_mutation_read_failure_is_not_classified_as_not_sent(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setattr(
+        "autocontribute.github._sleep",
+        lambda _: pytest.fail("mutations must not be retried on ambiguous failures"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(404, json={"message": "Not Found"})
+        raise httpx.ReadError("connection lost mid-response")
+
+    with _client(handler) as github, pytest.raises(GitHubError) as excinfo:
+        github.ensure_fork("upstream/project", "octocat")
+
+    assert not isinstance(excinfo.value, GitHubRequestNotSentError)
 
 
 def test_existing_unrelated_repository_cannot_be_reused_as_fork() -> None:

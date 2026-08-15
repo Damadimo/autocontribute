@@ -44,6 +44,7 @@ from autocontribute.domain import EligibilityResult, IssueCandidate, RunManifest
 from autocontribute.exceptions import (
     AutomaticRolloutBlocked,
     GitHubError,
+    GitHubRequestNotSentError,
     GitHubSafetyError,
     PolicyError,
     PublicationResumeRequired,
@@ -1607,6 +1608,41 @@ class Publisher:
                 if callback_failure is None or callback_failure is exc:
                     raise
                 raise callback_failure from exc
+            if isinstance(exc, GitHubRequestNotSentError):
+                # The POST provably never left this client, so no remote pull request can
+                # exist for this durable intent. Release the creation marker; a later
+                # scheduled run retries the exact same POST without a global stop.
+                if self._release_unsent_pull_request_creation(
+                    manifest,
+                    creation_details=creation_details,
+                    error_type=type(exc).__name__,
+                ):
+                    raise
+            else:
+                # A transport or response failure may follow a successful POST. Reconcile the
+                # exact head once: an existing PR is adopted as the durable canonical identity,
+                # while an absent or unreadable result keeps the conservative stop because a
+                # slow POST could still land after this read.
+                reconciled_pr: str | None = None
+                try:
+                    reconciled_pr = self.github.find_pull_request(
+                        repository_name,
+                        head=head,
+                    )
+                except GitHubSafetyError:
+                    raise
+                except Exception:
+                    reconciled_pr = None
+                if reconciled_pr is not None:
+                    return self._accept_existing_pull_request(
+                        manifest,
+                        reconciled_pr,
+                        login=login,
+                        head=head,
+                        allow_remote_mutation=True,
+                        allow_new_repository_identity=False,
+                        lease_guard=lease_guard,
+                    )
             self._trip_ambiguous_pull_request_creation(
                 manifest,
                 error_type=type(exc).__name__,
@@ -2323,6 +2359,39 @@ class Publisher:
             reason=reason,
             trigger_hash=trigger_hash,
         )
+
+    def _release_unsent_pull_request_creation(
+        self,
+        manifest: RunManifest,
+        *,
+        creation_details: dict[str, str],
+        error_type: str,
+    ) -> bool:
+        """Durably release a creation intent whose POST provably never left this client.
+
+        Returns True only when the release is durable; a False result means the durable
+        marker may still claim an in-flight creation, so the caller must keep the
+        conservative ambiguity stop.
+        """
+
+        manifest.pull_request_creation_started = False
+        try:
+            self.store.save(
+                manifest,
+                event="pull_request.creation.not_sent",
+                details={**creation_details, "error_type": error_type},
+            )
+        except Exception:
+            try:
+                marker_is_durable = self.store.get(manifest.run_id).pull_request_creation_started
+            except Exception:
+                # The durable state is unknown, so retain the conservative in-memory
+                # marker. A fresh process will reload the authoritative state.
+                manifest.pull_request_creation_started = True
+            else:
+                manifest.pull_request_creation_started = marker_is_durable
+            return not manifest.pull_request_creation_started
+        return True
 
     def _trip_ambiguous_pull_request_creation(
         self,
