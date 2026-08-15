@@ -1121,7 +1121,10 @@ def gc_workspaces(
         typer.Option(
             min=1,
             max=1_000,
-            help="Maximum old terminal workspace entries inspected in this invocation.",
+            help=(
+                "Maximum actionable deletions in this invocation; retained entries are "
+                "reported without consuming this budget."
+            ),
         ),
     ] = 25,
     execute: Annotated[
@@ -1611,7 +1614,7 @@ def _print_workspace_gc_report(report: WorkspaceGCReport) -> None:
     color = "green" if report.execute else "yellow"
     console.print(
         f"[{color}]Workspace cleanup: {mode}[/{color}] "
-        f"(terminal cutoff {report.cutoff.isoformat()}, inspection limit {report.limit})"
+        f"(terminal cutoff {report.cutoff.isoformat()}, deletion limit {report.limit})"
     )
     if report.items:
         table = Table("Run", "Status", "Action", "Entries", "Bytes", "Reason")
@@ -1632,7 +1635,9 @@ def _print_workspace_gc_report(report: WorkspaceGCReport) -> None:
         f"{report.retained} retained, {report.errors} error(s), "
         f"{report.protected_nonterminal} nonterminal workspace(s) protected, "
         f"{report.younger_terminal} terminal workspace(s) inside retention, "
-        f"{report.truncated} old terminal candidate(s) deferred."
+        f"{report.truncated} old terminal candidate(s) deferred, "
+        f"{report.stale_quarantines_deleted}/{report.stale_quarantines} "
+        "stale quarantine(s) reclaimed."
     )
 
 

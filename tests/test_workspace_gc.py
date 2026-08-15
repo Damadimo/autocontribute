@@ -27,7 +27,6 @@ from autocontribute.domain import (
     RunStatus,
 )
 from autocontribute.evaluation import EvaluationStore
-from autocontribute.exceptions import StateError
 from autocontribute.preparation import (
     compute_preparation_fingerprint,
     render_validation_artifact,
@@ -728,15 +727,17 @@ def test_quarantine_restores_swapped_real_directory_without_deleting_it(
 
     monkeypatch.setattr(workspace_gc.os, "rename", rename_with_swap)
 
-    with pytest.raises(StateError, match="restored without deletion"):
-        collect_terminal_workspaces(
-            store,
-            older_than=timedelta(days=7),
-            execute=True,
-            now=_future(run),
-        )
+    report = collect_terminal_workspaces(
+        store,
+        older_than=timedelta(days=7),
+        execute=True,
+        now=_future(run),
+    )
 
     assert swap_injected
+    assert report.deleted == 0
+    assert report.retained == report.errors == 1
+    assert "restored without deletion" in report.items[0].reason
     assert displaced.joinpath("repository", "evidence.txt").read_text(encoding="utf-8") == (
         "workspace\n"
     )
@@ -744,6 +745,151 @@ def test_quarantine_restores_swapped_real_directory_without_deleting_it(
     assert not any(
         entry.name.startswith(".autocontribute-gc-") for entry in store.workspaces_dir.iterdir()
     )
+
+
+def _terminal_file_entry(store: RunStore) -> RunManifest:
+    """A terminal run whose workspace entry is a plain file, a permanent retained error."""
+
+    run = store.create_run()
+    run.status = RunStatus.SKIPPED
+    store.save(run, event="fixture.terminal", details={"status": run.status.value})
+    (store.workspaces_dir / run.run_id).write_text("not a directory\n", encoding="utf-8")
+    return run
+
+
+def test_failed_recursive_deletion_is_a_retained_error_and_cleanup_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    first = _terminal_run(store)
+    second = _terminal_run(store)
+    original_rmtree = workspace_gc.shutil.rmtree
+    calls: list[object] = []
+
+    def failing_rmtree(*args: object, **kwargs: object) -> None:
+        calls.append(args)
+        if len(calls) == 1:
+            raise OSError("simulated undeletable subuid-owned file")
+        original_rmtree(*args, **kwargs)  # type: ignore[arg-type]
+
+    failing_rmtree.avoids_symlink_attacks = True  # type: ignore[attr-defined]
+    monkeypatch.setattr(workspace_gc.shutil, "rmtree", failing_rmtree)
+
+    report = collect_terminal_workspaces(
+        store,
+        older_than=timedelta(days=7),
+        execute=True,
+        now=_future(second),
+    )
+
+    assert report.deleted == 1
+    assert report.retained == report.errors == 1
+    error_item = next(item for item in report.items if item.error)
+    assert error_item.run_id == first.run_id
+    assert "deletion failed safely" in error_item.reason
+    assert not store.workspaces_dir.joinpath(second.run_id).exists()
+    quarantines = [
+        entry
+        for entry in store.workspaces_dir.iterdir()
+        if entry.name.startswith(".autocontribute-gc-")
+    ]
+    assert len(quarantines) == 1
+    preserved = quarantines[0] / "workspace" / "repository" / "evidence.txt"
+    assert preserved.read_text(encoding="utf-8") == "workspace\n"
+
+
+def test_persistent_retained_backlog_does_not_starve_younger_deletable_workspace(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    for _index in range(3):
+        _terminal_file_entry(store)
+    eligible = _terminal_run(store)
+
+    report = collect_terminal_workspaces(
+        store,
+        older_than=timedelta(days=7),
+        limit=1,
+        execute=True,
+        now=_future(eligible),
+    )
+
+    assert report.terminal_candidates == report.selected == 4
+    assert report.deleted == 1
+    assert report.retained == report.errors == 3
+    assert report.truncated == 0
+    assert not store.workspaces_dir.joinpath(eligible.run_id).exists()
+    assert all("not a real directory" in item.reason for item in report.items if item.error)
+
+
+def test_scan_bound_defers_candidates_beyond_five_deletion_budgets(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    for _index in range(6):
+        _terminal_file_entry(store)
+    eligible = _terminal_run(store)
+
+    report = collect_terminal_workspaces(
+        store,
+        older_than=timedelta(days=7),
+        limit=1,
+        execute=True,
+        now=_future(eligible),
+    )
+
+    assert report.terminal_candidates == 7
+    assert report.selected == 5
+    assert report.truncated == 2
+    assert report.deleted == 0
+    assert report.retained == report.errors == 5
+    assert store.workspaces_dir.joinpath(eligible.run_id).is_dir()
+
+
+def test_stale_quarantine_sweep_reclaims_only_old_exact_quarantines(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    run = _terminal_run(store)
+    observed_at = _future(run)
+    stale = store.workspaces_dir / f".autocontribute-gc-{'a' * 32}"
+    (stale / "workspace" / "repository").mkdir(parents=True)
+    (stale / "workspace" / "repository" / "junk.txt").write_text("junk\n", encoding="utf-8")
+    stale.chmod(0o700)
+    os.utime(stale, times=((observed_at - timedelta(hours=7)).timestamp(),) * 2)
+    live = store.workspaces_dir / f".autocontribute-gc-{'b' * 32}"
+    (live / "workspace").mkdir(parents=True)
+    live.chmod(0o700)
+    os.utime(live, times=((observed_at - timedelta(hours=1)).timestamp(),) * 2)
+    wrong_mode = store.workspaces_dir / f".autocontribute-gc-{'c' * 32}"
+    wrong_mode.mkdir()
+    wrong_mode.chmod(0o755)
+    os.utime(wrong_mode, times=((observed_at - timedelta(hours=7)).timestamp(),) * 2)
+    unrelated = store.workspaces_dir / ".autocontribute-gc-short"
+    unrelated.mkdir()
+    os.utime(unrelated, times=((observed_at - timedelta(hours=7)).timestamp(),) * 2)
+
+    dry = collect_terminal_workspaces(
+        store,
+        older_than=timedelta(days=7),
+        now=observed_at,
+    )
+
+    assert dry.stale_quarantines == 1
+    assert dry.stale_quarantines_deleted == 0
+    assert dry.errors == 1
+    assert stale.is_dir()
+
+    executed = collect_terminal_workspaces(
+        store,
+        older_than=timedelta(days=7),
+        execute=True,
+        now=observed_at,
+    )
+
+    assert executed.stale_quarantines == executed.stale_quarantines_deleted == 1
+    assert executed.errors == 1
+    assert not stale.exists()
+    assert live.joinpath("workspace").is_dir()
+    assert wrong_mode.is_dir()
+    assert unrelated.is_dir()
 
 
 def test_retention_age_keeps_recent_terminal_workspace(tmp_path: Path) -> None:

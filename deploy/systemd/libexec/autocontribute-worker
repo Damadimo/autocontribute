@@ -102,11 +102,20 @@ if [[ "$operation" == run ]]; then
   trap - EXIT
   unset worker_attempt_temporary
 
+  # Workspace cleanup is reported hygiene, not a scheduling gate: a retained or corrupt old
+  # workspace must never block the scheduled contribution run. Disk exhaustion is enforced
+  # separately by the workspace quota headroom check below.
+  gc_status=0
   "$executable" state gc-workspaces \
     --config "$config" \
     --older-than-days 7 \
     --limit 25 \
-    --execute
+    --execute || gc_status=$?
+  if [[ "$gc_status" -ne 0 ]]; then
+    printf 'Autocontribute workspace cleanup reported a problem (exit %s); continuing\n' \
+      "$gc_status" >&2
+  fi
+  unset gc_status
 fi
 "$workspace_quota_check" --headroom "$workspace_root"
 export XDG_RUNTIME_DIR="$runtime_directory"

@@ -1535,11 +1535,17 @@ autocontribute state gc-workspaces \
 
 For an operator review, omit `--execute`; dry run is the CLI default. The report is deterministic by
 terminal update time and run ID, includes the inspected entry/byte counts, and reports how many old
-candidates were deferred by the bound. Candidate discovery validates the complete supported run
-corpus and fails above its 10,000-run integrity bound, so older runs without workspaces cannot hide a
-newer eligible entry. `--json` produces the same report as structured JSON. An
-unsafe path, symlink workspace entry, nested mount, changed state, or invalid recovery artifact is
-retained and makes the command fail so systemd failure signaling can alert the operator.
+candidates were deferred by the bound. `--limit` bounds actionable deletions; retained entries —
+whether protected for reconciliation or held back as corrupt — are reported without consuming that
+budget, and the total scan is separately bounded at five times the limit, so a persistent unsafe
+backlog cannot starve younger deletable workspaces. Candidate discovery validates the complete
+supported run corpus and fails above its 10,000-run integrity bound, so older runs without
+workspaces cannot hide a newer eligible entry. `--json` produces the same report as structured
+JSON. An unsafe path, symlink workspace entry, nested mount, changed state, or invalid recovery
+artifact is retained and reported as an error, and the command exits with status 2 so monitoring
+can alert the operator. The checked-in worker treats that exit as reported hygiene, logs it, and
+continues to the scheduled contribution run: cleanup errors never wedge the scheduler, and disk
+exhaustion is enforced separately by the workspace quota headroom check that follows.
 
 Cleanup never deletes SQLite rows, run evidence, patches, validation sidecars, or evaluations. It
 never selects `queued` through `submitting`, `ready_for_approval`, or `approved` workspaces. This is
@@ -1558,7 +1564,11 @@ Execution atomically renames the selected inode into a private random quarantine
 opened workspace root, verifies its device/inode identity, and repeats the bounded tree and mount
 inspection there before descriptor-relative recursive deletion. If the selected directory was
 swapped, it is restored without deletion. A recursive deletion error after isolation preserves the
-quarantine and fails the service for operator review; automatic cleanup never adopts that orphan.
+quarantine and reports a retained error for that one workspace; the remaining candidates still
+proceed. Each invocation also reclaims quarantine directories preserved by an earlier failed
+deletion: only entries with the exact private quarantine shape (canonical `.autocontribute-gc-`
+name, real `0700` directory on the workspace filesystem, not a mount point) that are at least six
+hours old are removed, so a concurrent collection's live quarantine is never raced.
 
 The collector does not infer ownership of filesystem entries absent from durable run state and does
 not remove such orphan entries. Inspect those manually with the worker stopped; preserve or move

@@ -166,7 +166,7 @@
     {
       "source_path": "deploy/systemd/libexec/autocontribute-worker",
       "installed_path": "/usr/local/libexec/autocontribute-worker",
-      "sha256": "32cd8f7b4458fa5fe05d5b63b9d96d5c4bad6ffb174cf7d724b6ca64497d94c2",
+      "sha256": "380f941fa973c5901c6e4e03b846b22838a0991e6549524735af7602cb648706",
       "mode": "0755",
       "required": true
     },
