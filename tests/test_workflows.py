@@ -740,7 +740,7 @@ def test_ci_verifies_complete_systemd_assets_in_source_distribution() -> None:
     script = verify_sdist["run"]
 
     assert steps.index(build_sdist) < steps.index(verify_sdist) < steps.index(build_wheel)
-    assert "len(assets) != 26" in script
+    assert "len(assets) != 28" in script
     assert "source distribution contains non-regular systemd assets" in script
     assert "archived_assets != set(expected)" in script
     assert "extracted.read() != Path(source_path).read_bytes()" in script

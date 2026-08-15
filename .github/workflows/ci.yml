@@ -678,8 +678,8 @@ jobs:
           manifest_bytes = manifest_path.read_bytes()
           manifest = json.loads(manifest_bytes)
           assets = manifest.get("assets")
-          if not isinstance(assets, list) or len(assets) != 26:
-              raise SystemExit("source systemd asset manifest must contain exactly 26 assets")
+          if not isinstance(assets, list) or len(assets) != 28:
+              raise SystemExit("source systemd asset manifest must contain exactly 28 assets")
           expected = {
               asset["source_path"]: int(asset["mode"], 8)
               for asset in assets
