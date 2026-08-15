@@ -34,6 +34,15 @@ class GitHubSafetyError(GitHubError):
         self.trigger = trigger
 
 
+class GitHubRequestNotSentError(GitHubError):
+    """A GitHub request provably failed before any bytes reached the remote host.
+
+    Only connection-establishment failures (DNS, TCP, TLS, or connection-pool
+    acquisition) are classified this way, so a mutation that fails with this error
+    cannot have changed remote state and is safe to retry.
+    """
+
+
 class ModelError(AutocontributeError):
     """A model request failed or returned an invalid result."""
 

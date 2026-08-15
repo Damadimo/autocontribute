@@ -40,6 +40,7 @@ from autocontribute.evaluation import EvaluationSummary
 from autocontribute.exceptions import (
     AutomaticRolloutBlocked,
     GitHubError,
+    GitHubRequestNotSentError,
     PolicyError,
     PublicationResumeRequired,
     StateError,
@@ -4085,6 +4086,195 @@ def test_ambiguous_pull_request_post_is_never_sent_twice(
 
     assert posts == 1
     assert store.get(run_id).status == RunStatus.SUBMITTING
+
+
+def test_unsent_pull_request_post_releases_intent_for_clean_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_create = github.create_pull_request
+    posts = 0
+    fail_first_post = True
+
+    def unsent_post(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
+        nonlocal posts
+        posts += 1
+        if fail_first_post:
+            before_mutation = kwargs.pop("before_mutation")
+            before_mutation()
+            raise GitHubRequestNotSentError(
+                "GitHub request could not be sent: POST /repos/example/project/pulls"
+            )
+        return original_create(*args, **kwargs)
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+    monkeypatch.setattr(github, "create_pull_request", unsent_post)
+
+    with pytest.raises(GitHubRequestNotSentError):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    assert durable.status == RunStatus.SUBMITTING
+    assert durable.pull_request_creation_started is False
+    assert durable.pull_request_url is None
+    assert posts == 1
+    assert not store.circuit_breaker_status().is_tripped
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert "pull_request.creation.not_sent" in event_types
+
+    fail_first_post = False
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert published.pull_request_url == "https://github.com/example/project/pull/7"
+    assert posts == 2
+    assert not store.circuit_breaker_status().is_tripped
+
+
+def test_lost_response_pull_request_post_adopts_created_pr_without_breaker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_create = github.create_pull_request
+
+    def lost_response_post(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
+        original_create(*args, **kwargs)
+        github.existing_pr = "https://github.com/example/project/pull/7"
+        raise GitHubError("GitHub request failed: the response was lost after the POST was sent")
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+    monkeypatch.setattr(github, "create_pull_request", lost_response_post)
+
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert published.pull_request_url == "https://github.com/example/project/pull/7"
+    assert github.calls.count("create_pull_request") == 1
+    assert not store.circuit_breaker_status().is_tripped
+    durable = store.get(run_id)
+    assert durable.pull_request_url == published.pull_request_url
+    assert durable.pull_request_creation_started
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert "pull_request.discovered" in event_types
+
+
+def test_unreadable_reconciliation_after_lost_response_keeps_conservative_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_find = github.find_pull_request
+    posted = False
+
+    def lost_response_post(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
+        nonlocal posted
+        del args
+        before_mutation = kwargs.pop("before_mutation")
+        before_mutation()
+        github.calls.append("create_pull_request")
+        posted = True
+        raise GitHubError("GitHub request failed: the response was lost after the POST was sent")
+
+    def unreadable_find(repository: str, *, head: str) -> str | None:
+        if posted:
+            raise GitHubError("GitHub request failed while reading pull requests")
+        return original_find(repository, head=head)
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+    monkeypatch.setattr(github, "create_pull_request", lost_response_post)
+    monkeypatch.setattr(github, "find_pull_request", unreadable_find)
+
+    with pytest.raises(PublicationResumeRequired, match="will not send a second POST"):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    assert durable.status == RunStatus.SUBMITTING
+    assert durable.pull_request_creation_started
+    assert durable.pull_request_url is None
+    assert github.calls.count("create_pull_request") == 1
+    assert store.circuit_breaker_status().is_tripped
+
+
+def test_unsent_post_with_failed_release_keeps_conservative_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_save = store.save
+
+    def unsent_post(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
+        del args
+        before_mutation = kwargs.pop("before_mutation")
+        before_mutation()
+        github.calls.append("create_pull_request")
+        raise GitHubRequestNotSentError(
+            "GitHub request could not be sent: POST /repos/example/project/pulls"
+        )
+
+    def failing_release_save(*args, **kwargs):  # type: ignore[no-untyped-def]
+        if kwargs.get("event") == "pull_request.creation.not_sent":
+            raise OSError("database volume unavailable")
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+    monkeypatch.setattr(github, "create_pull_request", unsent_post)
+    monkeypatch.setattr(store, "save", failing_release_save)
+
+    with pytest.raises(PublicationResumeRequired, match="will not send a second POST"):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    assert durable.status == RunStatus.SUBMITTING
+    assert durable.pull_request_creation_started
+    assert durable.pull_request_url is None
+    assert github.calls.count("create_pull_request") == 1
+    assert store.circuit_breaker_status().is_tripped
 
 
 def test_malformed_post_response_retains_submitting_and_trips_breaker(
