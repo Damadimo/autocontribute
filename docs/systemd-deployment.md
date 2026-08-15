@@ -1293,8 +1293,7 @@ sudo -u autocontribute \
   state verify-latest-s3 \
   --config /etc/autocontribute/autocontribute.yml \
   --if-configured \
-  --max-age-hours 36 \
-  --required-after /var/lib/autocontribute/health/worker-attempt
+  --max-age-hours 36
 sudo -u autocontribute /usr/local/libexec/autocontribute-healthcheck
 df --block-size=1 \
   /var/lib/autocontribute/state \
@@ -1319,9 +1318,12 @@ The health timer runs every 15 minutes. It fails when the last successful worker
 hours, the last complete backup is older than 36 hours, either durable filesystem violates its
 fixed ceiling, state or backup falls below its fixed reserve, or Docker data has less than 1 GiB or
 16,384 inodes available. Before those checks, the health service also requires the newest bundle and
-exact S3 receipt to be no older than 36 hours and, once `worker-attempt` exists, to postdate that
-marker. The worker performs the same receipt check before cleanup, credential loading, or model
-work. Both invoke `verify-latest-s3 --if-configured`: only an absent block in `review_required`
+exact S3 receipt to be no older than 36 hours. It deliberately does not require them to postdate
+`worker-attempt`: the worker refreshes that marker at the start of every run, so during a normal
+in-flight worker/backup/replication window the newest evidence legitimately predates it. The
+postdating check runs race-free at the worker preflight instead — before cleanup, credential
+loading, or model work, and before the marker is refreshed — where it verifies the previous
+attempt's evidence. Both invoke `verify-latest-s3 --if-configured`: only an absent block in `review_required`
 produces an explicit skip, while a configured-but-invalid/stale block fails and auto mode cannot omit
 the block. The health service's storage checks receive read-only namespace views; the Docker check
 requires an explicit read-only layer over the same safe writable ext4 mount. The worker, doctor, and

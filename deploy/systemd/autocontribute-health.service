@@ -14,7 +14,7 @@ UMask=0077
 Environment=AUTOCONTRIBUTE_WORKER_MAX_AGE_SECONDS=64800
 Environment=AUTOCONTRIBUTE_BACKUP_MAX_AGE_SECONDS=129600
 ExecStartPre=/opt/autocontribute/current/.venv/bin/autocontribute deployment verify-systemd-assets
-ExecStartPre=/opt/autocontribute/current/.venv/bin/autocontribute state verify-latest-s3 --config /etc/autocontribute/autocontribute.yml --if-configured --max-age-hours 36 --required-after /var/lib/autocontribute/health/worker-attempt
+ExecStartPre=/opt/autocontribute/current/.venv/bin/autocontribute state verify-latest-s3 --config /etc/autocontribute/autocontribute.yml --if-configured --max-age-hours 36
 ExecStartPre=/usr/local/libexec/autocontribute-docker-data-check --read-only-health /var/lib/autocontribute/docker
 ExecStart=/usr/local/libexec/autocontribute-healthcheck
 TimeoutStartSec=30s

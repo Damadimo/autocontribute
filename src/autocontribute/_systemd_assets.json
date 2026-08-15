@@ -33,7 +33,7 @@
     {
       "source_path": "deploy/systemd/autocontribute-health.service",
       "installed_path": "/etc/systemd/system/autocontribute-health.service",
-      "sha256": "b0c0908c4f48c5ed985ce9ce1c4055eba89f58697ed0797d5750671c9d47a257",
+      "sha256": "2fea167f832127ecf910031f245b99043437b57160dde606c3d96b963b0ee07d",
       "mode": "0644",
       "required": true
     },

@@ -3119,7 +3119,10 @@ def test_worker_backup_and_replication_chain_shares_one_exclusive_lock() -> None
     )
     assert "--if-configured" in replication_preflight
     assert "--max-age-hours 36" in replication_preflight
-    assert "--required-after /var/lib/autocontribute/health/worker-attempt" in replication_preflight
+    # The postdating condition belongs only to the worker preflight, which checks the prior
+    # attempt's evidence before refreshing the marker. A polling health check would fail it
+    # by design for the whole in-flight worker/backup/replication window and page falsely.
+    assert "--required-after" not in replication_preflight
     assert "/var/lib/autocontribute/docker" in health_unit[("Unit", "RequiresMountsFor")]
     assert (
         "/usr/local/libexec/autocontribute-docker-data-check "
