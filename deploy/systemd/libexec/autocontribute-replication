@@ -50,4 +50,9 @@ for credential_name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 done
 unset credential_name
 
-exec "$executable" state replicate-next-s3 --config "$config"
+"$executable" state replicate-next-s3 --config "$config"
+
+# Prune only after the replication pass so a freshly proven receipt frees its
+# older bundle in the same run; a gc failure pages via OnFailure without
+# undoing the replication that already completed above.
+exec "$executable" state gc-bundles --config "$config"

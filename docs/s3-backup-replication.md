@@ -80,6 +80,7 @@ s3_replication:
   retention_days: 90
   timeout_seconds: 21600
   max_age_hours: 48
+  local_keep_bundles: 9
 ```
 
 The three directories, `bucket`, `expected_bucket_owner`, and `region` are required. `prefix`
@@ -87,8 +88,10 @@ defaults to `autocontribute`; it must be a non-empty safe namespace with no lead
 slash. `retention_days` accepts 30 through 3650 and defaults to 90. `timeout_seconds` accepts 10
 through 86400 seconds and defaults to 21600. `max_age_hours` accepts 1 through 8760 and defaults to
 48; `doctor` and the application-level scheduled-auto preflight use it when checking the latest
-bundle and receipt. Relative directory paths resolve from the configuration file, but production
-deployments should use the explicit dedicated paths above. Credentials never belong in YAML.
+bundle and receipt. `local_keep_bundles` accepts 1 through 1000 and defaults to 9; `state
+gc-bundles` uses it to bound how many complete bundles stay on local disk. Relative directory paths
+resolve from the configuration file, but production deployments should use the explicit dedicated
+paths above. Credentials never belong in YAML.
 
 This block is optional for local or manual `publishing.mode: review_required` use. The strict
 configuration validator rejects `publishing.mode: auto` when it is absent. A configured block is
@@ -164,11 +167,15 @@ content-addressed `receipts/sha256/` prefix using a separately controlled recove
 
 ## Retention and recovery
 
-This command never removes local backups. Local deletion remains an explicit operator action after
-the exact record is reviewed, at least two other restorable generations are confirmed, and the
-retention deadline satisfies policy. Compliance retention prevents even the normal AWS account from
-deleting that version before expiry; it does not replace account recovery, cross-account controls,
-monitoring, or a second-region/cross-account replication policy.
+`state replicate-next-s3` never removes local backups. Local retention is the separate
+`state gc-bundles` command: it keeps the newest `local_keep_bundles` complete bundles
+unconditionally and deletes an older bundle (with its receipt) only after re-verifying that the
+receipt binds that bundle's exact bytes to the configured bucket, account, region, and prefix. An
+older bundle without a receipt is never deleted; it is reported as awaiting replication so the only
+local copy of a backup cannot be discarded. An invalid receipt fails the command instead of being
+skipped. Compliance retention prevents even the normal AWS account from deleting an uploaded
+version before expiry; it does not replace account recovery, cross-account controls, monitoring, or
+a second-region/cross-account replication policy.
 
 For a recovery drill, fetch the receipt and bundle by their exact immutable version IDs—not by a
 latest object name. Use the receipt's `bucket`, `key`, and `version_id`, independently compare the
@@ -205,15 +212,19 @@ stored as an encrypted empty value for a long-lived access key that issues no se
 wrapper then leaves the variable unset instead of exporting an empty one. Its wrapper rejects
 unsafe credential paths, unsets alternate AWS profile, shared-file, container, role, and
 web-identity discovery variables, and sets `AWS_EC2_METADATA_DISABLED=true` before invoking
-`state replicate-next-s3`. The backup remains
+`state replicate-next-s3`. After a successful replication pass the wrapper runs
+`state gc-bundles`, so a freshly proven receipt frees its older local bundle in the same run and
+the hourly retry timer keeps local disk usage bounded. The backup remains
 credential-free and private-networked. Worker and doctor receive GitHub/model credentials but no AWS
 credentials; the replication service receives the AWS triplet but no GitHub or model credential.
 
 Before every packaged scheduled attempt, the worker runs `state verify-latest-s3` with a maximum age
 of 36 hours. Once `/var/lib/autocontribute/health/worker-attempt` exists, both the newest complete
 bundle and its receipt must also postdate that marker, proving the prior attempt was captured and
-replicated before another begins. The health service performs the same receipt and postdating check.
-Both use `--if-configured`, which explicitly skips an absent block only in `review_required`; an auto
+replicated before another begins. The health service requires the same freshness but deliberately
+not the postdating condition: the worker refreshes the marker at the start of every run, so a
+polling check would fail by design for the whole in-flight worker/backup/replication window. Both
+use `--if-configured`, which explicitly skips an absent block only in `review_required`; an auto
 configuration cannot omit the block. The Python scheduled-auto preflight separately enforces the
 configured `max_age_hours` before rollout evaluation or model work.
 

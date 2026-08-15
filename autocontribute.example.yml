@@ -121,3 +121,4 @@ storage:
 #   retention_days: 90                    # 30..3650, S3 Object Lock COMPLIANCE mode
 #   timeout_seconds: 21600                # 10..86400 per signed upload/read-back request
 #   max_age_hours: 48                     # 1..8760 for doctor and scheduled auto preflight
+#   local_keep_bundles: 9                 # 1..1000 newest local bundles kept by `state gc-bundles`

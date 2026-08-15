@@ -960,6 +960,8 @@ replication_empty_output="$(
 )"
 [[ "$replication_empty_output" == *"No unreplicated complete state bundles"* ]] || \
   fail "the installed replication helper did not accept an empty offline queue"
+[[ "$replication_empty_output" == *"Pruned 0 replicated local bundle(s)"* ]] || \
+  fail "the installed replication helper did not run local bundle retention"
 : >"${smoke_root}/AWS_SESSION_TOKEN"
 sudo install -o "$service_account" -g "$service_account" -m 0400 \
   "${smoke_root}/AWS_SESSION_TOKEN" "${replication_credentials}/AWS_SESSION_TOKEN"
@@ -971,6 +973,8 @@ replication_no_session_output="$(
 )"
 [[ "$replication_no_session_output" == *"No unreplicated complete state bundles"* ]] || \
   fail "the installed replication helper did not accept an empty session-token credential"
+[[ "$replication_no_session_output" == *"Pruned 0 replicated local bundle(s)"* ]] || \
+  fail "the installed replication helper did not run local bundle retention"
 unset replication_credentials replication_empty_output replication_no_session_output
 
 run_id="$({

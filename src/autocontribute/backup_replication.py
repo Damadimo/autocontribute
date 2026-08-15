@@ -253,6 +253,15 @@ class VerifiedStateBundleReplication:
 
 
 @dataclass(frozen=True, slots=True)
+class StateBundlePruneReport:
+    """Local complete bundles kept, deleted, or preserved awaiting replication."""
+
+    kept: tuple[Path, ...]
+    deleted: tuple[Path, ...]
+    pending_replication: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _DirectorySnapshot:
     path: Path
     device: int
@@ -747,6 +756,66 @@ def verify_latest_state_bundle_replication(
             )
     _assert_directory_unchanged(bundle_snapshot, label="S3 bundle directory")
     return verified
+
+
+def prune_replicated_state_bundles(
+    *,
+    bundle_directory: Path,
+    receipt_directory: Path,
+    bucket: str,
+    expected_bucket_owner: str,
+    region: str,
+    prefix: str,
+    keep: int,
+) -> StateBundlePruneReport:
+    """Delete old local bundles only after proving their exact immutable S3 evidence.
+
+    The newest ``keep`` exact complete bundles always survive, replicated or not.  An
+    older bundle is deleted together with its local receipt only when that receipt binds
+    the bundle's exact bytes to the configured S3 boundary; an older bundle without a
+    receipt is preserved for replication and reported as pending instead.
+    """
+
+    if not 1 <= keep <= 1_000:
+        raise StateError("Local bundle retention must keep between 1 and 1,000 bundles")
+    _validate_replication_boundary(
+        bucket=bucket,
+        expected_bucket_owner=expected_bucket_owner,
+        region=region,
+        prefix=prefix,
+    )
+    receipt_root = _trusted_local_directory(receipt_directory, label="S3 receipt directory")
+    candidates, _ = _local_bundle_inventory(bundle_directory, receipt_root=receipt_root)
+    prunable = candidates[:-keep]
+    deleted: list[Path] = []
+    pending: list[Path] = []
+    for candidate in prunable:
+        if not _path_entry_exists(candidate.record_path):
+            pending.append(candidate.path)
+            continue
+        _verify_local_replication_record(
+            candidate,
+            bucket=bucket,
+            expected_bucket_owner=expected_bucket_owner,
+            region=region,
+            prefix=prefix,
+        )
+        try:
+            current = os.stat(candidate.path, follow_symlinks=False)
+        except OSError as exc:
+            raise StateError("S3 bundle entry changed after inventory") from exc
+        _require_candidate_identity(candidate, current)
+        try:
+            os.unlink(candidate.path)
+            os.unlink(candidate.record_path)
+        except OSError as exc:
+            raise StateError("A replicated local state bundle could not be deleted") from exc
+        deleted.append(candidate.path)
+    return StateBundlePruneReport(
+        kept=tuple(candidate.path for candidate in candidates[len(prunable) :]),
+        deleted=tuple(deleted),
+        pending_replication=tuple(pending),
+    )
 
 
 def replicate_state_bundle_to_s3(
@@ -1708,7 +1777,9 @@ __all__ = [
     "ImmutableS3Object",
     "PendingStateBundleReplication",
     "ReplicaReadBack",
+    "StateBundlePruneReport",
     "VerifiedStateBundleReplication",
+    "prune_replicated_state_bundles",
     "replicate_state_bundle_to_s3",
     "select_next_state_bundle_for_s3",
     "verify_latest_state_bundle_replication",

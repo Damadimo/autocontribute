@@ -19,8 +19,10 @@ from autocontribute.backup_replication import (
     BackupReplicaReceipt,
     BackupReplicationRecord,
     PendingStateBundleReplication,
+    StateBundlePruneReport,
     _Credentials,
     _S3ObjectLockClient,
+    prune_replicated_state_bundles,
     replicate_state_bundle_to_s3,
     select_next_state_bundle_for_s3,
     verify_latest_state_bundle_replication,
@@ -961,6 +963,128 @@ def test_selector_bounds_directory_inventory(
             region="ca-central-1",
             prefix="autocontribute/production",
         )
+
+
+def _prune(bundles: Path, receipts: Path, *, keep: int) -> StateBundlePruneReport:
+    return prune_replicated_state_bundles(
+        bundle_directory=bundles,
+        receipt_directory=receipts,
+        bucket="backup-vault",
+        expected_bucket_owner=_ACCOUNT_ID,
+        region="ca-central-1",
+        prefix="autocontribute/production",
+        keep=keep,
+    )
+
+
+def test_prune_deletes_older_replicated_bundles_and_receipts_keeping_newest(
+    tmp_path: Path,
+) -> None:
+    oldest = _production_bundle(tmp_path, "20260720T010203.000000001Z", 11)
+    older = _production_bundle(tmp_path, "20260721T010203.000000002Z", 12)
+    unreplicated = _production_bundle(tmp_path, "20260722T010203.000000003Z", 13)
+    newest = _production_bundle(tmp_path, "20260723T010203.000000004Z", 14)
+    receipts = _receipt_directory(tmp_path)
+    for replicated in (oldest, older, newest):
+        _replicate(
+            replicated,
+            _ObjectLockS3(),
+            record_destination=_record_path(receipts, replicated),
+            scratch_directory=_scratch(tmp_path),
+        )
+
+    report = _prune(oldest.parent, receipts, keep=2)
+
+    assert report.deleted == (oldest, older)
+    assert report.kept == (unreplicated, newest)
+    assert report.pending_replication == ()
+    assert not oldest.exists() and not older.exists()
+    assert not _record_path(receipts, oldest).exists()
+    assert not _record_path(receipts, older).exists()
+    assert unreplicated.exists() and newest.exists()
+    assert _record_path(receipts, newest).exists()
+
+
+def test_prune_preserves_unreplicated_older_bundles_as_pending(tmp_path: Path) -> None:
+    oldest = _production_bundle(tmp_path, "20260721T010203.000000001Z", 21)
+    older = _production_bundle(tmp_path, "20260722T010203.000000002Z", 22)
+    newest = _production_bundle(tmp_path, "20260723T010203.000000003Z", 23)
+    receipts = _receipt_directory(tmp_path)
+
+    report = _prune(oldest.parent, receipts, keep=1)
+
+    assert report.deleted == ()
+    assert report.pending_replication == (oldest, older)
+    assert report.kept == (newest,)
+    assert oldest.exists() and older.exists() and newest.exists()
+
+
+def test_prune_rejects_invalid_receipt_on_prunable_bundle(tmp_path: Path) -> None:
+    old = _production_bundle(tmp_path, "20260722T010203.000000001Z", 31)
+    _production_bundle(tmp_path, "20260723T010203.000000002Z", 32)
+    receipts = _receipt_directory(tmp_path)
+    receipt = _record_path(receipts, old)
+    receipt.write_text("{}\n", encoding="utf-8")
+    receipt.chmod(0o400)
+
+    with pytest.raises(StateError, match="receipt is invalid"):
+        _prune(old.parent, receipts, keep=1)
+
+    assert old.exists()
+    assert receipt.exists()
+
+
+def test_prune_rejects_receipt_that_no_longer_binds_the_bundle_bytes(tmp_path: Path) -> None:
+    old = _production_bundle(tmp_path, "20260722T010203.000000001Z", 41)
+    _production_bundle(tmp_path, "20260723T010203.000000002Z", 42)
+    receipts = _receipt_directory(tmp_path)
+    _replicate(
+        old,
+        _ObjectLockS3(),
+        record_destination=_record_path(receipts, old),
+        scratch_directory=_scratch(tmp_path),
+    )
+    old.chmod(0o600)
+    with old.open("ab") as output:
+        output.write(b"changed after replication")
+    old.chmod(0o400)
+
+    with pytest.raises(StateError, match="does not bind the exact bundle bytes"):
+        _prune(old.parent, receipts, keep=1)
+
+    assert old.exists()
+    assert _record_path(receipts, old).exists()
+
+
+@pytest.mark.parametrize("keep", [0, -1, 1_001])
+def test_prune_requires_keep_within_bounds(tmp_path: Path, keep: int) -> None:
+    bundle = _production_bundle(tmp_path, "20260723T010203.000000001Z", 51)
+    receipts = _receipt_directory(tmp_path)
+
+    with pytest.raises(StateError, match="between 1 and 1,000"):
+        _prune(bundle.parent, receipts, keep=keep)
+
+    assert bundle.exists()
+
+
+def test_prune_keeps_everything_when_bundle_count_is_within_keep(tmp_path: Path) -> None:
+    older = _production_bundle(tmp_path, "20260722T010203.000000001Z", 61)
+    newest = _production_bundle(tmp_path, "20260723T010203.000000002Z", 62)
+    receipts = _receipt_directory(tmp_path)
+    _replicate(
+        older,
+        _ObjectLockS3(),
+        record_destination=_record_path(receipts, older),
+        scratch_directory=_scratch(tmp_path),
+    )
+
+    report = _prune(older.parent, receipts, keep=9)
+
+    assert report.deleted == ()
+    assert report.pending_replication == ()
+    assert report.kept == (older, newest)
+    assert older.exists() and newest.exists()
+    assert _record_path(receipts, older).exists()
 
 
 def test_latest_replication_verification_proves_fresh_bundle_and_receipt_after_marker(
