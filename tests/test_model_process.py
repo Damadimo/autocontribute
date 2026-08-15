@@ -231,3 +231,134 @@ def test_process_provider_rejects_noncanonical_ipc_result(
 
     with pytest.raises(ModelError, match="non-canonical IPC JSON"):
         _generate(provider, timeout_seconds=2)
+
+
+def test_worker_error_envelope_round_trips_provider_request_status() -> None:
+    from autocontribute import model_worker
+    from autocontribute.exceptions import ModelRequestError
+    from autocontribute.providers import _output_schema_id, _worker_result
+
+    payload = model_worker._error_result(
+        "provider_request_error",
+        "OpenAI Responses request failed (HTTP 503)",
+        http_status=503,
+    )
+
+    with pytest.raises(ModelRequestError) as raised:
+        _worker_result(
+            payload,
+            output_type=ContributionPlan,
+            output_schema=_output_schema_id(ContributionPlan),
+        )
+
+    assert raised.value.status_code == 503
+    assert str(raised.value) == "OpenAI Responses request failed (HTTP 503)"
+
+
+def test_worker_error_envelope_round_trips_statusless_request_failure() -> None:
+    from autocontribute import model_worker
+    from autocontribute.exceptions import ModelRequestError
+    from autocontribute.providers import _output_schema_id, _worker_result
+
+    payload = model_worker._error_result(
+        "provider_request_error",
+        "OpenAI Responses request failed",
+    )
+
+    with pytest.raises(ModelRequestError) as raised:
+        _worker_result(
+            payload,
+            output_type=ContributionPlan,
+            output_schema=_output_schema_id(ContributionPlan),
+        )
+
+    assert raised.value.status_code is None
+
+
+@pytest.mark.parametrize("http_status", [200, 399, 600, True, "503"])
+def test_worker_result_rejects_invalid_provider_http_status(http_status: object) -> None:
+    from autocontribute.providers import (
+        _MODEL_WORKER_PROTOCOL,
+        _canonical_json_bytes,
+        _output_schema_id,
+        _worker_result,
+    )
+
+    payload = _canonical_json_bytes(
+        {
+            "protocol": _MODEL_WORKER_PROTOCOL,
+            "status": "error",
+            "error_code": "provider_request_error",
+            "message": "OpenAI Responses request failed",
+            "http_status": http_status,
+        }
+    )
+
+    with pytest.raises(ModelError, match="invalid provider HTTP status"):
+        _worker_result(
+            payload,
+            output_type=ContributionPlan,
+            output_schema=_output_schema_id(ContributionPlan),
+        )
+
+
+def test_worker_result_rejects_http_status_on_other_error_codes() -> None:
+    from autocontribute.providers import (
+        _MODEL_WORKER_PROTOCOL,
+        _canonical_json_bytes,
+        _output_schema_id,
+        _worker_result,
+    )
+
+    payload = _canonical_json_bytes(
+        {
+            "protocol": _MODEL_WORKER_PROTOCOL,
+            "status": "error",
+            "error_code": "provider_error",
+            "message": "Model provider request failed",
+            "http_status": 503,
+        }
+    )
+
+    with pytest.raises(ModelError, match="invalid error envelope"):
+        _worker_result(
+            payload,
+            output_type=ContributionPlan,
+            output_schema=_output_schema_id(ContributionPlan),
+        )
+
+
+def test_worker_main_serializes_provider_request_error_with_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import os
+
+    from autocontribute import model_worker
+    from autocontribute.exceptions import ModelRequestError
+    from autocontribute.providers import _output_schema_id, _worker_result
+
+    def failing_execute(_payload: bytes) -> bytes:
+        raise ModelRequestError("OpenAI Responses request failed (HTTP 429)", status_code=429)
+
+    monkeypatch.setattr(model_worker, "_execute", failing_execute)
+    request_read, request_write = os.pipe()
+    result_read, result_write = os.pipe()
+    os.write(request_write, b"{}")
+    os.close(request_write)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["worker", "--request-fd", str(request_read), "--result-fd", str(result_write)],
+    )
+
+    assert model_worker.main() == 0
+
+    payload = os.read(result_read, 65_536)
+    os.close(result_read)
+    with pytest.raises(ModelRequestError) as raised:
+        _worker_result(
+            payload,
+            output_type=ContributionPlan,
+            output_schema=_output_schema_id(ContributionPlan),
+        )
+    assert raised.value.status_code == 429

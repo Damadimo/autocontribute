@@ -14,7 +14,7 @@ from contextlib import suppress
 from pydantic import BaseModel, ValidationError
 
 from autocontribute.config import ModelProfile
-from autocontribute.exceptions import ModelError
+from autocontribute.exceptions import ModelError, ModelRequestError
 from autocontribute.providers import (
     _MAX_MODEL_REQUEST_BYTES,
     _MAX_MODEL_RESULT_BYTES,
@@ -118,15 +118,16 @@ def _safe_provider_message(error: ModelError) -> str:
     return "Model provider request failed"
 
 
-def _error_result(error_code: str, message: str) -> bytes:
-    return _canonical_json_bytes(
-        {
-            "protocol": _MODEL_WORKER_PROTOCOL,
-            "status": "error",
-            "error_code": error_code,
-            "message": message,
-        }
-    )
+def _error_result(error_code: str, message: str, *, http_status: int | None = None) -> bytes:
+    envelope: dict[str, object] = {
+        "protocol": _MODEL_WORKER_PROTOCOL,
+        "status": "error",
+        "error_code": error_code,
+        "message": message,
+    }
+    if http_status is not None:
+        envelope["http_status"] = http_status
+    return _canonical_json_bytes(envelope)
 
 
 def _execute(payload: bytes) -> bytes:
@@ -187,6 +188,15 @@ def main() -> int:
         try:
             payload = _read_bounded(arguments.request_fd)
             response = _execute(payload)
+        except ModelRequestError as exc:
+            status_code = exc.status_code
+            if not (type(status_code) is int and 400 <= status_code <= 599):
+                status_code = None
+            response = _error_result(
+                "provider_request_error",
+                _safe_provider_message(exc),
+                http_status=status_code,
+            )
         except ModelError as exc:
             response = _error_result("provider_error", _safe_provider_message(exc))
         except Exception:

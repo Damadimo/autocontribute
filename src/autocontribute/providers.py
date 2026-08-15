@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from autocontribute.config import ModelProfile, validate_model_identifier
 from autocontribute.domain import ContributionPlan, CriticReview, PatchProposal
-from autocontribute.exceptions import ModelError, ModelTimeoutError
+from autocontribute.exceptions import ModelError, ModelRequestError, ModelTimeoutError
 from autocontribute.redaction import redact_model_input
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
@@ -177,7 +177,7 @@ def _request_error(
     *,
     profile: ModelProfile,
     configured_api_key: str,
-) -> ModelError:
+) -> ModelRequestError:
     """Create a useful error without echoing provider bodies, prompts, or credentials.
 
     Preserve only a numeric status from a genuine OpenAI SDK HTTP exception. All response-body
@@ -186,9 +186,11 @@ def _request_error(
     """
 
     details: list[str] = []
+    http_status: int | None = None
     if isinstance(exc, APIStatusError):
         status_code = getattr(exc, "status_code", None)
         if type(status_code) is int and 400 <= status_code <= 599:
+            http_status = status_code
             details.append(f"HTTP {status_code}")
 
     request_id = getattr(exc, "request_id", None)
@@ -200,7 +202,7 @@ def _request_error(
         else:
             details.append(f"request ID: {request_id}")
     detail_suffix = f" ({'; '.join(details)})" if details else ""
-    return ModelError(f"{provider} request failed{detail_suffix}")
+    return ModelRequestError(f"{provider} request failed{detail_suffix}", status_code=http_status)
 
 
 def _model_output_strings(value: object) -> Iterator[str]:
@@ -626,12 +628,23 @@ def _worker_result(
         raise ModelError("Model worker returned an incompatible IPC protocol")
     status = envelope.get("status")
     if status == "error":
+        error_code = envelope.get("error_code")
         expected_keys = {"protocol", "status", "error_code", "message"}
+        http_status: int | None = None
+        if error_code == "provider_request_error" and "http_status" in envelope:
+            expected_keys = expected_keys | {"http_status"}
+            raw_status = envelope.get("http_status")
+            if (
+                isinstance(raw_status, bool)
+                or not isinstance(raw_status, int)
+                or not 400 <= raw_status <= 599
+            ):
+                raise ModelError("Model worker returned an invalid provider HTTP status")
+            http_status = raw_status
         if set(envelope) != expected_keys:
             raise ModelError("Model worker returned an invalid error envelope")
-        error_code = envelope.get("error_code")
         message = envelope.get("message")
-        if error_code not in {"provider_error", "worker_error"}:
+        if error_code not in {"provider_error", "provider_request_error", "worker_error"}:
             raise ModelError("Model worker returned an unknown error code")
         if (
             not isinstance(message, str)
@@ -640,6 +653,8 @@ def _worker_result(
             or not message.isprintable()
         ):
             raise ModelError("Model worker returned an invalid error message")
+        if error_code == "provider_request_error":
+            raise ModelRequestError(message, status_code=http_status)
         raise ModelError(message)
     expected_keys = {
         "protocol",

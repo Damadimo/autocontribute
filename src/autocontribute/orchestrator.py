@@ -45,6 +45,8 @@ from autocontribute.domain import (
 from autocontribute.exceptions import (
     AutocontributeError,
     CircuitBreakerTrigger,
+    ModelError,
+    ModelRequestError,
     ModelTimeoutError,
     PolicyError,
     RepositoryError,
@@ -106,6 +108,26 @@ _RUN_HEARTBEAT_INTERVAL = timedelta(minutes=1)
 _STALE_RUN_AGE = timedelta(hours=2)
 _MAX_GUIDANCE_FILES = 30
 _MAX_GUIDANCE_CHARACTERS = 80_000
+_MODEL_CALL_ATTEMPTS = 3
+_MODEL_RETRY_BACKOFF_SECONDS = (10.0, 30.0)
+_RETRIABLE_MODEL_HTTP_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+_sleep = time.sleep
+
+
+def _transient_model_failure(exc: ModelError) -> bool:
+    """Return whether a failed model attempt is safe and worthwhile to retry.
+
+    Timeouts and network-level failures with no response are transient by nature;
+    HTTP failures retry only on the provider statuses that signal overload or a
+    server-side fault.  Everything else (auth, quota policy, malformed request,
+    semantic output errors) fails the run so the operator sees it.
+    """
+
+    if isinstance(exc, ModelTimeoutError):
+        return True
+    if isinstance(exc, ModelRequestError):
+        return exc.status_code is None or exc.status_code in _RETRIABLE_MODEL_HTTP_STATUSES
+    return False
 
 
 class RunInvocationMode(StrEnum):
@@ -1085,6 +1107,68 @@ class Orchestrator:
         )
 
     def _call_model(
+        self,
+        manifest: RunManifest,
+        *,
+        role: Literal["scout", "builder", "critic"],
+        instructions: str,
+        prompt: str,
+        output_type: type[OutputT],
+    ) -> ModelResult[OutputT]:
+        """Call the model, retrying transient provider failures inside the run budget.
+
+        Every attempt keeps its own durable reservation.  Before a retry, the failed
+        attempt's retained reservation is charged in full — the provider may have
+        billed anything up to it — so no request ever runs without durable coverage.
+        When no retry happens the reservation stays retained, exactly as before.
+        """
+
+        for attempt in range(1, _MODEL_CALL_ATTEMPTS + 1):
+            try:
+                return self._call_model_once(
+                    manifest,
+                    role=role,
+                    instructions=instructions,
+                    prompt=prompt,
+                    output_type=output_type,
+                )
+            except (ModelRequestError, ModelTimeoutError) as exc:
+                if attempt >= _MODEL_CALL_ATTEMPTS or not _transient_model_failure(exc):
+                    raise
+                reservation = manifest.model_reservation
+                if reservation is None or reservation.call != manifest.model_calls:
+                    raise
+                projected = manifest.model_copy(deep=True)
+                projected.model_input_tokens += reservation.input_tokens
+                projected.model_output_tokens += reservation.output_tokens
+                projected.model_cost_usd += reservation.cost_usd
+                projected.model_reservation = None
+                if not self._has_model_capacity(projected, [role]):
+                    raise
+                manifest.model_input_tokens += reservation.input_tokens
+                manifest.model_output_tokens += reservation.output_tokens
+                manifest.model_cost_usd += reservation.cost_usd
+                manifest.model_reservation = None
+                wait = _MODEL_RETRY_BACKOFF_SECONDS[
+                    min(attempt, len(_MODEL_RETRY_BACKOFF_SECONDS)) - 1
+                ]
+                self._assert_run_lease_owned()
+                self.store.save(
+                    manifest,
+                    event="model.call.retry_scheduled",
+                    details={
+                        "role": role,
+                        "failed_call": str(reservation.call),
+                        "attempt": str(attempt),
+                        "reservation_settled": "charged_in_full",
+                        "wait_seconds": str(wait),
+                    },
+                )
+                self._assert_operational()
+                _sleep(wait)
+        raise AssertionError("unreachable: the final model attempt returns or raises")
+
+    def _call_model_once(
         self,
         manifest: RunManifest,
         *,

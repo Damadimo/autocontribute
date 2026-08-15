@@ -21,7 +21,12 @@ from autocontribute.domain import (
     ReviewScores,
     RunStatus,
 )
-from autocontribute.exceptions import ModelTimeoutError, PolicyError, StateError
+from autocontribute.exceptions import (
+    ModelRequestError,
+    ModelTimeoutError,
+    PolicyError,
+    StateError,
+)
 from autocontribute.orchestrator import Orchestrator, RunInvocationMode
 from autocontribute.preparation import validate_preparation_fingerprint
 from autocontribute.providers import ModelResult, ModelUsage
@@ -2691,6 +2696,264 @@ def test_failed_model_call_retains_durable_reservation(tmp_path: Path) -> None:
     assert manifest.model_seconds == 1.5
     persisted = store.get(manifest.run_id)
     assert persisted.model_reservation == manifest.model_reservation
+
+
+class FlakyProvider(FixedProvider):
+    def __init__(self, output: Any, model: str, failures: list[Exception]) -> None:
+        super().__init__(output, model)
+        self.failures = list(failures)
+
+    def generate(self, **request: object) -> ModelResult[Any]:
+        if self.failures:
+            self.calls += 1
+            self.requests.append(request)
+            raise self.failures.pop(0)
+        return super().generate(**request)
+
+
+def _retry_test_orchestrator(
+    tmp_path: Path,
+    provider: FixedProvider,
+    *,
+    ticks: tuple[float, ...],
+    budget: dict[str, object] | None = None,
+) -> tuple[RunStore, Orchestrator]:
+    config = AutocontributeConfig.model_validate(
+        {
+            "budget": budget or {},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    tick_iter = iter(ticks)
+    orchestrator = Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
+        providers={"scout": provider},  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        clock=lambda: next(tick_iter),
+    )
+    return store, orchestrator
+
+
+def test_transient_provider_failure_is_retried_after_charging_its_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.orchestrator._sleep", waits.append)
+    plan = _providers()["scout"].output
+    provider = FlakyProvider(
+        plan,
+        "gpt-5.6",
+        [ModelRequestError("OpenAI Responses request failed (HTTP 503)", status_code=503)],
+    )
+    store, orchestrator = _retry_test_orchestrator(tmp_path, provider, ticks=(1.0, 2.5, 3.0, 4.5))
+    manifest = store.create_run()
+
+    result = orchestrator._call_model(
+        manifest,
+        role="scout",
+        instructions="Plan safely.",
+        prompt="Inspect one issue.",
+        output_type=ContributionPlan,
+    )
+
+    assert result.output == plan
+    assert waits == [10.0]
+    assert manifest.model_calls == 2
+    assert manifest.model_reservation is None
+    # The failed attempt is charged at its full reservation (output limit 40,000),
+    # then the successful attempt adds its real usage (5 output tokens).
+    assert manifest.model_output_tokens == 40_000 + 5
+    assert manifest.model_input_tokens > 10
+    model_events = [
+        event["event_type"]
+        for event in store.events(manifest.run_id)
+        if event["event_type"].startswith("model.call.")
+    ]
+    assert model_events == [
+        "model.call.started",
+        "model.call.failed",
+        "model.call.retry_scheduled",
+        "model.call.started",
+        "model.call.completed",
+    ]
+    retry_event = next(
+        event
+        for event in store.events(manifest.run_id)
+        if event["event_type"] == "model.call.retry_scheduled"
+    )
+    assert json.loads(retry_event["details"]) == {
+        "role": "scout",
+        "failed_call": "1",
+        "attempt": "1",
+        "reservation_settled": "charged_in_full",
+        "wait_seconds": "10.0",
+    }
+
+
+def test_hard_timeout_is_retried_when_the_wall_clock_budget_allows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.orchestrator._sleep", waits.append)
+    plan = _providers()["scout"].output
+    provider = FlakyProvider(
+        plan,
+        "gpt-5.6",
+        [
+            ModelTimeoutError(
+                timeout_seconds=900,
+                elapsed_seconds=900.4,
+                term_sent=True,
+                kill_sent=False,
+                child_exit_code=-15,
+            )
+        ],
+    )
+    store, orchestrator = _retry_test_orchestrator(tmp_path, provider, ticks=(1.0, 2.5, 3.0, 4.5))
+    manifest = store.create_run()
+
+    result = orchestrator._call_model(
+        manifest,
+        role="scout",
+        instructions="Plan safely.",
+        prompt="Inspect one issue.",
+        output_type=ContributionPlan,
+    )
+
+    assert result.output == plan
+    assert waits == [10.0]
+    assert manifest.model_calls == 2
+    assert manifest.model_reservation is None
+    model_events = [
+        event["event_type"]
+        for event in store.events(manifest.run_id)
+        if event["event_type"].startswith("model.call.")
+    ]
+    assert model_events == [
+        "model.call.started",
+        "model.call.timed_out",
+        "model.call.retry_scheduled",
+        "model.call.started",
+        "model.call.completed",
+    ]
+
+
+def test_non_retriable_provider_status_fails_without_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.orchestrator._sleep", waits.append)
+    plan = _providers()["scout"].output
+    provider = FlakyProvider(
+        plan,
+        "gpt-5.6",
+        [ModelRequestError("OpenAI Responses request failed (HTTP 401)", status_code=401)],
+    )
+    store, orchestrator = _retry_test_orchestrator(tmp_path, provider, ticks=(1.0, 2.5))
+    manifest = store.create_run()
+
+    with pytest.raises(ModelRequestError, match="HTTP 401"):
+        orchestrator._call_model(
+            manifest,
+            role="scout",
+            instructions="Plan safely.",
+            prompt="Inspect one issue.",
+            output_type=ContributionPlan,
+        )
+
+    assert waits == []
+    assert manifest.model_calls == 1
+    assert manifest.model_reservation is not None
+    persisted = store.get(manifest.run_id)
+    assert persisted.model_reservation == manifest.model_reservation
+
+
+def test_persistent_transient_failure_stops_after_bounded_attempts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.orchestrator._sleep", waits.append)
+    plan = _providers()["scout"].output
+    provider = FlakyProvider(
+        plan,
+        "gpt-5.6",
+        [ModelRequestError("OpenAI Responses request failed") for _ in range(3)],
+    )
+    store, orchestrator = _retry_test_orchestrator(
+        tmp_path, provider, ticks=(1.0, 2.5, 3.0, 4.5, 5.0, 6.5)
+    )
+    manifest = store.create_run()
+
+    with pytest.raises(ModelRequestError, match="request failed"):
+        orchestrator._call_model(
+            manifest,
+            role="scout",
+            instructions="Plan safely.",
+            prompt="Inspect one issue.",
+            output_type=ContributionPlan,
+        )
+
+    assert waits == [10.0, 30.0]
+    assert manifest.model_calls == 3
+    # The final attempt's reservation stays retained, exactly like a non-retried failure.
+    assert manifest.model_reservation is not None
+    assert manifest.model_reservation.call == 3
+    model_events = [
+        event["event_type"]
+        for event in store.events(manifest.run_id)
+        if event["event_type"].startswith("model.call.")
+    ]
+    assert model_events == [
+        "model.call.started",
+        "model.call.failed",
+        "model.call.retry_scheduled",
+        "model.call.started",
+        "model.call.failed",
+        "model.call.retry_scheduled",
+        "model.call.started",
+        "model.call.failed",
+    ]
+
+
+def test_transient_failure_is_not_retried_when_the_budget_cannot_cover_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    waits: list[float] = []
+    monkeypatch.setattr("autocontribute.orchestrator._sleep", waits.append)
+    plan = _providers()["scout"].output
+    provider = FlakyProvider(
+        plan,
+        "gpt-5.6",
+        [ModelRequestError("OpenAI Responses request failed (HTTP 503)", status_code=503)],
+    )
+    store, orchestrator = _retry_test_orchestrator(
+        tmp_path,
+        provider,
+        ticks=(1.0, 2.5),
+        budget={"max_model_seconds_per_run": 10},
+    )
+    manifest = store.create_run()
+
+    with pytest.raises(ModelRequestError, match="HTTP 503"):
+        orchestrator._call_model(
+            manifest,
+            role="scout",
+            instructions="Plan safely.",
+            prompt="Inspect one issue.",
+            output_type=ContributionPlan,
+        )
+
+    assert waits == []
+    assert manifest.model_calls == 1
+    assert manifest.model_reservation is not None
 
 
 def test_hard_model_timeout_retains_reservation_records_evidence_and_releases_lease(
