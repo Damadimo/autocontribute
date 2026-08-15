@@ -52,7 +52,10 @@ uv sync --extra dev
 uv run autocontribute init
 gh auth login
 export OPENAI_API_KEY="..."
-docker pull python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a
+
+# Edit autocontribute.yml: pick repositories you understand and set sandbox.image to your own
+# digest-pinned image containing their full offline toolchain (see docs/sandbox-image.md), then:
+docker pull registry.example.com/autocontribute/sandbox@sha256:YOUR_DIGEST
 
 # Inspect authentication, Docker, model credentials, and configuration.
 uv run autocontribute doctor
@@ -106,7 +109,10 @@ unsafe-local backend checks the host toolchain and does not require Docker.
 Copy [`autocontribute.example.yml`](autocontribute.example.yml) to `autocontribute.yml` and replace
 the example repositories with projects you understand. Define `validation.required_commands` for
 every explicit repository; those commands and the pinned Docker image must provide its complete
-offline toolchain. Configuration stores environment-variable *names* only; never place tokens in
+offline toolchain. The example ships a deliberately unpullable `example.invalid` image placeholder:
+build, digest-pin, and pre-pull a dependency-complete image of your own before running `doctor` —
+[docs/sandbox-image.md](docs/sandbox-image.md) covers the requirements, build recipe, and rotation.
+Configuration stores environment-variable *names* only; never place tokens in
 YAML. Docker images must be pinned by digest so scheduled checks cannot silently change toolchains
 between runs.
 
@@ -488,7 +494,8 @@ See [SECURITY.md](SECURITY.md) before enabling a schedule and [CONTRIBUTING.md](
 working on the agent itself.
 
 Design details live in [Architecture](docs/architecture.md), [Quality policy](docs/quality-policy.md),
-[Staging](docs/staging.md), [Scheduled operation](docs/scheduled-operation.md), and the
+[Sandbox toolchain images](docs/sandbox-image.md), [Staging](docs/staging.md),
+[Scheduled operation](docs/scheduled-operation.md), and the
 [operator-managed systemd deployment](docs/systemd-deployment.md). The signed, reproducible artifact
 process and independent verification commands are documented in [Releases](docs/releases.md).
 

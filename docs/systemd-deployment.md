@@ -1147,7 +1147,8 @@ unset release
 
 Confirm that the Docker smoke test reports `/var/lib/autocontribute/docker`, cgroup v2 with the
 `systemd` driver, and exactly one `name=rootless` security option. Pre-pull every digest-pinned
-sandbox image as the `autocontribute` user before doctor; never use a tag in production. The service
+sandbox image as the `autocontribute` user before doctor; never use a tag in production (see
+[Sandbox toolchain images](sandbox-image.md) for building and pinning such an image). The service
 sets `TMPDIR=/var/lib/autocontribute/tmp` because Docker's daemon must see the CID files created by
 the client; systemd's private `/tmp` mount is deliberately not used for those files.
 

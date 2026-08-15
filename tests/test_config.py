@@ -55,6 +55,33 @@ def test_example_config_is_valid() -> None:
     )
 
 
+def test_shipped_example_configs_are_valid_and_self_consistent() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for name in ("autocontribute.example.yml", "autocontribute.staging.example.yml"):
+        raw = (root / name).read_text(encoding="utf-8")
+        config = AutocontributeConfig.model_validate(yaml.safe_load(raw))
+        assert config.sandbox.network == "none"
+        assert config.publishing.mode == "review_required"
+        assert all(
+            config.validation.commands_for(repository) for repository in config.github.repositories
+        )
+        # Comments must not pin store schema versions; those drift silently as the schema evolves.
+        assert "schema-v" not in raw
+        assert "docs/sandbox-image.md" in raw
+
+    example = (root / "autocontribute.example.yml").read_text(encoding="utf-8")
+    staging = (root / "autocontribute.staging.example.yml").read_text(encoding="utf-8")
+    # The starter config names real repositories whose pytest commands need project dependencies.
+    # A pullable bare-interpreter image would pass config validation yet fail doctor, so the
+    # shipped image must be an unresolvable, unmistakable placeholder the operator has to replace.
+    placeholder = "example.invalid/sandbox@sha256:" + "0" * 64
+    assert placeholder in example
+    assert placeholder in example_config()
+    # The staging fixture's stdlib-only validation recipe is the one case a bare image satisfies.
+    assert "python:3.12-bookworm@sha256:" in staging
+    assert (root / "docs" / "sandbox-image.md").exists()
+
+
 def test_defaults_disclose_autonomous_work_without_claiming_human_validation() -> None:
     config = AutocontributeConfig()
     disclosure = config.policy.ai_disclosure.casefold()

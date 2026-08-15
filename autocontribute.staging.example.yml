@@ -44,8 +44,9 @@ models:
 
 sandbox:
   backend: docker
-  # The first fixture intentionally uses only Python's standard library. Replace this image with a
-  # digest-pinned, dependency-complete image before adding another repository ecosystem.
+  # The first fixture intentionally uses only Python's standard library, so a bare interpreter
+  # image is sufficient here. Replace it with a digest-pinned, dependency-complete image before
+  # adding another repository ecosystem: see docs/sandbox-image.md.
   image: >-
     python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a
   network: none
@@ -90,7 +91,7 @@ publishing:
   mode: review_required
   approval_expires_hours: 12
   draft: true
-  # These limits use durable schema-v5 reservations if a reviewed fixture is manually published.
+  # These limits use durable SQLite reservations if a reviewed fixture is manually published.
   max_new_pull_requests_per_day: 1
   max_open_pull_requests: 1
   repository_cooldown_days: 30
