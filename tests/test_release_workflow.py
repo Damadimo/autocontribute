@@ -232,7 +232,7 @@ def test_release_keyless_signs_attests_and_retains_exact_assets_before_publish()
     publish = _step("Stage verify and publish immutable-version GitHub Release")
 
     assert signing["uses"] == (
-        "sigstore/gh-action-sigstore-python@5b79a39c381910c090341a2c9b0bf022c8b387e1"
+        "sigstore/gh-action-sigstore-python@790bc6befb9d733738f18d8f895854b453640ec9"
     )
     assert signing["with"] == {
         "inputs": ("release/*.tar.gz\nrelease/*.whl\nrelease/*.cdx.json\nrelease/SHA256SUMS\n"),
@@ -246,7 +246,7 @@ def test_release_keyless_signs_attests_and_retains_exact_assets_before_publish()
         "release-signing-artifacts": False,
     }
     assert provenance["uses"] == (
-        "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373"
+        "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"
     )
     assert provenance["with"] == {"subject-checksums": "release/SHA256SUMS"}
     assert "provenance.sigstore.json" in str(seal["run"])

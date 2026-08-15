@@ -215,7 +215,7 @@ jobs:
           } >>"$GITHUB_OUTPUT"
       - name: Probe exact claimant generation
         id: claimant_probe
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ inputs.storage_root }}/runs/
@@ -247,7 +247,7 @@ jobs:
         if: >-
           ${{ inputs.recovery_action == 'promote_claimed' &&
           steps.claimant_probe.outputs.cache-hit == 'true' }}
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ inputs.storage_root }}/runs/
@@ -303,7 +303,7 @@ jobs:
         if: >-
           ${{ inputs.recovery_action == 'restore_parent_stopped' &&
           steps.recovery_lineage.outputs.parent_key != 'bootstrap' }}
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ inputs.storage_root }}/runs/
@@ -470,7 +470,7 @@ jobs:
           --overwrite
       - name: Save fresh recovered generation
         id: recovery_cache_save
-        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ inputs.storage_root }}/runs/
@@ -479,7 +479,7 @@ jobs:
           key: ${{ steps.recovery_lineage.outputs.recovery_key }}
       - name: Verify recovered generation persistence
         id: recovery_cache_verify
-        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ inputs.storage_root }}/runs/
