@@ -612,9 +612,7 @@ def test_permission_403_fails_without_retry_or_breaker(tmp_path, monkeypatch) ->
     assert not store.circuit_breaker_status().is_tripped
 
 
-def test_persistent_abuse_signal_is_persisted_after_honored_wait(
-    tmp_path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_persistent_abuse_signal_is_persisted_after_honored_wait(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     store = RunStore(tmp_path / "state")
     waits: list[float] = []
     monkeypatch.setattr("autocontribute.github._sleep", waits.append)
@@ -646,9 +644,7 @@ def test_persistent_abuse_signal_is_persisted_after_honored_wait(
     assert status.trigger_hash == first_hash
 
 
-def test_transient_abuse_signal_recovers_without_tripping_breaker(
-    tmp_path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_transient_abuse_signal_recovers_without_tripping_breaker(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     store = RunStore(tmp_path / "state")
     waits: list[float] = []
     monkeypatch.setattr("autocontribute.github._sleep", waits.append)
