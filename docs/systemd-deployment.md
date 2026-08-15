@@ -707,12 +707,18 @@ s3_replication:
   retention_days: 90
   timeout_seconds: 21600
   max_age_hours: 48
+  local_keep_bundles: 9
 ```
 
 The S3 block is non-secret. All three directories, the bucket, independently verified 12-digit
 bucket owner, and standard commercial AWS region are required. `prefix` defaults to
 `autocontribute`; retention defaults to 90 days (allowed 30–3650), request timeout to 21600 seconds
-(allowed 10–86400), and receipt age to 48 hours (allowed 1–8760). See
+(allowed 10–86400), receipt age to 48 hours (allowed 1–8760), and local bundle retention to the
+newest 9 bundles (allowed 1–1000). After each replication pass the replication service runs
+`autocontribute state gc-bundles`, which deletes older local bundles only when their receipts prove
+the exact bundle bytes reached the configured S3 boundary; older bundles without receipts are kept
+and reported as awaiting replication, so local disk usage stays bounded without ever discarding the
+only copy of a backup. See
 [Immutable S3 backup replication](s3-backup-replication.md) for the bucket, Object Lock, IAM, and
 recovery requirements. A local/manual `review_required` configuration may omit the block, in which
 case the packaged verification command reports an explicit skip. `publishing.mode: auto` rejects a

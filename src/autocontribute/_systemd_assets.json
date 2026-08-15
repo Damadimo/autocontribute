@@ -131,7 +131,7 @@
     {
       "source_path": "deploy/systemd/libexec/autocontribute-replication",
       "installed_path": "/usr/local/libexec/autocontribute-replication",
-      "sha256": "c2788d7f400b6aa32d140c6041109d448f8f2629e4881744b16c7e0e5ef7f1a6",
+      "sha256": "91a6ca09ae2de49cae3b94a46d59231082870a4f9b21255fde0816e48eac3dec",
       "mode": "0755",
       "required": true
     },

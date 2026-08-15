@@ -1006,29 +1006,89 @@ def test_verify_latest_s3_cli_is_read_only_and_honors_health_constraints(
     assert captured["bucket"] == "backup-vault"
 
 
+def test_gc_bundles_cli_prunes_with_configured_retention_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(
+        _s3_replication_config_text(tmp_path) + "  local_keep_bundles: 4\n",
+        encoding="utf-8",
+    )
+    deleted = tmp_path / "backups" / "old.bundle.zip"
+    kept = tmp_path / "backups" / "new.bundle.zip"
+    pending = tmp_path / "backups" / "unreplicated.bundle.zip"
+    captured: dict[str, object] = {}
+
+    def prune(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(deleted=(deleted,), kept=(kept,), pending_replication=(pending,))
+
+    monkeypatch.setattr(cli, "prune_replicated_state_bundles", prune)
+
+    result = runner.invoke(app, ["state", "gc-bundles", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert "Pruned 1 replicated local bundle(s); kept 1." in result.output
+    assert f"Deleted: {deleted}" in result.output
+    assert f"Awaiting replication: {pending}" in result.output
+    assert captured["bundle_directory"] == tmp_path / "backups"
+    assert captured["receipt_directory"] == tmp_path / "receipts"
+    assert captured["bucket"] == "backup-vault"
+    assert captured["expected_bucket_owner"] == "123456789012"
+    assert captured["region"] == "ca-central-1"
+    assert captured["prefix"] == "production/test"
+    assert captured["keep"] == 4
+
+
+def test_gc_bundles_cli_keep_option_overrides_configured_retention(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(_s3_replication_config_text(tmp_path), encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def prune(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return SimpleNamespace(deleted=(), kept=(), pending_replication=())
+
+    monkeypatch.setattr(cli, "prune_replicated_state_bundles", prune)
+
+    result = runner.invoke(
+        app,
+        ["state", "gc-bundles", "--config", str(config), "--keep", "2"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Pruned 0 replicated local bundle(s); kept 0." in result.output
+    assert captured["keep"] == 2
+
+
 def test_automated_s3_commands_fail_when_optional_review_configuration_is_disabled(
     tmp_path: Path,
 ) -> None:
     config = tmp_path / "autocontribute.yml"
     config.write_text("publishing:\n  mode: review_required\n", encoding="utf-8")
 
-    result = runner.invoke(app, ["state", "verify-latest-s3", "--config", str(config)])
-    conditional = runner.invoke(
-        app,
-        [
-            "state",
-            "verify-latest-s3",
-            "--config",
-            str(config),
-            "--if-configured",
-        ],
-    )
+    for command in ("verify-latest-s3", "gc-bundles"):
+        result = runner.invoke(app, ["state", command, "--config", str(config)])
+        conditional = runner.invoke(
+            app,
+            [
+                "state",
+                command,
+                "--config",
+                str(config),
+                "--if-configured",
+            ],
+        )
 
-    assert result.exit_code == 1
-    assert "S3 replication is not configured" in result.output
-    assert conditional.exit_code == 0, conditional.output
-    assert "optional review-mode replication" in conditional.output
-    assert "configured" in conditional.output
+        assert result.exit_code == 1
+        assert "S3 replication is not configured" in result.output
+        assert conditional.exit_code == 0, conditional.output
+        assert "optional review-mode replication" in conditional.output
+        assert "configured" in conditional.output
 
 
 def test_state_restore_cli_promotes_only_verified_snapshot(tmp_path: Path) -> None:

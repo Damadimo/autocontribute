@@ -1807,7 +1807,9 @@ def test_replication_timer_service_and_helper_form_a_separate_provider_boundary(
     assert "AWS_PROFILE AWS_ROLE_ARN AWS_SHARED_CREDENTIALS_FILE" in helper
     assert "AWS_WEB_IDENTITY_TOKEN_FILE" in helper
     assert "export AWS_EC2_METADATA_DISABLED=true" in helper
-    assert 'exec "$executable" state replicate-next-s3 --config "$config"' in helper
+    assert '"$executable" state replicate-next-s3 --config "$config"' in helper
+    assert 'exec "$executable" state gc-bundles --config "$config"' in helper
+    assert helper.index("state replicate-next-s3") < helper.index("state gc-bundles")
     assert "AWS_ACCESS_KEY_ID=" not in helper
     assert "AWS_SECRET_ACCESS_KEY=" not in helper
     assert "AWS_SESSION_TOKEN=" not in helper
@@ -1838,6 +1840,9 @@ def test_replication_helper_loads_exact_credentials_and_scrubs_ambient_aws_state
 set -euo pipefail
 printf '%s\n' "$*" >>"$AUTOCONTRIBUTE_TEST_CALLS"
 if [[ "$*" == "deployment verify-systemd-assets" ]]; then
+  exit 0
+fi
+if [[ "$*" == "state gc-bundles --config $AUTOCONTRIBUTE_TEST_CONFIG" ]]; then
   exit 0
 fi
 [[ "$*" == "state replicate-next-s3 --config $AUTOCONTRIBUTE_TEST_CONFIG" ]]
@@ -1886,6 +1891,7 @@ printf '%s\n' \
     assert calls.read_text(encoding="utf-8").splitlines() == [
         "deployment verify-systemd-assets",
         f"state replicate-next-s3 --config {config}",
+        f"state gc-bundles --config {config}",
     ]
     assert observed.read_text(encoding="utf-8").splitlines() == [
         *credential_values.values(),
@@ -1915,6 +1921,9 @@ def test_replication_helper_omits_an_empty_session_token(tmp_path: Path) -> None
 set -euo pipefail
 printf '%s\n' "$*" >>"$AUTOCONTRIBUTE_TEST_CALLS"
 if [[ "$*" == "deployment verify-systemd-assets" ]]; then
+  exit 0
+fi
+if [[ "$*" == "state gc-bundles --config $AUTOCONTRIBUTE_TEST_CONFIG" ]]; then
   exit 0
 fi
 [[ "$*" == "state replicate-next-s3 --config $AUTOCONTRIBUTE_TEST_CONFIG" ]]
@@ -1951,6 +1960,7 @@ printf '%s\n' \
     assert calls.read_text(encoding="utf-8").splitlines() == [
         "deployment verify-systemd-assets",
         f"state replicate-next-s3 --config {config}",
+        f"state gc-bundles --config {config}",
     ]
     assert observed.read_text(encoding="utf-8").splitlines() == [
         "AKIAIOSFODNN7EXAMPLE",

@@ -21,6 +21,7 @@ from rich.text import Text
 from autocontribute import __version__
 from autocontribute.backup import create_state_bundle, restore_state_bundle
 from autocontribute.backup_replication import (
+    prune_replicated_state_bundles,
     replicate_state_bundle_to_s3,
     select_next_state_bundle_for_s3,
     verify_latest_state_bundle_replication,
@@ -1102,6 +1103,60 @@ def verify_latest_state_s3(
     console.print("[green]Verified latest complete bundle has exact S3 receipt evidence.[/green]")
     console.print(f"Local bundle: {verified.bundle_path}", markup=False)
     console.print(f"Local record: {verified.record_path}", markup=False)
+
+
+@state_app.command(name="gc-bundles")
+def gc_state_bundles(
+    config: ConfigOption = DEFAULT_CONFIG,
+    if_configured: Annotated[
+        bool,
+        typer.Option(
+            "--if-configured",
+            help="Succeed explicitly when optional review-mode S3 replication is not configured.",
+        ),
+    ] = False,
+    keep: Annotated[
+        int | None,
+        typer.Option(
+            "--keep",
+            min=1,
+            max=1_000,
+            help="How many of the newest local bundles to keep (default: local_keep_bundles).",
+        ),
+    ] = None,
+) -> None:
+    """Delete old local bundles whose exact bytes are proven replicated to S3."""
+
+    settings = _config(config)
+    replication = settings.s3_replication
+    if replication is None:
+        if if_configured and settings.publishing.mode == "review_required":
+            console.print(
+                "[yellow]Local bundle pruning skipped: optional review-mode "
+                "replication is not configured.[/yellow]"
+            )
+            return
+        _fail("S3 replication is not configured; set s3_replication in the configuration")
+    try:
+        report = prune_replicated_state_bundles(
+            bundle_directory=replication.bundle_directory,
+            receipt_directory=replication.receipt_directory,
+            bucket=replication.bucket,
+            expected_bucket_owner=replication.expected_bucket_owner,
+            region=replication.region,
+            prefix=replication.prefix,
+            keep=keep if keep is not None else replication.local_keep_bundles,
+        )
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    console.print(
+        f"[green]Pruned {len(report.deleted)} replicated local bundle(s); "
+        f"kept {len(report.kept)}.[/green]"
+    )
+    for path in report.deleted:
+        console.print(f"Deleted: {path}", markup=False, soft_wrap=True)
+    for path in report.pending_replication:
+        console.print(f"Awaiting replication: {path}", markup=False, soft_wrap=True)
 
 
 @state_app.command(name="gc-workspaces")

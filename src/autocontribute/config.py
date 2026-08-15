@@ -635,6 +635,7 @@ class S3ReplicationConfig(StrictModel):
     retention_days: int = Field(default=90, ge=30, le=3_650)
     timeout_seconds: float = Field(default=21_600, ge=10, le=86_400)
     max_age_hours: int = Field(default=48, ge=1, le=8_760)
+    local_keep_bundles: int = Field(default=9, ge=1, le=1_000)
 
     @field_validator("bundle_directory", "receipt_directory", "scratch_directory", mode="before")
     @classmethod
