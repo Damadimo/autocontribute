@@ -38,6 +38,18 @@ class ModelError(AutocontributeError):
     """A model request failed or returned an invalid result."""
 
 
+class ModelRequestError(ModelError):
+    """A provider HTTP request failed before it produced a valid model response.
+
+    ``status_code`` is the provider's HTTP status when one was observed (4xx/5xx),
+    or ``None`` for network-level failures where no response arrived.
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class ModelTimeoutError(ModelError):
     """The application killed a model worker after its absolute deadline."""
 

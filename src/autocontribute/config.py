@@ -605,7 +605,10 @@ def auto_publish_opt_in_enabled(config: PublishingConfig) -> bool:
 
 
 class BudgetConfig(StrictModel):
-    max_model_calls_per_run: int = Field(default=6, ge=3, le=30)
+    # A maximum-length run makes 5 distinct calls (plan, replan, propose, critique,
+    # repair); the remainder is headroom for transient-failure retries, each of which
+    # consumes a call so retried requests stay visible in the billable accounting.
+    max_model_calls_per_run: int = Field(default=9, ge=3, le=30)
     max_candidates_per_run: int = Field(default=25, ge=1, le=200)
     max_input_tokens_per_run: int = Field(default=3_000_000, ge=1_000, le=20_000_000)
     max_output_tokens_per_run: int = Field(default=240_000, ge=1_000, le=4_000_000)
@@ -1008,7 +1011,7 @@ publishing:
   auto_publish_env: AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH
 
 budget:
-  max_model_calls_per_run: 6
+  max_model_calls_per_run: 9
   max_candidates_per_run: 25
   max_input_tokens_per_run: 3000000
   max_output_tokens_per_run: 240000
