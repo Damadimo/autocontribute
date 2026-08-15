@@ -158,9 +158,10 @@ _PUBLICATION_EVIDENCE_EVENT_TYPES: Final = (
     "publication.reservation.legacy",
     "publication.gate.held",
     "publication.gate.legacy",
+    "publication.gate.rebound",
     "publication.gate.released",
 )
-_MAX_PUBLICATION_EVIDENCE_EVENTS: Final = _MAX_RUN_CORPUS * 3
+_MAX_PUBLICATION_EVIDENCE_EVENTS: Final = _MAX_RUN_CORPUS * 4
 _LEGACY_INDEXES: Final = {
     "runs_status_idx",
     "runs_candidate_idx",
@@ -2159,11 +2160,14 @@ class RunStore:
         with self._connection() as connection:
             connection.execute("BEGIN")
             # Read-only reconciliation verifies every event anchor, binds publication rows to
-            # their ledger evidence, and compares both active-hold cursors.  In particular, a
-            # deleted automatic hold row cannot masquerade as a manual publication.
+            # their ledger evidence, and compares this run's active-hold cursors.  In
+            # particular, a deleted automatic hold row cannot masquerade as a manual
+            # publication, while another crashed run's drifted hold cannot block this run's
+            # own validated authority.
             _verify_publication_state(
                 connection,
                 require_current_rollout_cursors=True,
+                currency_run_id=normalized_run_id,
             )
             row = connection.execute(
                 """
@@ -3297,7 +3301,14 @@ class RunStore:
         connection: sqlite3.Connection,
         request: _PublicationReservationRequest,
     ) -> _PublicationReservationResult:
-        _reconcile_publication_state(connection, repair_missing=True)
+        # Rows and ledger evidence must agree exactly, but a durable hold whose anchored
+        # cursors drifted while its run awaited crash recovery must stay recoverable here:
+        # the request-cursor branch below re-verifies currency and re-anchors the hold.
+        _reconcile_publication_state(
+            connection,
+            repair_missing=True,
+            require_current_rollout_cursors=False,
+        )
         other_hold = connection.execute(
             """
             SELECT run_id FROM publication_gate_holds
@@ -3465,34 +3476,67 @@ class RunStore:
                 hold_created = True
             else:
                 hold = _publication_gate_hold_from_row(hold_row)
+                if hold.deployment_fingerprint != request.evaluation_deployment_fingerprint:
+                    raise StateError("Publication run already holds different rollout evidence")
+                if hold.outcome_corpus_cursor is None:
+                    raise StateError(
+                        "Publication gate hold predates schema-v6 upstream-outcome authority; "
+                        "automatic recovery is forbidden"
+                    )
                 if (
-                    hold.deployment_fingerprint != request.evaluation_deployment_fingerprint
-                    or hold.corpus_cursor != request.evaluation_corpus_cursor
+                    hold.corpus_cursor != request.evaluation_corpus_cursor
                     or hold.outcome_corpus_cursor != request.outcome_corpus_cursor
                 ):
-                    raise StateError("Publication run already holds different rollout evidence")
+                    # The corpus drifted while this run's crashed publication awaited recovery
+                    # (for example lifecycle outcomes observed for other runs). The request
+                    # cursors were verified against the live corpus above in this same
+                    # transaction, so re-anchor the hold to the current rollout authority
+                    # instead of wedging recovery behind bit-identical history.
+                    rebound = connection.execute(
+                        """
+                        UPDATE publication_gate_holds
+                        SET corpus_cursor = ?, outcome_corpus_cursor = ?, held_at = ?
+                        WHERE run_id = ? AND deployment_fingerprint IS ?
+                          AND corpus_cursor = ? AND outcome_corpus_cursor IS ? AND held_at = ?
+                        """,
+                        (
+                            request.evaluation_corpus_cursor,
+                            request.outcome_corpus_cursor,
+                            request.reserved_at.isoformat(),
+                            request.run_id,
+                            hold_row["deployment_fingerprint"],
+                            hold_row["corpus_cursor"],
+                            hold_row["outcome_corpus_cursor"],
+                            hold_row["held_at"],
+                        ),
+                    )
+                    if rebound.rowcount != 1:
+                        raise StateError(
+                            "Publication gate hold changed while it was being re-anchored"
+                        )
+                    self._append_event(
+                        connection,
+                        request.run_id,
+                        "publication.gate.rebound",
+                        {
+                            "deployment_fingerprint": request.evaluation_deployment_fingerprint,
+                            "corpus_cursor": request.evaluation_corpus_cursor,
+                            "outcome_corpus_cursor": request.outcome_corpus_cursor,
+                            "held_at": request.reserved_at.isoformat(),
+                        },
+                    )
         elif hold_row is not None:
             hold = _publication_gate_hold_from_row(hold_row)
-            if _evaluation_corpus_cursor_from_connection(connection) != hold.corpus_cursor:
-                raise StateError("Evaluation corpus differs from the active publication gate hold")
             if hold.deployment_fingerprint is None or hold.outcome_corpus_cursor is None:
                 raise StateError(
                     "Publication gate hold predates schema-v6 upstream-outcome authority; "
                     "automatic recovery is forbidden"
                 )
-            if request.publishing_login is None or request.publishing_api_origin is None:
-                raise StateError("Automatic publication recovery lacks its publishing identity")
-            current_outcome_cursor = _upstream_outcome_corpus_cursor_from_connection(
-                connection,
-                hold.deployment_fingerprint,
-                request.publishing_login,
-                request.publishing_api_origin,
-                request.run_id,
-            )
-            if current_outcome_cursor != hold.outcome_corpus_cursor:
-                raise StateError(
-                    "Upstream-outcome corpus differs from the active publication gate hold"
-                )
+            # Re-entry without proffered rollout cursors reconciles already-durable state
+            # (for example adopting a pull request that provably exists). Corpus drift since
+            # the hold was anchored must not wedge that bookkeeping; every constructive
+            # remote mutation still revalidates its own hold currency immediately before
+            # acting.
 
         return _PublicationReservationResult(
             reservation=PublicationReservation(
@@ -6116,6 +6160,51 @@ def _publication_evidence_from_connection(
             )
             continue
 
+        if event_type == "publication.gate.rebound":
+            if set(details) != {
+                "deployment_fingerprint",
+                "corpus_cursor",
+                "outcome_corpus_cursor",
+                "held_at",
+            }:
+                raise StateError(f"Run {run_id} publication gate rebind evidence is incomplete")
+            existing_hold = holds.get(run_id)
+            if existing_hold is None:
+                raise StateError(f"Run {run_id} publication gate rebind lacks hold evidence")
+            if run_id in releases:
+                raise StateError(f"Run {run_id} publication gate rebind follows its release")
+            if existing_hold.outcome_corpus_cursor is None:
+                raise StateError(f"Run {run_id} publication gate rebind targets a pre-v6 hold")
+            rebind_fingerprint = _stored_event_hash(
+                details["deployment_fingerprint"],
+                field=f"run {run_id} publication gate rebind deployment fingerprint",
+            )
+            if existing_hold.deployment_fingerprint != rebind_fingerprint:
+                raise StateError(
+                    f"Run {run_id} publication gate rebind changes its deployment identity"
+                )
+            _stored_datetime(
+                details["held_at"],
+                field=f"run {run_id} publication gate rebind time",
+            )
+            # A rebind re-anchors an unreleased hold to rollout cursors that were verified
+            # current in the same transaction; the latest rebind is the effective hold
+            # evidence that durable rows and the eventual release must match exactly.
+            holds[run_id] = _PublicationGateEvidence(
+                run_id=run_id,
+                deployment_fingerprint=rebind_fingerprint,
+                corpus_cursor=_stored_event_hash(
+                    details["corpus_cursor"],
+                    field=f"run {run_id} publication gate rebind corpus cursor",
+                ),
+                outcome_corpus_cursor=_stored_event_hash(
+                    details["outcome_corpus_cursor"],
+                    field=f"run {run_id} publication gate rebind outcome cursor",
+                ),
+                held_at=details["held_at"],
+            )
+            continue
+
         expected_keys = {"outcome", "corpus_cursor", "held_at"}
         if "deployment_fingerprint" in details:
             expected_keys.add("deployment_fingerprint")
@@ -6311,12 +6400,16 @@ def _reconcile_publication_state(
     *,
     repair_missing: bool,
     require_current_rollout_cursors: bool = True,
+    currency_run_id: str | None = None,
 ) -> None:
     """Cross-check publication tables against their verified per-run ledger evidence.
 
     Recovery-capable schema validation and exact compensation may waive current rollout-cursor
     equality without granting constructive authority. Ledger anchors, durable rows, hold identity,
     and every recorded modern deployment scope remain mandatory.
+
+    ``currency_run_id`` scopes the current-cursor requirement to that run's active hold, so one
+    crashed run's drifted hold cannot poison an unrelated caller's own validated authority.
     """
 
     _verify_event_anchors(connection)
@@ -6390,25 +6483,33 @@ def _reconcile_publication_state(
     for hold in active_holds:
         _validated_active_outcome_scope(connection, hold)
     if active_holds and require_current_rollout_cursors:
-        current_cursor = _evaluation_corpus_cursor_from_connection(connection)
-        for hold in active_holds:
-            if hold.corpus_cursor != current_cursor:
-                raise StateError(
-                    f"Publication gate hold for run {hold.run_id} disagrees with "
-                    "the evaluation corpus"
-                )
-            _verify_active_outcome_hold(connection, hold)
+        currency_holds = (
+            active_holds
+            if currency_run_id is None
+            else [hold for hold in active_holds if hold.run_id == currency_run_id]
+        )
+        if currency_holds:
+            current_cursor = _evaluation_corpus_cursor_from_connection(connection)
+            for hold in currency_holds:
+                if hold.corpus_cursor != current_cursor:
+                    raise StateError(
+                        f"Publication gate hold for run {hold.run_id} disagrees with "
+                        "the evaluation corpus"
+                    )
+                _verify_active_outcome_hold(connection, hold)
 
 
 def _verify_publication_state(
     connection: sqlite3.Connection,
     *,
     require_current_rollout_cursors: bool,
+    currency_run_id: str | None = None,
 ) -> None:
     _reconcile_publication_state(
         connection,
         repair_missing=False,
         require_current_rollout_cursors=require_current_rollout_cursors,
+        currency_run_id=currency_run_id,
     )
 
 
@@ -6553,51 +6654,18 @@ def _release_publication_gate_hold(
     outcome: str,
     required: bool,
 ) -> bool:
-    """Release a successful publication hold only while both rollout cursors remain current."""
+    """Release a publication gate hold with exact identity and outcome-scope validation.
 
-    return _release_publication_gate_hold_with_policy(
-        store,
-        connection,
-        run_id,
-        outcome=outcome,
-        required=required,
-        require_current_rollout_cursors=True,
-    )
+    The release copies the hold's anchored cursors into its ledger evidence verbatim. Corpus
+    drift observed after the held mutations completed must not wedge a finished publication:
+    constructive authority was already revalidated immediately before every remote mutation,
+    and releasing a hold grants no new authority.
+    """
 
-
-def _release_publication_gate_hold_for_compensation(
-    store: RunStore,
-    connection: sqlite3.Connection,
-    run_id: str,
-    *,
-    outcome: str,
-    required: bool,
-) -> bool:
-    """Release an exact compensated hold without treating rollout drift as new authority."""
-
-    return _release_publication_gate_hold_with_policy(
-        store,
-        connection,
-        run_id,
-        outcome=outcome,
-        required=required,
-        require_current_rollout_cursors=False,
-    )
-
-
-def _release_publication_gate_hold_with_policy(
-    store: RunStore,
-    connection: sqlite3.Connection,
-    run_id: str,
-    *,
-    outcome: str,
-    required: bool,
-    require_current_rollout_cursors: bool,
-) -> bool:
     _reconcile_publication_state(
         connection,
         repair_missing=True,
-        require_current_rollout_cursors=require_current_rollout_cursors,
+        require_current_rollout_cursors=False,
     )
     row = connection.execute(
         """
@@ -6614,13 +6682,7 @@ def _release_publication_gate_hold_with_policy(
     hold = _publication_gate_hold_from_row(row)
     if hold.run_id != run_id:
         raise StateError("Publication gate hold identity changed during release")
-    if require_current_rollout_cursors:
-        current_cursor = _evaluation_corpus_cursor_from_connection(connection)
-        if current_cursor != hold.corpus_cursor:
-            raise StateError("Evaluation corpus differs from the active publication gate hold")
-        _verify_active_outcome_hold(connection, hold)
-    else:
-        _validated_active_outcome_scope(connection, hold)
+    _validated_active_outcome_scope(connection, hold)
     release_details = {
         "outcome": outcome,
         "corpus_cursor": hold.corpus_cursor,
@@ -6655,8 +6717,31 @@ def _release_publication_gate_hold_with_policy(
     return True
 
 
+def _release_publication_gate_hold_for_compensation(
+    store: RunStore,
+    connection: sqlite3.Connection,
+    run_id: str,
+    *,
+    outcome: str,
+    required: bool,
+) -> bool:
+    """Release an exact compensated hold without treating rollout drift as new authority."""
+
+    return _release_publication_gate_hold(
+        store,
+        connection,
+        run_id,
+        outcome=outcome,
+        required=required,
+    )
+
+
 def _assert_no_publication_gate_hold(connection: sqlite3.Connection) -> None:
-    _reconcile_publication_state(connection, repair_missing=True)
+    _reconcile_publication_state(
+        connection,
+        repair_missing=True,
+        require_current_rollout_cursors=False,
+    )
     row = connection.execute(
         "SELECT run_id FROM publication_gate_holds ORDER BY run_id LIMIT 1"
     ).fetchone()

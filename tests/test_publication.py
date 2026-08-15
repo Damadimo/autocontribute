@@ -2867,43 +2867,195 @@ def test_auto_mode_publishes_only_after_every_measured_rollout_gate(
 
 
 @pytest.mark.parametrize("changed_cursor", ["evaluation", "outcome"])
-def test_automatic_recovery_rejects_rollout_hold_cursor_drift_before_github_mutation(
+def test_automatic_recovery_rebinds_hold_after_rollout_cursor_drift(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     changed_cursor: str,
 ) -> None:
+    """Routine corpus drift during a crash window re-anchors the hold and recovery completes.
+
+    Lifecycle snapshots for other runs keep moving while a crashed publication awaits recovery,
+    so the durable hold's anchored cursors routinely lag the live corpus.  Recovery re-proves
+    current rollout authority on fresh evidence and rebinds the hold instead of wedging forever
+    on bit-identical cursor equality.
+    """
+
     _, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
         tmp_path,
         monkeypatch,
     )
     hold = store.publication_gate_hold(run_id)
     assert hold is not None
-    selected_cursor = (
-        hold.corpus_cursor if changed_cursor == "evaluation" else hold.outcome_corpus_cursor
-    )
-    assert selected_cursor is not None
-    different_cursor = ("0" if selected_cursor[0] != "0" else "1") + selected_cursor[1:]
-    _install_fixture_rollout_gate(
-        monkeypatch,
-        evaluation_cursor=different_cursor if changed_cursor == "evaluation" else None,
-        outcome_cursor=different_cursor if changed_cursor == "outcome" else None,
-    )
+    holder = store.get(run_id)
+    assert holder.deployment_fingerprint is not None
+    drift_subject = store.create_run(deployment_fingerprint=holder.deployment_fingerprint)
+    if changed_cursor == "evaluation":
+        with store._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            store._append_event(
+                connection,
+                drift_subject.run_id,
+                "evaluation.recorded",
+                {"evaluation_hash": "a" * 64},
+            )
+    else:
+        store.save(
+            drift_subject,
+            event="publication.fixture_outcome_drift",
+            details={"version": "later"},
+        )
 
-    with pytest.raises(
-        StateError,
-        match="semantic rollout authority differs from the durable publication hold",
-    ):
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        before_mutation()
+        del workspace, fork, branch
+        github.branch_sha = commit_sha
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert published.pull_request_url == "https://github.com/example/project/pull/7"
+    assert store.publication_gate_hold(run_id) is None
+    events = store.events(run_id)
+    rebinds = [event for event in events if event["event_type"] == "publication.gate.rebound"]
+    assert len(rebinds) == 1
+    rebound_details = json.loads(rebinds[0]["details"])
+    assert rebound_details["deployment_fingerprint"] == hold.deployment_fingerprint
+    if changed_cursor == "evaluation":
+        assert rebound_details["corpus_cursor"] != hold.corpus_cursor
+    else:
+        assert rebound_details["outcome_corpus_cursor"] != hold.outcome_corpus_cursor
+    releases = [event for event in events if event["event_type"] == "publication.gate.released"]
+    assert len(releases) == 1
+    release_details = json.loads(releases[0]["details"])
+    assert release_details["outcome"] == "pr_open"
+    assert release_details["corpus_cursor"] == rebound_details["corpus_cursor"]
+    assert release_details["outcome_corpus_cursor"] == rebound_details["outcome_corpus_cursor"]
+    # The rebound ledger and released hold remain verifiable by a fresh process.
+    RunStore(store.root)
+
+
+def test_automatic_recovery_stays_anchored_when_rollout_gates_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing rollout gate blocks recovery before the hold is re-anchored or GitHub touched."""
+
+    _, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
+        tmp_path,
+        monkeypatch,
+    )
+    hold = store.publication_gate_hold(run_id)
+    assert hold is not None
+    holder = store.get(run_id)
+    assert holder.deployment_fingerprint is not None
+    drift_subject = store.create_run(deployment_fingerprint=holder.deployment_fingerprint)
+    store.save(
+        drift_subject,
+        event="publication.fixture_outcome_drift",
+        details={"version": "later"},
+    )
+    _install_fixture_rollout_gate(monkeypatch, manual_passed=False)
+
+    with pytest.raises(AutomaticRolloutBlocked, match="fixed manual upstream-outcome cohort"):
         publisher.publish(run_id)
 
     assert store.get(run_id).status == RunStatus.SUBMITTING
     assert store.publication_gate_hold(run_id) == hold
     assert not github.mutated
-    assert not {
-        "ensure_fork",
-        "create_pull_request",
-        "close_pull_request",
-        "mark_pull_request_ready_for_review",
-    }.intersection(github.calls)
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert "publication.gate.rebound" not in event_types
+
+
+def test_reconcile_submitting_adopts_existing_pull_request_despite_cursor_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reconciliation adopts already-durable remote state without asserting cursor currency."""
+
+    config, store, run_id, issue = _ready_run(tmp_path, guarded_auto=True)
+    manifest = store.get(run_id)
+    _remove_human_publication_context(manifest)
+    manifest.status = RunStatus.READY_FOR_APPROVAL
+    store.save(manifest, event="fixture.auto", details={})
+    _install_fixture_rollout_gate(monkeypatch)
+    monkeypatch.setenv(config.publishing.auto_publish_env, "1")
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    original_save = store.save
+    completion_crashed = False
+
+    def save_then_crash(
+        saved_manifest,  # type: ignore[no-untyped-def]
+        *,
+        event: str,
+        details: dict[str, str],
+    ) -> None:
+        nonlocal completion_crashed
+        if event == "pull_request.ready_for_review.completed" and not completion_crashed:
+            completion_crashed = True
+            raise RuntimeError("simulated crash before ready completion persistence")
+        original_save(saved_manifest, event=event, details=details)
+
+    monkeypatch.setattr(store, "save", save_then_crash)
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+
+    with pytest.raises(RuntimeError, match="ready completion persistence"):
+        publisher.publish(run_id)
+
+    monkeypatch.setattr(store, "save", original_save)
+    stranded = store.get(run_id)
+    assert stranded.status == RunStatus.SUBMITTING
+    assert stranded.pull_request_url == "https://github.com/example/project/pull/7"
+    assert stranded.deployment_fingerprint is not None
+    hold = store.publication_gate_hold(run_id)
+    assert hold is not None
+    drift_subject = store.create_run(deployment_fingerprint=stranded.deployment_fingerprint)
+    with store._connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        store._append_event(
+            connection,
+            drift_subject.run_id,
+            "evaluation.recorded",
+            {"evaluation_hash": "a" * 64},
+        )
+    store.save(
+        drift_subject,
+        event="publication.fixture_outcome_drift",
+        details={"version": "later"},
+    )
+
+    reconciled = publisher.reconcile_submitting(run_id)
+
+    assert reconciled.status == RunStatus.PR_OPEN
+    assert reconciled.pull_request_ready_completed
+    assert store.publication_gate_hold(run_id) is None
+    events = store.events(run_id)
+    event_types = [event["event_type"] for event in events]
+    assert "publication.gate.rebound" not in event_types
+    releases = [event for event in events if event["event_type"] == "publication.gate.released"]
+    assert len(releases) == 1
+    release_details = json.loads(releases[0]["details"])
+    assert release_details["corpus_cursor"] == hold.corpus_cursor
+    assert release_details["outcome_corpus_cursor"] == hold.outcome_corpus_cursor
+    RunStore(store.root)
 
 
 @pytest.mark.parametrize("changed_cursor", ["evaluation", "outcome"])
