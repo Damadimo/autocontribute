@@ -43,8 +43,12 @@ models:
 
 sandbox:
   backend: docker
+  # `network: none` is not configurable: nothing can be installed at validation time, so this one
+  # global image must already contain the complete offline toolchain (pytest, project dependencies)
+  # for every configured repository. A bare interpreter image cannot run the commands below and
+  # fails doctor. Build, digest-pin, and pre-pull your own image first: see docs/sandbox-image.md.
   image: >-
-    python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a
+    example.invalid/sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000
   network: none
   command_timeout_seconds: 900
   memory: 4g
@@ -52,7 +56,8 @@ sandbox:
 
 validation:
   # These commands are operator-owned and mandatory. Replace them with each repository's canonical
-  # checks and use a digest-pinned image that already contains the required toolchain/dependencies.
+  # checks; the sandbox image above must already contain everything they need to run offline
+  # (docs/sandbox-image.md covers building and pinning such an image).
   required_commands:
     facebookresearch/hydra:
       - python -m pytest
@@ -89,7 +94,7 @@ publishing:
   mode: review_required # guarded `auto` is limited to the one configured repository
   approval_expires_hours: 24
   draft: true
-  # Daily/cooldown capacity is durably reserved in schema-v6 SQLite before GitHub mutation.
+  # Daily/cooldown capacity is durably reserved in the SQLite store before GitHub mutation.
   # Never delete or roll back state to reclaim a failed or ambiguous attempt's reservation.
   max_new_pull_requests_per_day: 1
   max_open_pull_requests: 2

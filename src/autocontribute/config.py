@@ -964,8 +964,11 @@ models:
 
 sandbox:
   backend: docker
-  image: >-                         # override with a digest-pinned ecosystem image as needed
-    python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a
+  # Validation always runs offline, so this one global image must already contain the complete
+  # toolchain (pytest, project dependencies) for every configured repository; a bare interpreter
+  # image fails doctor. Build, digest-pin, and pre-pull your own: see docs/sandbox-image.md.
+  image: >-
+    example.invalid/sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000
   network: none
   command_timeout_seconds: 900
   memory: 4g
