@@ -1711,6 +1711,11 @@ def test_worker_is_twice_daily_persistent_and_uses_rootless_docker() -> None:
     assert "--older-than-days 7" in helper
     assert "--limit 25" in helper
     assert "--execute" in helper
+    # Workspace cleanup is reported hygiene: a gc failure must be logged and must not stop the
+    # scheduled run. The hard disk gate is the separate quota headroom check.
+    assert "--execute || gc_status=$?" in helper
+    assert '[[ "$gc_status" -ne 0 ]]' in helper
+    assert "workspace cleanup reported a problem" in helper
     gc_call = helper.index("state gc-workspaces")
     run_call = helper.index('run --scheduled --config "$config"')
     credential_read = helper.index('credential_value="$(<"$credential_path")"')

@@ -32,6 +32,15 @@ _CANONICAL_COMMIT_LENGTHS: Final = frozenset({40, 64})
 _QUARANTINE_PREFIX: Final = ".autocontribute-gc-"
 _QUARANTINED_WORKSPACE: Final = "workspace"
 _QUARANTINE_ATTEMPTS: Final = 16
+_QUARANTINE_TOKEN_LENGTH: Final = 32
+# Retained and corrupt entries do not consume the actionable deletion budget, so scanning past
+# them must have its own bound; five actionable budgets of inspection per invocation keeps one
+# scheduled cleanup cheap while still reaching deletable workspaces behind a persistent backlog.
+_RETAINED_SCAN_MULTIPLIER: Final = 5
+# A quarantine directory normally lives for seconds. One that survives this long belongs to an
+# earlier invocation whose recursive deletion failed after isolation, never to a live collection.
+_STALE_QUARANTINE_AGE: Final = timedelta(hours=6)
+_MAX_QUARANTINE_SWEEP: Final = 50
 _CANONICAL_PR_EVENTS: Final = frozenset(
     {
         "pull_request.created.response",
@@ -72,6 +81,8 @@ class WorkspaceGCReport(_StrictModel):
     would_delete: int = Field(ge=0)
     deleted: int = Field(ge=0)
     retained: int = Field(ge=0)
+    stale_quarantines: int = Field(ge=0)
+    stale_quarantines_deleted: int = Field(ge=0)
     errors: int = Field(ge=0)
     items: list[WorkspaceGCItem]
 
@@ -86,14 +97,21 @@ def collect_terminal_workspaces(
 ) -> WorkspaceGCReport:
     """Report or remove old terminal workspaces without deleting durable run evidence.
 
-    The default is a dry run. ``limit`` bounds workspace inspection, not merely successful
-    deletion, so an unsafe old entry cannot cause an unbounded scan in one invocation.
+    The default is a dry run. ``limit`` bounds actionable deletions per invocation. Entries that
+    are retained — for corruption or for expected protection — are reported without consuming
+    that budget, so a persistent unsafe backlog cannot starve younger deletable workspaces; the
+    total scan is separately bounded at ``limit * 5`` inspections. One failed deletion is
+    reported as a retained error and never aborts the remaining candidates. Quarantine
+    directories preserved by an earlier failed deletion are reclaimed once they are old enough
+    to prove no live collection owns them.
     """
 
     if not isinstance(older_than, timedelta) or older_than <= timedelta(0):
         raise ValueError("workspace retention age must be a positive duration")
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _MAX_LIMIT:
         raise ValueError("workspace cleanup limit must be between 1 and 1000")
+    if execute and not shutil.rmtree.avoids_symlink_attacks:
+        raise StateError("This Python runtime lacks symlink-safe recursive deletion")
     observed_at = _aware_utc(now or datetime.now(UTC), field="workspace cleanup time")
     try:
         cutoff = observed_at - older_than
@@ -105,6 +123,12 @@ def collect_terminal_workspaces(
         description="workspace root",
     )
     try:
+        stale_quarantines, stale_quarantines_deleted, quarantine_errors = _sweep_stale_quarantines(
+            store.workspaces_dir,
+            workspace_root_descriptor,
+            execute=execute,
+            observed_at=observed_at,
+        )
         # ``oldest_runs`` reads and validates the complete supported corpus before applying this
         # maximum. It raises above 10,000 runs instead of silently truncating, so old runs without
         # workspaces cannot starve a newer eligible workspace from this candidate set.
@@ -142,9 +166,12 @@ def collect_terminal_workspaces(
                 item[0].run_id,
             )
         )
-        selected_candidates = candidates[:limit]
+        scan_bound = limit * _RETAINED_SCAN_MULTIPLIER
         items: list[WorkspaceGCItem] = []
-        for manifest, metadata, component_error in selected_candidates:
+        actionable = 0
+        for manifest, metadata, component_error in candidates:
+            if actionable >= limit or len(items) >= scan_bound:
+                break
             if component_error is not None:
                 items.append(
                     _retained_item(
@@ -198,6 +225,7 @@ def collect_terminal_workspaces(
                         bytes=size,
                     )
                 )
+                actionable += 1
                 continue
 
             # Re-read both state and evidence after the potentially expensive tree walk. Terminal
@@ -240,8 +268,6 @@ def collect_terminal_workspaces(
                     )
                 )
                 continue
-            if not shutil.rmtree.avoids_symlink_attacks:
-                raise StateError("This Python runtime lacks symlink-safe recursive deletion")
             try:
                 entries, size = _delete_via_private_quarantine(
                     store.workspaces_dir,
@@ -249,10 +275,20 @@ def collect_terminal_workspaces(
                     fresh.run_id,
                     expected=metadata,
                 )
-            except OSError as exc:
-                raise StateError(
-                    f"Could not safely delete workspace for run {fresh.run_id}: {exc}"
-                ) from exc
+            except (OSError, StateError) as exc:
+                # The quarantine helper is fail-closed on its own: the workspace was either
+                # restored in place or preserved inside its quarantine for the stale-quarantine
+                # sweep. One undeletable workspace must not abort the remaining candidates.
+                items.append(
+                    _retained_item(
+                        fresh,
+                        f"workspace deletion failed safely: {exc}",
+                        error=True,
+                        entries=entries,
+                        size=size,
+                    )
+                )
+                continue
             items.append(
                 WorkspaceGCItem(
                     run_id=fresh.run_id,
@@ -264,6 +300,7 @@ def collect_terminal_workspaces(
                     bytes=size,
                 )
             )
+            actionable += 1
     finally:
         os.close(workspace_root_descriptor)
 
@@ -272,14 +309,16 @@ def collect_terminal_workspaces(
         cutoff=cutoff,
         limit=limit,
         terminal_candidates=len(candidates),
-        selected=len(selected_candidates),
-        truncated=max(0, len(candidates) - len(selected_candidates)),
+        selected=len(items),
+        truncated=max(0, len(candidates) - len(items)),
         protected_nonterminal=protected_nonterminal,
         younger_terminal=younger_terminal,
         would_delete=sum(item.action == "would_delete" for item in items),
         deleted=sum(item.action == "deleted" for item in items),
         retained=sum(item.action == "retained" for item in items),
-        errors=sum(item.error for item in items),
+        stale_quarantines=stale_quarantines,
+        stale_quarantines_deleted=stale_quarantines_deleted,
+        errors=sum(item.error for item in items) + quarantine_errors,
         items=items,
     )
 
@@ -872,6 +911,71 @@ def _remove_empty_quarantine(
         os.fsync(workspace_root_descriptor)
     except OSError as exc:
         raise StateError("Could not remove the empty private workspace quarantine") from exc
+
+
+def _sweep_stale_quarantines(
+    workspace_root: Path,
+    workspace_root_descriptor: int,
+    *,
+    execute: bool,
+    observed_at: datetime,
+) -> tuple[int, int, int]:
+    """Reclaim quarantine directories preserved by an earlier failed deletion.
+
+    Only entries with the exact private quarantine shape — canonical name, real directory, mode
+    ``0o700``, same filesystem, not a mount point — and older than the staleness age are touched,
+    so a concurrent collection's live quarantine is never raced. Returns the counts of stale
+    quarantines found, deleted, and sweep errors.
+    """
+
+    root_metadata = os.fstat(workspace_root_descriptor)
+    threshold = (observed_at - _STALE_QUARANTINE_AGE).timestamp()
+    stale = 0
+    deleted = 0
+    errors = 0
+    for name in sorted(os.listdir(workspace_root_descriptor)):
+        if stale >= _MAX_QUARANTINE_SWEEP:
+            break
+        if not _quarantine_entry_name(name):
+            continue
+        try:
+            metadata = _entry_metadata(workspace_root_descriptor, name)
+        except StateError:
+            errors += 1
+            continue
+        if metadata is None:
+            continue
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_dev != root_metadata.st_dev
+            or os.path.ismount(workspace_root / name)
+        ):
+            errors += 1
+            continue
+        if metadata.st_mtime > threshold:
+            continue
+        stale += 1
+        if not execute:
+            continue
+        try:
+            shutil.rmtree(name, dir_fd=workspace_root_descriptor)
+            os.fsync(workspace_root_descriptor)
+        except OSError:
+            errors += 1
+            continue
+        deleted += 1
+    return stale, deleted, errors
+
+
+def _quarantine_entry_name(name: str) -> bool:
+    token = name.removeprefix(_QUARANTINE_PREFIX)
+    return (
+        name != token
+        and len(token) == _QUARANTINE_TOKEN_LENGTH
+        and all(character in "0123456789abcdef" for character in token)
+    )
 
 
 def _open_safe_directory(path: Path, *, description: str) -> int:
