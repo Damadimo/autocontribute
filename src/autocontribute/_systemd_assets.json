@@ -3,9 +3,16 @@
   "schema_version": 1,
   "assets": [
     {
+      "source_path": "deploy/systemd/autocontribute-alert@.service",
+      "installed_path": "/etc/systemd/system/autocontribute-alert@.service",
+      "sha256": "0356678b726a55006af644fb9007e73d142e6183d9fe97d3df7fb978fe74f137",
+      "mode": "0644",
+      "required": true
+    },
+    {
       "source_path": "deploy/systemd/autocontribute-backup.service",
       "installed_path": "/etc/systemd/system/autocontribute-backup.service",
-      "sha256": "26419b02f3e4921ddb39f9bd9f0f2c745e6878b34e4be33985726c822153d80b",
+      "sha256": "f2598c04f343e78f2d809c9741539c98b14ea6d21d6e291f8da1aa9af1c71b03",
       "mode": "0644",
       "required": true
     },
@@ -19,7 +26,7 @@
     {
       "source_path": "deploy/systemd/autocontribute-doctor.service",
       "installed_path": "/etc/systemd/system/autocontribute-doctor.service",
-      "sha256": "9bf9e64af2d85821437afedc58d784c56c89edb345fa1f58ee7aedfc2938944c",
+      "sha256": "f63ffd16e163b7e76641cf6444873a9dc299479541915e322963612023791bda",
       "mode": "0644",
       "required": true
     },
@@ -33,7 +40,7 @@
     {
       "source_path": "deploy/systemd/autocontribute-health.service",
       "installed_path": "/etc/systemd/system/autocontribute-health.service",
-      "sha256": "2fea167f832127ecf910031f245b99043437b57160dde606c3d96b963b0ee07d",
+      "sha256": "56c5a2f255b82839443ee62636a1a02a827accec065e6de21a212d829f1c30b4",
       "mode": "0644",
       "required": true
     },
@@ -47,7 +54,7 @@
     {
       "source_path": "deploy/systemd/autocontribute-replication.service",
       "installed_path": "/etc/systemd/system/autocontribute-replication.service",
-      "sha256": "b34ed3a71705a1727eac6943506763581caa382e402b30c7eeaee54b9682f433",
+      "sha256": "671b269e74a0e2005dc187d90aa8ef197b6df209d7e928e107cd9c5f698edcdf",
       "mode": "0644",
       "required": true
     },
@@ -61,7 +68,7 @@
     {
       "source_path": "deploy/systemd/autocontribute-rootless-docker.service",
       "installed_path": "/etc/systemd/system/autocontribute-rootless-docker.service",
-      "sha256": "e5af60afa337f177674f63dfccda4e9f206918ca04db0e39299e48282ffcc386",
+      "sha256": "40007c17b4cfbd37136e89ab98590d1018c9ac53a5c6e302801fb18ab325ac76",
       "mode": "0644",
       "required": true
     },
@@ -75,7 +82,7 @@
     {
       "source_path": "deploy/systemd/autocontribute-worker.service",
       "installed_path": "/etc/systemd/system/autocontribute-worker.service",
-      "sha256": "c2ba3a5f61b7333051edd4e81a18951bc4fa1afe34ddbd4c6b47f08bb411c55e",
+      "sha256": "4c1049f7ba19c23bc0454848dc4b54c136f59eae38b91bd226fb4cf7ca5e0395",
       "mode": "0644",
       "required": true
     },
@@ -96,8 +103,15 @@
     {
       "source_path": "deploy/systemd/autocontribute.tmpfiles.conf",
       "installed_path": "/etc/tmpfiles.d/autocontribute.conf",
-      "sha256": "029bd22e8996434cfdd2409269e35da4ce8bd0a95c3571e503856b3414d4ef4a",
+      "sha256": "e58473cf264b4dd24b8cdf5993daaddb11889c30ad607bbaf3948641a35084df",
       "mode": "0644",
+      "required": true
+    },
+    {
+      "source_path": "deploy/systemd/libexec/autocontribute-alert",
+      "installed_path": "/usr/local/libexec/autocontribute-alert",
+      "sha256": "4d58287f62d93eed87f7aee3e81a538a4d1bd779299111c1a3a6e77034b257d4",
+      "mode": "0755",
       "required": true
     },
     {
@@ -117,7 +131,7 @@
     {
       "source_path": "deploy/systemd/libexec/autocontribute-healthcheck",
       "installed_path": "/usr/local/libexec/autocontribute-healthcheck",
-      "sha256": "b35e7f359d8bd9016a1eb50ba4c6d1c7b771cc12af30426ef74446a37bf4f784",
+      "sha256": "05451190ffc87dfc15be39081310a76aa0027758cc00401bdad1e64dfab877ed",
       "mode": "0755",
       "required": true
     },
@@ -166,7 +180,7 @@
     {
       "source_path": "deploy/systemd/libexec/autocontribute-worker",
       "installed_path": "/usr/local/libexec/autocontribute-worker",
-      "sha256": "380f941fa973c5901c6e4e03b846b22838a0991e6549524735af7602cb648706",
+      "sha256": "272bb5549a47ba09c8f4ae90c877b038b74defec226b4953cf0f888e50857e52",
       "mode": "0755",
       "required": true
     },

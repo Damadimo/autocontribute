@@ -289,6 +289,7 @@ cleanup() {
 
   if [[ "$assets_install_started" -eq 1 ]]; then
     sudo /bin/rm -f -- \
+      /etc/systemd/system/autocontribute-alert@.service \
       /etc/systemd/system/autocontribute-backup.service \
       /etc/systemd/system/autocontribute-backup.timer \
       /etc/systemd/system/autocontribute-doctor.service \
@@ -302,6 +303,7 @@ cleanup() {
       /etc/systemd/system/autocontribute-worker.timer \
       /etc/systemd/user/autocontribute-rootless-docker-daemon.service \
       /etc/tmpfiles.d/autocontribute.conf \
+      /usr/local/libexec/autocontribute-alert \
       /usr/local/libexec/autocontribute-backup \
       /usr/local/libexec/autocontribute-docker-data-check \
       /usr/local/libexec/autocontribute-healthcheck \
@@ -790,8 +792,8 @@ mapfile -d '' -t system_units < <(
 mapfile -d '' -t helpers < <(
   find "${release}/deploy/systemd/libexec" -maxdepth 1 -type f -print0 | sort -z
 )
-[[ "${#system_units[@]}" -eq 11 ]] || fail "the release must contain eleven system units"
-[[ "${#helpers[@]}" -eq 11 ]] || fail "the release must contain eleven helpers"
+[[ "${#system_units[@]}" -eq 12 ]] || fail "the release must contain twelve system units"
+[[ "${#helpers[@]}" -eq 12 ]] || fail "the release must contain twelve helpers"
 
 assets_install_started=1
 for shared_directory in /etc/systemd/system /etc/systemd/user /etc/tmpfiles.d; do

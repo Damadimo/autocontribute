@@ -82,14 +82,14 @@ def installed_root(tmp_path: Path) -> Path:
 def test_manifest_and_project_source_have_complete_verified_inventory() -> None:
     manifest = _manifest()
 
-    assert len(manifest.assets) == 26
-    assert sum(asset.required for asset in manifest.assets) == 25
+    assert len(manifest.assets) == 28
+    assert sum(asset.required for asset in manifest.assets) == 27
 
     result = verify_source_systemd_assets(PROJECT_ROOT, manifest_path=MANIFEST_PATH)
 
     assert result.scope == "source"
-    assert result.checked_assets == 26
-    assert result.required_assets == 25
+    assert result.checked_assets == 28
+    assert result.required_assets == 27
     assert result.source_only_assets == 1
 
 
@@ -97,8 +97,8 @@ def test_installed_release_verifies_with_explicit_identity(installed_root: Path)
     result = _verify_installed(installed_root)
 
     assert result.scope == "installed"
-    assert result.checked_assets == 25
-    assert result.required_assets == 25
+    assert result.checked_assets == 27
+    assert result.required_assets == 27
     assert result.source_only_assets == 1
 
 
@@ -515,7 +515,7 @@ def test_installed_release_allows_filesystem_safe_unattested_service_dropin(
 
     result = _verify_installed(installed_root)
 
-    assert result.checked_assets == 25
+    assert result.checked_assets == 27
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -1472,6 +1473,188 @@ def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monk
 
     assert result.exit_code == 0, result.output
     assert calls == ["sync:False:True", "run", "close"]
+
+
+def _install_run_outcome_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+    status: RunStatus,
+) -> None:
+    class FakeGitHub:
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class FakeOrchestrator:
+        def __init__(self, _: object, *, store: RunStore, github: object) -> None:
+            self.store = store
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def run(self, **_: object):  # type: ignore[no-untyped-def]
+            manifest = self.store.create_run()
+            manifest.status = status
+            if status == RunStatus.SKIPPED:
+                manifest.skip_reason = "fixture"
+            self.store.save(manifest, event="test.outcome", details={})
+            return manifest
+
+    monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
+    monkeypatch.setattr(cli, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(
+        cli,
+        "_sync_lifecycle",
+        lambda *_args, **_kwargs: LifecycleSyncResult(observations=()),
+    )
+
+
+def test_scheduled_run_refreshes_contribution_stamp_after_productive_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
+    stamp = tmp_path / "health" / "contribution-prepared"
+    stamp.parent.mkdir()
+    monkeypatch.setenv("AUTOCONTRIBUTE_CONTRIBUTION_STAMP", str(stamp))
+    _install_run_outcome_fixture(monkeypatch, RunStatus.READY_FOR_APPROVAL)
+
+    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert stamp.is_file()
+    assert stamp.stat().st_mode & 0o777 == 0o600
+
+
+def test_scheduled_run_refreshes_an_existing_contribution_stamp_mtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
+    stamp = tmp_path / "contribution-prepared"
+    stamp.touch(mode=0o600)
+    os.utime(stamp, (1_000_000_000, 1_000_000_000))
+    monkeypatch.setenv("AUTOCONTRIBUTE_CONTRIBUTION_STAMP", str(stamp))
+    _install_run_outcome_fixture(monkeypatch, RunStatus.READY_FOR_APPROVAL)
+
+    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert stamp.stat().st_mtime > 1_000_000_000
+
+
+def test_scheduled_run_leaves_contribution_stamp_untouched_when_skipped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
+    stamp = tmp_path / "contribution-prepared"
+    monkeypatch.setenv("AUTOCONTRIBUTE_CONTRIBUTION_STAMP", str(stamp))
+    _install_run_outcome_fixture(monkeypatch, RunStatus.SKIPPED)
+
+    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert not stamp.exists()
+
+
+def test_manual_run_never_refreshes_the_contribution_stamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
+    stamp = tmp_path / "contribution-prepared"
+    monkeypatch.setenv("AUTOCONTRIBUTE_CONTRIBUTION_STAMP", str(stamp))
+    _install_run_outcome_fixture(monkeypatch, RunStatus.READY_FOR_APPROVAL)
+
+    result = runner.invoke(app, ["run", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert not stamp.exists()
+
+
+def test_scheduled_run_pages_when_the_contribution_stamp_cannot_be_refreshed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
+    target = tmp_path / "real-stamp"
+    target.touch(mode=0o600)
+    stamp = tmp_path / "contribution-prepared"
+    stamp.symlink_to(target)
+    monkeypatch.setenv("AUTOCONTRIBUTE_CONTRIBUTION_STAMP", str(stamp))
+    _install_run_outcome_fixture(monkeypatch, RunStatus.READY_FOR_APPROVAL)
+
+    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert "contribution productivity stamp could not be refreshed" in result.output
+
+
+def test_alert_send_forwards_unit_and_credential_path_to_the_sender(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_send(*, unit: str, webhook_file: Path) -> None:
+        captured["unit"] = unit
+        captured["webhook_file"] = webhook_file
+
+    monkeypatch.setattr(cli, "send_failure_alert", fake_send)
+
+    result = runner.invoke(
+        app,
+        [
+            "alert",
+            "send",
+            "--unit",
+            "autocontribute-worker.service",
+            "--webhook-file",
+            str(tmp_path / "alert-webhook"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Alert delivered." in result.output
+    assert captured == {
+        "unit": "autocontribute-worker.service",
+        "webhook_file": tmp_path / "alert-webhook",
+    }
+
+
+def test_alert_send_fails_closed_with_the_safe_error_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_send(**_: object) -> None:
+        raise StateError("The alert webhook could not be reached")
+
+    monkeypatch.setattr(cli, "send_failure_alert", fake_send)
+
+    result = runner.invoke(
+        app,
+        [
+            "alert",
+            "send",
+            "--unit",
+            "autocontribute-worker.service",
+            "--webhook-file",
+            str(tmp_path / "alert-webhook"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "The alert webhook could not be reached" in result.output
 
 
 def test_auto_path_resyncs_lifecycle_immediately_before_publisher(

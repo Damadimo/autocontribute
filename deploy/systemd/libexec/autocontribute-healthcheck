@@ -4,11 +4,13 @@ set -euo pipefail
 readonly health_directory="${AUTOCONTRIBUTE_HEALTH_DIRECTORY:-/var/lib/autocontribute/health}"
 readonly worker_max_age="${AUTOCONTRIBUTE_WORKER_MAX_AGE_SECONDS:-64800}"
 readonly backup_max_age="${AUTOCONTRIBUTE_BACKUP_MAX_AGE_SECONDS:-129600}"
+readonly contribution_max_age="${AUTOCONTRIBUTE_CONTRIBUTION_MAX_AGE_SECONDS:-604800}"
 readonly state_root="/var/lib/autocontribute/state"
 readonly backup_root="/var/backups/autocontribute"
 readonly storage_capacity_check="/usr/local/libexec/autocontribute-storage-capacity-check"
 
-if [[ ! "$worker_max_age" =~ ^[1-9][0-9]*$ || ! "$backup_max_age" =~ ^[1-9][0-9]*$ ]]; then
+if [[ ! "$worker_max_age" =~ ^[1-9][0-9]*$ || ! "$backup_max_age" =~ ^[1-9][0-9]*$ || \
+      ! "$contribution_max_age" =~ ^[1-9][0-9]*$ ]]; then
   printf 'Autocontribute health age limits are invalid\n' >&2
   exit 1
 fi
@@ -45,6 +47,9 @@ check_stamp() {
 
 check_stamp worker "$worker_max_age" worker-success
 check_stamp backup "$backup_max_age" backup-success
+# tmpfiles.d creates this stamp once at install, so the productivity clock starts
+# at deployment; only a durably prepared contribution ever refreshes it.
+check_stamp contribution "$contribution_max_age" contribution-prepared
 
 if ((${#failures[@]})); then
   printf 'Autocontribute health check failed:\n' >&2
@@ -52,4 +57,4 @@ if ((${#failures[@]})); then
   exit 1
 fi
 
-printf 'Autocontribute worker and complete backup stamps are fresh; configured replication evidence passed preflight\n'
+printf 'Autocontribute worker, complete backup, and prepared contribution stamps are fresh; configured replication evidence passed preflight\n'

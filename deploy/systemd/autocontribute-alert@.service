@@ -1,12 +1,10 @@
 [Unit]
-Description=Create a verified complete Autocontribute state backup
+Description=Send failure alert for Autocontribute unit %i
 Documentation=https://github.com/Damadimo/autocontribute/blob/main/docs/systemd-deployment.md
+ConditionPathExists=/etc/autocontribute/alert-webhook
+Wants=network-online.target
+After=network-online.target
 OnFailure=autocontribute-failure@%n.service
-OnFailure=autocontribute-alert@%n.service
-OnSuccess=autocontribute-replication.service
-StartLimitIntervalSec=8h
-StartLimitBurst=2
-RequiresMountsFor=/var/lib/autocontribute/state /var/backups/autocontribute
 
 [Service]
 Type=oneshot
@@ -16,30 +14,21 @@ WorkingDirectory=/var/lib/autocontribute
 UMask=0077
 
 Environment=HOME=/var/lib/autocontribute
-Environment=TMPDIR=/var/backups/autocontribute
 Environment=NO_COLOR=1
 Environment=PYTHONUNBUFFERED=1
+LoadCredential=alert-webhook:/etc/autocontribute/alert-webhook
 
 ExecStartPre=/usr/bin/test -x /opt/autocontribute/current/.venv/bin/autocontribute
 ExecStartPre=/opt/autocontribute/current/.venv/bin/autocontribute deployment verify-systemd-assets
-ExecStartPre=/usr/bin/test -r /etc/autocontribute/autocontribute.yml
-ExecStartPre=/usr/bin/test -d /var/lib/autocontribute/state
-ExecStartPre=/usr/bin/test -d /var/backups/autocontribute
-ExecStart=/usr/bin/flock --exclusive --timeout 21600 /var/lib/autocontribute/operation.lock /usr/local/libexec/autocontribute-backup
-ExecStartPost=/usr/bin/touch /var/lib/autocontribute/health/backup-success
-
-TimeoutStartSec=7h
-TimeoutStopSec=2m
-KillMode=control-group
+ExecStart=/usr/local/libexec/autocontribute-alert %i
+TimeoutStartSec=2m
+TimeoutStopSec=30s
 Restart=no
-Nice=10
-IOSchedulingClass=idle
 
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateDevices=yes
-PrivateNetwork=yes
 PrivateTmp=yes
 ProtectClock=yes
 ProtectControlGroups=yes
@@ -51,7 +40,7 @@ ProtectKernelTunables=yes
 ProtectProc=invisible
 ProtectSystem=strict
 ProcSubset=pid
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
@@ -60,8 +49,8 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 KeyringMode=private
 ReadOnlyPaths=/etc/autocontribute /opt/autocontribute
-ReadWritePaths=/var/backups/autocontribute /var/lib/autocontribute
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=autocontribute-backup
+SyslogLevel=err
+SyslogIdentifier=autocontribute-alert

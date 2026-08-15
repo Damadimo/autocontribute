@@ -1,0 +1,29 @@
+#!/usr/bin/bash
+set -euo pipefail
+
+umask 077
+
+readonly executable="${AUTOCONTRIBUTE_EXECUTABLE:-/opt/autocontribute/current/.venv/bin/autocontribute}"
+readonly credential_directory="${CREDENTIALS_DIRECTORY:-}"
+readonly failed_unit="${1:-}"
+
+if [[ ! "$failed_unit" =~ ^[A-Za-z0-9@_.-]+$ ]]; then
+  printf 'Refusing to alert for an invalid systemd unit name\n' >&2
+  exit 1
+fi
+if [[ ! -x "$executable" ]]; then
+  printf 'Autocontribute executable is unavailable\n' >&2
+  exit 1
+fi
+"$executable" deployment verify-systemd-assets
+if [[ -z "$credential_directory" ]]; then
+  printf 'Autocontribute alert webhook credential directory is unavailable\n' >&2
+  exit 1
+fi
+readonly webhook_file="$credential_directory/alert-webhook"
+if [[ ! -f "$webhook_file" || -L "$webhook_file" ]]; then
+  printf 'Autocontribute alert webhook credential is unavailable\n' >&2
+  exit 1
+fi
+
+exec "$executable" alert send --unit "$failed_unit" --webhook-file "$webhook_file"
