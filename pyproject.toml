@@ -33,7 +33,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "hatchling==1.27.0",
-  "mypy>=1.15.0,<2",
+  "mypy>=1.15.0,<3",
   "pytest>=8.3.0,<10",
   "pytest-cov>=6.1.0,<8",
   "respx>=0.22.0,<1",
