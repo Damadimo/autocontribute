@@ -3,7 +3,7 @@
 Autocontribute finds open issues in GitHub repositories you choose, prepares a small fix in an isolated workspace, runs the repository's checks in a Docker sandbox with no network, has a critic model review the diff in a fresh context, and opens a pull request only after you approve the exact diff.
 
 > [!WARNING]
-> This is an early alpha. Keep `publishing.mode: review_required` and check every artifact before you approve it.
+> This is an early alpha. Check every artifact before you approve it.
 
 ## How it works
 
@@ -85,7 +85,7 @@ Many runs end `skipped` or `rejected`: no issue passed the rules, the plan found
 - **Disclosure.** Every PR body includes the `policy.ai_disclosure` text, and PRs open as drafts.
 - **Limits.** At most 1 new PR per UTC day and 2 open PRs, and no new PR to a repository where your account has an open PR or a closed one updated in the last 7 days. Every PR your account authored counts, including ones you opened yourself.
 - **Repository policies.** It skips repositories whose policy files appear to prohibit AI-assisted or automated contributions, and repositories that require a CLA or DCO until you attest with `policy attest` ([details](docs/configuration.md#legal-attestations)).
-- **Stops.** `lifecycle sync` checks the PRs Autocontribute opened and stops all work after a maintainer requests changes or asks you to stop, CI fails, the PR branch changes, or a PR is closed unmerged or reverted; scheduled runs and `publish` sync first. A maintainer's stop request on a candidate issue, repeated GitHub abuse-limit responses, or `safety stop --actor NAME --reason TEXT` also stop all work. `safety status` shows why, and `safety resume` restarts work once you pass it the trigger hash from `safety status`.
+- **Stops.** `lifecycle sync` checks the PRs Autocontribute opened and stops all work after a maintainer requests changes or asks you to stop, CI fails, the PR branch changes, or a PR is closed unmerged or reverted; `publish` syncs first. A maintainer's stop request on a candidate issue, repeated GitHub abuse-limit responses, or `safety stop --actor NAME --reason TEXT` also stop all work. `safety status` shows why, and `safety resume` restarts work once you pass it the trigger hash from `safety status`.
 
 ## Costs
 
@@ -93,7 +93,15 @@ Each run stops at the first `budget` limit it reaches: 9 model calls, 3,000,000 
 
 ## Scheduling
 
-`autocontribute run --scheduled` makes one unattended attempt: it runs `lifecycle sync` first, refuses `--issue`, and in review mode leaves prepared runs for you to approve. Run it from cron, or use the included GitHub Actions workflow, which runs in review mode only. Automatic publishing (`publishing.mode: auto`) is supported only on the systemd server deployment and stays locked until `rollout report` passes, which takes 100 expert-graded runs and 20 approved PRs merged unchanged. See [docs/scheduling.md](docs/scheduling.md).
+`autocontribute run --scheduled` makes one unattended attempt. It runs `lifecycle sync` first, picks the issue itself, refuses `--issue` and `--retry-unchanged`, and never publishes. An attempt that starts while another is running is refused. This crontab line (`crontab -e`) runs it at 09:17 and 21:17 in the machine's time zone:
+
+```cron
+17 9,21 * * * . "$HOME/.autocontribute.env" && autocontribute run --scheduled --config /path/to/autocontribute.yml >>/path/to/autocontribute.log 2>&1
+```
+
+cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod 600`), export a `PATH` on which `autocontribute`, `docker`, `git`, and `gh` resolve, and `OPENAI_API_KEY` (plus `AUTOCONTRIBUTE_GITHUB_TOKEN` with `github.auth: token`). With the starter config, this schedule can spend up to $100 a day on models.
+
+A GitHub Actions runner is planned.
 
 ## Command reference
 
@@ -102,7 +110,7 @@ Each run stops at the first `budget` limit it reaches: 9 model calls, 3,000,000 
 | `init` | Write a starter `autocontribute.yml` (`--path`, `--force`). |
 | `doctor` | Check config, credentials, GitHub access, Git, Docker, and the sandbox image; sends small paid model probes. |
 | `discover` | Show the best current candidate issue without cloning, model calls, or GitHub writes. |
-| `run` | Prepare one contribution or skip; `--issue owner/repo#N` pins an issue, `--scheduled` marks an unattended run. |
+| `run` | Prepare one contribution or skip; `--issue owner/repo#N` pins an issue, `--scheduled` makes an [unattended attempt](#scheduling). |
 | `approve RUN_ID` | Show the exact diff, check output, and PR text, then record your approval. |
 | `publish RUN_ID` | Create or reuse your fork, push one branch, and open one pull request. |
 | `version` | Print the installed version. |
@@ -117,22 +125,13 @@ Each run stops at the first `budget` limit it reaches: 9 model calls, 3,000,000 
 | `safety resume` | Resume after you resolve the cause (`--actor`, `--reason`, `--expected-trigger-hash`). |
 | `policy inspect REPO` | Link a repository's policy files and show the CLA or DCO requirements it detects. |
 | `policy attest REPO` | After you confirm, print a `policy.legal_attestations` entry (`--cla-completed`, `--authorize-dco-signoff`). |
-| `state gc-workspaces` | List old checkouts of finished runs; `--execute` deletes them. |
-
-The `eval`, `rollout`, other `state`, `deployment`, and `alert` commands serve automatic publishing and the server deployment; see [Scheduling](docs/scheduling.md), [systemd deployment](docs/systemd-deployment.md), and `autocontribute --help`.
 
 ## Documentation
 
 - [How it works](docs/how-it-works.md): the pipeline, hard gates, and run states.
 - [Configuration](docs/configuration.md): every config key and its default.
 - [Sandbox image](docs/sandbox-image.md): build and pin the image your checks run in.
-- [Scheduling](docs/scheduling.md): cron, GitHub Actions, and automatic publishing.
-- [systemd deployment](docs/systemd-deployment.md): a persistent worker on a Linux server.
-- [S3 backup replication](docs/s3-backup-replication.md): locked off-host copies of state backups.
-- [Staging](docs/staging.md): live end-to-end checks against a test repository you own.
-- [Releases](docs/releases.md): how releases are built, signed, and verified.
-- [Acceptance test](tests/acceptance/README.md): the Ubuntu install and recovery test.
-- [Security policy](SECURITY.md): reporting vulnerabilities and deployment expectations.
+- [Security policy](SECURITY.md): reporting vulnerabilities and safe use.
 - [Contributing](CONTRIBUTING.md): working on Autocontribute itself.
 
 ## Development

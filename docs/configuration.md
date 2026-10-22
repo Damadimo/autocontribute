@@ -51,8 +51,7 @@ Each role (`models.scout`, `models.builder`, `models.critic`) takes these keys:
 | `max_output_tokens` | `40000` | Output limit per call (1,000–128,000). |
 | `timeout_seconds` | `900` | Time limit per call (10–3600). |
 | `pricing` | none | Your prices in USD per million tokens, used for the dollar cap. Set it on all three roles or on none. |
-| `expected_response_model` | none | Exact model ID the provider must report; any other ID is refused. Required for `publishing.mode: auto`. |
-| `immutable_response_model_attested` | `false` | `true` states that you confirmed with the provider that this ID always names the same model. Required for `auto`. |
+| `expected_response_model` | none | Exact model ID the provider must report; any other ID is refused. |
 
 `pricing` takes `input_usd_per_million_tokens` and `output_usd_per_million_tokens`, both required, plus `cached_input_usd_per_million_tokens` and `cache_write_usd_per_million_tokens`, which default to the input price. There is no built-in price table: use your provider's current prices.
 
@@ -110,7 +109,6 @@ There is no network setting: the `docker` backend always runs checks with no net
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `mode` | `review_required` | `review_required`: you approve each run, then run `publish`. `auto`: see below. |
 | `approval_expires_hours` | `24` | Hours an approval stays valid (1–168). |
 | `branch_prefix` | `autocontribute` | Branches are named `<prefix>/issue-<number>-<first 8 characters of the run ID>`. |
 | `draft` | `true` | Open PRs as drafts. |
@@ -120,8 +118,6 @@ There is no network setting: the `docker` backend always runs checks with no net
 | `repository_cooldown_days` | `7` | Refuse a repository where your account has an open PR, or a closed one updated in this many days (0–365). |
 
 The three limits count every PR your GitHub account authored, including ones you opened yourself.
-
-`auto` publishes without your approval. It is a guarded pilot for the [systemd deployment](systemd-deployment.md), and config validation accepts it only with: exactly one entry in `github.repositories` and no `owners`; `draft` and `ready_for_review` both `true`; both PR limits at 1 and a cooldown of at least 7 days; `pricing`, `expected_response_model`, and `immutable_response_model_attested: true` on every model role; `budget.max_model_cost_usd_per_run`; `s3_replication`; `sandbox.backend: docker`; and the default `github.require_unassigned`, `policy`, and `quality` settings or stricter ones. It also needs `AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH=1` in the environment and a passing `autocontribute rollout report`. See [scheduling.md](scheduling.md#automatic-publishing).
 
 ## budget
 
@@ -143,10 +139,6 @@ Each limit applies to one run, and the run stops when it reaches a model limit.
 | `path` | `.autocontribute` | Directory for run state and evidence. A relative path is resolved from the config file's directory. |
 
 [How it works](how-it-works.md#where-evidence-is-written) lists what it holds. Deleting it erases the history that retries, publication limits, and `safety stop` rely on.
-
-## s3_replication
-
-`s3_replication` is unset by default; it is optional in review mode and required for `auto`. It configures `state replicate-next-s3`, which copies a complete state backup to an AWS S3 bucket with Object Lock, reads it back, and keeps a receipt. The block needs `bundle_directory`, `receipt_directory`, `scratch_directory`, `bucket`, `expected_bucket_owner` (a 12-digit AWS account ID), and `region`; `prefix` (`autocontribute`), `retention_days` (90), `timeout_seconds` (21600), `max_age_hours` (48), and `local_keep_bundles` (9) have defaults. Once the block is set, `doctor` fails without a fresh receipt for the newest bundle, even in review mode. AWS credentials come from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and optionally `AWS_SESSION_TOKEN` in the replication command's environment, never from this file. See [s3-backup-replication.md](s3-backup-replication.md).
 
 ## Legal attestations
 

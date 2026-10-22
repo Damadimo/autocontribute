@@ -1,8 +1,8 @@
 # How Autocontribute works
 
 A run picks one issue and prepares a patch. It reaches `ready_for_approval` only if every rule and
-gate below passes; many runs end `skipped` or `rejected`. In the default `review_required` mode
-nothing is written to GitHub until you approve. [Configuration](configuration.md) lists every key.
+gate below passes; many runs end `skipped` or `rejected`. Nothing is written to GitHub until you
+approve. [Configuration](configuration.md) lists every key.
 
 ## Pipeline
 
@@ -124,9 +124,9 @@ the target repository and base commit, the publishing account, and a fingerprint
 `publishing.approval_expires_hours` (24, at most 168). `publish` refuses unless:
 
 - the approval is current and matches the stored patch and command results;
-- the installed release, Python build, platform, and dependency versions, and the `models`,
-  `budget`, `github`, `sandbox`, `validation`, `policy`, `quality`, and `publishing` settings
-  (except each `api_key_env`, `github.auth`, and `github.token_env`) match the run's start;
+- the repository is still in `github.repositories`, or its owner in `github.owners`;
+- the repository's `validation.required_commands` and the `sandbox`, `policy`, `quality`, and
+  `publishing` settings match those the run was prepared with;
 - the PR body still shows the current `policy.ai_disclosure`, which preparation appends;
 - your account, counting every PR it authored, has fewer than `publishing.max_open_pull_requests`
   (2) open PRs, opened fewer than `publishing.max_new_pull_requests_per_day` (1) today (UTC), and
@@ -136,10 +136,10 @@ the target repository and base commit, the publishing account, and a fingerprint
   assignees, update time) are unchanged, and the issue still passes every rule with no linked PR.
 
 A failed recheck pushes nothing and leaves the run `approved`: retry `publish` after a limit clears,
-or run `autocontribute runs cancel RUN_ID --reason "TEXT"` and prepare the issue again (also the way
-past an expired approval). Once the rechecks pass, the attempt uses that day's slot and starts the
-cooldown even if a later step fails. `publish` creates or reuses your fork (`<login>/<repository>`),
-commits as `identity.name` and `identity.email` (if empty, your login and
+or run `autocontribute runs cancel RUN_ID --reason "TEXT"` and [retry the issue](#run-states) (also
+the way past an expired approval). Once the rechecks pass, the attempt uses that day's slot and
+starts the cooldown even if a later step fails. `publish` creates or reuses your fork
+(`<login>/<repository>`), commits as `identity.name` and `identity.email` (if empty, your login and
 `<login>@users.noreply.github.com`), and pushes the new branch
 `<publishing.branch_prefix>/issue-<number>-<run ID prefix>`, never overwriting an existing one. If
 the base, issue, or policy files changed meanwhile, it deletes the branch and the run ends `failed`;
@@ -166,9 +166,9 @@ queued → discovering → candidate_selected → eligibility_checked → planni
 | `failed` | an error, a limit, or the safety stop; also preparation left unfinished for 2 hours | open to the next run |
 | `cancelled` | `autocontribute runs cancel` on a `ready_for_approval` or `approved` run | passed over until updated |
 
-The one repair goes back to `implementing`, and `auto` mode skips `approved`. A run in any other
-state, `pr_open` included, keeps other runs off its issue. To retry an unchanged issue (every rule
-and gate runs again; `--scheduled` runs cannot do this):
+The one repair goes back to `implementing`. A run in any other state, `pr_open` included, keeps
+other runs off its issue. To retry an unchanged issue (every rule and gate runs again; `--scheduled`
+runs cannot do this):
 
 ```bash
 autocontribute run --issue owner/repo#123 --retry-unchanged --retry-actor NAME --retry-reason "TEXT"
@@ -176,9 +176,9 @@ autocontribute run --issue owner/repo#123 --retry-unchanged --retry-actor NAME -
 
 ## Lifecycle sync and the safety stop
 
-`autocontribute lifecycle sync` reads every PR this tool opened, stores a snapshot, and re-checks
-runs left in `submitting`. It runs first in every `run --scheduled` ([Scheduling](scheduling.md)),
-`publish`, and automatic publish, and exits with code 2 while a safety stop is active.
+`autocontribute lifecycle sync` reads every PR this tool opened and re-checks runs left in
+`submitting`. It runs first in every `run --scheduled` ([Scheduling](../README.md#scheduling)) and
+`publish`, and exits with code 2 while a safety stop is active.
 
 The safety stop is one global switch that never clears itself: while it is on, `run` and
 `publish` refuse for every repository, though a cleanup that an earlier `publish` started
@@ -205,26 +205,13 @@ autocontribute safety resume --actor NAME --reason "TEXT" --expected-trigger-has
 
 | Path under `storage.path` (default `.autocontribute`, next to the config file) | Contents |
 | --- | --- |
-| `state.sqlite3` | run records and audit events, approvals, safety-stop state and history, the reservations behind the daily limit and cooldown, PR snapshots |
+| `state.sqlite3` | run records and audit events, approvals, safety-stop state and history, the reservations behind the daily limit and cooldown |
 | `runs/<run-id>/manifest.json` | the full run record: issue and comments, eligibility evidence, plan, proposal, command results, gate results, approval, PR URL |
 | `runs/<run-id>/contribution.patch` | the exact diff that gets committed |
 | `runs/<run-id>/validation.json` | baseline and patched command results, with stdout and stderr |
 | `runs/<run-id>/context-search.txt` | code-search matches used to choose context files |
 | `runs/<run-id>/model-calls.json` | each completed model call: role, returned model ID, token usage, cost, duration |
 | `runs/<run-id>/report.md` | a readable summary; approval does not use it |
-| `workspaces/<run-id>/` | the repository checkout; remove old ones with `autocontribute state gc-workspaces --execute` |
-| `evaluations/` | expert grades from `autocontribute eval record` |
+| `workspaces/<run-id>/` | the repository checkout, deleted when the run reaches `pr_open`, `skipped`, `rejected`, `failed`, or `cancelled`; the next `run` retries a deletion that failed |
 
-Never delete or roll back `state.sqlite3`; the limits and the safety stop depend on it. Back up the
-database, run evidence, and grades with `autocontribute state backup --complete`.
-
-## Automatic publishing
-
-`publishing.mode: auto` publishes a ready run after the same rechecks, without approval. It needs:
-
-- exactly one `github.repositories` entry, plus the [other settings](configuration.md#publishing);
-- `AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH=1` in the worker's environment;
-- a persistent deployment with [S3 backup replication](s3-backup-replication.md), such as the
-  [systemd deployment](systemd-deployment.md); the hosted Actions workflow refuses auto mode;
-- passing calibration for this exact release and configuration: runs graded with
-  `autocontribute eval record` and approved PRs merged as-is (`autocontribute rollout report`).
+Never delete or roll back `state.sqlite3`; the limits and the safety stop depend on it.
