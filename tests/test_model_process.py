@@ -253,11 +253,12 @@ def test_process_provider_rejects_noncanonical_ipc_result(
 def test_worker_error_envelope_round_trips_provider_request_status() -> None:
     from autocontribute import model_worker
     from autocontribute.exceptions import ModelRequestError
-    from autocontribute.providers import _output_schema_id, _worker_result
+    from autocontribute.providers import _MODEL_WORKER_PROTOCOL, _output_schema_id, _worker_result
 
     payload = model_worker._error_result(
         "provider_request_error",
         "OpenAI Responses request failed (HTTP 503)",
+        protocol=_MODEL_WORKER_PROTOCOL,
         http_status=503,
     )
 
@@ -275,11 +276,12 @@ def test_worker_error_envelope_round_trips_provider_request_status() -> None:
 def test_worker_error_envelope_round_trips_statusless_request_failure() -> None:
     from autocontribute import model_worker
     from autocontribute.exceptions import ModelRequestError
-    from autocontribute.providers import _output_schema_id, _worker_result
+    from autocontribute.providers import _MODEL_WORKER_PROTOCOL, _output_schema_id, _worker_result
 
     payload = model_worker._error_result(
         "provider_request_error",
         "OpenAI Responses request failed",
+        protocol=_MODEL_WORKER_PROTOCOL,
     )
 
     with pytest.raises(ModelRequestError) as raised:
@@ -446,10 +448,12 @@ def test_worker_main_drops_request_details_the_parent_would_reject(
 
 def test_worker_error_envelope_round_trips_provider_code_and_retry_after() -> None:
     from autocontribute import model_worker
+    from autocontribute.providers import _MODEL_WORKER_PROTOCOL
 
     payload = model_worker._error_result(
         "provider_request_error",
         "OpenAI Responses request failed (HTTP 429; code: insufficient_quota)",
+        protocol=_MODEL_WORKER_PROTOCOL,
         http_status=429,
         provider_code="insufficient_quota",
         retry_after_seconds=2.5,
