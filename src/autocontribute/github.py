@@ -9,7 +9,7 @@ import os
 import re
 import subprocess
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from typing import Any, Protocol, TypeVar, cast
@@ -74,6 +74,9 @@ _MAX_SINGLE_WAIT_SECONDS = 60.0
 _MAX_TOTAL_WAIT_SECONDS = 180.0
 _TRANSIENT_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
 _TRANSIENT_STATUS_CODES = frozenset({500, 502, 503, 504})
+_MAX_REPOSITORY_LABELS = 1_000
+# Issues with this many comments are usually contested or need a design decision.
+_SEARCH_MAX_COMMENTS = 40
 
 # Test seam: retries sleep through this module attribute so tests never wait on wall clock.
 _sleep = time.sleep
@@ -488,14 +491,13 @@ class GitHubClient:
             if len(items) + len(page_items) > max_items:
                 raise GitHubError(
                     f"{resource.capitalize()} exceeded the safe limit of {max_items}; "
-                    "lifecycle evidence is incomplete"
+                    "the evidence is incomplete"
                 )
             items.extend(page_items)
             if len(page_items) < 100:
                 return items
         raise GitHubError(
-            f"{resource.capitalize()} reached the pagination limit; "
-            "lifecycle evidence is incomplete"
+            f"{resource.capitalize()} reached the pagination limit; the evidence is incomplete"
         )
 
     def authenticated_login(self) -> str:
@@ -735,33 +737,65 @@ class GitHubClient:
             )
         return comments
 
+    def list_labels(self, repository: str) -> list[str]:
+        """Return the names of every label defined in the repository."""
+
+        labels = self._bounded_list(
+            f"/repos/{quote(repository, safe='/')}/labels",
+            resource="repository labels",
+            max_items=_MAX_REPOSITORY_LABELS,
+        )
+        return [_nonempty(label.get("name"), field="repository label name") for label in labels]
+
     def search_issues(
-        self, repository: str, *, labels: Iterable[str], limit: int
+        self,
+        repository: str,
+        *,
+        include_labels: Sequence[str],
+        exclude_labels: Sequence[str],
+        unassigned: bool,
+        page: int,
+        per_page: int,
     ) -> list[IssueCandidate]:
-        results: dict[int, IssueCandidate] = {}
-        for label in labels:
-            query = f'repo:{repository} is:issue is:open label:"{label}"'
-            data = cast(
-                "dict[str, Any]",
-                self._request(
-                    "GET",
-                    "/search/issues",
-                    params={
-                        "q": query,
-                        "sort": "updated",
-                        "order": "desc",
-                        "per_page": min(limit, 100),
-                    },
-                ),
-            )
-            for item in cast("list[dict[str, Any]]", data.get("items", [])):
-                issue = _parse_issue(item, repository)
-                results[issue.number] = issue
-                if len(results) >= limit:
-                    break
-            if len(results) >= limit:
-                break
-        return list(results.values())
+        """Return one page of open issues that carry any include label, newest first.
+
+        One query covers every label. It leaves out issues with a linked pull request, an
+        exclude label, or a long discussion, and assigned issues when ``unassigned`` is set.
+        """
+
+        if not include_labels:
+            raise ValueError("issue search needs at least one include label")
+        if page < 1 or not 1 <= per_page <= 100:
+            raise ValueError("issue search pages start at 1 and hold 1 to 100 results")
+        qualifiers = [
+            f"repo:{repository}",
+            "is:issue",
+            "is:open",
+            "-linked:pr",
+            f"comments:<{_SEARCH_MAX_COMMENTS}",
+            "label:" + ",".join(_search_label(label) for label in include_labels),
+            *(f"-label:{_search_label(label)}" for label in exclude_labels),
+        ]
+        if unassigned:
+            qualifiers.append("no:assignee")
+        payload = _mapping(
+            self._request(
+                "GET",
+                "/search/issues",
+                params={
+                    "q": " ".join(qualifiers),
+                    "sort": "created",
+                    "order": "desc",
+                    "per_page": per_page,
+                    "page": page,
+                },
+            ),
+            resource="issue search",
+        )
+        return [
+            _parse_issue(item, repository)
+            for item in _mapping_list(payload.get("items"), resource="issue search results")
+        ]
 
     def search_competing_pull_requests(
         self,
@@ -1978,6 +2012,12 @@ def _positive_issue_number(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError("issue number must be a positive integer")
     return value
+
+
+def _search_label(label: str) -> str:
+    if '"' in label or not label.isprintable():
+        raise ValueError(f"label cannot be quoted in a GitHub search: {label!r}")
+    return f'"{label}"'
 
 
 def _issue_reference_pattern(repository: str, issue_number: int) -> str:

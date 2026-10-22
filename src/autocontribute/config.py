@@ -10,7 +10,15 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    HttpUrl,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from autocontribute.exceptions import ConfigurationError
 
@@ -66,13 +74,55 @@ class IdentityConfig(StrictModel):
     email: str = ""
 
 
+def _label_names(values: list[str], *, field: str) -> list[str]:
+    """Strip label names and reject ones that cannot be quoted in a GitHub search."""
+
+    names: list[str] = []
+    for value in values:
+        name = value.strip()
+        if not name or '"' in name or not name.isprintable():
+            raise ValueError(f"{field} must hold label names without double quotes")
+        if name.casefold() not in {existing.casefold() for existing in names}:
+            names.append(name)
+    return names
+
+
+class RepositoryLabels(StrictModel):
+    """Labels that replace github.include_labels or github.exclude_labels for one repository."""
+
+    include: list[str] | None = None
+    exclude: list[str] | None = None
+
+    @field_validator("include", "exclude")
+    @classmethod
+    def labels_are_searchable(
+        cls, values: list[str] | None, info: ValidationInfo
+    ) -> list[str] | None:
+        if values is None:
+            return None
+        names = _label_names(values, field=f"github.labels {info.field_name}")
+        if info.field_name == "include" and not names:
+            raise ValueError("github.labels include must name at least one label")
+        return names
+
+
 class GitHubConfig(StrictModel):
     auth: Literal["gh", "token"] = "gh"
     token_env: str = "AUTOCONTRIBUTE_GITHUB_TOKEN"
     api_url: HttpUrl = HttpUrl("https://api.github.com")
     repositories: list[str] = Field(default_factory=list)
     owners: list[str] = Field(default_factory=list)
-    include_labels: list[str] = Field(default_factory=lambda: ["help wanted", "good first issue"])
+    include_labels: list[str] = Field(
+        default_factory=lambda: [
+            "help wanted",
+            "bug",
+            "confirmed",
+            "accepted",
+            "status: help wanted",
+            "contributions welcome",
+            "pr welcome",
+        ]
+    )
     exclude_labels: list[str] = Field(
         default_factory=lambda: [
             "security",
@@ -80,14 +130,40 @@ class GitHubConfig(StrictModel):
             "needs design",
             "discussion",
             "blocked",
+            # Maintainers keep these for people making their first contribution.
+            "good first issue",
+            "first-timers-only",
         ]
     )
-    min_stars: int = Field(default=1_000, ge=0)
+    labels: dict[str, RepositoryLabels] = Field(default_factory=dict)
+    min_stars: int = Field(default=0, ge=0)
     repository_limit_per_owner: int = Field(default=8, ge=1, le=30)
     issue_limit_per_repository: int = Field(default=10, ge=1, le=50)
     require_unassigned: bool = True
     max_issue_age_days: int = Field(default=365, ge=1, le=3_650)
     max_repository_inactivity_days: int = Field(default=180, ge=1, le=3_650)
+
+    @field_validator("include_labels", "exclude_labels")
+    @classmethod
+    def labels_are_searchable(cls, values: list[str], info: ValidationInfo) -> list[str]:
+        return _label_names(values, field=f"github.{info.field_name}")
+
+    @field_validator("labels")
+    @classmethod
+    def label_overrides_are_repository_scoped(
+        cls, values: dict[str, RepositoryLabels]
+    ) -> dict[str, RepositoryLabels]:
+        normalized: dict[str, RepositoryLabels] = {}
+        for repository, labels in values.items():
+            if not _REPOSITORY.fullmatch(repository):
+                raise ValueError("github.labels keys must use owner/name syntax")
+            key = repository.casefold()
+            if key in normalized:
+                raise ValueError(
+                    f"duplicate github.labels repository after case-folding: {repository}"
+                )
+            normalized[key] = labels
+        return normalized
 
     @field_validator("token_env")
     @classmethod
@@ -723,9 +799,12 @@ github:
   repositories:                   # explicit repositories are safest
     - your-org/your-repo
   owners: []                       # optional discovery across selected owners
-  include_labels: ["help wanted", "good first issue"]
-  exclude_labels: ["security", "breaking change", "needs design", "blocked", "discussion"]
-  min_stars: 1000
+  include_labels: ["help wanted", "bug", "confirmed", "accepted", "status: help wanted",
+                   "contributions welcome", "pr welcome"]
+  exclude_labels: ["security", "breaking change", "needs design", "discussion", "blocked",
+                   "good first issue", "first-timers-only"]
+  labels: {}                       # per repository: {owner/repo: {include: [...], exclude: [...]}}
+  min_stars: 0
   require_unassigned: true
   max_repository_inactivity_days: 180
 
@@ -818,6 +897,7 @@ __all__ = [
     "LegalAttestation",
     "ModelPricing",
     "ModelProfile",
+    "RepositoryLabels",
     "ValidationConfig",
     "example_config",
     "load_config",

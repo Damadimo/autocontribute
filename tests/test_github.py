@@ -868,6 +868,93 @@ def test_ensure_fork_does_not_invoke_mutation_callback_for_existing_fork() -> No
     assert requests == [("GET", "/repos/octocat/project")]
 
 
+def test_issue_search_is_one_query_for_every_label_newest_first() -> None:
+    params: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        params.update(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json={
+                "total_count": 1,
+                "incomplete_results": False,
+                "items": [_candidate_issue_payload()],
+            },
+        )
+
+    with _client(handler) as github:
+        issues = github.search_issues(
+            "example/project",
+            include_labels=["help wanted", "Status: Help Wanted"],
+            exclude_labels=["good first issue", "blocked"],
+            unassigned=True,
+            page=2,
+            per_page=50,
+        )
+
+    assert [issue.reference for issue in issues] == ["example/project#42"]
+    assert params == {
+        "q": (
+            'repo:example/project is:issue is:open -linked:pr comments:<40 label:"help wanted",'
+            '"Status: Help Wanted" -label:"good first issue" -label:"blocked" no:assignee'
+        ),
+        "sort": "created",
+        "order": "desc",
+        "per_page": "50",
+        "page": "2",
+    }
+
+
+def test_issue_search_can_include_assigned_issues_but_never_unquotable_labels() -> None:
+    queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        queries.append(request.url.params["q"])
+        return httpx.Response(200, json={"total_count": 0, "items": []})
+
+    with _client(handler) as github:
+        assert (
+            github.search_issues(
+                "example/project",
+                include_labels=["bug"],
+                exclude_labels=[],
+                unassigned=False,
+                page=1,
+                per_page=10,
+            )
+            == []
+        )
+        with pytest.raises(ValueError, match="cannot be quoted"):
+            github.search_issues(
+                "example/project",
+                include_labels=['help" repo:other/project'],
+                exclude_labels=[],
+                unassigned=True,
+                page=1,
+                per_page=10,
+            )
+
+    assert queries == ['repo:example/project is:issue is:open -linked:pr comments:<40 label:"bug"']
+
+
+def test_repository_labels_are_read_across_pages() -> None:
+    pages: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/example/project/labels"
+        pages.append(request.url.params["page"])
+        if request.url.params["page"] == "1":
+            return httpx.Response(200, json=[{"name": f"area-{index}"} for index in range(100)])
+        return httpx.Response(200, json=[{"name": "help wanted"}])
+
+    with _client(handler) as github:
+        names = github.list_labels("example/project")
+
+    assert len(names) == 101
+    assert names[-1] == "help wanted"
+    assert pages == ["1", "2"]
+
+
 def test_competing_pull_request_search_paginates_issue_timeline() -> None:
     pages: list[int] = []
 

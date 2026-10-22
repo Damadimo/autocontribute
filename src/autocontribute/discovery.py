@@ -8,7 +8,7 @@ import json
 import re
 from collections import Counter
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 
@@ -140,6 +140,22 @@ _AUTOMATION_TERMS = re.compile(
     re.I,
 )
 _CLAIM_WINDOW = timedelta(days=30)
+# Repositories name the same invitation in many ways; these are searched whenever a repository
+# defines them, unless github.labels sets the repository's include list.
+_INVITATION_SYNONYMS = (
+    "status: help wanted",
+    "sprintable",
+    "E-easy",
+    "contributions welcome",
+    "PR welcome",
+    "accepted",
+    "confirmed",
+)
+_SEARCH_PAGE_SIZE = 100
+_MAX_SEARCH_PAGES = 3
+# A search result has no discussion, and a maintainer comment there can still invite the work
+# or raise the score; every other gate already holds for the full issue.
+_DISCUSSION_DEPENDENT_BLOCKERS = frozenset({"no invitation", "low score"})
 _LINKED_PULL_REQUEST_ACTIVITY = timedelta(days=90)
 _STOP_TARGET = (
     r"(?:(?:(?:ai|llm)[ -]generated|ai[ -]assisted|automated|bot[ -]authored|"
@@ -546,12 +562,14 @@ class DiscoveryService:
                 skipped_repositories.append((repository.full_name, _REPOSITORY_BASELINE_REASON))
                 continue
             try:
+                include_labels, exclude_labels = self._search_labels(repository.full_name)
+                if not include_labels:
+                    skipped_repositories.append(
+                        (repository.full_name, "repository has none of the invitation labels")
+                    )
+                    continue
                 repository_ref = self._pin_repository_ref(repository)
-                found = self.github.search_issues(
-                    repository.full_name,
-                    labels=self.config.github.include_labels,
-                    limit=self.config.github.issue_limit_per_repository,
-                )
+                found, rejected = self._search(repository, include_labels, exclude_labels)
                 if found:
                     # Read the policy surface once here so that a failure is reported against
                     # the repository, not retried and repeated for each of its issues.
@@ -561,6 +579,7 @@ class DiscoveryService:
             except _ISOLATED_ERRORS as exc:
                 repository_errors.append((repository.full_name, str(exc)))
                 continue
+            evaluations.extend(rejected)
             for snapshot in found:
                 if len(eligible) >= candidate_limit:
                     break
@@ -611,6 +630,84 @@ class DiscoveryService:
             issue_errors=tuple(issue_errors),
         )
 
+    def _search_labels(self, repository: str) -> tuple[list[str], list[str]]:
+        """Name the repository's own labels that discovery searches for and leaves out."""
+
+        include_keys, exclude_keys = self._label_keys(repository)
+        names = self.github.list_labels(repository)
+        return (
+            [name for name in names if _label_key(name) in include_keys],
+            [name for name in names if _label_key(name) in exclude_keys],
+        )
+
+    def _label_keys(self, repository: str) -> tuple[frozenset[str], frozenset[str]]:
+        override = self.config.github.labels.get(repository.casefold())
+        include: Sequence[str] = (*self.config.github.include_labels, *_INVITATION_SYNONYMS)
+        exclude: Sequence[str] = self.config.github.exclude_labels
+        if override is not None and override.include is not None:
+            include = override.include
+        if override is not None and override.exclude is not None:
+            exclude = override.exclude
+        return frozenset(map(_label_key, include)), frozenset(map(_label_key, exclude))
+
+    def _search(
+        self,
+        repository: RepositoryInfo,
+        include_labels: list[str],
+        exclude_labels: list[str],
+    ) -> tuple[list[IssueCandidate], list[IssueEvaluation]]:
+        """Page through open issues, newest first, until enough pass the issue-only gates.
+
+        Returns the search results worth fetching in full and the evaluations of the rest.
+        """
+
+        limit = self.config.github.issue_limit_per_repository
+        found: list[IssueCandidate] = []
+        rejected: list[IssueEvaluation] = []
+        seen: set[int] = set()
+        for page in range(1, _MAX_SEARCH_PAGES + 1):
+            results = self.github.search_issues(
+                repository.full_name,
+                include_labels=include_labels,
+                exclude_labels=exclude_labels,
+                unassigned=self._unassigned_only,
+                page=page,
+                per_page=_SEARCH_PAGE_SIZE,
+            )
+            for snapshot in results:
+                if snapshot.number in seen:
+                    continue
+                seen.add(snapshot.number)
+                evaluation = self._assess(
+                    snapshot,
+                    repository,
+                    check_remote_policy=False,
+                    check_competing_pull_requests=False,
+                )
+                if set(evaluation.blocker_kinds) - _DISCUSSION_DEPENDENT_BLOCKERS:
+                    rejected.append(
+                        replace(
+                            evaluation,
+                            notes=(
+                                *evaluation.notes,
+                                "rejected from the search result; the discussion was not read",
+                            ),
+                        )
+                    )
+                    continue
+                found.append(snapshot)
+                if len(found) >= limit:
+                    return found, rejected
+            if len(results) < _SEARCH_PAGE_SIZE:
+                break
+        return found, rejected
+
+    @property
+    def _unassigned_only(self) -> bool:
+        return (
+            self.config.github.require_unassigned and not self.config.policy.allow_assigned_issues
+        )
+
     def evaluate(
         self,
         issue: IssueCandidate,
@@ -638,24 +735,36 @@ class DiscoveryService:
         repository_ref: str | None = None,
     ) -> IssueEvaluation:
         blockers: list[tuple[str, str]] = []
-        labels = {label.casefold() for label in issue.labels}
-        include = {label.casefold() for label in self.config.github.include_labels}
-        exclude = {label.casefold() for label in self.config.github.exclude_labels}
+        include_keys, exclude_keys = self._label_keys(repository.full_name)
+        labels = {_label_key(label): label for label in issue.labels}
+        invitation_labels = sorted(labels[key] for key in labels.keys() & include_keys)
+        excluded = sorted(labels[key] for key in labels.keys() & exclude_keys)
+        maintainer_comments = [
+            comment for comment in issue.discussion if _is_trusted_maintainer(comment)
+        ]
+        invited_in_discussion = any(
+            _stated(_WORK_INVITATION, comment.body) for comment in maintainer_comments
+        )
 
         if not self._repository_baseline(repository):
             blockers.append(("repository", _REPOSITORY_BASELINE_REASON))
         if issue.state.casefold() != "open":
             blockers.append(("closed", "issue is not open"))
-        if self.config.policy.require_maintainer_signal and not labels.intersection(include):
-            blockers.append(("no invitation", "issue has no configured maintainer-signal label"))
-        excluded = labels.intersection(exclude)
-        if excluded:
-            blockers.append(
-                ("excluded label", f"issue has excluded labels: {', '.join(sorted(excluded))}")
-            )
-        if issue.assignees and not (
-            self.config.policy.allow_assigned_issues or not self.config.github.require_unassigned
+        if (
+            self.config.policy.require_maintainer_signal
+            and not invitation_labels
+            and not invited_in_discussion
         ):
+            blockers.append(
+                (
+                    "no invitation",
+                    "issue has no invitation label and no maintainer comment inviting a pull "
+                    "request",
+                )
+            )
+        if excluded:
+            blockers.append(("excluded label", f"issue has excluded labels: {', '.join(excluded)}"))
+        if issue.assignees and self._unassigned_only:
             blockers.append(("assigned", "issue is already assigned"))
         now = datetime.now(UTC)
         age = (now - issue.updated_at).days
@@ -681,9 +790,6 @@ class DiscoveryService:
                 )
             )
 
-        maintainer_comments = [
-            comment for comment in issue.discussion if _is_trusted_maintainer(comment)
-        ]
         claimed_by = _active_claimants(issue.discussion, maintainer_comments, now=now)
         if claimed_by:
             blockers.append(
@@ -714,10 +820,8 @@ class DiscoveryService:
             f"loaded={len(issue.discussion)}/{issue.comments}, "
             f"maintainer_comments={len(maintainer_comments)}, claims={len(claimed_by)}"
         )
-        signal = 25 if labels.intersection(include) else 0
-        evidence["maintainer_signal"] = (
-            f"{signal}/25: labels={sorted(labels.intersection(include))}"
-        )
+        signal = 25 if invitation_labels or invited_in_discussion else 0
+        evidence["maintainer_signal"] = f"{signal}/25: labels={invitation_labels}"
 
         body_length = len(issue.body.strip())
         clarity = 10 if body_length >= 100 else 0
@@ -732,7 +836,7 @@ class DiscoveryService:
         evidence["reproducibility"] = f"{reproducibility}/20"
 
         scope_labels = {"good first issue", "small", "size/s", "documentation", "bug"}
-        scope = 15 if labels.intersection(scope_labels) else 7
+        scope = 15 if labels.keys() & scope_labels else 7
         evidence["scope"] = f"{scope}/15"
 
         activity = 10 if age <= 30 else 7 if age <= 90 else 3
@@ -1483,6 +1587,12 @@ def _maintainer_stop_sentences(body: str) -> list[str]:
         ):
             sentences.append(segment)
     return sentences
+
+
+def _label_key(name: str) -> str:
+    """Compare labels as people spell them, ignoring case, hyphens, and underscores."""
+
+    return " ".join(re.split(r"[\s_-]+", name.casefold())).strip()
 
 
 def _is_trusted_maintainer(comment: IssueComment) -> bool:

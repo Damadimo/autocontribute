@@ -96,6 +96,18 @@ class PolicyGitHub(FakeGitHub):
         return [path for owner_repository, path in self.files if owner_repository == repository]
 
 
+REPOSITORY_LABELS = ["help wanted", "bug", "Good First Issue", "security", "wontfix"]
+
+
+def _search_page(issues: list[IssueCandidate], *, page: int, per_page: int) -> list[IssueCandidate]:
+    """Serve one page of search results; like GitHub's, they carry no discussion."""
+
+    start = (page - 1) * per_page
+    return [
+        issue.model_copy(update={"discussion": []}) for issue in issues[start : start + per_page]
+    ]
+
+
 class CandidateDiscoveryGitHub(FakeGitHub):
     def __init__(self, issues: list[IssueCandidate]) -> None:
         self.issues = {issue.number: issue for issue in issues}
@@ -105,15 +117,22 @@ class CandidateDiscoveryGitHub(FakeGitHub):
         del full_name
         return _repository()
 
+    def list_labels(self, repository: str) -> list[str]:
+        del repository
+        return REPOSITORY_LABELS
+
     def search_issues(
         self,
         repository: str,
         *,
-        labels: list[str],
-        limit: int,
+        include_labels: list[str],
+        exclude_labels: list[str],
+        unassigned: bool,
+        page: int,
+        per_page: int,
     ) -> list[IssueCandidate]:
-        del repository, labels
-        return list(self.issues.values())[:limit]
+        del repository, include_labels, exclude_labels, unassigned
+        return _search_page(list(self.issues.values()), page=page, per_page=per_page)
 
     def get_issue(self, repository: str, number: int) -> IssueCandidate:
         del repository
@@ -173,7 +192,7 @@ def _issue(**updates: object) -> IssueCandidate:
         "html_url": "https://github.com/example/project/issues/42",
         "state": "open",
         "author": "maintainer",
-        "labels": ["help wanted", "bug", "good first issue"],
+        "labels": ["help wanted", "bug"],
         "assignees": [],
         "comments": 2,
         "created_at": datetime.now(UTC) - timedelta(days=10),
@@ -395,7 +414,7 @@ def test_security_issue_term_in_later_discussion_comment_fails_closed(tmp_path) 
 )
 def test_security_issue_labels_fail_closed(tmp_path, label: str) -> None:
     service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
-    issue = _issue(labels=["help wanted", "bug", "good first issue", label])
+    issue = _issue(labels=["help wanted", "bug", label])
 
     result = service.evaluate(issue, _repository())
 
@@ -408,7 +427,7 @@ def test_explicit_security_issue_override_applies_to_text_and_labels(tmp_path) -
     service = DiscoveryService(config, FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
     issue = _issue(
         title="Denial of service in the parser",
-        labels=["help wanted", "bug", "good first issue", "vulnerability"],
+        labels=["help wanted", "bug", "vulnerability"],
         comments=1,
         discussion=[_comment(body="A private report confirms an authentication bypass.")],
     )
@@ -533,16 +552,23 @@ class IsolationGitHub(FakeGitHub):
         del limit
         return [self.get_repository(name) for name in self.issues if name.startswith(f"{owner}/")]
 
+    def list_labels(self, repository: str) -> list[str]:
+        self._fail(f"labels:{repository}")
+        return REPOSITORY_LABELS
+
     def search_issues(
         self,
         repository: str,
         *,
-        labels: list[str],
-        limit: int,
+        include_labels: list[str],
+        exclude_labels: list[str],
+        unassigned: bool,
+        page: int,
+        per_page: int,
     ) -> list[IssueCandidate]:
-        del labels
+        del include_labels, exclude_labels, unassigned
         self._fail(f"search:{repository}")
-        return self.issues[repository][:limit]
+        return _search_page(self.issues[repository], page=page, per_page=per_page)
 
     def get_issue(self, repository: str, number: int) -> IssueCandidate:
         self._fail(f"issue:{repository}#{number}")
@@ -681,6 +707,188 @@ def test_safety_stops_and_state_errors_still_end_discovery(
 
     with pytest.raises(type(failure)):
         service.discover()
+
+
+class SearchGitHub(FakeGitHub):
+    def __init__(self, issues: list[IssueCandidate], labels: list[str]) -> None:
+        self.issues = issues
+        self.labels = labels
+        self.searches: list[dict[str, object]] = []
+        self.fetched: list[int] = []
+
+    def get_repository(self, full_name: str) -> RepositoryInfo:
+        del full_name
+        return _repository()
+
+    def list_labels(self, repository: str) -> list[str]:
+        del repository
+        return self.labels
+
+    def search_issues(
+        self,
+        repository: str,
+        *,
+        include_labels: list[str],
+        exclude_labels: list[str],
+        unassigned: bool,
+        page: int,
+        per_page: int,
+    ) -> list[IssueCandidate]:
+        del repository
+        self.searches.append(
+            {
+                "include": include_labels,
+                "exclude": exclude_labels,
+                "unassigned": unassigned,
+                "page": page,
+            }
+        )
+        return _search_page(self.issues, page=page, per_page=per_page)
+
+    def get_issue(self, repository: str, number: int) -> IssueCandidate:
+        del repository
+        self.fetched.append(number)
+        return next(issue for issue in self.issues if issue.number == number)
+
+
+def test_search_uses_the_repository_spelling_of_invitation_labels_and_synonyms(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = SearchGitHub(
+        [_issue(labels=["Help-Wanted"])],
+        labels=[
+            "Help-Wanted",
+            "Status: Help Wanted",
+            "sprintable",
+            "E-easy",
+            "enhancement",
+            "good-first-issue",
+            "Security",
+        ],
+    )
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project"), github, RunStore(tmp_path)
+    )
+
+    outcome = service.discover()
+
+    assert outcome.selection is not None
+    assert github.searches == [
+        {
+            "include": ["Help-Wanted", "Status: Help Wanted", "sprintable", "E-easy"],
+            "exclude": ["good-first-issue", "Security"],
+            "unassigned": True,
+            "page": 1,
+        }
+    ]
+
+
+def test_repository_label_override_replaces_the_global_lists_and_synonyms(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    config = _discovery_config("example/project")
+    config.github.labels = {  # type: ignore[assignment]
+        "Example/Project": {"include": ["enhancement"], "exclude": []}
+    }
+    github = SearchGitHub(
+        [_issue(labels=["Enhancement", "Good First Issue"])],
+        labels=["help wanted", "sprintable", "enhancement", "Good First Issue"],
+    )
+    service = DiscoveryService(config, github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    outcome = service.discover()
+
+    assert github.searches[0]["include"] == ["enhancement"]
+    assert github.searches[0]["exclude"] == []
+    assert outcome.selection is not None
+
+
+def test_repository_without_invitation_labels_is_skipped_before_searching(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = SearchGitHub([_issue()], labels=["enhancement", "question"])
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project"), github, RunStore(tmp_path)
+    )
+
+    outcome = service.discover()
+
+    assert outcome.selection is None
+    assert outcome.skipped_repositories == (
+        ("example/project", "repository has none of the invitation labels"),
+    )
+    assert github.searches == []
+
+
+def test_search_pages_past_issues_rejected_from_the_search_result(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    assigned = [_issue(number=number, assignees=["someone"]) for number in range(1, 101)]
+    github = SearchGitHub([*assigned, _issue(number=101), _issue(number=102)], REPOSITORY_LABELS)
+    config = _discovery_config("example/project")
+    config.github.issue_limit_per_repository = 2
+    service = DiscoveryService(config, github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    outcome = service.discover()
+
+    assert [search["page"] for search in github.searches] == [1, 2]
+    assert github.fetched == [101, 102]
+    assert outcome.blocker_counts == [("assigned", 100)]
+    assert outcome.evaluations[0].notes == (
+        "rejected from the search result; the discussion was not read",
+    )
+    assert outcome.selection is not None
+
+
+def test_search_reads_a_bounded_number_of_pages(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    assigned = [_issue(number=number, assignees=["someone"]) for number in range(1, 401)]
+    github = SearchGitHub(assigned, REPOSITORY_LABELS)
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project"), github, RunStore(tmp_path)
+    )
+
+    outcome = service.discover()
+
+    assert [search["page"] for search in github.searches] == [1, 2, 3]
+    assert github.fetched == []
+    assert outcome.ineligible_candidates == 300
+
+
+@pytest.mark.parametrize(
+    ("labels", "blocker"),
+    [
+        (["Status: Help Wanted"], None),
+        (["HELP WANTED"], None),
+        (["sprintable"], None),
+        (["help wanted", "Good-First-Issue"], "issue has excluded labels: Good-First-Issue"),
+        (
+            ["enhancement"],
+            "issue has no invitation label and no maintainer comment inviting a pull request",
+        ),
+    ],
+)
+def test_labels_match_without_case_hyphens_or_underscores(
+    tmp_path,
+    labels: list[str],
+    blocker: str | None,
+) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+
+    result = service.evaluate(_issue(labels=labels), _repository())
+
+    if blocker is None:
+        assert result.eligible, result.blockers
+    else:
+        assert blocker in result.blockers
+
+
+def test_maintainer_comment_inviting_a_pull_request_is_an_invitation(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    invited = _issue(
+        labels=["enhancement"],
+        comments=1,
+        discussion=[
+            _comment(body="Good idea, PRs welcome!", author="maintainer", association="MEMBER")
+        ],
+    )
+    from_contributor = invited.model_copy(
+        update={"discussion": [_comment(body="Good idea, PRs welcome!")]}
+    )
+
+    assert service.evaluate(invited, _repository()).eligible
+    assert not service.evaluate(from_contributor, _repository()).eligible
 
 
 class LinkedPullRequestGitHub(FakeGitHub):

@@ -15,6 +15,7 @@ from autocontribute.domain import (
     CriticReview,
     FileEdit,
     IssueCandidate,
+    IssueComment,
     PatchProposal,
     RepositoryInfo,
     ReviewScores,
@@ -77,7 +78,7 @@ def _issue(*, assigned: bool = False) -> IssueCandidate:
         html_url="https://github.com/example/project/issues/42",
         state="open",
         author="maintainer",
-        labels=["help wanted", "bug", "good first issue"],
+        labels=["help wanted", "bug"],
         assignees=["other"] if assigned else [],
         comments=2,
         created_at=now - timedelta(days=10),
@@ -153,16 +154,24 @@ class DiscoveryGitHub(CountingGitHub):
         super().__init__(issue, repository, sha)
         self.search_calls = 0
 
+    def list_labels(self, repository: str) -> list[str]:
+        del repository
+        return ["help wanted", "bug"]
+
     def search_issues(
         self,
         repository: str,
         *,
-        labels: list[str],
-        limit: int,
+        include_labels: list[str],
+        exclude_labels: list[str],
+        unassigned: bool,
+        page: int,
+        per_page: int,
     ) -> list[IssueCandidate]:
-        del repository, labels, limit
+        del repository, include_labels, exclude_labels, unassigned, per_page
         self.search_calls += 1
-        return [self.issue]
+        # Like GitHub's, search results carry no discussion.
+        return [self.issue.model_copy(update={"discussion": []})] if page == 1 else []
 
 
 class FixedProvider:
@@ -2497,7 +2506,23 @@ def test_unpinned_discovery_exhausts_suppressed_revision_without_model_work(
     )
     store = RunStore(config.storage.path)
     providers = _providers()
-    github = DiscoveryGitHub(_issue(assigned=True), _repository(sha), sha)
+    now = datetime.now(UTC)
+    claimed = _issue().model_copy(
+        update={
+            "comments": 1,
+            "discussion": [
+                IssueComment(
+                    author="contributor",
+                    author_association="NONE",
+                    body="I'm working on this.",
+                    html_url="https://github.com/example/project/issues/42#issuecomment-1",
+                    created_at=now,
+                    updated_at=now,
+                )
+            ],
+        }
+    )
+    github = DiscoveryGitHub(claimed, _repository(sha), sha)
 
     with Orchestrator(
         config,

@@ -22,11 +22,12 @@ A DCO attestation needs both keys set, because the `Signed-off-by` trailer must 
 | `api_url` | `https://api.github.com` | GitHub API URL. Must use HTTPS. |
 | `repositories` | `[]` | Repositories to search, as `owner/name`. Each needs a `validation.required_commands` entry. |
 | `owners` | `[]` | Users or organizations whose most recently pushed public repositories are searched too. If the chosen issue's repository has no `validation.required_commands` entry, the run stops before any model call. |
-| `include_labels` | `help wanted`, `good first issue` | Discovery searches only open issues that carry one of these labels. |
-| `exclude_labels` | `security`, `breaking change`, `needs design`, `discussion`, `blocked` | Skip issues that carry any of these labels. |
-| `min_stars` | `1000` | Skip repositories with fewer stars, including ones listed in `repositories`. |
+| `include_labels` | `help wanted`, `bug`, `confirmed`, `accepted`, `status: help wanted`, `contributions welcome`, `pr welcome` | Discovery searches only open issues that carry one of these labels. Labels match regardless of case, hyphens, and underscores, so `Help-Wanted` matches `help wanted`. Discovery also searches for `status: help wanted`, `sprintable`, `E-easy`, `contributions welcome`, `PR welcome`, `accepted`, and `confirmed` when a repository defines them, even if you change this list. |
+| `exclude_labels` | `security`, `breaking change`, `needs design`, `discussion`, `blocked`, `good first issue`, `first-timers-only` | Skip issues that carry any of these labels. Maintainers keep `good first issue` and `first-timers-only` issues for people making their first contribution. |
+| `labels` | `{}` | Labels for one repository, as `owner/name: {include: [...], exclude: [...]}`. A list you set replaces `include_labels` or `exclude_labels` for that repository, and a set `include` list also turns off the extra labels above. |
+| `min_stars` | `0` | Skip repositories with fewer stars, including ones listed in `repositories`. |
 | `repository_limit_per_owner` | `8` | Repositories searched for each entry in `owners` (1–30). |
-| `issue_limit_per_repository` | `10` | Issues fetched per repository, most recently updated first (1–50). |
+| `issue_limit_per_repository` | `10` | Issues read in full per repository, newest first (1–50). Discovery skips search results that are assigned, carry an excluded label, or fail another check that needs only the issue itself, and reads at most 300 search results per repository. |
 | `require_unassigned` | `true` | Skip assigned issues. `false`, or `policy.allow_assigned_issues: true`, allows them. |
 | `max_issue_age_days` | `365` | Skip issues not updated for this many days (1–3650). |
 | `max_repository_inactivity_days` | `180` | Skip repositories with no push for this many days (1–3650). |
@@ -82,7 +83,7 @@ There is no network setting: the `docker` backend always runs checks with no net
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `require_maintainer_signal` | `true` | Issues must carry one of `github.include_labels`. |
+| `require_maintainer_signal` | `true` | Issues must carry one of the `github.include_labels` (or `github.labels`) labels, or have a maintainer comment that invites a pull request. |
 | `require_contribution_guidelines` | `true` | The repository, or the owner's `.github` repository, must have a CONTRIBUTING file. |
 | `allow_assigned_issues` | `false` | `true` allows assigned issues. |
 | `allow_security_issues` | `false` | `true` allows issues that look security-related. |
