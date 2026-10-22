@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -142,6 +143,23 @@ def test_production_factory_cannot_select_the_in_process_sdk_adapter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert isinstance(providers.create_provider(_profile(monkeypatch)), SubprocessModelProvider)
+
+
+def test_parent_process_never_imports_provider_sdks() -> None:
+    probe = (
+        "import sys\n"
+        "import autocontribute.cli\n"
+        "print(sorted({name.split('.')[0] for name in sys.modules} & {'anthropic', 'openai'}))\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", probe],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+
+    assert completed.stdout == "[]\n"
 
 
 def test_process_provider_round_trips_allowlisted_output_and_usage(
