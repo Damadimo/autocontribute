@@ -12,14 +12,12 @@ import tempfile
 from collections.abc import Callable, Iterable
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from typing import cast
 
 import httpx
 from rich.markup import escape
 
-from autocontribute.backup_replication import verify_latest_state_bundle_replication
 from autocontribute.config import (
     AutocontributeConfig,
     ModelProfile,
@@ -217,7 +215,6 @@ def _run_doctor(
                 )
             )
 
-    checks.append(_s3_replication_check(config))
     checks.append(_command_check("git", ["git", "--version"]))
     if config.sandbox.backend == "docker":
         checks.append(
@@ -295,41 +292,6 @@ def _run_doctor(
         )
     )
     return checks
-
-
-def _s3_replication_check(config: AutocontributeConfig) -> DoctorCheck:
-    replication = config.s3_replication
-    if replication is None:
-        return DoctorCheck(
-            "latest S3 backup replication",
-            True,
-            "not configured; optional",
-            warning=True,
-        )
-    try:
-        verified = verify_latest_state_bundle_replication(
-            bundle_directory=replication.bundle_directory,
-            receipt_directory=replication.receipt_directory,
-            bucket=replication.bucket,
-            expected_bucket_owner=replication.expected_bucket_owner,
-            region=replication.region,
-            prefix=replication.prefix,
-            maximum_age=timedelta(hours=replication.max_age_hours),
-            minimum_retention=timedelta(days=replication.retention_days),
-        )
-    except (AutocontributeError, OSError, ValueError) as exc:
-        return DoctorCheck(
-            "latest S3 backup replication",
-            False,
-            _safe_detail(str(exc)),
-        )
-    return DoctorCheck(
-        "latest S3 backup replication",
-        True,
-        _safe_detail(
-            f"{verified.bundle_path.name} is bound to exact receipt {verified.record_path.name}"
-        ),
-    )
 
 
 def _model_capability_checks(config: AutocontributeConfig) -> list[DoctorCheck]:

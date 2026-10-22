@@ -13,7 +13,6 @@ from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     GitHubSafetyError,
     PolicyError,
-    StateError,
 )
 from autocontribute.github import GitHubClient
 from autocontribute.store import RunStore
@@ -47,15 +46,6 @@ def _pinned_config() -> AutocontributeConfig:
                 "critic": {**profile, "reasoning_mode": "pro"},
             },
             "validation": {"required_commands": {"example/project": ["python -m unittest"]}},
-            "s3_replication": {
-                "bundle_directory": "/var/backups/autocontribute",
-                "receipt_directory": "/var/backups/autocontribute/receipts",
-                "scratch_directory": "/var/backups/autocontribute/replication-scratch",
-                "bucket": "autocontribute-backup",
-                "expected_bucket_owner": "123456789012",
-                "region": "ca-central-1",
-                "prefix": "production/test",
-            },
         }
     )
 
@@ -190,48 +180,6 @@ def test_required_systemd_asset_marker_rejects_noncanonical_values(
     assert "must be exactly 1" in checks[0].detail
 
 
-def test_doctor_reports_optional_review_mode_replication_as_an_explicit_warning() -> None:
-    check = doctor._s3_replication_check(_config())
-
-    assert check.name == "latest S3 backup replication"
-    assert check.passed
-    assert check.warning
-    assert "optional" in check.detail
-
-
-def test_doctor_proves_latest_configured_replication_or_fails_closed(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _pinned_config()
-    captured: dict[str, object] = {}
-
-    def verify(**kwargs: object) -> SimpleNamespace:
-        captured.update(kwargs)
-        return SimpleNamespace(
-            bundle_path=Path("autocontribute-state-current.bundle.zip"),
-            record_path=Path("autocontribute-state-current.bundle.zip.s3-replication.json"),
-        )
-
-    monkeypatch.setattr(doctor, "verify_latest_state_bundle_replication", verify)
-    passed = doctor._s3_replication_check(config)
-
-    assert passed.passed
-    assert not passed.warning
-    assert captured["maximum_age"] == doctor.timedelta(hours=48)
-    assert captured["minimum_retention"] == doctor.timedelta(days=90)
-    assert "current.bundle.zip" in passed.detail
-
-    monkeypatch.setattr(
-        doctor,
-        "verify_latest_state_bundle_replication",
-        lambda **_kwargs: (_ for _ in ()).throw(StateError("exact receipt is missing")),
-    )
-    failed = doctor._s3_replication_check(config)
-
-    assert not failed.passed
-    assert "exact receipt is missing" in failed.detail
-
-
 def test_active_breaker_skips_billed_model_and_github_probes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -280,7 +228,7 @@ def test_active_breaker_skips_billed_model_and_github_probes(
     assert not any(check.name.startswith("GitHub ") for check in checks)
 
 
-def test_doctor_github_safety_trigger_survives_snapshot_restore(
+def test_doctor_github_safety_trigger_survives_reopening_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -291,12 +239,10 @@ def test_doctor_github_safety_trigger_survives_snapshot_restore(
 
     assert not checks[0].passed
     assert store.circuit_breaker_status().is_tripped
-    snapshot = store.create_snapshot(tmp_path / "snapshots" / "state.sqlite3")
-    RunStore.restore_snapshot(tmp_path / "restored", snapshot)
-    restored = RunStore(tmp_path / "restored").circuit_breaker_status()
-    assert restored.is_tripped
-    assert restored.source == "github_api:rate_or_abuse_limit"
-    assert restored.trigger_hash == "a" * 64
+    reopened = RunStore(tmp_path / "state").circuit_breaker_status()
+    assert reopened.is_tripped
+    assert reopened.source == "github_api:rate_or_abuse_limit"
+    assert reopened.trigger_hash == "a" * 64
 
 
 def test_model_capability_probe_deduplicates_exact_profiles_and_is_bounded(

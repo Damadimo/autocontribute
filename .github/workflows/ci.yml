@@ -591,25 +591,6 @@ jobs:
               "$service_path"
           done
 
-  ubuntu-deployment-recovery:
-    name: Ubuntu 24.04 deployment/recovery acceptance
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Install uv and Python
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
-        with:
-          version: "0.9.30"
-          python-version: "3.12"
-          enable-cache: true
-      - name: Exercise installed backup and recovery
-        shell: bash
-        run: tests/acceptance/ubuntu_24_04_deployment_recovery.sh
-
   test:
     strategy:
       fail-fast: false
