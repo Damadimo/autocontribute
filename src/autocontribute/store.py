@@ -3352,6 +3352,17 @@ class RunStore:
         for row in rows:
             self._remove_workspace(str(row["run_id"]))
 
+    def unfinished_run_ids(self) -> frozenset[str]:
+        """Return every run that has not reached a terminal status."""
+
+        finished = tuple(sorted(status.value for status in TERMINAL_STATUSES))
+        placeholders = ",".join("?" for _ in finished)
+        # Only placeholder tokens are interpolated; all status values remain bound parameters.
+        query = f"SELECT run_id FROM runs WHERE status NOT IN ({placeholders})"
+        with self._connection() as connection:
+            rows = connection.execute(query, finished).fetchall()
+        return frozenset(str(row["run_id"]) for row in rows)
+
     def _remove_workspace(self, run_id: str) -> None:
         """Best-effort deletion of a finished run's clone; its evidence in runs/ stays."""
 

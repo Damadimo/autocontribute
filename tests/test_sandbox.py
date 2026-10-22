@@ -893,3 +893,60 @@ def test_session_requires_a_real_git_directory_and_a_safe_run_id(
             store_root=tmp_path / "state",
         )
     assert docker.calls == []
+
+
+def test_leftover_sweep_removes_finished_or_unknown_runs_of_this_store_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    containers = {"running": "a" * 64, "finished": "b" * 64, "unlabelled": "c" * 64}
+    networks = {"finished": "d" * 64, "running": "e" * 64}
+    calls: list[list[str]] = []
+
+    def control(
+        _docker_binary: str,
+        arguments: Sequence[str],
+        _environment: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        call = list(arguments)
+        calls.append(call)
+        if call[0] == "ps":
+            rows = (
+                f"{containers['running']} run-active\n"
+                f"{containers['finished']} run-done\n"
+                f"{containers['unlabelled']} \n"
+            )
+            return subprocess.CompletedProcess(call, 0, rows, "")
+        if call[:2] == ["network", "ls"]:
+            rows = f"{networks['finished']} run-done\n{networks['running']} run-active\n"
+            return subprocess.CompletedProcess(call, 0, rows, "")
+        return subprocess.CompletedProcess(call, 0, "", "")
+
+    monkeypatch.setattr(sandbox, "_docker_control", control)
+    store_hash = hashlib.sha256(os.fsencode((tmp_path / "state").resolve())).hexdigest()[:16]
+    selection = [
+        "--filter",
+        f"label=org.autocontribute.store={store_hash}",
+        "--format",
+        '{{.ID}} {{.Label "org.autocontribute.run"}}',
+    ]
+
+    sandbox.remove_leftover_containers(tmp_path / "state", {"run-active", "run-queued"})
+
+    assert calls == [
+        ["ps", "--all", "--no-trunc", *selection],
+        ["rm", "--force", "--volumes", containers["finished"]],
+        ["rm", "--force", "--volumes", containers["unlabelled"]],
+        ["network", "ls", "--no-trunc", *selection],
+        ["network", "rm", networks["finished"]],
+    ]
+
+
+def test_leftover_sweep_fails_closed_when_docker_cannot_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sandbox, "_docker_control", lambda *_args: None)
+
+    with pytest.raises(SandboxError, match="Could not list leftover"):
+        sandbox.remove_leftover_containers(tmp_path / "state", set())

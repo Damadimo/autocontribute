@@ -2492,6 +2492,25 @@ def test_finished_workspace_sweep_deletes_only_leftovers_of_finished_runs(
     assert unknown.is_dir()
 
 
+def test_unfinished_run_ids_lists_every_run_without_a_terminal_status(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    statuses = {
+        RunStatus.IMPLEMENTING: store.create_run(),
+        RunStatus.READY_FOR_APPROVAL: store.create_run(),
+        RunStatus.FAILED: store.create_run(),
+        RunStatus.PR_OPEN: store.create_run(),
+    }
+    for status, run in statuses.items():
+        _set_status(store, run, status)
+    queued = store.create_run()
+
+    assert store.unfinished_run_ids() == {
+        queued.run_id,
+        statuses[RunStatus.IMPLEMENTING].run_id,
+        statuses[RunStatus.READY_FOR_APPROVAL].run_id,
+    }
+
+
 def test_workspace_cleanup_never_follows_a_symlinked_workspace(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     outside = tmp_path / "outside"
