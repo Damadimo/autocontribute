@@ -27,6 +27,7 @@ from autocontribute.domain import (
     IssueCandidate,
     IssueComment,
     RepositoryInfo,
+    RunManifest,
     RunStatus,
 )
 from autocontribute.exceptions import (
@@ -142,8 +143,16 @@ class CandidateDiscoveryGitHub(FakeGitHub):
 
 
 class DispositionStore:
-    def __init__(self, states: dict[int, CandidateAttemptState]) -> None:
+    def __init__(
+        self,
+        states: dict[int, CandidateAttemptState],
+        open_pull_request_runs: list[RunManifest] | None = None,
+    ) -> None:
         self.states = states
+        self.open_pull_request_runs = open_pull_request_runs or []
+
+    def list_open_pull_request_runs(self) -> list[RunManifest]:
+        return self.open_pull_request_runs
 
     def candidate_attempt_disposition(
         self,
@@ -619,6 +628,44 @@ def test_discovery_exhaustion_distinguishes_suppressed_active_and_ineligible_can
         "prior skipped, rejected, or cancelled run; 1 candidate already has an active run; "
         "1 candidate failed discovery gates (assigned 1)."
     )
+
+
+def _open_pull_request_run(repository: str) -> RunManifest:
+    now = datetime.now(UTC)
+    return RunManifest(
+        run_id="open-pull-request",
+        status=RunStatus.PR_OPEN,
+        created_at=now,
+        updated_at=now,
+        candidate=_repository_issue(repository, 5),
+        pull_request_url=f"https://github.com/{repository}/pull/77",
+    )
+
+
+def test_repository_with_an_open_autocontribute_pull_request_is_skipped() -> None:
+    github = IsolationGitHub(
+        {
+            "example/project": [_repository_issue("example/project", 42)],
+            "other/project": [_repository_issue("other/project", 7)],
+        }
+    )
+    store = DispositionStore({}, [_open_pull_request_run("Example/Project")])
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project", "other/project"), github, store
+    )
+
+    outcome = service.discover()
+
+    assert outcome.selection is not None
+    assert outcome.selection[0].reference == "other/project#7"
+    assert outcome.skipped_repositories == (
+        (
+            "example/project",
+            "an autocontribute pull request is already open: "
+            "https://github.com/Example/Project/pull/77",
+        ),
+    )
+    assert [evaluation.issue.repository for evaluation in outcome.evaluations] == ["other/project"]
 
 
 def test_empty_discovery_preserves_generic_no_candidate_reason() -> None:

@@ -618,6 +618,14 @@ class DiscoveryService:
 
     def discover(self) -> DiscoveryOutcome:
         repositories, repository_errors = self.repositories()
+        # At most one open autocontribute pull request per repository.
+        open_pull_requests = {
+            manifest.candidate.repository.casefold(): (
+                manifest.pull_request_url or f"run {manifest.run_id}"
+            )
+            for manifest in self.store.list_open_pull_request_runs()
+            if manifest.candidate is not None
+        }
         evaluations: list[IssueEvaluation] = []
         eligible: list[IssueEvaluation] = []
         skipped_repositories: list[tuple[str, str]] = []
@@ -630,6 +638,15 @@ class DiscoveryService:
                 break
             if not self._repository_baseline(repository):
                 skipped_repositories.append((repository.full_name, _REPOSITORY_BASELINE_REASON))
+                continue
+            open_pull_request = open_pull_requests.get(repository.full_name.casefold())
+            if open_pull_request is not None:
+                skipped_repositories.append(
+                    (
+                        repository.full_name,
+                        f"an autocontribute pull request is already open: {open_pull_request}",
+                    )
+                )
                 continue
             try:
                 include_labels, exclude_labels = self._search_labels(repository.full_name)
