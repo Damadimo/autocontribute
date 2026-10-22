@@ -1,6 +1,5 @@
 import hashlib
 import json
-import os
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -22,81 +21,6 @@ from autocontribute.store import (
     CandidateRetryAuthorization,
     RunStore,
 )
-
-
-def test_required_storage_root_binds_store_to_verified_mount(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    required = tmp_path / "state"
-    required.mkdir()
-    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT", os.fspath(required))
-
-    store = RunStore(required)
-
-    assert store.root == required
-
-
-def test_required_storage_root_rejects_storage_bypass(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    required = tmp_path / "bounded"
-    required.mkdir()
-    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT", os.fspath(required))
-
-    with pytest.raises(StateError, match="bypasses the required storage root"):
-        RunStore(tmp_path / "unbounded")
-
-
-@pytest.mark.parametrize("required", ("", "relative/state"))
-def test_required_storage_root_rejects_invalid_values(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    required: str,
-) -> None:
-    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT", required)
-
-    with pytest.raises(StateError, match="Required storage root"):
-        RunStore(tmp_path / "state")
-
-
-def test_required_workspace_root_binds_storage_to_verified_mount(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state = tmp_path / "state"
-    required = state / "workspaces"
-    required.mkdir(parents=True)
-    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT", os.fspath(required))
-
-    store = RunStore(state)
-
-    assert store.workspaces_dir == required
-
-
-def test_required_workspace_root_rejects_storage_bypass(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    required = tmp_path / "bounded" / "workspaces"
-    required.mkdir(parents=True)
-    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT", os.fspath(required))
-
-    with pytest.raises(StateError, match="bypasses the required workspace root"):
-        RunStore(tmp_path / "unbounded")
-
-
-@pytest.mark.parametrize("required", ("", "relative/workspaces"))
-def test_required_workspace_root_rejects_invalid_values(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    required: str,
-) -> None:
-    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT", required)
-
-    with pytest.raises(StateError, match="Required workspace root"):
-        RunStore(tmp_path / "state")
 
 
 def _set_status(store: RunStore, run: RunManifest, status: RunStatus) -> None:
@@ -234,7 +158,7 @@ def _publication_run(
     repository: str = "example/project",
     number: int = 42,
 ) -> RunManifest:
-    run = store.create_run(deployment_fingerprint="d" * 64)
+    run = store.create_run()
     _set_status(store, run, RunStatus.DISCOVERING)
     run.candidate = _issue_candidate(repository=repository, number=number)
     lease = store.acquire_lease(

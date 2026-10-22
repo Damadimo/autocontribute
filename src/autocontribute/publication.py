@@ -31,7 +31,6 @@ from autocontribute.coordination import (
     PUBLICATION_LEASE_TTL,
     LeaseHeartbeatGuard,
 )
-from autocontribute.deployment import validate_deployment_fingerprint
 from autocontribute.discovery import (
     LEGAL_ATTESTATION_EVIDENCE_KEY,
     LEGAL_POLICY_EVIDENCE_KEY,
@@ -989,13 +988,7 @@ class Publisher:
                 raise PolicyError("Run has not passed every quality gate")
             if not manifest.candidate or not manifest.repository or not manifest.base_sha:
                 raise PolicyError("Run is missing repository freshness evidence")
-            creation_deployment_fingerprint = self.store.run_deployment_fingerprint(run_id)
-            if manifest.deployment_fingerprint != creation_deployment_fingerprint:
-                raise PolicyError(
-                    "Run deployment fingerprint differs from its immutable creation evidence"
-                )
             validate_preparation_config_fingerprint(manifest, self.config)
-            validate_deployment_fingerprint(creation_deployment_fingerprint, self.config)
         assert manifest.candidate is not None
         assert manifest.repository is not None
         assert manifest.base_sha is not None

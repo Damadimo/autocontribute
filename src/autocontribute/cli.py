@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import uuid
 from datetime import UTC, datetime
@@ -49,10 +48,6 @@ from autocontribute.orchestrator import Orchestrator, RunInvocationMode
 from autocontribute.publication import Publisher, approve_run, build_approval_review
 from autocontribute.reporting import render_approval_review, render_run_report
 from autocontribute.store import CandidateRetryAuthorization, RunStore
-from autocontribute.systemd_assets import (
-    verify_installed_systemd_assets,
-    verify_source_systemd_assets,
-)
 
 app = typer.Typer(
     name="autocontribute",
@@ -73,16 +68,11 @@ policy_app = typer.Typer(
     help="Inspect immutable repository policy and create scoped legal attestations.",
     no_args_is_help=True,
 )
-deployment_app = typer.Typer(
-    help="Verify release-bound production deployment assets.",
-    no_args_is_help=True,
-)
 app.add_typer(runs_app, name="runs")
 app.add_typer(config_app, name="config")
 app.add_typer(lifecycle_app, name="lifecycle")
 app.add_typer(safety_app, name="safety")
 app.add_typer(policy_app, name="policy")
-app.add_typer(deployment_app, name="deployment")
 
 console = Console()
 DEFAULT_CONFIG = Path("autocontribute.yml")
@@ -91,10 +81,6 @@ ConfigOption = Annotated[
     typer.Option("--config", "-c", help="Path to the YAML configuration."),
 ]
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_CONTRIBUTION_STAMP_ENV = "AUTOCONTRIBUTE_CONTRIBUTION_STAMP"
-_PRODUCTIVE_SCHEDULED_STATUSES = frozenset(
-    {RunStatus.READY_FOR_APPROVAL, RunStatus.SUBMITTING, RunStatus.PR_OPEN}
-)
 # Prepared work that has not started publishing. Earlier stages belong to a live worker, and a
 # submitting run must be reconciled with GitHub before its state can change.
 _CANCELLABLE_STATUSES = frozenset({RunStatus.READY_FOR_APPROVAL, RunStatus.APPROVED})
@@ -146,35 +132,6 @@ def doctor(
     console.print(table)
     if any(not check.passed for check in checks):
         raise typer.Exit(1)
-
-
-@deployment_app.command(name="verify-systemd-assets")
-def verify_systemd_deployment_assets(
-    source_root: Annotated[
-        Path | None,
-        typer.Option(
-            "--source-root",
-            help=(
-                "Verify an immutable release checkout before installation; omit to verify the "
-                "exact production host paths."
-            ),
-        ),
-    ] = None,
-) -> None:
-    """Fail unless every systemd deployment asset matches this Python release."""
-
-    try:
-        if source_root is None:
-            result = verify_installed_systemd_assets()
-        else:
-            result = verify_source_systemd_assets(source_root)
-    except (AutocontributeError, OSError, ValueError) as exc:
-        _fail(str(exc))
-    console.print(
-        "[green]Verified[/green] "
-        f"{result.checked_assets} {result.scope} systemd deployment asset(s) "
-        f"against manifest {result.manifest_sha256}."
-    )
 
 
 @app.command()
@@ -264,8 +221,6 @@ def run_once(
                 ),
                 retry_authorization=retry_authorization,
             )
-        if scheduled and manifest.status in _PRODUCTIVE_SCHEDULED_STATUSES:
-            _refresh_contribution_stamp()
     except (AutocontributeError, ValueError) as exc:
         _fail(str(exc))
     finally:
@@ -940,30 +895,6 @@ def _print_lifecycle_result(result: LifecycleSyncResult) -> None:
                 f"{signal.reason} ({signal.source_url})",
                 markup=False,
             )
-
-
-def _refresh_contribution_stamp() -> None:
-    """Refresh the scheduler productivity stamp after a durably prepared contribution.
-
-    A stamp failure must page (exit 1) rather than pass silently: the stamp is the
-    only signal separating a productive deployment from one that runs healthily
-    without ever preparing contributions. The prepared contribution itself stays
-    durable in the run store either way.
-    """
-
-    stamp = os.environ.get(_CONTRIBUTION_STAMP_ENV)
-    if not stamp:
-        return
-    try:
-        descriptor = os.open(stamp, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-    except OSError as exc:
-        raise StateError("The contribution productivity stamp could not be refreshed") from exc
-    try:
-        os.utime(descriptor)
-    except OSError as exc:
-        raise StateError("The contribution productivity stamp could not be refreshed") from exc
-    finally:
-        os.close(descriptor)
 
 
 def _print_outcome(manifest: RunManifest, store: RunStore) -> None:

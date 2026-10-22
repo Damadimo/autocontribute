@@ -308,10 +308,6 @@ class RunManifest(DomainModel):
     status: RunStatus
     created_at: datetime
     updated_at: datetime
-    deployment_fingerprint: str | None = Field(
-        default=None,
-        pattern=r"^[0-9a-f]{64}$",
-    )
     candidate: IssueCandidate | None = None
     eligibility: EligibilityResult | None = None
     repository: RepositoryInfo | None = None

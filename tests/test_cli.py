@@ -1,9 +1,7 @@
 import json
-import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -1010,131 +1008,6 @@ def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monk
     assert calls == ["sync:True", "run", "close"]
 
 
-def _install_run_outcome_fixture(
-    monkeypatch: pytest.MonkeyPatch,
-    status: RunStatus,
-) -> None:
-    class FakeGitHub:
-        def __init__(self, *_: object, **__: object) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    class FakeOrchestrator:
-        def __init__(self, _: object, *, store: RunStore, github: object) -> None:
-            self.store = store
-
-        def __enter__(self):  # type: ignore[no-untyped-def]
-            return self
-
-        def __exit__(self, *_: object) -> None:
-            pass
-
-        def run(self, **_: object):  # type: ignore[no-untyped-def]
-            manifest = self.store.create_run()
-            manifest.status = status
-            if status == RunStatus.SKIPPED:
-                manifest.skip_reason = "fixture"
-            self.store.save(manifest, event="test.outcome", details={})
-            return manifest
-
-    monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
-    monkeypatch.setattr(cli, "Orchestrator", FakeOrchestrator)
-    monkeypatch.setattr(
-        cli,
-        "_sync_lifecycle",
-        lambda *_args, **_kwargs: LifecycleSyncResult(observations=()),
-    )
-
-
-def test_scheduled_run_refreshes_contribution_stamp_after_productive_outcome(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = tmp_path / "autocontribute.yml"
-    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
-    stamp = tmp_path / "health" / "contribution-prepared"
-    stamp.parent.mkdir()
-    monkeypatch.setenv("AUTOCONTRIBUTE_CONTRIBUTION_STAMP", str(stamp))
-    _install_run_outcome_fixture(monkeypatch, RunStatus.READY_FOR_APPROVAL)
-
-    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
-
-    assert result.exit_code == 0, result.output
-    assert stamp.is_file()
-    assert stamp.stat().st_mode & 0o777 == 0o600
-
-
-def test_scheduled_run_refreshes_an_existing_contribution_stamp_mtime(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = tmp_path / "autocontribute.yml"
-    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
-    stamp = tmp_path / "contribution-prepared"
-    stamp.touch(mode=0o600)
-    os.utime(stamp, (1_000_000_000, 1_000_000_000))
-    monkeypatch.setenv("AUTOCONTRIBUTE_CONTRIBUTION_STAMP", str(stamp))
-    _install_run_outcome_fixture(monkeypatch, RunStatus.READY_FOR_APPROVAL)
-
-    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
-
-    assert result.exit_code == 0, result.output
-    assert stamp.stat().st_mtime > 1_000_000_000
-
-
-def test_scheduled_run_leaves_contribution_stamp_untouched_when_skipped(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = tmp_path / "autocontribute.yml"
-    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
-    stamp = tmp_path / "contribution-prepared"
-    monkeypatch.setenv("AUTOCONTRIBUTE_CONTRIBUTION_STAMP", str(stamp))
-    _install_run_outcome_fixture(monkeypatch, RunStatus.SKIPPED)
-
-    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
-
-    assert result.exit_code == 0, result.output
-    assert not stamp.exists()
-
-
-def test_manual_run_never_refreshes_the_contribution_stamp(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = tmp_path / "autocontribute.yml"
-    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
-    stamp = tmp_path / "contribution-prepared"
-    monkeypatch.setenv("AUTOCONTRIBUTE_CONTRIBUTION_STAMP", str(stamp))
-    _install_run_outcome_fixture(monkeypatch, RunStatus.READY_FOR_APPROVAL)
-
-    result = runner.invoke(app, ["run", "--config", str(config)])
-
-    assert result.exit_code == 0, result.output
-    assert not stamp.exists()
-
-
-def test_scheduled_run_pages_when_the_contribution_stamp_cannot_be_refreshed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = tmp_path / "autocontribute.yml"
-    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
-    target = tmp_path / "real-stamp"
-    target.touch(mode=0o600)
-    stamp = tmp_path / "contribution-prepared"
-    stamp.symlink_to(target)
-    monkeypatch.setenv("AUTOCONTRIBUTE_CONTRIBUTION_STAMP", str(stamp))
-    _install_run_outcome_fixture(monkeypatch, RunStatus.READY_FOR_APPROVAL)
-
-    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
-
-    assert result.exit_code == 1
-    assert "contribution productivity stamp could not be refreshed" in result.output
-
-
 @pytest.mark.parametrize("already_active", [False, True])
 def test_scheduled_preflight_fails_after_lifecycle_when_breaker_is_active(
     tmp_path: Path,
@@ -1724,46 +1597,3 @@ def test_lifecycle_sync_command_reports_bounded_summary(tmp_path: Path, monkeypa
 
     assert result.exit_code == 0, result.output
     assert "Lifecycle sync: 0 PR(s), 0 safety signal(s), 0 new trigger(s)" in result.output
-
-
-def test_deployment_asset_command_verifies_a_source_release(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[Path] = []
-    monkeypatch.setattr(
-        cli,
-        "verify_source_systemd_assets",
-        lambda root: (
-            calls.append(root)
-            or SimpleNamespace(
-                checked_assets=23,
-                scope="source",
-                manifest_sha256="a" * 64,
-            )
-        ),
-    )
-
-    result = runner.invoke(
-        app,
-        ["deployment", "verify-systemd-assets", "--source-root", str(tmp_path)],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert calls == [tmp_path]
-    assert "Verified 23 source systemd deployment asset(s)" in result.output
-
-
-def test_deployment_asset_command_reports_installed_mismatch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        cli,
-        "verify_installed_systemd_assets",
-        lambda: (_ for _ in ()).throw(StateError("installed assets differ")),
-    )
-
-    result = runner.invoke(app, ["deployment", "verify-systemd-assets"])
-
-    assert result.exit_code == 1
-    assert "installed assets differ" in result.output

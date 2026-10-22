@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import tomllib
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -60,23 +58,7 @@ def test_build_backend_is_exactly_pinned_in_the_lockfile() -> None:
     assert locked_versions["hatchling"] == "1.27.0"
 
 
-def test_packaged_build_identity_matches_project_material() -> None:
-    project_root = Path(__file__).resolve().parents[1]
-    manifest_path = project_root / "src" / "autocontribute" / "_build_identity.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-
-    assert manifest == {
-        "project": "autocontribute",
-        "pyproject_sha256": hashlib.sha256(
-            (project_root / "pyproject.toml").read_bytes()
-        ).hexdigest(),
-        "schema_version": 1,
-        "uv_lock_sha256": hashlib.sha256((project_root / "uv.lock").read_bytes()).hexdigest(),
-    }
-
-
 if __name__ == "__main__":
     test_lockfile_uses_only_portable_public_sources()
     test_dependency_snapshot_is_locked_and_at_least_seven_days_old()
     test_build_backend_is_exactly_pinned_in_the_lockfile()
-    test_packaged_build_identity_matches_project_material()

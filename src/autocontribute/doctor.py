@@ -23,7 +23,7 @@ from autocontribute.config import (
     ModelProfile,
     validate_model_identifier,
 )
-from autocontribute.exceptions import AutocontributeError, SandboxError
+from autocontribute.exceptions import SandboxError
 from autocontribute.github import GitHubClient
 from autocontribute.providers import ModelCapabilityResponse, create_provider
 from autocontribute.redaction import redact_text
@@ -35,7 +35,6 @@ from autocontribute.sandbox import (
     docker_container_identity,
 )
 from autocontribute.store import RunStore
-from autocontribute.systemd_assets import verify_installed_systemd_assets
 
 _DETAIL_LIMIT = 500
 _MODEL_PROBE_MAX_OUTPUT_TOKENS = 1_024
@@ -152,35 +151,10 @@ def run_doctor(
     names_token = _DOCTOR_SECRET_ENV_NAMES.set(secret_env_names)
     values_token = _DOCTOR_SECRET_VALUES.set(secret_values)
     try:
-        deployment_check = _required_systemd_asset_check()
-        if deployment_check is not None and not deployment_check.passed:
-            return [deployment_check]
-        checks = _run_doctor(config, store=store)
-        return ([deployment_check] if deployment_check is not None else []) + checks
+        return _run_doctor(config, store=store)
     finally:
         _DOCTOR_SECRET_VALUES.reset(values_token)
         _DOCTOR_SECRET_ENV_NAMES.reset(names_token)
-
-
-def _required_systemd_asset_check() -> DoctorCheck | None:
-    marker = os.environ.get("AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS")
-    if marker is None:
-        return None
-    if marker != "1":
-        return DoctorCheck(
-            "systemd deployment assets",
-            False,
-            "AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS must be exactly 1",
-        )
-    try:
-        result = verify_installed_systemd_assets()
-    except (AutocontributeError, OSError, ValueError) as exc:
-        return DoctorCheck("systemd deployment assets", False, _safe_detail(str(exc)))
-    return DoctorCheck(
-        "systemd deployment assets",
-        True,
-        (f"{result.checked_assets} release-bound files match manifest {result.manifest_sha256}"),
-    )
 
 
 def _run_doctor(

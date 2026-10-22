@@ -36,8 +36,6 @@ _MAX_ACTIVE_CIRCUIT_BREAKER_TRIGGERS: Final = 10_000
 _MAX_RUN_CORPUS: Final = 10_000
 _CANDIDATE_REPOSITORY: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
-_REQUIRED_STORAGE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT"
-_REQUIRED_WORKSPACE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT"
 _INITIAL_EVENT_HASH: Final = "0" * 64
 _METADATA_COLUMNS: Final = {"singleton", "schema_version", "migrated_at"}
 _RUN_COLUMNS: Final = {
@@ -837,53 +835,11 @@ class RunStore:
         self.runs_dir = self.root / "runs"
         self.workspaces_dir = self.root / "workspaces"
         self.database_path = self.root / "state.sqlite3"
-        self._validate_required_storage_root()
-        self._validate_required_workspace_root()
         self.root.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.workspaces_dir.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self.synchronize_manifest_artifacts()
-
-    def _validate_required_storage_root(self) -> None:
-        """Bind a hardened deployment to its preflight-verified durable-state mount."""
-
-        required_value = os.environ.get(_REQUIRED_STORAGE_ROOT_ENV)
-        if required_value is None:
-            return
-        if not required_value or "\0" in required_value:
-            raise StateError("Required storage root is invalid")
-        required = Path(required_value)
-        if not required.is_absolute():
-            raise StateError("Required storage root must be absolute")
-        try:
-            resolved = required.resolve(strict=True)
-        except OSError as exc:
-            raise StateError("Required storage root is unavailable") from exc
-        if required != resolved:
-            raise StateError("Required storage root must be an exact real path")
-        if self.root != required:
-            raise StateError("Configured storage path bypasses the required storage root")
-
-    def _validate_required_workspace_root(self) -> None:
-        """Bind a hardened deployment to its preflight-verified workspace mount."""
-
-        required_value = os.environ.get(_REQUIRED_WORKSPACE_ROOT_ENV)
-        if required_value is None:
-            return
-        if not required_value or "\0" in required_value:
-            raise StateError("Required workspace root is invalid")
-        required = Path(required_value)
-        if not required.is_absolute():
-            raise StateError("Required workspace root must be absolute")
-        try:
-            resolved = required.resolve(strict=True)
-        except OSError as exc:
-            raise StateError("Required workspace root is unavailable") from exc
-        if required != resolved:
-            raise StateError("Required workspace root must be an exact real path")
-        if self.workspaces_dir != required:
-            raise StateError("Configured storage path bypasses the required workspace root")
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -1251,14 +1207,13 @@ class RunStore:
         with self._connection() as connection:
             return self._detect_schema_version(connection)
 
-    def create_run(self, *, deployment_fingerprint: str | None = None) -> RunManifest:
+    def create_run(self) -> RunManifest:
         now = utc_now()
         manifest = RunManifest(
             run_id=uuid.uuid4().hex[:16],
             status=RunStatus.QUEUED,
             created_at=now,
             updated_at=now,
-            deployment_fingerprint=deployment_fingerprint,
         )
         manifest_json = manifest.model_dump_json()
         with self._connection() as connection:
@@ -1275,10 +1230,7 @@ class RunStore:
                     manifest_json,
                 ),
             )
-            creation_details = {"status": "queued"}
-            if deployment_fingerprint is not None:
-                creation_details["deployment_fingerprint"] = deployment_fingerprint
-            self._append_event(connection, manifest.run_id, "run.created", creation_details)
+            self._append_event(connection, manifest.run_id, "run.created", {"status": "queued"})
             _mark_manifest_artifact_sync(
                 connection,
                 run_id=manifest.run_id,
@@ -1307,43 +1259,6 @@ class RunStore:
                 "SELECT manifest_json FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [RunManifest.model_validate_json(row["manifest_json"]) for row in rows]
-
-    def run_deployment_fingerprint(self, run_id: str) -> str | None:
-        """Read the deployment identity sealed into a run's first ledger event."""
-
-        normalized_run_id = _lease_identity(run_id, field="run id")
-        with self._connection() as connection:
-            connection.execute("BEGIN")
-            _verify_event_anchors(connection, selected_run_id=normalized_run_id)
-            row = connection.execute(
-                """
-                SELECT event_type, details_json FROM events
-                WHERE run_id = ? ORDER BY id ASC LIMIT 1
-                """,
-                (normalized_run_id,),
-            ).fetchone()
-        if row is None or row["event_type"] != "run.created":
-            raise StateError(f"Run {normalized_run_id} is missing valid creation evidence")
-        try:
-            details = json.loads(row["details_json"])
-        except (TypeError, ValueError) as exc:
-            raise StateError(f"Run {normalized_run_id} has invalid creation evidence") from exc
-        if details == {"status": "queued"}:
-            return None
-        if not isinstance(details, dict) or set(details) != {
-            "deployment_fingerprint",
-            "status",
-        }:
-            raise StateError(f"Run {normalized_run_id} has invalid creation evidence")
-        fingerprint = details.get("deployment_fingerprint")
-        if (
-            details.get("status") != "queued"
-            or not isinstance(fingerprint, str)
-            or len(fingerprint) != 64
-            or any(character not in "0123456789abcdef" for character in fingerprint)
-        ):
-            raise StateError(f"Run {normalized_run_id} has invalid creation evidence")
-        return fingerprint
 
     def list_open_pull_request_runs(self, *, limit: int = 1_000) -> builtins.list[RunManifest]:
         """Return every lifecycle-managed PR, failing instead of truncating the set."""
