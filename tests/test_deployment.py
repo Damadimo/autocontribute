@@ -60,7 +60,6 @@ def test_storage_credentials_identity_and_review_to_auto_transition_are_normaliz
     changed.github.token_env = "OTHER_GITHUB_TOKEN"
     changed.models.builder.api_key_env = "OTHER_MODEL_KEY"
     changed.publishing.mode = "auto"
-    changed.publishing.auto_publish_env = "OTHER_AUTO_SWITCH"
 
     assert compute_deployment_fingerprint(
         base, source_digest=SOURCE_DIGEST

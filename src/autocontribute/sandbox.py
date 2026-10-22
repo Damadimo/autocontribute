@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from pathlib import Path
 from typing import Final, Literal
@@ -130,27 +130,6 @@ class SandboxRunner:
             environment=self._docker_environment,
         )
 
-    def run_all(
-        self,
-        workspace: RepositoryWorkspace | Path,
-        commands: Sequence[str],
-        *,
-        stop_on_failure: bool = True,
-    ) -> list[CommandResult]:
-        """Run validation commands in order, stopping at the first failure by default."""
-
-        if len(commands) > self.config.max_commands - self._commands_run:
-            raise SandboxError(
-                f"Validation requested more than the {self.config.max_commands}-command budget"
-            )
-        results: list[CommandResult] = []
-        for command in commands:
-            result = self.run(workspace, command)
-            results.append(result)
-            if stop_on_failure and not result.passed:
-                break
-        return results
-
     def run_isolated(
         self,
         workspace: RepositoryWorkspace | Path,
@@ -173,10 +152,8 @@ class SandboxRunner:
         self,
         workspace: RepositoryWorkspace | Path,
         commands: Sequence[str],
-        *,
-        stop_on_failure: bool = True,
     ) -> list[CommandResult]:
-        """Run each command on a fresh copy so checks cannot mutate shared evidence."""
+        """Run each command on a fresh copy, stopping at the first failure."""
 
         if len(commands) > self.config.max_commands - self._commands_run:
             raise SandboxError(
@@ -186,7 +163,7 @@ class SandboxRunner:
         for command in commands:
             result = self.run_isolated(workspace, command)
             results.append(result)
-            if stop_on_failure and not result.passed:
+            if not result.passed:
                 break
         return results
 
@@ -196,8 +173,6 @@ class SandboxRunner:
         root = _workspace_path(workspace)
         _validate_command(command)
         _validate_image(self.config.image)
-        if self.config.network != "none":
-            raise SandboxError("Docker validation must use network=none")
         if "," in str(root) or "\n" in str(root):
             raise SandboxError("Workspace path cannot be represented safely as a Docker mount")
         if cidfile.exists() and cidfile.is_symlink():
@@ -551,15 +526,12 @@ def _verify_docker_data_headroom(path: str) -> None:
         raise SandboxError("Docker data-root is below the required free inode headroom")
 
 
-def docker_client_environment(
-    source: Mapping[str, str] | None = None,
-) -> dict[str, str]:
+def docker_client_environment() -> dict[str, str]:
     """Copy only Docker endpoint and boundary settings, never provider credentials."""
 
-    values = os.environ if source is None else source
-    environment = {"PATH": values.get("PATH", "")}
+    environment = {"PATH": os.environ.get("PATH", "")}
     for name in _DOCKER_CLIENT_ENV_NAMES:
-        if value := values.get(name):
+        if value := os.environ.get(name):
             environment[name] = value
     return environment
 

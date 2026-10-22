@@ -23,7 +23,11 @@ from autocontribute.approval import (
     manifest_fingerprint,
     validate_approval,
 )
-from autocontribute.config import AutocontributeConfig, auto_publish_opt_in_enabled
+from autocontribute.config import (
+    AUTO_PUBLISH_ENV,
+    AutocontributeConfig,
+    auto_publish_opt_in_enabled,
+)
 from autocontribute.coordination import (
     PUBLICATION_HEARTBEAT_INTERVAL,
     PUBLICATION_LEASE_NAME,
@@ -491,9 +495,6 @@ class Publisher:
         self.config = config
         self.store = store
         self.github = github
-        bind_safety = getattr(github, "bind_safety_trigger_handler", None)
-        if callable(bind_safety):
-            bind_safety(store.trip_circuit_breaker_trigger)
 
     def _require_automatic_rollout(
         self,
@@ -505,10 +506,9 @@ class Publisher:
     ) -> RolloutSummary:
         """Return exact dual-gate authority or an expected no-publication decision."""
 
-        if not auto_publish_opt_in_enabled(self.config.publishing):
+        if not auto_publish_opt_in_enabled():
             raise AutomaticRolloutBlocked(
-                "Automatic publication is disabled; set "
-                f"{self.config.publishing.auto_publish_env}=1 deliberately"
+                f"Automatic publication is disabled; set {AUTO_PUBLISH_ENV}=1 deliberately"
             )
         scope = UpstreamPublicationScope(
             deployment_fingerprint=deployment_fingerprint,
@@ -551,11 +551,6 @@ class Publisher:
         hold, and each constructive mutation revalidates that hold immediately before acting.
         """
 
-        if hold.deployment_fingerprint is None or hold.outcome_corpus_cursor is None:
-            raise StateError(
-                "Publication gate hold predates schema-v6 upstream-outcome authority; "
-                "automatic recovery is forbidden"
-            )
         if hold.deployment_fingerprint != summary.scope.deployment_fingerprint:
             raise StateError(
                 "Current semantic rollout authority differs from the durable publication hold"
@@ -580,13 +575,13 @@ class Publisher:
             publishing_api_origin=manifest.publishing_api_origin,
         )
         lease_guard.assert_owned()
-        if automatic and not auto_publish_opt_in_enabled(self.config.publishing):
+        if automatic and not auto_publish_opt_in_enabled():
             raise AutomaticRolloutBlocked(
                 "Automatic publication was disabled before the next remote mutation"
             )
         self.store.assert_circuit_breaker_clear()
         lease_guard.assert_owned()
-        if automatic and not auto_publish_opt_in_enabled(self.config.publishing):
+        if automatic and not auto_publish_opt_in_enabled():
             raise AutomaticRolloutBlocked(
                 "Automatic publication was disabled before the next remote mutation"
             )
@@ -976,14 +971,6 @@ class Publisher:
             publication_hold = self.store.publication_gate_hold(run_id)
             if publication_hold is not None:
                 _validate_current_config(self.config)
-                if (
-                    publication_hold.deployment_fingerprint is None
-                    or publication_hold.outcome_corpus_cursor is None
-                ):
-                    raise StateError(
-                        "Publication gate hold predates schema-v6 upstream-outcome authority; "
-                        "automatic recovery is forbidden"
-                    )
                 creation_deployment_fingerprint = self.store.run_deployment_fingerprint(run_id)
                 if (
                     manifest.deployment_fingerprint != creation_deployment_fingerprint
@@ -3100,14 +3087,6 @@ class Publisher:
         )
         login = context.login
         publication_hold = self.store.publication_gate_hold(run_id)
-        if publication_hold is not None and (
-            publication_hold.deployment_fingerprint is None
-            or publication_hold.outcome_corpus_cursor is None
-        ):
-            raise StateError(
-                "Publication gate hold predates schema-v6 upstream-outcome authority; "
-                "automatic recovery is forbidden"
-            )
         if publication_hold is None:
             self._require_exact_review_recovery(manifest)
         lease_guard.assert_owned()
@@ -3707,8 +3686,6 @@ class Publisher:
     def _assert_current_eligibility_evidence(
         manifest: RunManifest,
         eligibility: EligibilityResult,
-        *,
-        require_eligible: bool = True,
     ) -> None:
         if manifest.eligibility is None:
             raise PolicyError("Run is missing its recorded eligibility evidence")
@@ -3729,7 +3706,7 @@ class Publisher:
                 raise PolicyError(
                     "Repository legal requirements or attestation changed; approval is stale"
                 )
-        if require_eligible and not eligibility.eligible:
+        if not eligibility.eligible:
             reasons = "; ".join(eligibility.blockers)
             raise PolicyError(f"Candidate no longer passes deterministic eligibility: {reasons}")
 
@@ -3805,7 +3782,6 @@ class Publisher:
                 manifest,
                 patch,
                 commit_sha=commit_sha,
-                require_clean=True,
             )
             manifest.commit_sha = commit_sha
             # A prior attempt committed before an uncertain push. The caller can reconcile or
@@ -3827,7 +3803,6 @@ class Publisher:
                 manifest,
                 patch,
                 commit_sha=head,
-                require_clean=True,
             )
             # A crash can occur after Git creates the commit but before commit_sha is saved.
             # Recover only the unique clean commit that is exactly derivable from durable intent.
@@ -3915,7 +3890,6 @@ class Publisher:
             manifest,
             patch,
             commit_sha=commit_sha,
-            require_clean=True,
         )
         return commit_sha
 
@@ -3926,7 +3900,6 @@ class Publisher:
         patch: bytes,
         *,
         commit_sha: str,
-        require_clean: bool,
     ) -> None:
         """Bind a local commit to the exact durable publication intent."""
 
@@ -3970,13 +3943,12 @@ class Publisher:
             raise PolicyError("Contribution commit identity differs from durable intent")
         if _git_diff_bytes(workspace, old=base, new=commit) != patch:
             raise PolicyError("Contribution commit diff does not match the approved patch")
-        if require_clean:
-            status = _git(
-                workspace,
-                ["status", "--porcelain=v1", "--untracked-files=all"],
-            )
-            if status:
-                raise PolicyError("Committed publication workspace is not clean")
+        status = _git(
+            workspace,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+        )
+        if status:
+            raise PolicyError("Committed publication workspace is not clean")
 
     def _push(
         self,

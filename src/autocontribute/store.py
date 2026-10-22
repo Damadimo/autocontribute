@@ -51,7 +51,7 @@ _REQUIRED_WORKSPACE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT"
 _OFFLINE_VERIFICATION: Final = object()
 _INITIAL_EVENT_HASH: Final = "0" * 64
 _METADATA_COLUMNS: Final = {"singleton", "schema_version", "migrated_at"}
-_V3_RUN_COLUMNS: Final = {
+_RUN_COLUMNS: Final = {
     "run_id",
     "status",
     "repository",
@@ -59,14 +59,8 @@ _V3_RUN_COLUMNS: Final = {
     "created_at",
     "updated_at",
     "manifest_json",
-}
-_V4_RUN_COLUMNS: Final = {
-    *_V3_RUN_COLUMNS,
     "event_count",
     "event_head_hash",
-}
-_RUN_COLUMNS: Final = {
-    *_V4_RUN_COLUMNS,
     "issue_revision",
 }
 _EVENT_COLUMNS: Final = {
@@ -120,14 +114,11 @@ _PUBLICATION_RESERVATION_COLUMNS: Final = {
     "repository",
     "reserved_at",
 }
-_V4_PUBLICATION_GATE_HOLD_COLUMNS: Final = {
+_PUBLICATION_GATE_HOLD_COLUMNS: Final = {
     "run_id",
     "deployment_fingerprint",
     "corpus_cursor",
     "held_at",
-}
-_PUBLICATION_GATE_HOLD_COLUMNS: Final = {
-    *_V4_PUBLICATION_GATE_HOLD_COLUMNS,
     "outcome_corpus_cursor",
 }
 _MANIFEST_ARTIFACT_SYNC_COLUMNS: Final = {
@@ -147,45 +138,28 @@ _CANDIDATE_RETRY_AUTHORIZATION_COLUMNS: Final = {
     "reason",
     "authorized_at",
 }
-_LEGACY_CANDIDATE_RETRY_OVERRIDE_COLUMNS: Final = {
-    "event_id",
-    "run_id",
-    "event_hash",
-    "migrated_at",
-}
 _PUBLICATION_EVIDENCE_EVENT_TYPES: Final = (
     "publication.reserved",
-    "publication.reservation.legacy",
     "publication.gate.held",
-    "publication.gate.legacy",
     "publication.gate.rebound",
     "publication.gate.released",
 )
 _MAX_PUBLICATION_EVIDENCE_EVENTS: Final = _MAX_RUN_CORPUS * 4
-_LEGACY_INDEXES: Final = {
+_REQUIRED_INDEXES: Final = {
     "runs_status_idx",
     "runs_candidate_idx",
     "events_run_idx",
-}
-_V2_REQUIRED_INDEXES: Final = {
-    *_LEGACY_INDEXES,
     "leases_expiry_idx",
     "lifecycle_snapshots_run_idx",
     "circuit_breaker_events_epoch_idx",
-}
-_V6_REQUIRED_INDEXES: Final = {
-    *_V2_REQUIRED_INDEXES,
     "publication_reservations_reserved_at_idx",
     "publication_reservations_repository_idx",
-}
-_V7_REQUIRED_INDEXES: Final = {
-    *_V6_REQUIRED_INDEXES,
     "runs_candidate_revision_idx",
-}
-_REQUIRED_INDEXES: Final = {
-    *_V7_REQUIRED_INDEXES,
     "runs_active_candidate_idx",
 }
+# Development builds created schemas 1-7 and an earlier schema-8 layout that still had this
+# table. That state is not migrated; opening it asks the operator to start a fresh state root.
+_DEVELOPMENT_SCHEMA_8_TABLE: Final = "legacy_candidate_retry_overrides"
 
 _CANDIDATE_CLAIM_LEASE_NAME: Final = "autocontribute.run"
 
@@ -808,8 +782,6 @@ class Lease:
     name: str
     owner: str
     generation: int
-    acquired_at: datetime
-    heartbeat_at: datetime
     expires_at: datetime
 
 
@@ -849,10 +821,9 @@ class PublicationReservation:
 @dataclass(frozen=True, slots=True)
 class PublicationGateHold:
     run_id: str
-    deployment_fingerprint: str | None
+    deployment_fingerprint: str
     corpus_cursor: str
-    outcome_corpus_cursor: str | None
-    held_at: datetime
+    outcome_corpus_cursor: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -889,9 +860,9 @@ class _PublicationReservationEvidence:
 @dataclass(frozen=True, slots=True)
 class _PublicationGateEvidence:
     run_id: str
-    deployment_fingerprint: str | None
+    deployment_fingerprint: str
     corpus_cursor: str
-    outcome_corpus_cursor: str | None
+    outcome_corpus_cursor: str
     held_at: str
 
 
@@ -1024,47 +995,11 @@ class RunStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:
-            detected = self._detect_schema_version(connection)
-            if detected > CURRENT_SCHEMA_VERSION:
-                raise StateError(
-                    f"State schema {detected} is newer than supported schema "
-                    f"{CURRENT_SCHEMA_VERSION}"
-                )
+            self._supported_schema_version(connection)
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("BEGIN IMMEDIATE")
-            version = self._detect_schema_version(connection)
-            if version > CURRENT_SCHEMA_VERSION:
-                raise StateError(
-                    f"State schema {version} is newer than supported schema "
-                    f"{CURRENT_SCHEMA_VERSION}"
-                )
-            if version == 1 and "schema_metadata" not in self._table_names(connection):
-                self._adopt_legacy_schema(connection)
-            if version in {2, 3, 4, 5, 6, 7}:
-                # Validate the complete source schema before executing migration SQL. This
-                # prevents unexpected views or triggers from participating in the migration,
-                # even though a later validation would ultimately roll the transaction back.
-                self._validate_schema_version(connection, expected_version=version)
-            while version < CURRENT_SCHEMA_VERSION:
-                if version == 0:
-                    self._migrate_0_to_1(connection)
-                elif version == 1:
-                    self._migrate_1_to_2(connection)
-                elif version == 2:
-                    self._migrate_2_to_3(connection)
-                elif version == 3:
-                    self._migrate_3_to_4(connection)
-                elif version == 4:
-                    self._migrate_4_to_5(connection)
-                elif version == 5:
-                    self._migrate_5_to_6(connection)
-                elif version == 6:
-                    self._migrate_6_to_7(connection)
-                elif version == 7:
-                    self._migrate_7_to_8(connection)
-                else:  # pragma: no cover - guarded by the supported-version checks
-                    raise StateError(f"No state migration is available from schema {version}")
-                version += 1
+            if self._supported_schema_version(connection) == 0:
+                self._create_schema(connection)
             _reconcile_publication_state(
                 connection,
                 repair_missing=True,
@@ -1077,6 +1012,30 @@ class RunStore:
             raise
         finally:
             connection.close()
+
+    def _supported_schema_version(self, connection: sqlite3.Connection) -> int:
+        """Return the stored schema version, refusing state this release cannot open."""
+
+        version = self._detect_schema_version(connection)
+        if version > CURRENT_SCHEMA_VERSION:
+            raise StateError(
+                f"State schema {version} is newer than supported schema {CURRENT_SCHEMA_VERSION}"
+            )
+        if self._is_development_schema(connection, version):
+            raise StateError(
+                f"State database {self.database_path} was created by an older development "
+                f"version of Autocontribute (schema {version}) and cannot be migrated; delete "
+                f"the state directory {self.root} and run again"
+            )
+        return version
+
+    @classmethod
+    def _is_development_schema(cls, connection: sqlite3.Connection, version: int) -> bool:
+        """Whether stored state comes from a development build this release does not migrate."""
+
+        return version not in {0, CURRENT_SCHEMA_VERSION} or (
+            _DEVELOPMENT_SCHEMA_8_TABLE in cls._table_names(connection)
+        )
 
     @staticmethod
     def _table_names(connection: sqlite3.Connection) -> set[str]:
@@ -1100,7 +1059,6 @@ class RunStore:
             "publication_gate_holds",
             "manifest_artifact_sync",
             "candidate_retry_authorizations",
-            "legacy_candidate_retry_overrides",
         }:
             raise StateError(f"Refusing to inspect unexpected state table: {table}")
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -1118,44 +1076,30 @@ class RunStore:
         tables = cls._table_names(connection)
         if not tables:
             return 0
-        if "schema_metadata" in tables:
-            if cls._table_columns(connection, "schema_metadata") != _METADATA_COLUMNS:
-                raise StateError("State schema metadata has an unsupported shape")
-            rows = connection.execute(
-                "SELECT singleton, schema_version FROM schema_metadata"
-            ).fetchall()
-            if len(rows) != 1 or rows[0]["singleton"] != 1:
-                raise StateError("State schema metadata must contain exactly one canonical row")
-            version = rows[0]["schema_version"]
-            if isinstance(version, bool) or not isinstance(version, int) or version < 1:
-                raise StateError("State schema metadata contains an invalid version")
-            return int(version)
-        if tables != {"runs", "events"}:
-            raise StateError("Unversioned state does not match the supported legacy schema")
-        if cls._table_columns(connection, "runs") != _V3_RUN_COLUMNS:
-            raise StateError("Legacy runs table has an unsupported shape")
-        if cls._table_columns(connection, "events") != _EVENT_COLUMNS:
-            raise StateError("Legacy events table has an unsupported shape")
-        if not _LEGACY_INDEXES.issubset(cls._index_names(connection)):
-            raise StateError("Legacy state database is missing one or more required indexes")
-        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-            raise StateError("Legacy state database contains invalid foreign-key references")
-        return 1
+        if "schema_metadata" not in tables:
+            raise StateError("State database lacks schema metadata and is not supported")
+        if cls._table_columns(connection, "schema_metadata") != _METADATA_COLUMNS:
+            raise StateError("State schema metadata has an unsupported shape")
+        rows = connection.execute(
+            "SELECT singleton, schema_version FROM schema_metadata"
+        ).fetchall()
+        if len(rows) != 1 or rows[0]["singleton"] != 1:
+            raise StateError("State schema metadata must contain exactly one canonical row")
+        version = rows[0]["schema_version"]
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise StateError("State schema metadata contains an invalid version")
+        return int(version)
 
-    def _adopt_legacy_schema(self, connection: sqlite3.Connection) -> None:
-        self._create_metadata_table(connection)
-        connection.execute(
-            """
-            INSERT INTO schema_metadata(singleton, schema_version, migrated_at)
-            VALUES (1, 1, ?)
-            """,
-            (utc_now().isoformat(),),
-        )
+    @staticmethod
+    def _create_schema(connection: sqlite3.Connection) -> None:
+        """Create the complete current schema in an empty database.
 
-    @classmethod
-    def _migrate_0_to_1(cls, connection: sqlite3.Connection) -> None:
-        connection.execute(
-            """
+        The canonical schema manifest is derived from these statements, so any textual change
+        here also changes what every existing state database must match.
+        """
+
+        statements = (
+            f"""
             CREATE TABLE runs (
                 run_id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
@@ -1163,15 +1107,32 @@ class RunStore:
                 issue_number INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
-                manifest_json TEXT NOT NULL
+                manifest_json TEXT NOT NULL,
+                event_count INTEGER NOT NULL DEFAULT 0 CHECK(event_count >= 0),
+                event_head_hash TEXT NOT NULL DEFAULT '{_INITIAL_EVENT_HASH}' CHECK(
+                    length(event_head_hash) = 64
+                    AND event_head_hash NOT GLOB '*[^0-9a-f]*'
+                ),
+                issue_revision TEXT CHECK(
+                    issue_revision IS NULL OR (
+                        length(issue_revision) = 64
+                        AND issue_revision NOT GLOB '*[^0-9a-f]*'
+                    )
+                )
             )
+            """,
+            "CREATE INDEX runs_status_idx ON runs(status)",
+            "CREATE INDEX runs_candidate_idx ON runs(repository, issue_number, status)",
             """
-        )
-        connection.execute("CREATE INDEX runs_status_idx ON runs(status)")
-        connection.execute(
-            "CREATE INDEX runs_candidate_idx ON runs(repository, issue_number, status)"
-        )
-        connection.execute(
+            CREATE INDEX runs_candidate_revision_idx
+            ON runs(repository COLLATE NOCASE, issue_number, issue_revision, status)
+            """,
+            """
+            CREATE UNIQUE INDEX runs_active_candidate_idx
+            ON runs(repository COLLATE NOCASE, issue_number)
+            WHERE issue_number IS NOT NULL
+                AND status NOT IN ('cancelled', 'failed', 'rejected', 'skipped')
+            """,
             """
             CREATE TABLE events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1182,33 +1143,15 @@ class RunStore:
                 previous_hash TEXT NOT NULL,
                 event_hash TEXT NOT NULL UNIQUE
             )
-            """
-        )
-        connection.execute("CREATE INDEX events_run_idx ON events(run_id, id)")
-        cls._create_metadata_table(connection)
-        connection.execute(
-            """
-            INSERT INTO schema_metadata(singleton, schema_version, migrated_at)
-            VALUES (1, 1, ?)
             """,
-            (utc_now().isoformat(),),
-        )
-
-    @staticmethod
-    def _create_metadata_table(connection: sqlite3.Connection) -> None:
-        connection.execute(
+            "CREATE INDEX events_run_idx ON events(run_id, id)",
             """
             CREATE TABLE schema_metadata (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                 schema_version INTEGER NOT NULL CHECK(schema_version >= 1),
                 migrated_at TEXT NOT NULL
             )
-            """
-        )
-
-    @staticmethod
-    def _migrate_1_to_2(connection: sqlite3.Connection) -> None:
-        connection.execute(
+            """,
             """
             CREATE TABLE leases (
                 lease_name TEXT PRIMARY KEY,
@@ -1218,10 +1161,14 @@ class RunStore:
                 heartbeat_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL
             )
+            """,
+            "CREATE INDEX leases_expiry_idx ON leases(expires_at)",
             """
-        )
-        connection.execute("CREATE INDEX leases_expiry_idx ON leases(expires_at)")
-        connection.execute(
+            CREATE TABLE lease_generations (
+                lease_name TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL CHECK(generation >= 1)
+            )
+            """,
             """
             CREATE TABLE lifecycle_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1231,12 +1178,8 @@ class RunStore:
                 snapshot_json TEXT NOT NULL,
                 UNIQUE(run_id, fingerprint)
             )
-            """
-        )
-        connection.execute(
-            "CREATE INDEX lifecycle_snapshots_run_idx ON lifecycle_snapshots(run_id, id)"
-        )
-        connection.execute(
+            """,
+            "CREATE INDEX lifecycle_snapshots_run_idx ON lifecycle_snapshots(run_id, id)",
             """
             CREATE TABLE circuit_breaker (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -1254,17 +1197,7 @@ class RunStore:
                         AND trigger_hash IS NOT NULL)
                 )
             )
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO circuit_breaker(
-                singleton, is_tripped, epoch, changed_at, source, reason, trigger_hash
-            ) VALUES (1, 0, 1, ?, NULL, NULL, NULL)
             """,
-            (utc_now().isoformat(),),
-        )
-        connection.execute(
             """
             CREATE TABLE circuit_breaker_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1276,195 +1209,41 @@ class RunStore:
                 trigger_hash TEXT NOT NULL,
                 UNIQUE(event_type, trigger_hash)
             )
-            """
-        )
-        connection.execute(
-            "CREATE INDEX circuit_breaker_events_epoch_idx ON circuit_breaker_events(epoch, id)"
-        )
-        connection.execute(
-            """
-            UPDATE schema_metadata
-            SET schema_version = 2, migrated_at = ?
-            WHERE singleton = 1 AND schema_version = 1
             """,
-            (utc_now().isoformat(),),
-        )
-        if connection.execute("SELECT changes()").fetchone()[0] != 1:
-            raise StateError("State schema changed while migration was in progress")
-
-    @staticmethod
-    def _migrate_2_to_3(connection: sqlite3.Connection) -> None:
-        connection.execute(
+            "CREATE INDEX circuit_breaker_events_epoch_idx ON circuit_breaker_events(epoch, id)",
             """
             CREATE TABLE publication_reservations (
                 run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
                 repository TEXT NOT NULL,
                 reserved_at TEXT NOT NULL
             )
-            """
-        )
-        connection.execute(
+            """,
             """
             CREATE INDEX publication_reservations_reserved_at_idx
             ON publication_reservations(reserved_at)
-            """
-        )
-        connection.execute(
+            """,
             """
             CREATE INDEX publication_reservations_repository_idx
             ON publication_reservations(repository, reserved_at)
-            """
-        )
-        migrated_at = utc_now()
-        rows = connection.execute(
-            """
-            SELECT run_id, repository FROM runs
-            WHERE status IN (?, ?)
-            ORDER BY run_id
             """,
-            (RunStatus.SUBMITTING.value, RunStatus.PR_OPEN.value),
-        ).fetchall()
-        for row in rows:
-            run_id = _lease_identity(str(row["run_id"]), field="backfilled publication run id")
-            repository_value = row["repository"]
-            if not isinstance(repository_value, str):
-                raise StateError(
-                    f"Published run {run_id} lacks a repository for reservation backfill"
-                )
-            repository = _repository_identity(repository_value)
-            connection.execute(
-                """
-                INSERT INTO publication_reservations(run_id, repository, reserved_at)
-                VALUES (?, ?, ?)
-                """,
-                (run_id, repository, migrated_at.isoformat()),
-            )
-        connection.execute(
-            """
-            UPDATE schema_metadata
-            SET schema_version = 3, migrated_at = ?
-            WHERE singleton = 1 AND schema_version = 2
-            """,
-            (migrated_at.isoformat(),),
-        )
-        if connection.execute("SELECT changes()").fetchone()[0] != 1:
-            raise StateError("State schema changed while migration was in progress")
-
-    @staticmethod
-    def _migrate_3_to_4(connection: sqlite3.Connection) -> None:
-        connection.execute(
-            """
-            ALTER TABLE runs ADD COLUMN event_count INTEGER NOT NULL DEFAULT 0
-            CHECK(event_count >= 0)
-            """
-        )
-        connection.execute(
-            f"""
-            ALTER TABLE runs ADD COLUMN event_head_hash TEXT NOT NULL
-            DEFAULT '{_INITIAL_EVENT_HASH}'
-            CHECK(
-                length(event_head_hash) = 64
-                AND event_head_hash NOT GLOB '*[^0-9a-f]*'
-            )
-            """
-        )
-        run_rows = connection.execute("SELECT run_id FROM runs ORDER BY run_id").fetchall()
-        event_rows = connection.execute(
-            """
-            SELECT id, run_id, occurred_at, event_type, details_json,
-                   previous_hash, event_hash
-            FROM events ORDER BY run_id ASC, id ASC
-            """
-        ).fetchall()
-        heads = _verified_event_heads(run_rows, event_rows)
-        for run_id, (event_count, event_head_hash) in heads.items():
-            update = connection.execute(
-                """
-                UPDATE runs SET event_count = ?, event_head_hash = ?
-                WHERE run_id = ? AND event_count = 0 AND event_head_hash = ?
-                """,
-                (event_count, event_head_hash, run_id, _INITIAL_EVENT_HASH),
-            )
-            if update.rowcount != 1:
-                raise StateError(f"Run {run_id} changed while event heads were migrated")
-
-        connection.execute(
-            """
-            CREATE TABLE lease_generations (
-                lease_name TEXT PRIMARY KEY,
-                generation INTEGER NOT NULL CHECK(generation >= 1)
-            )
-            """
-        )
-        lease_rows = connection.execute(
-            "SELECT lease_name, generation FROM leases ORDER BY lease_name"
-        ).fetchall()
-        for row in lease_rows:
-            lease_name = _lease_identity(row["lease_name"], field="stored lease name")
-            generation = _stored_generation(
-                row["generation"], field=f"lease {lease_name} generation"
-            )
-            connection.execute(
-                "INSERT INTO lease_generations(lease_name, generation) VALUES (?, ?)",
-                (lease_name, generation),
-            )
-
-        connection.execute(
             """
             CREATE TABLE publication_gate_holds (
                 run_id TEXT PRIMARY KEY REFERENCES publication_reservations(run_id),
-                deployment_fingerprint TEXT CHECK(
-                    deployment_fingerprint IS NULL OR (
-                        length(deployment_fingerprint) = 64
-                        AND deployment_fingerprint NOT GLOB '*[^0-9a-f]*'
-                    )
+                deployment_fingerprint TEXT NOT NULL CHECK(
+                    length(deployment_fingerprint) = 64
+                    AND deployment_fingerprint NOT GLOB '*[^0-9a-f]*'
                 ),
                 corpus_cursor TEXT NOT NULL CHECK(
                     length(corpus_cursor) = 64
                     AND corpus_cursor NOT GLOB '*[^0-9a-f]*'
                 ),
-                held_at TEXT NOT NULL
-            )
-            """
-        )
-        migrated_at = utc_now().isoformat()
-        submitting_reservations = connection.execute(
-            """
-            SELECT publication_reservations.run_id
-            FROM publication_reservations
-            JOIN runs USING(run_id)
-            WHERE runs.status = ?
-            ORDER BY publication_reservations.run_id
-            """,
-            (RunStatus.SUBMITTING.value,),
-        ).fetchall()
-        if submitting_reservations:
-            corpus_cursor = _evaluation_corpus_cursor_from_connection(connection)
-            for row in submitting_reservations:
-                run_id = _lease_identity(row["run_id"], field="backfilled publication gate run id")
-                connection.execute(
-                    """
-                    INSERT INTO publication_gate_holds(
-                        run_id, deployment_fingerprint, corpus_cursor, held_at
-                    ) VALUES (?, NULL, ?, ?)
-                    """,
-                    (run_id, corpus_cursor, migrated_at),
+                held_at TEXT NOT NULL,
+                outcome_corpus_cursor TEXT NOT NULL CHECK(
+                    length(outcome_corpus_cursor) = 64
+                    AND outcome_corpus_cursor NOT GLOB '*[^0-9a-f]*'
                 )
-
-        connection.execute(
-            """
-            UPDATE schema_metadata
-            SET schema_version = 4, migrated_at = ?
-            WHERE singleton = 1 AND schema_version = 3
+            )
             """,
-            (migrated_at,),
-        )
-        if connection.execute("SELECT changes()").fetchone()[0] != 1:
-            raise StateError("State schema changed while migration was in progress")
-
-    @staticmethod
-    def _migrate_4_to_5(connection: sqlite3.Connection) -> None:
-        connection.execute(
             """
             CREATE TABLE manifest_artifact_sync (
                 run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
@@ -1474,161 +1253,7 @@ class RunStore:
                     AND manifest_sha256 NOT GLOB '*[^0-9a-f]*'
                 )
             )
-            """
-        )
-        _migrate_legacy_publication_evidence(connection)
-        migrated_at = utc_now().isoformat()
-        connection.execute(
-            """
-            UPDATE schema_metadata
-            SET schema_version = 5, migrated_at = ?
-            WHERE singleton = 1 AND schema_version = 4
             """,
-            (migrated_at,),
-        )
-        if connection.execute("SELECT changes()").fetchone()[0] != 1:
-            raise StateError("State schema changed while migration was in progress")
-
-    @staticmethod
-    def _migrate_5_to_6(connection: sqlite3.Connection) -> None:
-        """Fence new automatic authority from pre-outcome-gate publication holds.
-
-        Existing holds remain present but deliberately have a NULL outcome cursor. They can be
-        inspected or compensated, but cannot be mistaken for schema-v6 automatic authority.
-        """
-
-        connection.execute(
-            """
-            ALTER TABLE publication_gate_holds
-            ADD COLUMN outcome_corpus_cursor TEXT CHECK(
-                outcome_corpus_cursor IS NULL OR (
-                    length(outcome_corpus_cursor) = 64
-                    AND outcome_corpus_cursor NOT GLOB '*[^0-9a-f]*'
-                )
-            )
-            """
-        )
-        migrated_at = utc_now().isoformat()
-        connection.execute(
-            """
-            UPDATE schema_metadata
-            SET schema_version = 6, migrated_at = ?
-            WHERE singleton = 1 AND schema_version = 5
-            """,
-            (migrated_at,),
-        )
-        if connection.execute("SELECT changes()").fetchone()[0] != 1:
-            raise StateError("State schema changed while migration was in progress")
-
-    @staticmethod
-    def _migrate_6_to_7(connection: sqlite3.Connection) -> None:
-        """Bind candidate rows to a stable digest of their complete issue evidence."""
-
-        connection.execute(
-            """
-            ALTER TABLE runs ADD COLUMN issue_revision TEXT CHECK(
-                issue_revision IS NULL OR (
-                    length(issue_revision) = 64
-                    AND issue_revision NOT GLOB '*[^0-9a-f]*'
-                )
-            )
-            """
-        )
-        rows = connection.execute(
-            """
-            SELECT run_id, status, repository, issue_number, manifest_json
-            FROM runs ORDER BY run_id
-            """
-        ).fetchall()
-        if len(rows) > _MAX_RUN_CORPUS:
-            raise StateError("Run corpus exceeds the supported issue-revision migration bound")
-        for row in rows:
-            try:
-                run_id = _lease_identity(row["run_id"], field="stored run id")
-            except (TypeError, ValueError) as exc:
-                raise StateError("Issue-revision migration found an invalid run ID") from exc
-            try:
-                manifest = RunManifest.model_validate_json(row["manifest_json"])
-            except (TypeError, ValueError) as exc:
-                raise StateError(f"Run {run_id} contains an invalid manifest") from exc
-            status = _stored_run_status(row["status"], run_id=run_id)
-            if manifest.run_id != run_id or manifest.status != status:
-                raise StateError(f"Run {run_id} manifest disagrees with its state row")
-            candidate = manifest.candidate
-            if candidate is None:
-                if row["issue_number"] is not None:
-                    raise StateError(f"Run {run_id} has issue identity without a candidate")
-                continue
-            if row["repository"] != candidate.repository or row["issue_number"] != candidate.number:
-                raise StateError(f"Run {run_id} candidate disagrees with its state row")
-            try:
-                revision = compute_issue_revision(candidate)
-            except (TypeError, ValueError) as exc:
-                raise StateError(f"Run {run_id} has invalid issue revision evidence") from exc
-            updated = connection.execute(
-                """
-                UPDATE runs SET issue_revision = ?
-                WHERE run_id = ? AND issue_revision IS NULL
-                """,
-                (revision, run_id),
-            )
-            if updated.rowcount != 1:
-                raise StateError(f"Run {run_id} changed during issue-revision migration")
-
-        connection.execute(
-            """
-            CREATE INDEX runs_candidate_revision_idx
-            ON runs(repository, issue_number, issue_revision, status)
-            """
-        )
-        migrated_at = utc_now().isoformat()
-        connection.execute(
-            """
-            UPDATE schema_metadata
-            SET schema_version = 7, migrated_at = ?
-            WHERE singleton = 1 AND schema_version = 6
-            """,
-            (migrated_at,),
-        )
-        if connection.execute("SELECT changes()").fetchone()[0] != 1:
-            raise StateError("State schema changed while migration was in progress")
-
-    @staticmethod
-    def _migrate_7_to_8(connection: sqlite3.Connection) -> None:
-        """Fence active claims and persist exact operator retry authorization."""
-
-        duplicate = connection.execute(
-            """
-            SELECT lower(repository) AS repository_key, issue_number
-            FROM runs
-            WHERE issue_number IS NOT NULL
-                AND status NOT IN (?, ?, ?, ?)
-            GROUP BY lower(repository), issue_number
-            HAVING count(*) > 1
-            LIMIT 1
-            """,
-            tuple(sorted(status.value for status in _CANDIDATE_RELEASED_STATUSES)),
-        ).fetchone()
-        if duplicate is not None:
-            raise StateError(
-                "State migration found duplicate active attempts for one candidate issue"
-            )
-        connection.execute("DROP INDEX runs_candidate_revision_idx")
-        connection.execute(
-            """
-            CREATE INDEX runs_candidate_revision_idx
-            ON runs(repository COLLATE NOCASE, issue_number, issue_revision, status)
-            """
-        )
-        connection.execute(
-            """
-            CREATE UNIQUE INDEX runs_active_candidate_idx
-            ON runs(repository COLLATE NOCASE, issue_number)
-            WHERE issue_number IS NOT NULL
-                AND status NOT IN ('cancelled', 'failed', 'rejected', 'skipped')
-            """
-        )
-        connection.execute(
             """
             CREATE TABLE candidate_retry_authorizations (
                 authorization_id TEXT PRIMARY KEY CHECK(
@@ -1651,81 +1276,26 @@ class RunStore:
                 authorized_at TEXT NOT NULL,
                 CHECK(run_id <> prior_run_id)
             )
+            """,
+        )
+        for statement in statements:
+            connection.execute(statement)
+        created_at = utc_now().isoformat()
+        connection.execute(
             """
+            INSERT INTO circuit_breaker(
+                singleton, is_tripped, epoch, changed_at, source, reason, trigger_hash
+            ) VALUES (1, 0, 1, ?, NULL, NULL, NULL)
+            """,
+            (created_at,),
         )
         connection.execute(
             """
-            CREATE TABLE legacy_candidate_retry_overrides (
-                event_id INTEGER PRIMARY KEY REFERENCES events(id),
-                run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
-                event_hash TEXT NOT NULL UNIQUE CHECK(
-                    length(event_hash) = 64
-                    AND event_hash NOT GLOB '*[^0-9a-f]*'
-                ),
-                migrated_at TEXT NOT NULL
-            )
-            """
-        )
-        legacy_events = connection.execute(
-            """
-            SELECT id, run_id, occurred_at, event_hash, details_json
-            FROM events
-            WHERE event_type = 'candidate.retry_override'
-            ORDER BY id LIMIT ?
+            INSERT INTO schema_metadata(singleton, schema_version, migrated_at)
+            VALUES (1, ?, ?)
             """,
-            (_MAX_RUN_CORPUS + 1,),
-        ).fetchall()
-        if len(legacy_events) > _MAX_RUN_CORPUS:
-            raise StateError("Legacy candidate retry overrides exceed the migration bound")
-        source_metadata = connection.execute(
-            "SELECT migrated_at FROM schema_metadata WHERE singleton = 1"
-        ).fetchone()
-        if source_metadata is None:
-            raise StateError("State schema metadata disappeared during migration")
-        migration_time = max(
-            _aware_utc(utc_now(), field="schema v8 migration time"),
-            _stored_canonical_utc_datetime(
-                source_metadata["migrated_at"],
-                field="schema v7 migration time",
-            ),
+            (CURRENT_SCHEMA_VERSION, created_at),
         )
-        validated_legacy_events: list[tuple[int, str, str]] = []
-        for event in legacy_events:
-            event_id, run_id, event_hash = _validated_legacy_candidate_retry_override(
-                connection,
-                event_id=event["id"],
-                run_id=event["run_id"],
-                event_hash=event["event_hash"],
-                details_json=event["details_json"],
-            )
-            migration_time = max(
-                migration_time,
-                _stored_datetime(
-                    event["occurred_at"],
-                    field="legacy candidate retry event time",
-                ),
-            )
-            validated_legacy_events.append((event_id, run_id, event_hash))
-        migrated_at = migration_time.isoformat()
-        for event_id, run_id, event_hash in validated_legacy_events:
-            connection.execute(
-                """
-                INSERT INTO legacy_candidate_retry_overrides(
-                    event_id, run_id, event_hash, migrated_at
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (event_id, run_id, event_hash, migrated_at),
-            )
-        connection.execute(
-            """
-            UPDATE schema_metadata
-            SET schema_version = 8, migrated_at = ?
-            WHERE singleton = 1 AND schema_version = 7
-            """,
-            (migrated_at,),
-        )
-        if connection.execute("SELECT changes()").fetchone()[0] != 1:
-            raise StateError("State schema changed while migration was in progress")
 
     @staticmethod
     def _schema_manifest(
@@ -1756,123 +1326,76 @@ class RunStore:
         return tuple(manifest)
 
     @classmethod
-    def _expected_schema_manifest(
-        cls, version: int
-    ) -> tuple[tuple[str, str, str, str | None], ...]:
-        if version not in {2, 3, 4, 5, 6, 7, CURRENT_SCHEMA_VERSION}:
-            raise StateError(f"No canonical schema manifest exists for state version {version}")
+    def _expected_schema_manifest(cls) -> tuple[tuple[str, str, str, str | None], ...]:
         expected = sqlite3.connect(":memory:")
         expected.row_factory = sqlite3.Row
         expected.execute("PRAGMA foreign_keys = ON")
         try:
-            cls._migrate_0_to_1(expected)
-            cls._migrate_1_to_2(expected)
-            if version >= 3:
-                cls._migrate_2_to_3(expected)
-            if version >= 4:
-                cls._migrate_3_to_4(expected)
-            if version >= 5:
-                cls._migrate_4_to_5(expected)
-            if version >= 6:
-                cls._migrate_5_to_6(expected)
-            if version >= 7:
-                cls._migrate_6_to_7(expected)
-            if version >= 8:
-                cls._migrate_7_to_8(expected)
+            cls._create_schema(expected)
             return cls._schema_manifest(expected)
         finally:
             expected.close()
 
     @classmethod
-    def _validate_schema_version(
-        cls, connection: sqlite3.Connection, *, expected_version: int
-    ) -> None:
+    def _validate_current_schema(cls, connection: sqlite3.Connection) -> None:
         expected = {
             "schema_metadata": _METADATA_COLUMNS,
-            "runs": (
-                _RUN_COLUMNS
-                if expected_version >= 7
-                else _V4_RUN_COLUMNS
-                if expected_version >= 4
-                else _V3_RUN_COLUMNS
-            ),
+            "runs": _RUN_COLUMNS,
             "events": _EVENT_COLUMNS,
             "leases": _LEASE_COLUMNS,
+            "lease_generations": _LEASE_GENERATION_COLUMNS,
             "lifecycle_snapshots": _LIFECYCLE_SNAPSHOT_COLUMNS,
             "circuit_breaker": _CIRCUIT_BREAKER_COLUMNS,
             "circuit_breaker_events": _CIRCUIT_BREAKER_EVENT_COLUMNS,
+            "publication_reservations": _PUBLICATION_RESERVATION_COLUMNS,
+            "publication_gate_holds": _PUBLICATION_GATE_HOLD_COLUMNS,
+            "manifest_artifact_sync": _MANIFEST_ARTIFACT_SYNC_COLUMNS,
+            "candidate_retry_authorizations": _CANDIDATE_RETRY_AUTHORIZATION_COLUMNS,
         }
-        required_indexes = _V2_REQUIRED_INDEXES
-        if expected_version >= 3:
-            expected["publication_reservations"] = _PUBLICATION_RESERVATION_COLUMNS
-            required_indexes = _V6_REQUIRED_INDEXES
-        if expected_version >= 7:
-            required_indexes = _V7_REQUIRED_INDEXES
-        if expected_version >= 8:
-            required_indexes = _REQUIRED_INDEXES
-            expected["candidate_retry_authorizations"] = _CANDIDATE_RETRY_AUTHORIZATION_COLUMNS
-            expected["legacy_candidate_retry_overrides"] = _LEGACY_CANDIDATE_RETRY_OVERRIDE_COLUMNS
-        if expected_version >= 4:
-            expected["lease_generations"] = _LEASE_GENERATION_COLUMNS
-            expected["publication_gate_holds"] = (
-                _PUBLICATION_GATE_HOLD_COLUMNS
-                if expected_version >= 6
-                else _V4_PUBLICATION_GATE_HOLD_COLUMNS
-            )
-        if expected_version >= 5:
-            expected["manifest_artifact_sync"] = _MANIFEST_ARTIFACT_SYNC_COLUMNS
         tables = cls._table_names(connection)
         if tables != set(expected):
             raise StateError("State database contains missing or unsupported tables")
         for table, columns in expected.items():
             if cls._table_columns(connection, table) != columns:
                 raise StateError(f"State table {table} has an unsupported shape")
-        if not required_indexes.issubset(cls._index_names(connection)):
+        if not _REQUIRED_INDEXES.issubset(cls._index_names(connection)):
             raise StateError("State database is missing one or more required indexes")
         if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise StateError("State database contains invalid foreign-key references")
         version = cls._detect_schema_version(connection)
-        if version != expected_version:
+        if version != CURRENT_SCHEMA_VERSION:
             raise StateError(
-                f"State schema migration ended at {version}, expected {expected_version}"
+                f"State schema {version} does not match supported schema {CURRENT_SCHEMA_VERSION}"
             )
-        if cls._schema_manifest(connection) != cls._expected_schema_manifest(expected_version):
+        if cls._schema_manifest(connection) != cls._expected_schema_manifest():
             raise StateError("State database schema objects do not match the canonical manifest")
         _verify_circuit_breaker_evidence(connection)
-        if expected_version >= 4:
-            _verify_event_anchors(connection)
-        else:
-            _verify_unanchored_event_chains(connection)
+        _verify_event_anchors(connection)
         _verify_lifecycle_snapshot_evidence(connection, collect=False)
-        if expected_version == 4:
-            _verify_publication_gate_holds(connection)
-        if expected_version >= 5:
-            _verify_manifest_artifact_sync(connection)
-            _verify_publication_state(
-                connection,
-                require_current_rollout_cursors=False,
-            )
-        if expected_version >= 7:
-            _verify_issue_revision_evidence(
-                connection,
-                require_current_provenance=expected_version >= 8,
-            )
-
-    @classmethod
-    def _validate_current_schema(cls, connection: sqlite3.Connection) -> None:
-        cls._validate_schema_version(connection, expected_version=CURRENT_SCHEMA_VERSION)
+        _verify_manifest_artifact_sync(connection)
+        _verify_publication_state(
+            connection,
+            require_current_rollout_cursors=False,
+        )
+        _verify_issue_revision_evidence(connection)
 
     @classmethod
     def _validate_restorable_schema(cls, connection: sqlite3.Connection) -> None:
+        """Validate a snapshot before restore, naming state that this release cannot open."""
+
         version = cls._detect_schema_version(connection)
-        if version == 0:
-            raise StateError("State database contains missing or unsupported tables")
-        if version not in {2, 3, 4, 5, 6, 7, CURRENT_SCHEMA_VERSION}:
+        if version > CURRENT_SCHEMA_VERSION:
             raise StateError(
-                f"State snapshot schema {version} cannot be restored; expected version 2, 3, 4, "
-                f"5, 6, 7, or {CURRENT_SCHEMA_VERSION}"
+                f"State snapshot schema {version} is newer than supported schema "
+                f"{CURRENT_SCHEMA_VERSION}"
             )
-        cls._validate_schema_version(connection, expected_version=version)
+        if cls._is_development_schema(connection, version):
+            raise StateError(
+                "State snapshot was created by an older development version of Autocontribute "
+                f"(schema {version}) and cannot be restored; start from a fresh state directory "
+                "instead"
+            )
+        cls._validate_current_schema(connection)
 
     @property
     def schema_version(self) -> int:
@@ -2181,11 +1704,6 @@ class RunStore:
                 return False
 
             hold = _publication_gate_hold_from_row(row)
-            if hold.deployment_fingerprint is None or hold.outcome_corpus_cursor is None:
-                raise StateError(
-                    "Publication gate hold predates schema-v6 upstream-outcome authority; "
-                    "automatic publication is forbidden"
-                )
             if deployment_fingerprint is None:
                 raise StateError("Automatic publication lacks its deployment fingerprint")
             deployment, login, origin, _ = _upstream_outcome_cursor_scope(
@@ -2826,7 +2344,7 @@ class RunStore:
                     },
                 )
                 if hold_row is not None:
-                    _release_publication_gate_hold_for_compensation(
+                    _release_publication_gate_hold(
                         self,
                         connection,
                         manifest.run_id,
@@ -2955,7 +2473,7 @@ class RunStore:
                     },
                 )
                 if hold_row is not None:
-                    _release_publication_gate_hold_for_compensation(
+                    _release_publication_gate_hold(
                         self,
                         connection,
                         manifest.run_id,
@@ -2978,21 +2496,6 @@ class RunStore:
             manifest_sha256=_manifest_json_digest(updated_manifest_json),
         )
         return manifest
-
-    def has_active_candidate(self, repository: str, issue_number: int) -> bool:
-        repository_key, normalized_issue_number = _candidate_identity(repository, issue_number)
-        released = tuple(sorted(status.value for status in _CANDIDATE_RELEASED_STATUSES))
-        placeholders = ",".join("?" for _ in released)
-        query = (
-            "SELECT 1 FROM runs WHERE repository = ? COLLATE NOCASE AND issue_number = ? "
-            f"AND status NOT IN ({placeholders}) LIMIT 1"
-        )
-        with self._connection() as connection:
-            row = connection.execute(
-                query,
-                (repository_key, normalized_issue_number, *released),
-            ).fetchone()
-        return row is not None
 
     def candidate_attempt_disposition(
         self,
@@ -3478,11 +2981,6 @@ class RunStore:
                 hold = _publication_gate_hold_from_row(hold_row)
                 if hold.deployment_fingerprint != request.evaluation_deployment_fingerprint:
                     raise StateError("Publication run already holds different rollout evidence")
-                if hold.outcome_corpus_cursor is None:
-                    raise StateError(
-                        "Publication gate hold predates schema-v6 upstream-outcome authority; "
-                        "automatic recovery is forbidden"
-                    )
                 if (
                     hold.corpus_cursor != request.evaluation_corpus_cursor
                     or hold.outcome_corpus_cursor != request.outcome_corpus_cursor
@@ -3496,8 +2994,8 @@ class RunStore:
                         """
                         UPDATE publication_gate_holds
                         SET corpus_cursor = ?, outcome_corpus_cursor = ?, held_at = ?
-                        WHERE run_id = ? AND deployment_fingerprint IS ?
-                          AND corpus_cursor = ? AND outcome_corpus_cursor IS ? AND held_at = ?
+                        WHERE run_id = ? AND deployment_fingerprint = ?
+                          AND corpus_cursor = ? AND outcome_corpus_cursor = ? AND held_at = ?
                         """,
                         (
                             request.evaluation_corpus_cursor,
@@ -3526,12 +3024,7 @@ class RunStore:
                         },
                     )
         elif hold_row is not None:
-            hold = _publication_gate_hold_from_row(hold_row)
-            if hold.deployment_fingerprint is None or hold.outcome_corpus_cursor is None:
-                raise StateError(
-                    "Publication gate hold predates schema-v6 upstream-outcome authority; "
-                    "automatic recovery is forbidden"
-                )
+            _publication_gate_hold_from_row(hold_row)
             # Re-entry without proffered rollout cursors reconciles already-durable state
             # (for example adopting a pull request that provably exists). Corpus drift since
             # the hold was anchored must not wedge that bookkeeping; every constructive
@@ -3547,56 +3040,6 @@ class RunStore:
             reservation_created=reservation_created,
             hold_created=hold_created,
         )
-
-    def stale_run_ids(self, *, stale_before: datetime, limit: int = 100) -> builtins.list[str]:
-        """Return old, safely recoverable in-flight runs in deterministic order."""
-
-        cutoff = _aware_utc(stale_before, field="stale_before")
-        if not 1 <= limit <= 1_000:
-            raise ValueError("stale run limit must be between 1 and 1000")
-        recoverable = tuple(sorted(status.value for status in RECOVERABLE_IN_FLIGHT_STATUSES))
-        placeholders = ",".join("?" for _ in recoverable)
-        query = (
-            # The interpolated text contains only one placeholder per member of the internal,
-            # fixed RunStatus set; every value remains a bound SQLite parameter.
-            "SELECT run_id, status FROM runs "
-            f"WHERE status IN ({placeholders}) AND updated_at < ? "
-            "ORDER BY updated_at ASC, run_id ASC LIMIT ?"
-        )
-        with self._connection() as connection:
-            rows = connection.execute(query, (*recoverable, cutoff.isoformat(), limit)).fetchall()
-        run_ids: builtins.list[str] = []
-        for row in rows:
-            try:
-                status = RunStatus(str(row["status"]))
-            except ValueError as exc:
-                raise StateError(f"Run {row['run_id']} contains an unknown status") from exc
-            if status not in RECOVERABLE_IN_FLIGHT_STATUSES:
-                continue
-            run_ids.append(str(row["run_id"]))
-        return run_ids
-
-    def is_stale_in_flight(self, run_id: str, *, stale_before: datetime) -> bool:
-        """Return whether one run can safely be crash-recovered at the given cutoff."""
-
-        cutoff = _aware_utc(stale_before, field="stale_before")
-        with self._connection() as connection:
-            row = connection.execute(
-                "SELECT status, updated_at FROM runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-        if row is None:
-            raise StateError(f"Unknown run: {run_id}")
-        try:
-            status = RunStatus(str(row["status"]))
-        except ValueError as exc:
-            raise StateError(f"Run {run_id} contains an unknown status") from exc
-        updated_at = _stored_datetime(row["updated_at"], field=f"run {run_id} updated_at")
-        return status in RECOVERABLE_IN_FLIGHT_STATUSES and updated_at < cutoff
-
-    def is_stale_nonterminal(self, run_id: str, *, stale_before: datetime) -> bool:
-        """Compatibility alias for the deliberately narrower in-flight definition."""
-
-        return self.is_stale_in_flight(run_id, stale_before=stale_before)
 
     def recover_stale_runs(
         self,
@@ -3748,8 +3191,6 @@ class RunStore:
                     name=lease_name,
                     owner=lease_owner,
                     generation=generation,
-                    acquired_at=acquired_at,
-                    heartbeat_at=acquired_at,
                     expires_at=requested_expiry,
                 )
 
@@ -3823,8 +3264,6 @@ class RunStore:
                 name=lease_name,
                 owner=lease_owner,
                 generation=generation,
-                acquired_at=effective_acquired_at,
-                heartbeat_at=acquired_at,
                 expires_at=effective_expiry,
             )
 
@@ -3897,14 +3336,11 @@ class RunStore:
             )
             if update.rowcount != 1:
                 raise StateError(f"Lease {lease_name} changed while heartbeating")
+            _stored_datetime(row["acquired_at"], field=f"lease {lease_name} acquisition")
             return Lease(
                 name=lease_name,
                 owner=lease_owner,
                 generation=lease_generation,
-                acquired_at=_stored_datetime(
-                    row["acquired_at"], field=f"lease {lease_name} acquisition"
-                ),
-                heartbeat_at=heartbeat_at,
                 expires_at=effective_expiry,
             )
 
@@ -3981,16 +3417,12 @@ class RunStore:
             != lease_generation
         ):
             raise StateError(f"Lease {lease_name} fencing counter is inconsistent")
+        _stored_datetime(row["acquired_at"], field=f"lease {lease_name} acquisition")
+        _stored_datetime(row["heartbeat_at"], field=f"lease {lease_name} heartbeat")
         return Lease(
             name=lease_name,
             owner=str(row["owner"]),
             generation=lease_generation,
-            acquired_at=_stored_datetime(
-                row["acquired_at"], field=f"lease {lease_name} acquisition"
-            ),
-            heartbeat_at=_stored_datetime(
-                row["heartbeat_at"], field=f"lease {lease_name} heartbeat"
-            ),
             expires_at=_stored_datetime(row["expires_at"], field=f"lease {lease_name} expiry"),
         )
 
@@ -4637,47 +4069,6 @@ class RunStore:
                 details,
             )
 
-    def evaluation_record_anchors(self, *, limit: int = 10_000) -> builtins.list[dict[str, str]]:
-        """Return the complete bounded set of durable evaluation-record events."""
-
-        if isinstance(limit, bool) or not isinstance(limit, int):
-            raise TypeError("evaluation anchor limit must be an integer")
-        if not 1 <= limit <= 10_000:
-            raise ValueError("evaluation anchor limit must be between 1 and 10000")
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT run_id, details_json FROM events
-                WHERE event_type = 'evaluation.recorded'
-                ORDER BY id LIMIT ?
-                """,
-                (limit + 1,),
-            ).fetchall()
-        if len(rows) > limit:
-            raise StateError("Evaluation record anchor set exceeds the configured safety bound")
-
-        anchors: builtins.list[dict[str, str]] = []
-        seen_run_ids: set[str] = set()
-        for row in rows:
-            run_id_value = row["run_id"]
-            details_value = row["details_json"]
-            if not isinstance(run_id_value, str) or not isinstance(details_value, str):
-                raise StateError("Evaluation record anchor contains invalid stored values")
-            try:
-                parsed_details = json.loads(details_value)
-            except json.JSONDecodeError as exc:
-                raise StateError("Evaluation record anchor contains malformed details") from exc
-            if not isinstance(parsed_details, dict) or not all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in parsed_details.items()
-            ):
-                raise StateError("Evaluation record anchor contains malformed details")
-            if run_id_value in seen_run_ids:
-                raise StateError(f"Duplicate evaluation record anchor for run {run_id_value}")
-            seen_run_ids.add(run_id_value)
-            anchors.append({"run_id": run_id_value, "details": details_value})
-        return anchors
-
     def evaluation_revision_anchors(
         self,
         *,
@@ -5085,11 +4476,7 @@ def _verified_issue_revision_row(
     return run_id, status, revision
 
 
-def _verify_issue_revision_evidence(
-    connection: sqlite3.Connection,
-    *,
-    require_current_provenance: bool,
-) -> None:
+def _verify_issue_revision_evidence(connection: sqlite3.Connection) -> None:
     rows = connection.execute(
         """
         SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
@@ -5104,8 +4491,6 @@ def _verify_issue_revision_evidence(
         run_id, _, revision = _verified_issue_revision_row(row)
         if revision is not None:
             candidate_runs.add(run_id)
-    if not require_current_provenance:
-        return
     selected_runs = _verify_candidate_selection_events(connection)
     authorized_retry_runs = _verify_candidate_retry_authorizations(connection)
     missing_provenance = candidate_runs - selected_runs - authorized_retry_runs
@@ -5145,12 +4530,9 @@ def _verify_candidate_selection_events(connection: sqlite3.Connection) -> set[st
             row["details_json"],
             field=f"run {run_id} candidate selection event",
         )
-        event_revision = details.get("issue_revision")
-        if event_revision is not None and event_revision != revision:
+        if details.get("issue_revision") != revision:
             raise StateError(f"Run {run_id} candidate selection has a mismatched issue revision")
-        expected_keys = {"issue", "score"}
-        if event_revision is not None:
-            expected_keys.add("issue_revision")
+        expected_keys = {"issue", "issue_revision", "score"}
         score = details.get("score")
         try:
             parsed_score = int(score) if isinstance(score, str) else -1
@@ -5169,77 +4551,7 @@ def _verify_candidate_selection_events(connection: sqlite3.Connection) -> set[st
 
 
 def _verify_candidate_retry_authorizations(connection: sqlite3.Connection) -> set[str]:
-    metadata = connection.execute(
-        "SELECT migrated_at FROM schema_metadata WHERE singleton = 1"
-    ).fetchone()
-    if metadata is None:
-        raise StateError("Candidate retry evidence lacks schema migration metadata")
-    schema_migrated_at = _stored_canonical_utc_datetime(
-        metadata["migrated_at"],
-        field="schema migration time",
-    )
-    markers = connection.execute(
-        """
-        SELECT legacy_candidate_retry_overrides.event_id AS marker_event_id,
-               legacy_candidate_retry_overrides.run_id AS marker_run_id,
-               legacy_candidate_retry_overrides.event_hash AS marker_event_hash,
-               legacy_candidate_retry_overrides.migrated_at,
-               events.id AS event_id, events.run_id AS event_run_id,
-               events.event_type, events.occurred_at, events.event_hash,
-               events.details_json
-        FROM legacy_candidate_retry_overrides
-        LEFT JOIN events ON events.id = legacy_candidate_retry_overrides.event_id
-        ORDER BY legacy_candidate_retry_overrides.event_id LIMIT ?
-        """,
-        (_MAX_RUN_CORPUS + 1,),
-    ).fetchall()
-    if len(markers) > _MAX_RUN_CORPUS:
-        raise StateError("Legacy candidate retry markers exceed the supported integrity bound")
     covered_event_ids: set[int] = set()
-    legacy_runs: set[str] = set()
-    for marker in markers:
-        marker_event_id = marker["marker_event_id"]
-        event_id = marker["event_id"]
-        if (
-            isinstance(marker_event_id, bool)
-            or not isinstance(marker_event_id, int)
-            or marker_event_id < 1
-            or event_id != marker_event_id
-            or marker["event_type"] != "candidate.retry_override"
-            or marker["event_run_id"] != marker["marker_run_id"]
-            or marker["event_hash"] != marker["marker_event_hash"]
-        ):
-            raise StateError("Legacy candidate retry marker disagrees with its exact event")
-        marker_migrated_at = _stored_canonical_utc_datetime(
-            marker["migrated_at"],
-            field="legacy candidate retry migration time",
-        )
-        event_occurred_at = _stored_datetime(
-            marker["occurred_at"],
-            field="legacy candidate retry event time",
-        )
-        if (
-            marker["migrated_at"] != metadata["migrated_at"]
-            or marker_migrated_at != schema_migrated_at
-            or event_occurred_at > marker_migrated_at
-        ):
-            raise StateError("Legacy candidate retry marker has an invalid migration cutoff")
-        validated_event_id, run_id, event_hash = _validated_legacy_candidate_retry_override(
-            connection,
-            event_id=event_id,
-            run_id=marker["event_run_id"],
-            event_hash=marker["event_hash"],
-            details_json=marker["details_json"],
-        )
-        if (
-            validated_event_id in covered_event_ids
-            or run_id in legacy_runs
-            or event_hash != marker["marker_event_hash"]
-        ):
-            raise StateError("Legacy candidate retry marker is duplicated or mismatched")
-        covered_event_ids.add(validated_event_id)
-        legacy_runs.add(run_id)
-
     authorizations = connection.execute(
         """
         SELECT authorization_id, run_id, repository, issue_number, issue_revision,
@@ -5371,9 +4683,6 @@ def _verify_candidate_retry_authorizations(connection: sqlite3.Connection) -> se
         covered_event_ids.add(event_id)
         authorized_runs.add(run_id)
 
-    if legacy_runs & authorized_runs:
-        raise StateError("Candidate retry evidence mixes legacy and authorized provenance")
-
     retry_events = connection.execute(
         """
         SELECT id FROM events
@@ -5386,100 +4695,8 @@ def _verify_candidate_retry_authorizations(connection: sqlite3.Connection) -> se
         raise StateError("Candidate retry overrides exceed the supported integrity bound")
     retry_event_ids = {row["id"] for row in retry_events}
     if retry_event_ids != covered_event_ids:
-        raise StateError(
-            "Candidate retry override event lacks durable authorization or migration provenance"
-        )
-    return authorized_runs | legacy_runs
-
-
-def _validated_legacy_candidate_retry_override(
-    connection: sqlite3.Connection,
-    *,
-    event_id: object,
-    run_id: object,
-    event_hash: object,
-    details_json: object,
-) -> tuple[int, str, str]:
-    """Bind one schema-v7 retry event to its exact current and prior run evidence."""
-
-    if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 1:
-        raise StateError("Legacy candidate retry override has an invalid event ID")
-    try:
-        if not isinstance(run_id, str):
-            raise TypeError("legacy candidate retry run ID must be a string")
-        normalized_run_id = _lease_identity(run_id, field="legacy candidate retry run id")
-    except (TypeError, ValueError) as exc:
-        raise StateError("Legacy candidate retry override has an invalid run ID") from exc
-    normalized_event_hash = _stored_event_hash(
-        event_hash,
-        field="legacy candidate retry event hash",
-    )
-    details = _stored_event_details(
-        details_json,
-        field=f"run {normalized_run_id} legacy candidate retry override",
-    )
-    expected_keys = {"issue", "issue_revision", "prior_run_id", "prior_status"}
-    if set(details) != expected_keys:
-        raise StateError(
-            f"Run {normalized_run_id} legacy candidate retry override has unsupported details"
-        )
-    try:
-        prior_run_id = _lease_identity(
-            details["prior_run_id"],
-            field="legacy candidate retry prior run id",
-        )
-        prior_status = RunStatus(details["prior_status"])
-    except (TypeError, ValueError) as exc:
-        raise StateError(
-            f"Run {normalized_run_id} legacy candidate retry override has invalid prior evidence"
-        ) from exc
-    if prior_run_id == normalized_run_id or prior_status not in _CANDIDATE_SUPPRESSED_STATUSES:
-        raise StateError(
-            f"Run {normalized_run_id} legacy candidate retry override has invalid prior evidence"
-        )
-    revision = _stored_event_hash(
-        details["issue_revision"],
-        field="legacy candidate retry issue revision",
-    )
-    run_row = connection.execute(
-        """
-        SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
-        FROM runs WHERE run_id = ?
-        """,
-        (normalized_run_id,),
-    ).fetchone()
-    prior_row = connection.execute(
-        """
-        SELECT run_id, status, repository, issue_number, issue_revision, manifest_json
-        FROM runs WHERE run_id = ?
-        """,
-        (prior_run_id,),
-    ).fetchone()
-    if run_row is None or prior_row is None:
-        raise StateError(
-            f"Run {normalized_run_id} legacy candidate retry override references a missing run"
-        )
-    _, _, run_revision = _verified_issue_revision_row(run_row)
-    _, stored_prior_status, prior_revision = _verified_issue_revision_row(prior_row)
-    manifest = RunManifest.model_validate_json(run_row["manifest_json"])
-    candidate = manifest.candidate
-    expected_details = {
-        "issue": candidate.reference if candidate is not None else "",
-        "issue_revision": revision,
-        "prior_run_id": prior_run_id,
-        "prior_status": prior_status.value,
-    }
-    if (
-        candidate is None
-        or run_revision != revision
-        or prior_revision != revision
-        or stored_prior_status != prior_status
-        or details != expected_details
-    ):
-        raise StateError(
-            f"Run {normalized_run_id} legacy candidate retry override disagrees with run evidence"
-        )
-    return event_id, normalized_run_id, normalized_event_hash
+        raise StateError("Candidate retry override event lacks durable authorization provenance")
+    return authorized_runs
 
 
 def _verified_event_heads(
@@ -5574,20 +4791,6 @@ def _verify_circuit_breaker_evidence(connection: sqlite3.Connection) -> None:
             or latest["trigger_hash"] != row["trigger_hash"]
         ):
             raise StateError("Circuit-breaker state does not identify its latest trigger")
-
-
-def _verify_unanchored_event_chains(connection: sqlite3.Connection) -> None:
-    """Verify legacy v2/v3 hashes even though those schemas predate run-row anchors."""
-
-    run_rows = connection.execute("SELECT run_id FROM runs ORDER BY run_id").fetchall()
-    event_rows = connection.execute(
-        """
-        SELECT id, run_id, occurred_at, event_type, details_json,
-               previous_hash, event_hash
-        FROM events ORDER BY run_id ASC, id ASC
-        """
-    ).fetchall()
-    _verified_event_heads(run_rows, event_rows)
 
 
 def _verify_lifecycle_snapshot_evidence(
@@ -6096,7 +5299,7 @@ def _publication_evidence_from_connection(
             raise StateError(f"Run {run_id} publication evidence contains malformed details")
         details = cast(dict[str, str], parsed)
 
-        if event_type in {"publication.reserved", "publication.reservation.legacy"}:
+        if event_type == "publication.reserved":
             if set(details) != {"repository", "reserved_at"}:
                 raise StateError(f"Run {run_id} publication reservation evidence is incomplete")
             try:
@@ -6120,27 +5323,22 @@ def _publication_evidence_from_connection(
             )
             continue
 
-        if event_type in {"publication.gate.held", "publication.gate.legacy"}:
-            expected_keys = {"corpus_cursor", "held_at"}
-            if event_type == "publication.gate.held":
-                expected_keys.add("deployment_fingerprint")
-            modern_keys = {*expected_keys, "outcome_corpus_cursor"}
-            if frozenset(details) not in {frozenset(expected_keys), frozenset(modern_keys)}:
+        if event_type == "publication.gate.held":
+            if set(details) != {
+                "deployment_fingerprint",
+                "corpus_cursor",
+                "outcome_corpus_cursor",
+                "held_at",
+            }:
                 raise StateError(f"Run {run_id} publication gate evidence is incomplete")
-            fingerprint: str | None = None
-            outcome_cursor: str | None = None
-            if event_type == "publication.gate.held":
-                fingerprint = _stored_event_hash(
-                    details["deployment_fingerprint"],
-                    field=f"run {run_id} publication gate evidence deployment fingerprint",
-                )
-            if "outcome_corpus_cursor" in details:
-                if event_type != "publication.gate.held":
-                    raise StateError(f"Run {run_id} legacy gate has outcome authority")
-                outcome_cursor = _stored_event_hash(
-                    details["outcome_corpus_cursor"],
-                    field=f"run {run_id} publication gate evidence outcome cursor",
-                )
+            fingerprint = _stored_event_hash(
+                details["deployment_fingerprint"],
+                field=f"run {run_id} publication gate evidence deployment fingerprint",
+            )
+            outcome_cursor = _stored_event_hash(
+                details["outcome_corpus_cursor"],
+                field=f"run {run_id} publication gate evidence outcome cursor",
+            )
             cursor = _stored_event_hash(
                 details["corpus_cursor"],
                 field=f"run {run_id} publication gate evidence corpus cursor",
@@ -6173,8 +5371,6 @@ def _publication_evidence_from_connection(
                 raise StateError(f"Run {run_id} publication gate rebind lacks hold evidence")
             if run_id in releases:
                 raise StateError(f"Run {run_id} publication gate rebind follows its release")
-            if existing_hold.outcome_corpus_cursor is None:
-                raise StateError(f"Run {run_id} publication gate rebind targets a pre-v6 hold")
             rebind_fingerprint = _stored_event_hash(
                 details["deployment_fingerprint"],
                 field=f"run {run_id} publication gate rebind deployment fingerprint",
@@ -6205,32 +5401,26 @@ def _publication_evidence_from_connection(
             )
             continue
 
-        expected_keys = {"outcome", "corpus_cursor", "held_at"}
-        if "deployment_fingerprint" in details:
-            expected_keys.add("deployment_fingerprint")
-        if "outcome_corpus_cursor" in details:
-            expected_keys.add("outcome_corpus_cursor")
-        if set(details) != expected_keys or details["outcome"] not in {
-            "pr_open",
-            "verified_compensation",
-        }:
+        if set(details) != {
+            "outcome",
+            "deployment_fingerprint",
+            "corpus_cursor",
+            "outcome_corpus_cursor",
+            "held_at",
+        } or details["outcome"] not in {"pr_open", "verified_compensation"}:
             raise StateError(f"Run {run_id} publication gate release evidence is incomplete")
-        release_fingerprint = None
-        if "deployment_fingerprint" in details:
-            release_fingerprint = _stored_event_hash(
-                details["deployment_fingerprint"],
-                field=f"run {run_id} publication gate release deployment fingerprint",
-            )
+        release_fingerprint = _stored_event_hash(
+            details["deployment_fingerprint"],
+            field=f"run {run_id} publication gate release deployment fingerprint",
+        )
         release_cursor = _stored_event_hash(
             details["corpus_cursor"],
             field=f"run {run_id} publication gate release corpus cursor",
         )
-        release_outcome_cursor = None
-        if "outcome_corpus_cursor" in details:
-            release_outcome_cursor = _stored_event_hash(
-                details["outcome_corpus_cursor"],
-                field=f"run {run_id} publication gate release outcome cursor",
-            )
+        release_outcome_cursor = _stored_event_hash(
+            details["outcome_corpus_cursor"],
+            field=f"run {run_id} publication gate release outcome cursor",
+        )
         _stored_datetime(
             details["held_at"],
             field=f"run {run_id} publication gate release time",
@@ -6291,18 +5481,6 @@ def _publication_gate_evidence_from_row(row: sqlite3.Row) -> _PublicationGateEvi
     )
 
 
-def _publication_gate_outcome_projection(connection: sqlite3.Connection) -> str:
-    columns = {
-        str(row["name"])
-        for row in connection.execute("PRAGMA table_info(publication_gate_holds)").fetchall()
-    }
-    return (
-        "outcome_corpus_cursor"
-        if "outcome_corpus_cursor" in columns
-        else "NULL AS outcome_corpus_cursor"
-    )
-
-
 def _bounded_publication_rows(
     connection: sqlite3.Connection,
 ) -> tuple[
@@ -6316,16 +5494,11 @@ def _bounded_publication_rows(
         """,
         (_MAX_RUN_CORPUS + 1,),
     ).fetchall()
-    outcome_projection = _publication_gate_outcome_projection(connection)
-    # The projection helper returns one of two hard-coded SQL fragments after inspecting the
-    # schema.  No stored or operator-controlled value is interpolated into this statement.
-    hold_query = (
-        "SELECT run_id, deployment_fingerprint, corpus_cursor, "
-        f"{outcome_projection}, held_at "
-        "FROM publication_gate_holds ORDER BY run_id LIMIT ?"
-    )
     hold_rows = connection.execute(
-        hold_query,
+        """
+        SELECT run_id, deployment_fingerprint, corpus_cursor, outcome_corpus_cursor, held_at
+        FROM publication_gate_holds ORDER BY run_id LIMIT ?
+        """,
         (_MAX_RUN_CORPUS + 1,),
     ).fetchall()
     if len(reservation_rows) > _MAX_RUN_CORPUS:
@@ -6343,56 +5516,6 @@ def _bounded_publication_rows(
     if len(reservations) != len(reservation_rows) or len(holds) != len(hold_rows):
         raise StateError("Publication state contains duplicate run identities")
     return reservations, holds
-
-
-def _migrate_legacy_publication_evidence(connection: sqlite3.Connection) -> None:
-    """Attest canonical v3/v4 rows without blessing missing modern evidence."""
-
-    _verify_event_anchors(connection)
-    event_reservations, event_holds, releases = _publication_evidence_from_connection(connection)
-    row_reservations, row_holds = _bounded_publication_rows(connection)
-
-    for run_id, reservation in row_reservations.items():
-        if run_id not in event_reservations:
-            _append_event_to_ledger(
-                connection,
-                run_id,
-                "publication.reservation.legacy",
-                {
-                    "repository": reservation.repository,
-                    "reserved_at": reservation.reserved_at,
-                },
-            )
-
-    for run_id, hold in row_holds.items():
-        if run_id not in event_holds and run_id not in releases:
-            if hold.deployment_fingerprint is not None:
-                raise StateError(
-                    f"Run {run_id} has a modern publication gate hold without ledger evidence"
-                )
-            _append_event_to_ledger(
-                connection,
-                run_id,
-                "publication.gate.legacy",
-                {"corpus_cursor": hold.corpus_cursor, "held_at": hold.held_at},
-            )
-
-    for run_id, release in releases.items():
-        if run_id in event_holds:
-            continue
-        if run_id in row_holds:
-            # Strict reconciliation below rejects released evidence with an active row.
-            continue
-        if release.deployment_fingerprint is not None:
-            raise StateError(
-                f"Run {run_id} has a modern publication gate release without hold evidence"
-            )
-        _append_event_to_ledger(
-            connection,
-            run_id,
-            "publication.gate.legacy",
-            {"corpus_cursor": release.corpus_cursor, "held_at": release.held_at},
-        )
 
 
 def _reconcile_publication_state(
@@ -6517,13 +5640,9 @@ def _verify_active_outcome_hold(
     connection: sqlite3.Connection,
     hold: PublicationGateHold | _PublicationGateEvidence,
 ) -> None:
-    """Validate a v6 outcome cursor; a NULL cursor remains fenced legacy evidence."""
+    """Validate that an active hold's outcome cursor is still current."""
 
     scope = _validated_active_outcome_scope(connection, hold)
-    if hold.outcome_corpus_cursor is None:
-        return
-    if scope is None:  # pragma: no cover - guarded by validated outcome authority
-        raise StateError("Publication gate hold outcome scope is missing")
     actual = _upstream_outcome_corpus_cursor_from_connection(connection, *scope)
     if actual != hold.outcome_corpus_cursor:
         raise StateError(
@@ -6535,18 +5654,9 @@ def _verify_active_outcome_hold(
 def _validated_active_outcome_scope(
     connection: sqlite3.Connection,
     hold: PublicationGateHold | _PublicationGateEvidence,
-) -> tuple[str, str, str, str | None] | None:
-    """Validate hold ownership and return its modern outcome scope without comparing cursors."""
+) -> tuple[str, str, str, str | None]:
+    """Validate hold ownership and return its outcome scope without comparing cursors."""
 
-    if hold.outcome_corpus_cursor is None:
-        # Pre-v6 holds remain eligible only for exposure-reducing compensation. Their exact row
-        # and ledger evidence is checked by reconciliation, but no outcome scope was ever held.
-        return None
-    if hold.deployment_fingerprint is None:
-        raise StateError(
-            f"Publication gate hold for run {hold.run_id} has outcome authority without a "
-            "deployment fingerprint"
-        )
     row = connection.execute(
         "SELECT manifest_json FROM runs WHERE run_id = ?",
         (hold.run_id,),
@@ -6590,17 +5700,15 @@ def _publication_gate_hold_from_row(row: sqlite3.Row) -> PublicationGateHold:
     run_id_value = row["run_id"]
     if not isinstance(run_id_value, str) or not run_id_value:
         raise StateError("Publication gate hold contains an invalid run ID")
-    fingerprint_value = row["deployment_fingerprint"]
-    if fingerprint_value is not None:
-        fingerprint_value = _stored_event_hash(
-            fingerprint_value,
-            field=f"publication gate hold {run_id_value} deployment fingerprint",
-        )
+    fingerprint_value = _stored_event_hash(
+        row["deployment_fingerprint"],
+        field=f"publication gate hold {run_id_value} deployment fingerprint",
+    )
     cursor = _stored_event_hash(
         row["corpus_cursor"],
         field=f"publication gate hold {run_id_value} corpus cursor",
     )
-    held_at = _stored_datetime(
+    _stored_datetime(
         row["held_at"],
         field=f"publication gate hold {run_id_value} time",
     )
@@ -6608,42 +5716,11 @@ def _publication_gate_hold_from_row(row: sqlite3.Row) -> PublicationGateHold:
         run_id=run_id_value,
         deployment_fingerprint=fingerprint_value,
         corpus_cursor=cursor,
-        outcome_corpus_cursor=(
-            _stored_event_hash(
-                row["outcome_corpus_cursor"],
-                field=f"publication gate hold {run_id_value} outcome corpus cursor",
-            )
-            if row["outcome_corpus_cursor"] is not None
-            else None
+        outcome_corpus_cursor=_stored_event_hash(
+            row["outcome_corpus_cursor"],
+            field=f"publication gate hold {run_id_value} outcome corpus cursor",
         ),
-        held_at=held_at,
     )
-
-
-def _verify_publication_gate_holds(connection: sqlite3.Connection) -> None:
-    outcome_projection = _publication_gate_outcome_projection(connection)
-    # The projection is selected from two hard-coded fragments by schema introspection.
-    hold_query = (
-        "SELECT run_id, deployment_fingerprint, corpus_cursor, "
-        f"{outcome_projection}, held_at "
-        "FROM publication_gate_holds ORDER BY run_id LIMIT ?"
-    )
-    rows = connection.execute(
-        hold_query,
-        (_MAX_RUN_CORPUS + 1,),
-    ).fetchall()
-    if len(rows) > _MAX_RUN_CORPUS:
-        raise StateError("Publication gate hold set exceeds the configured safety bound")
-    if not rows:
-        return
-    current_cursor = _evaluation_corpus_cursor_from_connection(connection)
-    for row in rows:
-        hold = _publication_gate_hold_from_row(row)
-        if hold.corpus_cursor != current_cursor:
-            raise StateError(
-                f"Publication gate hold for run {hold.run_id} disagrees with the evaluation corpus"
-            )
-        _verify_active_outcome_hold(connection, hold)
 
 
 def _release_publication_gate_hold(
@@ -6685,13 +5762,11 @@ def _release_publication_gate_hold(
     _validated_active_outcome_scope(connection, hold)
     release_details = {
         "outcome": outcome,
+        "deployment_fingerprint": hold.deployment_fingerprint,
         "corpus_cursor": hold.corpus_cursor,
+        "outcome_corpus_cursor": hold.outcome_corpus_cursor,
         "held_at": str(row["held_at"]),
     }
-    if hold.deployment_fingerprint is not None:
-        release_details["deployment_fingerprint"] = hold.deployment_fingerprint
-    if hold.outcome_corpus_cursor is not None:
-        release_details["outcome_corpus_cursor"] = hold.outcome_corpus_cursor
     store._append_event(
         connection,
         run_id,
@@ -6701,8 +5776,8 @@ def _release_publication_gate_hold(
     deletion = connection.execute(
         """
         DELETE FROM publication_gate_holds
-        WHERE run_id = ? AND deployment_fingerprint IS ?
-          AND corpus_cursor = ? AND outcome_corpus_cursor IS ? AND held_at = ?
+        WHERE run_id = ? AND deployment_fingerprint = ?
+          AND corpus_cursor = ? AND outcome_corpus_cursor = ? AND held_at = ?
         """,
         (
             run_id,
@@ -6715,25 +5790,6 @@ def _release_publication_gate_hold(
     if deletion.rowcount != 1:
         raise StateError("Publication gate hold changed while it was being released")
     return True
-
-
-def _release_publication_gate_hold_for_compensation(
-    store: RunStore,
-    connection: sqlite3.Connection,
-    run_id: str,
-    *,
-    outcome: str,
-    required: bool,
-) -> bool:
-    """Release an exact compensated hold without treating rollout drift as new authority."""
-
-    return _release_publication_gate_hold(
-        store,
-        connection,
-        run_id,
-        outcome=outcome,
-        required=required,
-    )
 
 
 def _assert_no_publication_gate_hold(connection: sqlite3.Connection) -> None:

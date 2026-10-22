@@ -46,21 +46,6 @@ class LeaseHeartbeatGuard:
         self._lease: Lease | None = None
         self._lost_reason: str | None = None
 
-    @property
-    def owner(self) -> str:
-        return self._owner
-
-    @property
-    def lease(self) -> Lease:
-        with self._lock:
-            if self._lease is None:
-                raise StateError(f"Lease {self._name} has not been acquired")
-            return self._lease
-
-    @property
-    def generation(self) -> int:
-        return self.lease.generation
-
     def __enter__(self) -> LeaseHeartbeatGuard:
         with self._lock:
             if self._lease is not None or self._thread is not None:

@@ -235,8 +235,6 @@ class SystemdAssetVerification:
     scope: Literal["source", "installed"]
     manifest_sha256: str
     checked_assets: int
-    required_assets: int
-    source_only_assets: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,12 +243,6 @@ class _LoadedManifest:
     data: bytes
     digest: str
     path: Path
-
-
-def load_systemd_asset_manifest(path: Path | None = None) -> SystemdAssetManifest:
-    """Load and fully validate the packaged deployment-asset manifest."""
-
-    return _load_manifest(path).manifest
 
 
 def packaged_systemd_asset_manifest_digest(path: Path | None = None) -> str:
@@ -407,8 +399,6 @@ def verify_installed_systemd_assets(
         scope="installed",
         manifest_sha256=loaded.digest,
         checked_assets=checked,
-        required_assets=required,
-        source_only_assets=sum(asset.installed_path is None for asset in loaded.manifest.assets),
     )
 
 
@@ -759,8 +749,6 @@ def _verification_summary(
         scope=scope,
         manifest_sha256=loaded.digest,
         checked_assets=len(loaded.manifest.assets),
-        required_assets=sum(asset.required for asset in loaded.manifest.assets),
-        source_only_assets=sum(asset.installed_path is None for asset in loaded.manifest.assets),
     )
 
 
@@ -768,7 +756,6 @@ __all__ = [
     "SystemdAsset",
     "SystemdAssetManifest",
     "SystemdAssetVerification",
-    "load_systemd_asset_manifest",
     "packaged_systemd_asset_manifest_digest",
     "verify_installed_systemd_assets",
     "verify_source_systemd_assets",

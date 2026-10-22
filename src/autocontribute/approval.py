@@ -309,21 +309,6 @@ def validate_approval(
         raise PolicyError("Approval actor does not match the authorized GitHub publishing account")
 
 
-def approval_is_valid(
-    approval: Approval,
-    manifest: ApprovalManifest,
-    *,
-    now: datetime | None = None,
-) -> bool:
-    """Boolean form for status displays; publication should call ``validate_approval``."""
-
-    try:
-        validate_approval(approval, manifest, now=now)
-    except PolicyError:
-        return False
-    return True
-
-
 def _aware_utc(value: datetime, *, field: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise PolicyError(f"{field} must be timezone-aware")
@@ -333,7 +318,6 @@ def _aware_utc(value: datetime, *, field: str) -> datetime:
 __all__ = [
     "ApprovalManifest",
     "ApprovalReview",
-    "approval_is_valid",
     "build_approval_manifest",
     "create_approval",
     "hash_diff",

@@ -1244,10 +1244,6 @@ def _verify_local_replication_record(
         raw_record = json.loads(receipt_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise StateError("Local S3 replication receipt is invalid") from exc
-    if isinstance(raw_record, dict) and raw_record.get("schema_version") == 1:
-        raise StateError(
-            "Local S3 replication receipt uses a legacy schema without retention-policy evidence"
-        )
     try:
         record = BackupReplicationRecord.model_validate(raw_record)
     except ValueError as exc:

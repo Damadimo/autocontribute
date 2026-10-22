@@ -9,8 +9,8 @@ from autocontribute.config import load_config
 
 ROOT = Path(__file__).resolve().parents[1]
 HOSTED_SCHEMA_VERSION = 8
-HOSTED_PARENT_SCHEMA_VERSIONS = tuple(range(3, HOSTED_SCHEMA_VERSION + 1))
-RECOVERY_CANDIDATE_SCHEMA_VERSIONS = (5, 6, 7, 8)
+HOSTED_PARENT_SCHEMA_VERSIONS = (HOSTED_SCHEMA_VERSION,)
+RECOVERY_CANDIDATE_SCHEMA_VERSIONS = (HOSTED_SCHEMA_VERSION,)
 
 
 def _security_workflow() -> dict[str, object]:
@@ -120,7 +120,6 @@ def test_checked_in_staging_config_is_safe_for_the_operator_fixture() -> None:
     assert settings.publishing.mode == "review_required"
     assert settings.publishing.draft is True
     assert settings.sandbox.backend == "docker"
-    assert settings.sandbox.network == "none"
     assert settings.sandbox.max_commands == 11
     assert settings.storage.path == ROOT / ".autocontribute-staging"
     assert settings.models.scout.model == "gpt-5.5"
@@ -252,6 +251,7 @@ def test_scheduler_cache_uses_externally_committed_exact_lineage(
         assert f'[[ "$current" =~ $v{version}_lineage_pattern ]]' in resolve["run"]
         assert f'parent_schema="v{version}"' in resolve["run"]
     assert "v2_lineage_pattern" not in resolve["run"]
+    assert "v7_lineage_pattern" not in resolve["run"]
     assert "v9_lineage_pattern" not in resolve["run"]
     assert "== committed:" not in resolve["run"]
     assert 'echo "parent_schema=$parent_schema"' in resolve["run"]
@@ -415,7 +415,6 @@ def test_hosted_workflows_require_review_only_docker_isolation(
 
     assert 'settings.publishing.mode != "review_required"' in step["run"]
     assert 'settings.sandbox.backend != "docker"' in step["run"]
-    assert 'settings.sandbox.network != "none"' in step["run"]
     assert "settings.sandbox.allow_unsafe_local" in step["run"]
     assert "work_budget_seconds > 3 * 60 * 60" in step["run"]
     assert job["timeout-minutes"] == 240
@@ -515,7 +514,6 @@ def test_hosted_lineage_recovery_wrappers_share_scheduler_lock_and_fixed_boundar
     ]
     assert inputs["expected_claim"]["required"] is True
     assert inputs["restore_over_unusable_claimant"]["default"] is False
-    assert inputs["legacy_claim_intent"]["default"] == "reject"
     assert "operator_actor" not in inputs
     assert document["permissions"] == {"actions": "read", "contents": "read"}
     assert document["concurrency"] == scheduler_document["concurrency"]
@@ -555,10 +553,6 @@ def test_hosted_lineage_recovery_requires_exact_claim_and_exact_retained_evidenc
     assert '"${#claim_parts[@]}" -eq 7' in resolve["run"]
     assert '"${claim_parts[1]}" == "v2"' in resolve["run"]
     assert 'candidate_key="${claim_parts[6]}"' in resolve["run"]
-    assert (
-        'candidate_key="${KEY_PREFIX}v5-${RUNNER_OS}-${REPOSITORY_ID}-'
-        '${claim_run_id}-${claim_run_attempt}"' in resolve["run"]
-    )
     candidate_versions = "|".join(str(version) for version in RECOVERY_CANDIDATE_SCHEMA_VERSIONS)
     assert f'candidate_pattern="^${{KEY_PREFIX}}v({candidate_versions})-' in resolve["run"]
     assert '[[ ! "$candidate_key" =~ $candidate_pattern ]]' in resolve["run"]
@@ -567,7 +561,7 @@ def test_hosted_lineage_recovery_requires_exact_claim_and_exact_retained_evidenc
     assert f"^${{KEY_PREFIX}}v({parent_versions})-" in resolve["run"]
     assert f'recovery_key="${{KEY_PREFIX}}v{HOSTED_SCHEMA_VERSION}-' in resolve["run"]
     assert 'echo "candidate_schema=$candidate_schema"' in resolve["run"]
-    assert "requires an explicit committed or handoff intent" in resolve["run"]
+    assert "legacy" not in resolve["run"]
     assert claimant_probe["with"]["key"] == "${{ steps.recovery_lineage.outputs.candidate_key }}"
     assert claimant_probe["with"]["lookup-only"] is True
     assert "restore-keys" not in claimant_probe["with"]

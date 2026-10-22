@@ -91,20 +91,6 @@ class TextMatch:
     line: str
 
 
-@dataclass(frozen=True, slots=True)
-class PatchMetrics:
-    """Deterministic metrics for the complete working-tree patch."""
-
-    changed_files: int
-    insertions: int
-    deletions: int
-    binary_files: int = 0
-
-    @property
-    def changed_lines(self) -> int:
-        return self.insertions + self.deletions
-
-
 class RepositoryWorkspace:
     """A repository checked out at an immutable base commit.
 
@@ -232,9 +218,6 @@ class RepositoryWorkspace:
         if not self.path.is_dir() or not (self.path / ".git").is_dir():
             raise RepositoryError("Repository workspace cannot be discarded safely")
         shutil.rmtree(self.path)
-
-    # A shorter alias is convenient for agent context assembly.
-    read_text = read_file
 
     def context_index(
         self,
@@ -571,66 +554,6 @@ class RepositoryWorkspace:
                 environment=environment,
             )
 
-    def diff_stat(self) -> str:
-        """Return Git's human-readable diffstat for the complete patch."""
-
-        with self._temporary_index() as environment:
-            output = self._git_bytes(
-                [
-                    "diff",
-                    "--cached",
-                    "--stat",
-                    "--no-color",
-                    "--no-ext-diff",
-                    "--no-renames",
-                    "HEAD",
-                    "--",
-                ],
-                environment=environment,
-            )
-        return output.decode("utf-8", errors="replace")
-
-    # Common spelling used in review UIs.
-    diffstat = diff_stat
-
-    def metrics(self) -> PatchMetrics:
-        """Measure insertions/deletions without trusting model-supplied counts."""
-
-        with self._temporary_index() as environment:
-            output = self._git_bytes(
-                [
-                    "diff",
-                    "--cached",
-                    "--numstat",
-                    "-z",
-                    "--no-renames",
-                    "HEAD",
-                    "--",
-                ],
-                environment=environment,
-            )
-        insertions = 0
-        deletions = 0
-        binary_files = 0
-        files = 0
-        for record in output.split(b"\0"):
-            if not record:
-                continue
-            fields = record.split(b"\t", 2)
-            if len(fields) != 3:
-                raise RepositoryError("Git returned malformed patch metrics")
-            added, removed, _path = fields
-            files += 1
-            if added == b"-" or removed == b"-":
-                binary_files += 1
-                continue
-            try:
-                insertions += int(added)
-                deletions += int(removed)
-            except ValueError as exc:
-                raise RepositoryError("Git returned malformed line counts") from exc
-        return PatchMetrics(files, insertions, deletions, binary_files)
-
     def _tracked_paths(self) -> list[str]:
         output = self._git_bytes(["ls-files", "-z", "--cached"])
         return sorted(
@@ -789,13 +712,12 @@ class RepositoryWorkspace:
         arguments: list[str],
         *,
         check: bool = True,
-        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return _run_git_at(
             self.path,
             arguments,
             timeout_seconds=_GIT_TIMEOUT_SECONDS,
-            environment=environment or _git_environment(),
+            environment=_git_environment(),
             check=check,
         )
 
@@ -849,7 +771,7 @@ class _TemporaryIndex:
         self.environment = environment
         return environment
 
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+    def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
         if self._directory is not None:
             self._directory.cleanup()
 
@@ -1063,4 +985,4 @@ def _guidance_sort_key(relative_path: str) -> tuple[int, int, str]:
     return 7, len(pure_path.parts), lowered
 
 
-__all__ = ["ContextEntry", "PatchMetrics", "RepositoryWorkspace", "TextMatch"]
+__all__ = ["ContextEntry", "RepositoryWorkspace", "TextMatch"]

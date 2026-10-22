@@ -205,7 +205,6 @@ class ExactHumanApproval:
     """One ledger-bound approval that authorized an exact publication intent."""
 
     approval_event_hash: str
-    publication_intent_event_hash: str
     publication_intent_at: datetime
 
 
@@ -739,13 +738,12 @@ def _authorization(
     scope: UpstreamPublicationScope,
 ) -> _AuthorizationEvidence:
     modern = [event for event in events if event["event_type"] == "publication.gate.held"]
-    legacy = [event for event in events if event["event_type"] == "publication.gate.legacy"]
     releases = [event for event in events if event["event_type"] == "publication.gate.released"]
-    if legacy or len(modern) > 1:
+    if len(modern) > 1:
         return _AuthorizationEvidence(
             PublicationAuthorization.AMBIGUOUS,
-            "publication has legacy or duplicate automatic-gate evidence",
-            tuple(event["event_hash"] for event in (*modern, *legacy, *releases)),
+            "publication has duplicate automatic-gate evidence",
+            tuple(event["event_hash"] for event in (*modern, *releases)),
         )
     if modern:
         hold_index = next(index for index, event in enumerate(events) if event is modern[0])
@@ -842,7 +840,6 @@ def classify_exact_human_approval(
         event["event_type"]
         in {
             "publication.gate.held",
-            "publication.gate.legacy",
             "publication.gate.released",
         }
         for event in events
@@ -874,15 +871,11 @@ def classify_exact_human_approval(
             event["event_hash"],
             field="approval event hash",
         )
-        intent_event_hash = _event_hash(
-            intent["event_hash"],
-            field="publication intent event hash",
-        )
+        _event_hash(intent["event_hash"], field="publication intent event hash")
     except (StateError, TypeError, ValueError):
         return None
     return ExactHumanApproval(
         approval_event_hash=approval_event_hash,
-        publication_intent_event_hash=intent_event_hash,
         publication_intent_at=intent_at,
     )
 
@@ -1339,7 +1332,6 @@ def _lifecycle_outcome(
     timeline_identities: dict[str, tuple[object, ...]] = {}
     reference_identities: dict[str, tuple[object, ...]] = {}
     detected_signals: list[str] = []
-    incomplete_history = False
     for row in rows:
         if row.run_id != manifest.run_id:
             raise StateError("lifecycle row belongs to another run")
@@ -1405,15 +1397,9 @@ def _lifecycle_outcome(
         detected_signals.extend(f"{signal.kind.value}:{signal.evidence_key}" for signal in signals)
         parsed.append(snapshot)
         fingerprints.append(row.fingerprint)
-        if not snapshot.has_complete_upstream_history:
-            incomplete_history = True
-            continue
-
         commits = snapshot.commits
         timeline_events = snapshot.timeline_events
         timeline_item_count = snapshot.timeline_item_count
-        if commits is None or timeline_events is None or timeline_item_count is None:
-            raise StateError("complete lifecycle snapshot omits required history")
         if (
             previous_timeline_item_count is not None
             and timeline_item_count < previous_timeline_item_count
@@ -1450,8 +1436,6 @@ def _lifecycle_outcome(
                 detected_signals.append(f"close_reopen:{event.node_id}")
 
         for reference in snapshot.references:
-            if reference.node_id is None:
-                raise StateError("complete lifecycle snapshot omits a reference node identity")
             reference_identity = (
                 reference.identifier,
                 reference.source_url,
@@ -1471,12 +1455,6 @@ def _lifecycle_outcome(
             UpstreamOutcome.FAILED,
             tuple(fingerprints),
             ("adverse lifecycle evidence: " + ", ".join(sorted(set(detected_signals))),),
-        )
-    if incomplete_history:
-        return (
-            UpstreamOutcome.UNKNOWN,
-            tuple(fingerprints),
-            ("lifecycle evidence lacks complete upstream history",),
         )
     if any(snapshot.pull_request.merged for snapshot in parsed):
         return (

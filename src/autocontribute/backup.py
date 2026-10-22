@@ -333,7 +333,7 @@ def _validate_archive(
 
 
 def _validate_restorable_database(path: Path) -> None:
-    """Reject invalid or empty SQLite state before RunStore can initialize or migrate it."""
+    """Reject invalid, empty, or non-current SQLite state before RunStore opens it."""
 
     validation: sqlite3.Connection | None = None
     try:

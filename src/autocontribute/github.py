@@ -118,9 +118,7 @@ class PullRequestDetails:
     head_repository: str
     issue_comment_count: int
     review_comment_count: int
-    # Legacy lifecycle payloads predate complete commit-history collection. GitHub reads always
-    # populate this value; ``None`` is reserved for strictly parsed historical evidence.
-    commit_count: int | None
+    commit_count: int
     title: str = ""
     body: str = ""
     base_ref: str = ""
@@ -197,9 +195,7 @@ class PullRequestReference:
     """One PR-to-PR timeline reference used only as explicit revert evidence."""
 
     identifier: int
-    # Legacy lifecycle payloads retained the reference but not its immutable GraphQL identity.
-    # GitHub reads always populate this value; ``None`` is reserved for historical evidence.
-    node_id: str | None
+    node_id: str
     source_url: str
     source_title: str
     source_body: str
@@ -510,19 +506,16 @@ class GitHubClient:
         *,
         resource: str,
         max_items: int,
-        params: dict[str, str | int] | None = None,
     ) -> list[dict[str, Any]]:
         """Read a complete REST collection or reject ambiguous/truncated evidence."""
 
         if not 1 <= max_items <= 1_000:
             raise ValueError(f"{resource} limit must be between 1 and 1,000")
         items: list[dict[str, Any]] = []
-        base_params = dict(params or {})
         # One overflow page distinguishes an exact multiple of 100 from a truncated collection.
         maximum_pages = max_items // 100 + 1
         for page in range(1, maximum_pages + 1):
-            request_params = {**base_params, "per_page": 100, "page": page}
-            data = self._request("GET", path, params=request_params)
+            data = self._request("GET", path, params={"per_page": 100, "page": page})
             page_items = _mapping_list(data, resource=resource)
             if len(page_items) > 100:
                 raise GitHubError(f"GitHub returned an oversized {resource} page")
@@ -1507,23 +1500,6 @@ class GitHubClient:
                     ),
                 )
             ),
-        )
-
-    def list_pull_request_references(
-        self,
-        repository: str,
-        number: int,
-        *,
-        max_events: int = 1_000,
-    ) -> list[PullRequestReference]:
-        """Compatibility wrapper for callers that need only explicit revert references."""
-
-        return list(
-            self.get_pull_request_timeline(
-                repository,
-                number,
-                max_events=max_events,
-            ).references
         )
 
     def ensure_fork(

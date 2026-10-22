@@ -43,13 +43,13 @@ models:
 
 sandbox:
   backend: docker
-  # `network: none` is not configurable: nothing can be installed at validation time, so this one
-  # global image must already contain the complete offline toolchain (pytest, project dependencies)
-  # for every configured repository. A bare interpreter image cannot run the commands below and
-  # fails doctor. Build, digest-pin, and pre-pull your own image first: see docs/sandbox-image.md.
+  # Validation always runs with networking disabled, so nothing can be installed at that time: this
+  # one global image must already contain the complete offline toolchain (pytest, project
+  # dependencies) for every configured repository. A bare interpreter image cannot run the commands
+  # below and fails doctor. Build, digest-pin, and pre-pull your own image first: see
+  # docs/sandbox-image.md.
   image: >-
     example.invalid/sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000
-  network: none
   command_timeout_seconds: 900
   memory: 4g
   cpus: 2
@@ -87,7 +87,6 @@ quality:
   min_dimension_score: 80
   max_files_changed: 8
   max_changed_lines: 400
-  require_validation_commands: true
   require_regression_evidence_for_bugfix: true
 
 publishing:
@@ -99,7 +98,6 @@ publishing:
   max_new_pull_requests_per_day: 1
   max_open_pull_requests: 2
   repository_cooldown_days: 7
-  auto_publish_env: AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH
 
 budget:
   max_model_calls_per_run: 6

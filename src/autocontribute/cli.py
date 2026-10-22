@@ -28,6 +28,7 @@ from autocontribute.backup_replication import (
     verify_latest_state_bundle_replication,
 )
 from autocontribute.config import (
+    AUTO_PUBLISH_ENV,
     CLA_ATTESTATION_STATEMENT,
     DCO_ATTESTATION_STATEMENT,
     AutocontributeConfig,
@@ -317,8 +318,7 @@ def run_once(
                 store,
                 github,
                 resume_submitting_publications=(
-                    settings.publishing.mode == "auto"
-                    and auto_publish_opt_in_enabled(settings.publishing)
+                    settings.publishing.mode == "auto" and auto_publish_opt_in_enabled()
                 ),
                 scheduled_preflight=True,
             )
@@ -404,7 +404,7 @@ def publish(
     settings = _config(config)
     store = RunStore(settings.storage.path)
     manifest = store.get(run_id)
-    _show_report(store, manifest)
+    _show_report(manifest)
     if not yes and not typer.confirm("Publish this exact approved artifact to GitHub"):
         raise typer.Abort()
     try:
@@ -463,7 +463,7 @@ def show_run(
             review = build_approval_review(settings, store, run_id, actor=actor)
             console.print(render_approval_review(review), markup=False)
         else:
-            _show_report(store, manifest)
+            _show_report(manifest)
     except AutocontributeError as exc:
         _fail(str(exc))
 
@@ -1517,8 +1517,6 @@ def _rollout_summary(
     settings: AutocontributeConfig,
     store: RunStore,
     github: GitHubClient,
-    *,
-    exclude_run_id: str | None = None,
 ) -> RolloutSummary:
     """Compute one decision for the exact deployed code and publishing identity."""
 
@@ -1527,10 +1525,7 @@ def _rollout_summary(
         publishing_login=github.authenticated_login().strip().casefold(),
         publishing_api_origin=github.api_origin,
     )
-    return RolloutGate.for_store(store).summary(
-        scope,
-        exclude_run_id=exclude_run_id,
-    )
+    return RolloutGate.for_store(store).summary(scope)
 
 
 def _scheduled_auto_preflight(
@@ -1556,15 +1551,14 @@ def _scheduled_auto_preflight(
         minimum_retention=timedelta(days=replication.retention_days),
     )
     summary = _rollout_summary(settings, store, github)
-    switch_enabled = auto_publish_opt_in_enabled(settings.publishing)
+    switch_enabled = auto_publish_opt_in_enabled()
     if switch_enabled and summary.overall_gate_passed:
         return True
 
     blockers: list[str] = []
     if not switch_enabled:
         blockers.append(
-            f"{settings.publishing.auto_publish_env} is not enabled as the dedicated "
-            "automatic-publication switch"
+            f"{AUTO_PUBLISH_ENV} is not enabled as the dedicated automatic-publication switch"
         )
     if not summary.evaluation_gate_passed:
         blockers.append("expert-evaluation shadow cohort")
@@ -1611,30 +1605,23 @@ def _sync_lifecycle(
         for manifest in store.list_submitting_runs():
             lease_guard.assert_owned()
             try:
-                reconcile_owned = getattr(publisher, "_reconcile_submitting", None)
-                if callable(reconcile_owned):
-                    reconcile_owned(
-                        manifest.run_id,
-                        lease_guard=lease_guard,
-                    )
-                else:  # Narrow compatibility path for injected CLI test doubles.
-                    publisher.reconcile_submitting(manifest.run_id)
+                publisher._reconcile_submitting(manifest.run_id, lease_guard=lease_guard)
             except PublicationResumeRequired:
                 lease_guard.assert_owned()
                 retry_this_run = manifest.run_id == publication_retry_run_id
                 scheduled_resume_allowed = (
                     resume_submitting_publications
                     and settings.publishing.mode == "auto"
-                    and auto_publish_opt_in_enabled(settings.publishing)
+                    and auto_publish_opt_in_enabled()
                 )
                 if not (scheduled_resume_allowed or retry_this_run):
                     if scheduled_preflight:
                         continue
                     if settings.publishing.mode != "auto":
                         reason = "publishing.mode is review_required"
-                    elif not auto_publish_opt_in_enabled(settings.publishing):
+                    elif not auto_publish_opt_in_enabled():
                         reason = (
-                            f"{settings.publishing.auto_publish_env} is not enabled as the "
+                            f"{AUTO_PUBLISH_ENV} is not enabled as the "
                             "dedicated automatic-publication switch"
                         )
                     else:
@@ -1652,11 +1639,7 @@ def _sync_lifecycle(
                     continue
                 lease_guard.assert_owned()
                 try:
-                    publish_owned = getattr(publisher, "_publish", None)
-                    if callable(publish_owned):
-                        publish_owned(manifest.run_id, lease_guard=lease_guard)
-                    else:  # Narrow compatibility path for injected CLI test doubles.
-                        publisher.publish(manifest.run_id)
+                    publisher._publish(manifest.run_id, lease_guard=lease_guard)
                 except AutomaticRolloutBlocked as resume_exc:
                     lease_guard.assert_owned()
                     if not scheduled_preflight:
@@ -1691,7 +1674,7 @@ def _print_lifecycle_result(result: LifecycleSyncResult) -> None:
         f"{result.newly_tripped} new trigger(s)."
     )
     for item in result.observations:
-        for signal in item.observation.signals:
+        for signal in item.signals:
             console.print(
                 f"- {signal.kind.value}: {signal.repository}#{signal.pull_request_number}: "
                 f"{signal.reason} ({signal.source_url})",
@@ -1774,8 +1757,7 @@ def _print_outcome(manifest: RunManifest, store: RunStore) -> None:
         console.print(f"[red]{manifest.error}[/red]")
 
 
-def _show_report(store: RunStore, manifest: RunManifest) -> None:
-    del store
+def _show_report(manifest: RunManifest) -> None:
     console.print(
         render_run_report(manifest, manifest.patched_validation),
         markup=False,

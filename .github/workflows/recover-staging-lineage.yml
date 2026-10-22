@@ -19,14 +19,6 @@ on:
         required: true
         default: false
         type: boolean
-      legacy_claim_intent:
-        description: "For legacy promotion only; staging claims were always committed"
-        required: true
-        default: reject
-        type: choice
-        options:
-          - reject
-          - committed
       recovery_reason:
         description: "Required incident reason for parent recovery"
         required: false
@@ -50,7 +42,6 @@ jobs:
       enabled_variable: AUTOCONTRIBUTE_STAGING_ENABLED
       expected_claim: ${{ inputs.expected_claim }}
       key_prefix: autocontribute-staging-state-
-      legacy_claim_intent: ${{ inputs.legacy_claim_intent }}
       lineage_variable: AUTOCONTRIBUTE_STAGING_STATE_LINEAGE
       recovery_action: ${{ inputs.recovery_action }}
       recovery_reason: ${{ inputs.recovery_reason }}

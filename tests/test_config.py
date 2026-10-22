@@ -47,7 +47,6 @@ def test_example_config_is_valid() -> None:
     assert config.models.critic.reasoning_mode == "pro"
     assert config.publishing.mode == "review_required"
     assert config.publishing.draft is True
-    assert config.sandbox.network == "none"
     assert config.budget.max_model_cost_usd_per_run == Decimal("50")
     assert config.models.scout.pricing is not None
     assert all(
@@ -60,7 +59,6 @@ def test_shipped_example_configs_are_valid_and_self_consistent() -> None:
     for name in ("autocontribute.example.yml", "autocontribute.staging.example.yml"):
         raw = (root / name).read_text(encoding="utf-8")
         config = AutocontributeConfig.model_validate(yaml.safe_load(raw))
-        assert config.sandbox.network == "none"
         assert config.publishing.mode == "review_required"
         assert all(
             config.validation.commands_for(repository) for repository in config.github.repositories
@@ -315,11 +313,6 @@ def test_trusted_validation_commands_must_not_be_empty() -> None:
         )
 
 
-def test_validation_cannot_be_disabled() -> None:
-    with pytest.raises(ValueError, match="require_validation_commands"):
-        AutocontributeConfig.model_validate({"quality": {"require_validation_commands": False}})
-
-
 def test_required_validation_commands_must_fit_the_sandbox_budget() -> None:
     with pytest.raises(ValueError, match=r"exceed sandbox\.max_commands"):
         AutocontributeConfig.model_validate(
@@ -355,27 +348,6 @@ def test_guarded_auto_mode_accepts_one_repository_weekly_draft_pilot() -> None:
     )
 
     assert config.publishing.mode == "auto"
-
-
-def test_guarded_auto_mode_requires_the_dedicated_publication_switch() -> None:
-    with pytest.raises(
-        ValueError,
-        match=r"publishing\.auto_publish_env must equal AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH",
-    ):
-        AutocontributeConfig.model_validate(
-            {
-                "github": {"repositories": ["example/project"], "owners": []},
-                "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-                "publishing": {
-                    "mode": "auto",
-                    "ready_for_review": True,
-                    "max_open_pull_requests": 1,
-                    "auto_publish_env": "CI",
-                },
-                "models": _priced_models(),
-                "budget": {"max_model_cost_usd_per_run": "25"},
-            }
-        )
 
 
 def test_guarded_auto_mode_requires_s3_replication_configuration() -> None:

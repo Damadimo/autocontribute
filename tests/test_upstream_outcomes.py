@@ -168,7 +168,6 @@ def _scope(deployment_fingerprint: str = DEPLOYMENT) -> UpstreamPublicationScope
 def _rollout_config(
     mode: str,
     *,
-    auto_publish_env: str = "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH",
     repository: str = REPOSITORY,
 ) -> AutocontributeConfig:
     profile = {
@@ -192,7 +191,6 @@ def _rollout_config(
                 "max_new_pull_requests_per_day": 1,
                 "max_open_pull_requests": 1,
                 "repository_cooldown_days": 7,
-                "auto_publish_env": auto_publish_env,
             },
             "s3_replication": {
                 "bundle_directory": "/var/backups/autocontribute",
@@ -577,10 +575,7 @@ def _passing_manual_cohort(
 
 
 def test_review_to_auto_switch_preserves_the_exact_first_twenty_cohort() -> None:
-    review_config = _rollout_config(
-        "review_required",
-        auto_publish_env="REVIEW_ONLY_SWITCH",
-    )
+    review_config = _rollout_config("review_required")
     auto_config = _rollout_config("auto")
     review_fingerprint = _deployment_fingerprint(review_config)
     auto_fingerprint = _deployment_fingerprint(auto_config)
@@ -1021,42 +1016,6 @@ def test_revert_observed_after_merge_permanently_fails_the_outcome() -> None:
     assert "reverted" in summary.prior_automatic[0].reasons[0]
 
 
-def test_legacy_partial_lifecycle_history_can_never_prove_merge_as_is() -> None:
-    store = FakeStore()
-    evaluations = FakeEvaluations()
-    _passing_manual_cohort(store, evaluations)
-    automatic = _add_publication(store, evaluations, 20, automatic=True)
-    current_row = store.snapshots_by_run[automatic.run_id][0]
-    payload = json.loads(current_row.snapshot_json)
-    del payload["evidence_version"]
-    del payload["commits"]
-    del payload["timeline_events"]
-    del payload["timeline_item_count"]
-    del payload["pull_request"]["commit_count"]
-    for reference in payload["references"]:
-        del reference["node_id"]
-    legacy_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    legacy = parse_lifecycle_snapshot_json(
-        legacy_json,
-        observed_at=current_row.observed_at,
-    )
-    assert legacy.has_complete_upstream_history is False
-    store.snapshots_by_run[automatic.run_id] = [
-        LifecycleSnapshot(
-            run_id=automatic.run_id,
-            fingerprint=legacy.fingerprint(),
-            observed_at=current_row.observed_at,
-            snapshot_json=legacy_json,
-        )
-    ]
-
-    summary = UpstreamOutcomeGate(store, evaluations).summary(_scope())
-
-    assert summary.prior_automatic[0].outcome == UpstreamOutcome.UNKNOWN
-    assert "lacks complete upstream history" in summary.prior_automatic[0].reasons[0]
-    assert summary.gate_passed is False
-
-
 def test_ambiguous_authorization_blocks_instead_of_becoming_manual() -> None:
     store = FakeStore()
     evaluations = FakeEvaluations()
@@ -1112,7 +1071,6 @@ def test_exact_human_approval_exposes_ledger_bound_intent_time() -> None:
     approval = _event(store, publication.run_id, "approval.created")
     intent = _event(store, publication.run_id, "publication.intent.begun")
     assert authority.approval_event_hash == approval["event_hash"]
-    assert authority.publication_intent_event_hash == intent["event_hash"]
     assert authority.publication_intent_at == datetime.fromisoformat(intent["occurred_at"])
 
 

@@ -39,8 +39,6 @@ _ABSTENTION_STATUSES = {
     RunStatus.FAILED,
     RunStatus.CANCELLED,
 }
-_PREPARED_VERDICTS: set[EvaluationVerdict]  # initialized after the enum definition
-_ABSTENTION_VERDICTS: set[EvaluationVerdict]
 _INITIAL_ANCHOR_FIELDS = {
     "agent_prepared",
     "evaluation_hash",
@@ -195,7 +193,6 @@ class EvaluationSummary(EvaluationModel):
 @dataclass(frozen=True)
 class _EvaluationAnchor:
     run_id: str
-    event_type: str
     revision: int
     details: dict[str, str]
 
@@ -588,7 +585,6 @@ class EvaluationStore:
             anchors[run_id].append(
                 _EvaluationAnchor(
                     run_id=run_id,
-                    event_type=event_type,
                     revision=revision,
                     details=details,
                 )

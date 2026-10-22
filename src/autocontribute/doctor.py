@@ -22,6 +22,7 @@ from rich.markup import escape
 
 from autocontribute.backup_replication import verify_latest_state_bundle_replication
 from autocontribute.config import (
+    AUTO_PUBLISH_ENV,
     AutocontributeConfig,
     ModelProfile,
     auto_publish_opt_in_enabled,
@@ -293,16 +294,12 @@ def _run_doctor(
         )
     )
     if config.publishing.mode == "auto":
-        enabled = auto_publish_opt_in_enabled(config.publishing)
+        enabled = auto_publish_opt_in_enabled()
         checks.append(
             DoctorCheck(
                 "automatic publication kill-switch",
                 enabled,
-                (
-                    "enabled"
-                    if enabled
-                    else f"set {config.publishing.auto_publish_env}=1 to allow GitHub writes"
-                ),
+                ("enabled" if enabled else f"set {AUTO_PUBLISH_ENV}=1 to allow GitHub writes"),
             )
         )
     else:

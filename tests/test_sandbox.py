@@ -46,7 +46,6 @@ def test_docker_command_enforces_isolation_and_clears_environment(
             "python:3.12-bookworm@"
             "sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a"
         ),
-        network="none",
         memory="2g",
         cpus=1.5,
         pids_limit=64,
@@ -151,7 +150,6 @@ def test_each_isolated_command_receives_a_fresh_workspace_copy(tmp_path: Path) -
     results = runner.run_all_isolated(
         workspace,
         ["touch command-one-generated", "test ! -e command-one-generated"],
-        stop_on_failure=False,
     )
 
     assert all(result.passed for result in results)

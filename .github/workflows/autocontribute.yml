@@ -74,11 +74,6 @@ jobs:
             exit 1
           fi
           v8_lineage_pattern="^committed:autocontribute-state-v8-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
-          v7_lineage_pattern="^committed:autocontribute-state-v7-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
-          v6_lineage_pattern="^committed:autocontribute-state-v6-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
-          v5_lineage_pattern="^committed:autocontribute-state-v5-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
-          v4_lineage_pattern="^committed:autocontribute-state-v4-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
-          v3_lineage_pattern="^committed:autocontribute-state-v3-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$"
           bootstrap=false
           parent_schema=""
           if [[ -z "$current" ]]; then
@@ -96,21 +91,6 @@ jobs:
           elif [[ "$current" =~ $v8_lineage_pattern ]]; then
             parent_key="${current#committed:}"
             parent_schema="v8"
-          elif [[ "$current" =~ $v7_lineage_pattern ]]; then
-            parent_key="${current#committed:}"
-            parent_schema="v7"
-          elif [[ "$current" =~ $v6_lineage_pattern ]]; then
-            parent_key="${current#committed:}"
-            parent_schema="v6"
-          elif [[ "$current" =~ $v5_lineage_pattern ]]; then
-            parent_key="${current#committed:}"
-            parent_schema="v5"
-          elif [[ "$current" =~ $v4_lineage_pattern ]]; then
-            parent_key="${current#committed:}"
-            parent_schema="v4"
-          elif [[ "$current" =~ $v3_lineage_pattern ]]; then
-            parent_key="${current#committed:}"
-            parent_schema="v3"
           elif [[ "$current" == handoff:* ]]; then
             echo "Hosted scheduler state was handed off and cannot be resumed here" >&2
             exit 1
@@ -196,8 +176,6 @@ jobs:
               raise SystemExit("Production Actions requires publishing.mode: review_required")
           if settings.sandbox.backend != "docker":
               raise SystemExit("Production Actions requires sandbox.backend: docker")
-          if settings.sandbox.network != "none":
-              raise SystemExit("Production Actions requires sandbox.network: none")
           if settings.sandbox.allow_unsafe_local:
               raise SystemExit("Production Actions forbids sandbox.allow_unsafe_local")
           work_budget_seconds = (
@@ -237,11 +215,6 @@ jobs:
           storage = Path(".autocontribute")
           expected = {
               "bootstrap": 8,
-              "v3": 3,
-              "v4": 4,
-              "v5": 5,
-              "v6": 6,
-              "v7": 7,
               "v8": 8,
           }.get(os.environ["PARENT_SCHEMA"])
           if expected is None:
