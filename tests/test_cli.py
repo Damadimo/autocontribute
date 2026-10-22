@@ -39,7 +39,7 @@ from autocontribute.preparation import (
     compute_preparation_fingerprint,
     render_validation_artifact,
 )
-from autocontribute.store import CandidateRetryAuthorization, RunStore
+from autocontribute.store import CandidateAttemptState, CandidateRetryAuthorization, RunStore
 
 runner = CliRunner()
 
@@ -396,15 +396,189 @@ def test_init_and_config_validation_are_offline(tmp_path: Path) -> None:
     config = tmp_path / "autocontribute.yml"
 
     initialized = runner.invoke(app, ["init", "--path", str(config)])
-    validated = runner.invoke(
+    refused = runner.invoke(
         app,
         ["config", "validate", "--config", str(config)],
     )
 
     assert initialized.exit_code == 0, initialized.output
     assert config.is_file()
+    assert refused.exit_code == 1, refused.output
+    refusal = " ".join(refused.output.split())
+    assert "still contains starter placeholders" in refusal
+    assert "github.repositories lists your-org/your-repo" in refusal
+    assert "sandbox.image comes from the example.invalid placeholder registry" in refusal
+    assert "identity" not in refusal
+    assert "Configuration is valid" not in refusal
+
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        .replace("your-org/your-repo", "example/project")
+        .replace("example.invalid/sandbox@sha256:", "ghcr.io/example/sandbox@sha256:"),
+        encoding="utf-8",
+    )
+    validated = runner.invoke(
+        app,
+        ["config", "validate", "--config", str(config)],
+    )
+
+    assert validated.exit_code == 0, validated.output
     assert "Configuration is valid" in validated.output
     assert "gpt-5.6" in validated.output
+
+
+@pytest.mark.parametrize("command", (["doctor"], ["discover"], ["run"], ["run", "--scheduled"]))
+def test_commands_refuse_starter_placeholders_before_external_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(
+        "identity:\n"
+        '  name: "Your Name"\n'
+        '  email: "your-handle@users.noreply.github.com"\n'
+        "github:\n"
+        "  repositories: [your-org/your-repo]\n"
+        "validation:\n"
+        "  required_commands:\n"
+        "    your-org/your-repo: [python -m pytest]\n"
+        "sandbox:\n"
+        f"  image: example.invalid/sandbox@sha256:{'0' * 64}\n"
+        f"storage:\n  path: {tmp_path / 'state'}\n",
+        encoding="utf-8",
+    )
+
+    def unexpected(*_: object, **__: object) -> None:
+        pytest.fail("a placeholder configuration must stop before any external work")
+
+    monkeypatch.setattr(cli, "_github_client", unexpected)
+    monkeypatch.setattr(cli, "run_doctor", unexpected)
+    monkeypatch.setattr(cli, "RunStore", unexpected)
+
+    result = runner.invoke(app, [*command, "--config", str(config)])
+
+    assert result.exit_code == 1, result.output
+    output = " ".join(result.output.split())
+    assert "still contains starter placeholders" in output
+    for placeholder in (
+        "github.repositories lists your-org/your-repo",
+        "sandbox.image comes from the example.invalid placeholder registry",
+        'identity.name is "Your Name"',
+        'identity.email is "your-handle@users.noreply.github.com"',
+    ):
+        assert placeholder in output
+    assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize("approved", (False, True))
+def test_runs_cancel_releases_a_prepared_run_and_records_the_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approved: bool,
+) -> None:
+    config_path, store, run_id = _ready_review_run(tmp_path)
+    if approved:
+        monkeypatch.setattr(cli, "_github_client", lambda *_: _ReviewGitHub())
+        approval = runner.invoke(app, ["approve", run_id, "--yes", "--config", str(config_path)])
+        assert approval.exit_code == 0, approval.output
+    prepared = store.get(run_id)
+    assert prepared.status is (RunStatus.APPROVED if approved else RunStatus.READY_FOR_APPROVAL)
+    assert prepared.candidate is not None
+    active = store.candidate_attempt_disposition(prepared.candidate)
+    assert active.state is CandidateAttemptState.ACTIVE
+
+    result = runner.invoke(
+        app,
+        [
+            "runs",
+            "cancel",
+            run_id,
+            "--reason",
+            "  The maintainer fixed the issue upstream.  ",
+            "--config",
+            str(config_path),
+        ],
+        input="y\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"Autocontribute run `{run_id}`" in result.output
+    assert f"Cancel run {run_id} and release its issue" in result.output
+    cancelled = store.get(run_id)
+    assert cancelled.status is RunStatus.CANCELLED
+    transition = store.events(run_id)[-1]
+    assert transition["event_type"] == "run.transitioned"
+    assert json.loads(transition["details"]) == {
+        "from": prepared.status.value,
+        "to": "cancelled",
+        "reason": "The maintainer fixed the issue upstream.",
+    }
+    released = store.candidate_attempt_disposition(prepared.candidate)
+    assert released.state is CandidateAttemptState.SUPPRESSED
+    assert released.prior_run_id == run_id
+    assert "`cancelled`" in (store.artifact_dir(run_id) / "report.md").read_text(encoding="utf-8")
+
+
+def test_runs_cancel_requires_a_reason_and_confirmation(tmp_path: Path) -> None:
+    config_path, store, run_id = _ready_review_run(tmp_path)
+    events = store.events(run_id)
+
+    missing = runner.invoke(app, ["runs", "cancel", run_id, "--config", str(config_path)])
+    blank = runner.invoke(
+        app,
+        ["runs", "cancel", run_id, "--reason", " \t ", "--yes", "--config", str(config_path)],
+    )
+    declined = runner.invoke(
+        app,
+        ["runs", "cancel", run_id, "--reason", "Duplicate work", "--config", str(config_path)],
+        input="n\n",
+    )
+
+    assert missing.exit_code == 2
+    assert blank.exit_code == 1, blank.output
+    assert "--reason must explain why the run is cancelled" in blank.output
+    assert declined.exit_code == 1, declined.output
+    assert f"Autocontribute run `{run_id}`" in declined.output
+    assert store.get(run_id).status is RunStatus.READY_FOR_APPROVAL
+    assert store.events(run_id) == events
+
+
+# The store also allows QUEUED -> CANCELLED, but a queued run belongs to a live worker.
+@pytest.mark.parametrize("status", (RunStatus.QUEUED, RunStatus.FAILED, RunStatus.CANCELLED))
+def test_runs_cancel_refuses_runs_that_are_not_awaiting_approval_or_publication(
+    tmp_path: Path,
+    status: RunStatus,
+) -> None:
+    state = tmp_path / "state"
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+    store = RunStore(state)
+    manifest = store.create_run()
+    if status is not RunStatus.QUEUED:
+        store.transition(manifest, status, reason="fixture")
+    events = store.events(manifest.run_id)
+
+    result = runner.invoke(
+        app,
+        [
+            "runs",
+            "cancel",
+            manifest.run_id,
+            "--reason",
+            "No longer wanted",
+            "--yes",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    output = " ".join(result.output.split())
+    assert f"Run {manifest.run_id} is {status.value}" in output
+    assert "only ready_for_approval or approved runs can be cancelled" in output
+    assert store.get(manifest.run_id).status is status
+    assert store.events(manifest.run_id) == events
 
 
 def test_init_does_not_overwrite_without_force(tmp_path: Path) -> None:

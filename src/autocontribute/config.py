@@ -47,6 +47,11 @@ _GUARDED_AUTO_FORBIDDEN_PATHS = frozenset(
 )
 _AUTO_PUBLISH_ENABLED_VALUES = frozenset({"1", "true", "yes"})
 AUTO_PUBLISH_ENV = "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH"
+# Values the starter templates ship with; they parse, but no command may act on them.
+_STARTER_REPOSITORY = "your-org/your-repo"
+_STARTER_REGISTRY_HOST = "example.invalid"
+_STARTER_IDENTITY_NAME = "Your Name"
+_STARTER_IDENTITY_EMAIL = "your-handle@users.noreply.github.com"
 
 CLA_ATTESTATION_STATEMENT = (
     "I attest that the GitHub account named by attested_by has completed every account-level "
@@ -592,9 +597,10 @@ def auto_publish_opt_in_enabled() -> bool:
 
 
 class BudgetConfig(StrictModel):
-    # A maximum-length run makes 5 distinct calls (plan, replan, propose, critique,
-    # repair); the remainder is headroom for transient-failure retries, each of which
-    # consumes a call so retried requests stay visible in the billable accounting.
+    # A maximum-length run makes 6 distinct calls (plan, replan, propose, critique,
+    # repair, re-critique); the remainder is headroom for transient-failure retries,
+    # each of which consumes a call so retried requests stay visible in the billable
+    # accounting.
     max_model_calls_per_run: int = Field(default=9, ge=3, le=30)
     max_candidates_per_run: int = Field(default=25, ge=1, le=200)
     max_input_tokens_per_run: int = Field(default=3_000_000, ge=1_000, le=20_000_000)
@@ -900,21 +906,54 @@ def load_config(path: Path) -> AutocontributeConfig:
     return config
 
 
+def starter_placeholders(config: AutocontributeConfig) -> list[str]:
+    """Describe each starter-template placeholder that still needs a real value."""
+
+    placeholders: list[str] = []
+    if any(
+        repository.casefold() == _STARTER_REPOSITORY for repository in config.github.repositories
+    ):
+        placeholders.append(
+            f"github.repositories lists {_STARTER_REPOSITORY}: replace it with the repositories "
+            "you want to contribute to, and give each one a validation.required_commands entry"
+        )
+    # The local backend never pulls or runs the image, so a leftover starter image is harmless.
+    image_registry, separator, _ = config.sandbox.image.partition("/")
+    if (
+        config.sandbox.backend == "docker"
+        and separator
+        and image_registry.partition(":")[0].casefold() == _STARTER_REGISTRY_HOST
+    ):
+        placeholders.append(
+            f"sandbox.image comes from the {_STARTER_REGISTRY_HOST} placeholder registry: build, "
+            "digest-pin, and pre-pull your own validation image (see docs/sandbox-image.md)"
+        )
+    if config.identity.name.strip() == _STARTER_IDENTITY_NAME:
+        placeholders.append(
+            f'identity.name is "{_STARTER_IDENTITY_NAME}": set your own name, or leave it empty '
+            "to use your GitHub login"
+        )
+    if config.identity.email.strip().casefold() == _STARTER_IDENTITY_EMAIL:
+        placeholders.append(
+            f'identity.email is "{_STARTER_IDENTITY_EMAIL}": set your own address, or leave it '
+            "empty to use your GitHub noreply address"
+        )
+    return placeholders
+
+
 def example_config() -> str:
     """Return a documented starter configuration with no embedded credentials."""
 
     return """# Credentials are read only from the named environment variables.
-identity:
-  name: "Your Name"
-  email: "your-handle@users.noreply.github.com"
+identity:                          # empty = your GitHub login and its noreply email address
+  name: ""
+  email: ""
 
 github:
   auth: gh                         # use `gh auth login`, or change to `token`
   token_env: AUTOCONTRIBUTE_GITHUB_TOKEN
   repositories:                   # explicit repositories are safest
-    - facebookresearch/hydra
-    - google/python-fire
-    - NVIDIA-NeMo/Guardrails
+    - your-org/your-repo
   owners: []                       # optional discovery across selected owners
   include_labels: ["help wanted", "good first issue"]
   exclude_labels: ["security", "breaking change", "needs design", "blocked", "discussion"]
@@ -958,11 +997,7 @@ sandbox:
 
 validation:
   required_commands:               # operator-owned; model commands are supplementary only
-    facebookresearch/hydra:
-      - python -m pytest
-    google/python-fire:
-      - python -m pytest
-    nvidia-nemo/guardrails:
+    your-org/your-repo:
       - python -m pytest
 
 policy:
@@ -1022,5 +1057,6 @@ __all__ = [
     "auto_publish_opt_in_enabled",
     "example_config",
     "load_config",
+    "starter_placeholders",
     "validate_model_identifier",
 ]

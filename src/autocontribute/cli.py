@@ -36,6 +36,7 @@ from autocontribute.config import (
     auto_publish_opt_in_enabled,
     example_config,
     load_config,
+    starter_placeholders,
 )
 from autocontribute.coordination import (
     PUBLICATION_HEARTBEAT_INTERVAL,
@@ -80,7 +81,7 @@ app = typer.Typer(
     help="Prepare issue-backed open-source contributions behind hard quality gates.",
     no_args_is_help=True,
 )
-runs_app = typer.Typer(help="Inspect durable contribution runs.", no_args_is_help=True)
+runs_app = typer.Typer(help="List, show, or cancel contribution runs.", no_args_is_help=True)
 config_app = typer.Typer(help="Inspect configuration safely.", no_args_is_help=True)
 evaluation_app = typer.Typer(
     help="Record expert shadow-run grades and inspect rollout gates.",
@@ -136,6 +137,9 @@ _CONTRIBUTION_STAMP_ENV = "AUTOCONTRIBUTE_CONTRIBUTION_STAMP"
 _PRODUCTIVE_SCHEDULED_STATUSES = frozenset(
     {RunStatus.READY_FOR_APPROVAL, RunStatus.SUBMITTING, RunStatus.PR_OPEN}
 )
+# Prepared work that has not started publishing. Earlier stages belong to a live worker, and a
+# submitting run must be reconciled with GitHub before its state can change.
+_CANCELLABLE_STATUSES = frozenset({RunStatus.READY_FOR_APPROVAL, RunStatus.APPROVED})
 
 
 @app.command()
@@ -154,7 +158,9 @@ def init(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(example_config(), encoding="utf-8")
     console.print(f"Created [bold]{target}[/bold]")
-    console.print("Edit the repository allowlist, then run `autocontribute doctor`.")
+    console.print(
+        "Replace the placeholder repository and sandbox image, then run `autocontribute doctor`."
+    )
 
 
 @app.command()
@@ -168,7 +174,7 @@ def doctor(
     """Check configuration, credentials, GitHub, Git, and sandbox availability."""
 
     del non_interactive  # The doctor never prompts; the flag documents CI intent.
-    settings = _config(config)
+    settings = _actionable_config(config)
     checks = run_doctor(settings, store=RunStore(settings.storage.path))
     table = Table("Check", "Result", "Detail")
     for check in checks:
@@ -240,7 +246,7 @@ def alert_send(
 def discover(config: ConfigOption = DEFAULT_CONFIG) -> None:
     """Find the strongest current candidate without cloning or changing GitHub."""
 
-    settings = _config(config)
+    settings = _actionable_config(config)
     store = RunStore(settings.storage.path)
     try:
         with _github_client(settings, store) as github:
@@ -307,7 +313,7 @@ def run_once(
         )
     except (TypeError, ValueError) as exc:
         _fail(str(exc))
-    settings = _config(config)
+    settings = _actionable_config(config)
     store = RunStore(settings.storage.path)
     github: GitHubClient | None = None
     try:
@@ -468,11 +474,51 @@ def show_run(
         _fail(str(exc))
 
 
+@runs_app.command(name="cancel")
+def cancel_run(
+    run_id: Annotated[str, typer.Argument(help="Run identifier to cancel.")],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", help="Why the run is cancelled; recorded in the run ledger."),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Cancel without asking for confirmation."),
+    ] = False,
+) -> None:
+    """Cancel a prepared run that is waiting for approval or publication."""
+
+    normalized_reason = reason.strip()
+    if not normalized_reason:
+        _fail("--reason must explain why the run is cancelled")
+    settings = _config(config)
+    store = RunStore(settings.storage.path)
+    try:
+        manifest = store.get(run_id)
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    if manifest.status not in _CANCELLABLE_STATUSES:
+        _fail(
+            f"Run {run_id} is {manifest.status.value}; only ready_for_approval or approved runs "
+            "can be cancelled"
+        )
+    _show_report(manifest)
+    if not yes and not typer.confirm(f"Cancel run {run_id} and release its issue"):
+        raise typer.Abort()
+    try:
+        manifest = store.transition(manifest, RunStatus.CANCELLED, reason=normalized_reason)
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    _refresh_report(store, manifest)
+    console.print(f"[yellow]Cancelled[/yellow] `{run_id}`.")
+
+
 @config_app.command(name="validate")
 def validate_config(config: ConfigOption = DEFAULT_CONFIG) -> None:
     """Parse configuration and print a credential-free summary."""
 
-    settings = _config(config)
+    settings = _actionable_config(config)
     console.print("[green]Configuration is valid.[/green]")
     console.print(f"Repositories: {len(settings.github.repositories)}")
     console.print(f"Owners: {len(settings.github.owners)}")
@@ -1499,6 +1545,19 @@ def _config(path: Path):  # type: ignore[no-untyped-def]
         return load_config(path)
     except ConfigurationError as exc:
         _fail(str(exc))
+
+
+def _actionable_config(path: Path) -> AutocontributeConfig:
+    """Load a configuration that commands may act on: no starter placeholder may remain."""
+
+    settings: AutocontributeConfig = _config(path)
+    placeholders = starter_placeholders(settings)
+    if placeholders:
+        _fail(
+            f"{path} still contains starter placeholders. Replace each one, then run the "
+            "command again:\n" + "\n".join(f"  - {placeholder}" for placeholder in placeholders)
+        )
+    return settings
 
 
 def _github_client(

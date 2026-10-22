@@ -1,15 +1,13 @@
 # Copy this file to autocontribute.yml. Never put API keys or GitHub tokens here.
-identity:
-  name: "Your Name"
-  email: "your-handle@users.noreply.github.com"
+identity:  # empty = your GitHub login and its noreply email address
+  name: ""
+  email: ""
 
 github:
   auth: gh
   token_env: AUTOCONTRIBUTE_GITHUB_TOKEN
   repositories:
-    - facebookresearch/hydra
-    - google/python-fire
-    - NVIDIA-NeMo/Guardrails
+    - your-org/your-repo
   owners: []
   include_labels: ["help wanted", "good first issue"]
   exclude_labels: ["security", "breaking change", "needs design", "blocked", "discussion"]
@@ -59,11 +57,7 @@ validation:
   # checks; the sandbox image above must already contain everything they need to run offline
   # (docs/sandbox-image.md covers building and pinning such an image).
   required_commands:
-    facebookresearch/hydra:
-      - python -m pytest
-    google/python-fire:
-      - python -m pytest
-    nvidia-nemo/guardrails:
+    your-org/your-repo:
       - python -m pytest
 
 policy:
@@ -100,7 +94,7 @@ publishing:
   repository_cooldown_days: 7
 
 budget:
-  max_model_calls_per_run: 6
+  max_model_calls_per_run: 9
   max_candidates_per_run: 25
   max_input_tokens_per_run: 3000000
   max_output_tokens_per_run: 240000
