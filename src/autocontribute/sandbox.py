@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import secrets
 import shutil
 import signal
 import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Final, Literal
 
 from autocontribute.config import SandboxConfig
@@ -25,6 +29,28 @@ _SHM_SIZE: Final = "256m"
 _MAX_CAPTURE_BYTES: Final = 2_000_000
 _TRUNCATED_MARKER: Final = b"\n[output truncated by autocontribute]\n"
 _SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_SESSION_SHELL: Final = "/bin/sh"
+_SESSION_TMP_SIZE: Final = "1g"
+_SESSION_MAIN_UID: Final = 65_534
+_SESSION_ENVIRONMENT: Final = (
+    ("HOME", "/tmp/home"),
+    ("TMPDIR", "/tmp"),
+    ("PATH", _SAFE_CONTAINER_PATH),
+    ("CI", "1"),
+    ("NO_COLOR", "1"),
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("AUTOCONTRIBUTE_SANDBOX", "1"),
+)
+_RUN_LABEL: Final = "org.autocontribute.run"
+_STORE_LABEL: Final = "org.autocontribute.store"
+_RUN_ID: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_ENVIRONMENT_NAME: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_DOCKER_OBJECT_ID: Final = re.compile(r"^[0-9a-f]{12,64}$")
+_DOCKER_CONTROL_TIMEOUT_SECONDS: Final = 30
+_REAP_ATTEMPTS: Final = 3
+_REAP_SETTLE_SECONDS: Final = 0.05
 _DOCKER_RUNTIME_INFO_FORMAT: Final = (
     '{"security_options":{{json .SecurityOptions}},'
     '"cgroup_version":{{json .CgroupVersion}},'
@@ -280,6 +306,239 @@ class DockerSandbox(SandboxRunner):
         super().__init__(config, docker_binary=docker_binary)
 
 
+@dataclass(frozen=True, slots=True)
+class SessionCommandResult:
+    """One session command's result and what the session did to stay usable afterwards."""
+
+    result: CommandResult
+    # Set when the container failed rather than the command: it stopped, could not be
+    # inspected, or ran out of memory. The command's exit code then says little.
+    infrastructure_failure: str | None
+    # The container was restarted after the command, which empties /tmp.
+    restarted: bool
+
+
+class SessionContainer:
+    """A long-lived, network-less container whose commands run through ``docker exec``.
+
+    The main process runs as 65534, so commands can neither signal it nor read its
+    environment. After every command the session kills whatever the command left running,
+    so no process writes to the workspace while host-side tools read or edit it.
+    """
+
+    def __init__(
+        self,
+        config: SandboxConfig,
+        *,
+        image: str,
+        workspace: Path,
+        run_id: str,
+        store_root: Path,
+        docker_binary: str = "docker",
+    ) -> None:
+        _validate_image(image)
+        if not _RUN_ID.fullmatch(run_id):
+            raise SandboxError("Run identifier cannot label a sandbox container")
+        if not docker_binary or "\0" in docker_binary:
+            raise SandboxError("Docker binary is invalid")
+        self.config = config
+        self.image = image
+        self.workspace = _workspace_path(workspace)
+        self.run_id = run_id
+        self.docker_binary = docker_binary
+        self._store_label = _store_label(store_root)
+        # One Docker endpoint for the whole session, as in SandboxRunner.
+        self._docker_environment = docker_client_environment()
+        self._command_user = ""
+        self._name: str | None = None
+
+    def __enter__(self) -> SessionContainer:
+        self.start()
+        return self
+
+    def __exit__(self, *_exception: object) -> None:
+        self.remove()
+
+    @property
+    def name(self) -> str:
+        """Return the name of the started container."""
+
+        if self._name is None:
+            raise SandboxError("Sandbox session is not started")
+        return self._name
+
+    def start(self) -> None:
+        """Create and start the container; :meth:`remove` tears it down."""
+
+        if self._name is not None:
+            raise SandboxError("Sandbox session is already started")
+        mode = detect_docker_daemon_mode(self.docker_binary, environment=self._docker_environment)
+        uid, gid = docker_container_identity(mode)
+        if uid == _SESSION_MAIN_UID:
+            raise SandboxError("Sandbox commands cannot share the main process identity 65534")
+        self._command_user = f"{uid}:{gid}"
+        self._create()
+
+    def exec(
+        self,
+        command: str,
+        *,
+        timeout_seconds: int,
+        workdir: str = _CONTAINER_WORKSPACE,
+        environment: Mapping[str, str] | None = None,
+    ) -> SessionCommandResult:
+        """Run one command in a fresh shell, then kill whatever it left running."""
+
+        _validate_command(command)
+        if timeout_seconds < 1:
+            raise SandboxError("Sandbox command timeout must be at least one second")
+        arguments = [
+            self.docker_binary,
+            "exec",
+            f"--user={self._command_user}",
+            f"--workdir={_container_directory(workdir)}",
+            self.name,
+            "/usr/bin/env",
+            "-i",
+            *_session_environment(environment),
+            _SESSION_SHELL,
+            "-c",
+            # On its own line, so the command parses exactly as it would alone.
+            f'mkdir -p "$HOME" || exit\n{command}',
+        ]
+        result = _execute(
+            arguments,
+            command=command,
+            cwd=self.workspace,
+            timeout_seconds=timeout_seconds,
+            environment=self._docker_environment,
+            cleanup=self._signal_command_processes,
+        )
+        # Checked after every command: a process can be killed for memory inside a
+        # command that still exits 0.
+        failure = self._infrastructure_failure()
+        if failure is None and self._reap():
+            return SessionCommandResult(result, None, restarted=False)
+        self.restart()
+        return SessionCommandResult(result, failure, restarted=True)
+
+    def restart(self) -> None:
+        """Kill every process and start the container again.
+
+        The workspace persists and /tmp is emptied. A container that does not come back is
+        replaced by a new one.
+        """
+
+        name = self.name
+        self._docker("kill", name)
+        started = self._docker("start", name)
+        if (
+            started is not None
+            and started.returncode == 0
+            and self._infrastructure_failure() is None
+        ):
+            return
+        self._remove_container(name)
+        self._create()
+
+    def remove(self) -> None:
+        """Remove the container and its anonymous volumes; safe to call again."""
+
+        if self._name is not None:
+            self._remove_container(self._name)
+            self._name = None
+
+    def _create(self) -> None:
+        name = f"ac-{self.run_id}-{secrets.token_hex(4)}"
+        arguments = self._run_arguments(name)
+        self._name = name
+        try:
+            failure = self._start_failure(self._docker(*arguments))
+        except BaseException:
+            self.remove()
+            raise
+        if failure is not None:
+            self.remove()
+            raise SandboxError(f"Could not start the sandbox container: {failure}")
+
+    def _start_failure(self, created: subprocess.CompletedProcess[str] | None) -> str | None:
+        if created is None:
+            return "Docker did not answer"
+        if created.returncode != 0:
+            return _first_line(created.stderr) or f"docker run exited with {created.returncode}"
+        return self._infrastructure_failure()
+
+    def _run_arguments(self, name: str) -> list[str]:
+        git_dir = self.workspace / ".git"
+        if git_dir.is_symlink() or not git_dir.is_dir():
+            # The read-only .git mount is what keeps commands from planting Git
+            # configuration that host git would execute.
+            raise SandboxError("Sandbox session workspace needs a real .git directory")
+        return [
+            "run",
+            "--detach",
+            f"--name={name}",
+            f"--label={_RUN_LABEL}={self.run_id}",
+            f"--label={_STORE_LABEL}={self._store_label}",
+            *docker_isolation_arguments(
+                self.config,
+                user=f"{_SESSION_MAIN_UID}:{_SESSION_MAIN_UID}",
+                tmp_size=_SESSION_TMP_SIZE,
+            ),
+            f"--workdir={_CONTAINER_WORKSPACE}",
+            *_workspace_mounts(self.workspace),
+            self.image,
+            "-i",
+            "PATH=/usr/bin:/bin",
+            "/bin/sleep",
+            "infinity",
+        ]
+
+    def _signal_command_processes(self) -> None:
+        # The shell builtin forks nothing, so it runs even when leftovers hold every
+        # slot under the pids limit.
+        self._docker(
+            "exec", f"--user={self._command_user}", self.name, _SESSION_SHELL, "-c", "kill -KILL -1"
+        )
+
+    def _reap(self) -> bool:
+        uid = self._command_user.partition(":")[0]
+        for _ in range(_REAP_ATTEMPTS):
+            self._signal_command_processes()
+            listed = self._docker("top", self.name, "-o", "pid,uid")
+            if listed is None or listed.returncode != 0:
+                return False
+            uids = {line.split()[-1] for line in listed.stdout.splitlines()[1:] if line.strip()}
+            if uid not in uids:
+                return True
+            # Killed processes stay listed until docker-init reaps them.
+            time.sleep(_REAP_SETTLE_SECONDS)
+        return False
+
+    def _infrastructure_failure(self) -> str | None:
+        inspected = self._docker(
+            "inspect", "--format", "{{.State.Running}} {{.State.OOMKilled}}", self.name
+        )
+        if inspected is None or inspected.returncode != 0:
+            return "the sandbox container could not be inspected"
+        running, _, out_of_memory = inspected.stdout.strip().partition(" ")
+        if out_of_memory == "true":
+            # Docker keeps this flag until the next start, so the restart that follows
+            # keeps it from blaming later commands.
+            return f"the sandbox ran out of memory (limit {self.config.memory})"
+        if running != "true":
+            return "the sandbox container stopped"
+        return None
+
+    def _remove_container(self, name: str) -> None:
+        # Best effort: a container that survives this keeps the run and store labels
+        # that the leftover sweep looks for.
+        self._docker("rm", "--force", "--volumes", name)
+
+    def _docker(self, *arguments: str) -> subprocess.CompletedProcess[str] | None:
+        return _docker_control(self.docker_binary, arguments, self._docker_environment)
+
+
 def _execute(
     arguments: list[str],
     *,
@@ -409,6 +668,52 @@ def _workspace_mounts(root: Path) -> list[str]:
         # choose commands that run on the host.
         mounts.append(f"--mount=type=bind,src={git_dir},dst={_CONTAINER_WORKSPACE}/.git,readonly")
     return mounts
+
+
+def _docker_control(
+    docker_binary: str,
+    arguments: Sequence[str],
+    environment: dict[str, str],
+) -> subprocess.CompletedProcess[str] | None:
+    """Run one short Docker management command; ``None`` means it did not finish."""
+
+    try:
+        return subprocess.run(
+            [docker_binary, *arguments],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=_DOCKER_CONTROL_TIMEOUT_SECONDS,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _store_label(store_root: Path) -> str:
+    return hashlib.sha256(os.fsencode(store_root.expanduser().resolve())).hexdigest()[:16]
+
+
+def _session_environment(environment: Mapping[str, str] | None) -> list[str]:
+    values = dict(_SESSION_ENVIRONMENT)
+    for name, value in (environment or {}).items():
+        if not _ENVIRONMENT_NAME.fullmatch(name) or "\0" in value:
+            raise SandboxError("Sandbox environment names must be identifiers without NUL values")
+        values[name] = value
+    return [f"{name}={value}" for name, value in values.items()]
+
+
+def _container_directory(path: str) -> str:
+    candidate = PurePosixPath(path)
+    if not candidate.is_absolute() or ".." in candidate.parts or any(c in path for c in "\0\n\r"):
+        raise SandboxError("Sandbox working directory must be an absolute container path")
+    return str(candidate)
+
+
+def _first_line(text: str) -> str:
+    return next((line.strip()[:300] for line in text.splitlines() if line.strip()), "")
 
 
 def _workspace_path(workspace: RepositoryWorkspace | Path) -> Path:
@@ -557,6 +862,8 @@ __all__ = [
     "DockerDaemonMode",
     "DockerSandbox",
     "SandboxRunner",
+    "SessionCommandResult",
+    "SessionContainer",
     "detect_docker_daemon_mode",
     "docker_client_environment",
     "docker_container_identity",
