@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import re
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,7 +14,14 @@ from pathlib import PurePosixPath
 
 from autocontribute.config import AutocontributeConfig, LegalAttestation
 from autocontribute.domain import EligibilityResult, IssueCandidate, RepositoryInfo
-from autocontribute.exceptions import CircuitBreakerTrigger, GitHubError, PolicyError, StateError
+from autocontribute.exceptions import (
+    AutocontributeError,
+    CircuitBreakerTrigger,
+    GitHubError,
+    GitHubSafetyError,
+    PolicyError,
+    StateError,
+)
 from autocontribute.github import GitHubClient
 from autocontribute.store import CandidateAttemptState, RunStore
 
@@ -233,6 +241,14 @@ _RETIRED_STOP_PREFIX = re.compile(
 _BOT_LOGIN = re.compile(r"\[bot\]$", re.I)
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+_REPOSITORY_BASELINE_REASON = (
+    "repository is private, archived, disabled, inactive, or below the star floor"
+)
+_SUMMARY_BLOCKER_KINDS = 3
+# Safety stops and local state failures (the breaker, leases, store integrity) end discovery.
+# Every other failure belongs to one repository or one issue and must not hide the rest.
+_FATAL_ERRORS = (GitHubSafetyError, StateError)
+_ISOLATED_ERRORS = (AutocontributeError, ValueError)
 
 MAX_POLICY_FILES_PER_REPOSITORY = 128
 MAX_POLICY_FILE_BYTES = 256_000
@@ -340,23 +356,59 @@ DiscoverySelection = tuple[IssueCandidate, RepositoryInfo, EligibilityResult]
 
 
 @dataclass(frozen=True, slots=True)
+class IssueEvaluation:
+    """One assessed issue; each blocker has a short kind that discovery summaries count."""
+
+    issue: IssueCandidate
+    repository: RepositoryInfo
+    eligibility: EligibilityResult
+    blocker_kinds: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class DiscoveryOutcome:
-    """A selection or a bounded explanation of why discovery exhausted its search."""
+    """A selection plus every evaluation, skipped repository, and failure behind it."""
 
     selection: DiscoverySelection | None
     active_candidates: int = 0
     suppressed_candidates: int = 0
-    ineligible_candidates: int = 0
+    evaluations: tuple[IssueEvaluation, ...] = ()
+    skipped_repositories: tuple[tuple[str, str], ...] = ()
+    repository_errors: tuple[tuple[str, str], ...] = ()
+    issue_errors: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def ineligible_candidates(self) -> int:
+        return sum(not evaluation.eligibility.eligible for evaluation in self.evaluations)
+
+    @property
+    def blocker_counts(self) -> list[tuple[str, int]]:
+        """Blocker kinds with the number of issues each one blocked, most common first."""
+
+        return Counter(
+            kind for evaluation in self.evaluations for kind in evaluation.blocker_kinds
+        ).most_common()
+
+    @property
+    def summary(self) -> str:
+        eligible = len(self.evaluations) - self.ineligible_candidates
+        explanations = [
+            _counted_reason(len(self.evaluations), singular="issue", plural="issues")
+            + f" evaluated, {eligible} eligible",
+            *self._explanations(),
+        ]
+        return "; ".join(explanations) + "."
 
     @property
     def no_candidate_reason(self) -> str:
         if self.selection is not None:
             raise ValueError("A successful discovery outcome has no exhaustion reason")
-        if not any(
-            (self.active_candidates, self.suppressed_candidates, self.ineligible_candidates)
-        ):
+        explanations = self._explanations()
+        if not explanations:
             return "No candidate passed deterministic discovery gates."
+        return "No candidate is currently available: " + "; ".join(explanations) + "."
 
+    def _explanations(self) -> list[str]:
         explanations: list[str] = []
         if self.suppressed_candidates:
             explanations.append(
@@ -381,14 +433,31 @@ class DiscoveryOutcome:
                 )
             )
         if self.ineligible_candidates:
+            top_blockers = ", ".join(
+                f"{kind} {count}" for kind, count in self.blocker_counts[:_SUMMARY_BLOCKER_KINDS]
+            )
             explanations.append(
                 _counted_reason(
                     self.ineligible_candidates,
-                    singular="candidate failed deterministic discovery gates",
-                    plural="candidates failed deterministic discovery gates",
+                    singular="candidate failed discovery gates",
+                    plural="candidates failed discovery gates",
                 )
+                + f" ({top_blockers})"
             )
-        return "No candidate is currently available: " + "; ".join(explanations) + "."
+        for failures, singular, plural in (
+            (self.skipped_repositories, "repository was skipped", "repositories were skipped"),
+            (
+                self.repository_errors,
+                "repository could not be searched",
+                "repositories could not be searched",
+            ),
+            (self.issue_errors, "issue could not be evaluated", "issues could not be evaluated"),
+        ):
+            if failures:
+                explanations.append(
+                    _counted_reason(len(failures), singular=singular, plural=plural)
+                )
+        return explanations
 
 
 class DiscoveryService:
@@ -406,71 +475,105 @@ class DiscoveryService:
         self._repository_policy_refs: dict[str, str] = {}
         self._organization_policy_refs: dict[str, str | None] = {}
 
-    def repositories(self) -> list[RepositoryInfo]:
+    def repositories(self) -> tuple[list[RepositoryInfo], list[tuple[str, str]]]:
+        """Resolve configured repositories and owners; one failure never hides the others."""
+
         by_name: dict[str, RepositoryInfo] = {}
+        errors: list[tuple[str, str]] = []
         for full_name in self.config.github.repositories:
-            repository = self.github.get_repository(full_name)
+            try:
+                repository = self.github.get_repository(full_name)
+            except _FATAL_ERRORS:
+                raise
+            except _ISOLATED_ERRORS as exc:
+                errors.append((full_name, str(exc)))
+                continue
             by_name[repository.full_name] = repository
         for owner in self.config.github.owners:
-            for repository in self.github.list_owner_repositories(
-                owner, limit=self.config.github.repository_limit_per_owner
-            ):
+            try:
+                listed = self.github.list_owner_repositories(
+                    owner, limit=self.config.github.repository_limit_per_owner
+                )
+            except _FATAL_ERRORS:
+                raise
+            except _ISOLATED_ERRORS as exc:
+                errors.append((owner, str(exc)))
+                continue
+            for repository in listed:
                 by_name[repository.full_name] = repository
-        return sorted(by_name.values(), key=lambda repo: repo.stars, reverse=True)
+        return sorted(by_name.values(), key=lambda repo: repo.stars, reverse=True), errors
 
     def discover(self) -> DiscoveryOutcome:
-        ranked: list[DiscoverySelection] = []
+        repositories, repository_errors = self.repositories()
+        evaluations: list[IssueEvaluation] = []
+        eligible: list[IssueEvaluation] = []
+        skipped_repositories: list[tuple[str, str]] = []
+        issue_errors: list[tuple[str, str]] = []
         active_candidates = 0
         suppressed_candidates = 0
-        ineligible_candidates = 0
-        for repository in self.repositories():
-            if not self._repository_baseline(repository):
-                continue
-            repository_ref = self._pin_repository_ref(repository)
-            issues = self.github.search_issues(
-                repository.full_name,
-                labels=self.config.github.include_labels,
-                limit=self.config.github.issue_limit_per_repository,
-            )
-            for issue in issues:
-                # Search results omit the discussion and may contain a shortened body. Fetch the
-                # canonical issue before spending model budget or deciding that work is unclaimed.
-                issue = self.github.get_issue(repository.full_name, issue.number)
-                disposition = self.store.candidate_attempt_disposition(issue)
-                if disposition.state == CandidateAttemptState.ACTIVE:
-                    active_candidates += 1
-                    continue
-                if disposition.state == CandidateAttemptState.SUPPRESSED:
-                    suppressed_candidates += 1
-                    continue
-                eligibility = self.evaluate(
-                    issue,
-                    repository,
-                    repository_ref=repository_ref,
-                )
-                issue.score = eligibility.score
-                issue.score_evidence = eligibility.evidence
-                if eligibility.eligible:
-                    ranked.append((issue, repository, eligibility))
-                else:
-                    ineligible_candidates += 1
-                if len(ranked) >= self.config.budget.max_candidates_per_run:
-                    break
-            if len(ranked) >= self.config.budget.max_candidates_per_run:
+        candidate_limit = self.config.budget.max_candidates_per_run
+        for repository in repositories:
+            if len(eligible) >= candidate_limit:
                 break
-        if not ranked:
-            return DiscoveryOutcome(
-                selection=None,
-                active_candidates=active_candidates,
-                suppressed_candidates=suppressed_candidates,
-                ineligible_candidates=ineligible_candidates,
-            )
-        ranked.sort(key=lambda item: (item[2].score, item[0].updated_at), reverse=True)
+            if not self._repository_baseline(repository):
+                skipped_repositories.append((repository.full_name, _REPOSITORY_BASELINE_REASON))
+                continue
+            try:
+                repository_ref = self._pin_repository_ref(repository)
+                found = self.github.search_issues(
+                    repository.full_name,
+                    labels=self.config.github.include_labels,
+                    limit=self.config.github.issue_limit_per_repository,
+                )
+                if found:
+                    # Read the policy surface once here so that a failure is reported against
+                    # the repository, not retried and repeated for each of its issues.
+                    self.policy_snapshot(repository, repository_ref=repository_ref)
+            except _FATAL_ERRORS:
+                raise
+            except _ISOLATED_ERRORS as exc:
+                repository_errors.append((repository.full_name, str(exc)))
+                continue
+            for snapshot in found:
+                if len(eligible) >= candidate_limit:
+                    break
+                try:
+                    # Search results omit the discussion and may contain a shortened body. Fetch
+                    # the canonical issue before spending model budget or deciding that work is
+                    # unclaimed.
+                    issue = self.github.get_issue(repository.full_name, snapshot.number)
+                    disposition = self.store.candidate_attempt_disposition(issue)
+                    if disposition.state == CandidateAttemptState.ACTIVE:
+                        active_candidates += 1
+                        continue
+                    if disposition.state == CandidateAttemptState.SUPPRESSED:
+                        suppressed_candidates += 1
+                        continue
+                    evaluation = self._assess(issue, repository, repository_ref=repository_ref)
+                except _FATAL_ERRORS:
+                    raise
+                except _ISOLATED_ERRORS as exc:
+                    issue_errors.append((snapshot.reference, str(exc)))
+                    continue
+                evaluations.append(evaluation)
+                if evaluation.eligibility.eligible:
+                    eligible.append(evaluation)
+        eligible.sort(
+            key=lambda evaluation: (evaluation.eligibility.score, evaluation.issue.updated_at),
+            reverse=True,
+        )
         return DiscoveryOutcome(
-            selection=ranked[0],
+            selection=(
+                (eligible[0].issue, eligible[0].repository, eligible[0].eligibility)
+                if eligible
+                else None
+            ),
             active_candidates=active_candidates,
             suppressed_candidates=suppressed_candidates,
-            ineligible_candidates=ineligible_candidates,
+            evaluations=tuple(evaluations),
+            skipped_repositories=tuple(skipped_repositories),
+            repository_errors=tuple(repository_errors),
+            issue_errors=tuple(issue_errors),
         )
 
     def evaluate(
@@ -482,29 +585,46 @@ class DiscoveryService:
         check_competing_pull_requests: bool = True,
         repository_ref: str | None = None,
     ) -> EligibilityResult:
-        blockers: list[str] = []
+        return self._assess(
+            issue,
+            repository,
+            check_remote_policy=check_remote_policy,
+            check_competing_pull_requests=check_competing_pull_requests,
+            repository_ref=repository_ref,
+        ).eligibility
+
+    def _assess(
+        self,
+        issue: IssueCandidate,
+        repository: RepositoryInfo,
+        *,
+        check_remote_policy: bool = True,
+        check_competing_pull_requests: bool = True,
+        repository_ref: str | None = None,
+    ) -> IssueEvaluation:
+        blockers: list[tuple[str, str]] = []
         labels = {label.casefold() for label in issue.labels}
         include = {label.casefold() for label in self.config.github.include_labels}
         exclude = {label.casefold() for label in self.config.github.exclude_labels}
 
         if not self._repository_baseline(repository):
-            blockers.append(
-                "repository is private, archived, disabled, inactive, or below the star floor"
-            )
+            blockers.append(("repository", _REPOSITORY_BASELINE_REASON))
         if issue.state.casefold() != "open":
-            blockers.append("issue is not open")
+            blockers.append(("closed", "issue is not open"))
         if self.config.policy.require_maintainer_signal and not labels.intersection(include):
-            blockers.append("issue has no configured maintainer-signal label")
+            blockers.append(("no invitation", "issue has no configured maintainer-signal label"))
         excluded = labels.intersection(exclude)
         if excluded:
-            blockers.append(f"issue has excluded labels: {', '.join(sorted(excluded))}")
+            blockers.append(
+                ("excluded label", f"issue has excluded labels: {', '.join(sorted(excluded))}")
+            )
         if issue.assignees and not (
             self.config.policy.allow_assigned_issues or not self.config.github.require_unassigned
         ):
-            blockers.append("issue is already assigned")
+            blockers.append(("assigned", "issue is already assigned"))
         age = (datetime.now(UTC) - issue.updated_at).days
         if age > self.config.github.max_issue_age_days:
-            blockers.append(f"issue has not been updated for {age} days")
+            blockers.append(("stale", f"issue has not been updated for {age} days"))
         issue_discussion_text = (
             issue.title,
             issue.body,
@@ -514,15 +634,24 @@ class DiscoveryService:
             _is_security_sensitive(text) for text in issue_discussion_text
         ) or any(_DANGEROUS_LABEL.search(label) for label in issue.labels)
         if not self.config.policy.allow_security_issues and security_sensitive:
-            blockers.append("issue may concern a vulnerability and requires private handling")
+            blockers.append(
+                ("security", "issue may concern a vulnerability and requires private handling")
+            )
         if _is_maintainer_stop(f"{issue.title}\n{issue.body}"):
-            blockers.append("issue description asks contributors not to open a pull request")
+            blockers.append(
+                (
+                    "stop request",
+                    "issue description asks contributors not to open a pull request",
+                )
+            )
 
         claimed_by = sorted(
             {comment.author for comment in issue.discussion if _WORK_CLAIM.search(comment.body)}
         )
         if claimed_by:
-            blockers.append(f"issue discussion indicates claimed work by {', '.join(claimed_by)}")
+            blockers.append(
+                ("claimed", f"issue discussion indicates claimed work by {', '.join(claimed_by)}")
+            )
 
         maintainer_stops = [
             comment
@@ -625,7 +754,12 @@ class DiscoveryService:
                 and contribution_policy is None
                 and organization_contribution_policy is None
             ):
-                blockers.append("no repository or organization contribution guidelines were found")
+                blockers.append(
+                    (
+                        "no contribution guidelines",
+                        "no repository or organization contribution guidelines were found",
+                    )
+                )
                 policy_fit = 0
                 evidence["policy_fit"] = "0/10: contribution guidelines missing"
             ai_policy = self._combined_existing_files(
@@ -640,11 +774,21 @@ class DiscoveryService:
             )
             combined_ai_policy = f"{ai_policy}\n{organization_ai_policy}"
             if combined_ai_policy and _AI_PROHIBITION.search(combined_ai_policy):
-                blockers.append("repository policy appears to prohibit AI-assisted contributions")
+                blockers.append(
+                    (
+                        "AI policy",
+                        "repository policy appears to prohibit AI-assisted contributions",
+                    )
+                )
                 policy_fit = 0
                 evidence["policy_fit"] = "0/10: AI-assistance prohibition detected"
             elif combined_ai_policy and _AUTOMATION_PROHIBITION.search(combined_ai_policy):
-                blockers.append("repository policy appears to prohibit automated contributions")
+                blockers.append(
+                    (
+                        "automation policy",
+                        "repository policy appears to prohibit automated contributions",
+                    )
+                )
                 policy_fit = 0
                 evidence["policy_fit"] = "0/10: contribution automation prohibition detected"
 
@@ -659,8 +803,11 @@ class DiscoveryService:
                     )
                 else:
                     blockers.append(
-                        "CLA/DCO requirements lack an exact current repository attestation: "
-                        + mismatch
+                        (
+                            "CLA/DCO",
+                            "CLA/DCO requirements lack an exact current repository attestation: "
+                            + mismatch,
+                        )
                     )
                     policy_fit = 0
                     evidence["policy_fit"] = "0/10: unresolved repository-bound legal attestation"
@@ -673,7 +820,12 @@ class DiscoveryService:
                 issue.number,
             )
             if competing:
-                blockers.append(f"possible competing pull request already exists: {competing[0]}")
+                blockers.append(
+                    (
+                        "linked pull request",
+                        f"possible competing pull request already exists: {competing[0]}",
+                    )
+                )
                 evidence["no_duplicate"] = f"0/required: {len(competing)} possible duplicate(s)"
             else:
                 evidence["no_duplicate"] = "passed: no open PR references the issue"
@@ -681,12 +833,17 @@ class DiscoveryService:
         score = signal + clarity + reproducibility + scope + activity + policy_fit
         threshold = self.config.quality.min_candidate_score
         if score < threshold:
-            blockers.append(f"candidate score {score} is below required {threshold}")
-        return EligibilityResult(
-            eligible=not blockers,
-            score=score,
-            evidence=evidence,
-            blockers=blockers,
+            blockers.append(("low score", f"candidate score {score} is below required {threshold}"))
+        return IssueEvaluation(
+            issue=issue,
+            repository=repository,
+            eligibility=EligibilityResult(
+                eligible=not blockers,
+                score=score,
+                evidence=evidence,
+                blockers=[reason for _, reason in blockers],
+            ),
+            blocker_kinds=tuple(kind for kind, _ in blockers),
         )
 
     def _repository_baseline(self, repository: RepositoryInfo) -> bool:
@@ -1349,6 +1506,7 @@ __all__ = [
     "DiscoveryOutcome",
     "DiscoverySelection",
     "DiscoveryService",
+    "IssueEvaluation",
     "PolicySnapshot",
     "apply_legal_commit_message",
     "legal_attestation_fingerprint",

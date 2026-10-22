@@ -32,7 +32,7 @@ from autocontribute.coordination import (
     PUBLICATION_LEASE_TTL,
     LeaseHeartbeatGuard,
 )
-from autocontribute.discovery import DiscoveryService, PolicySnapshot
+from autocontribute.discovery import DiscoveryOutcome, DiscoveryService, PolicySnapshot
 from autocontribute.doctor import run_doctor
 from autocontribute.domain import RunManifest, RunStatus
 from autocontribute.exceptions import (
@@ -135,7 +135,19 @@ def doctor(
 
 
 @app.command()
-def discover(config: ConfigOption = DEFAULT_CONFIG) -> None:
+def discover(
+    config: ConfigOption = DEFAULT_CONFIG,
+    explain: Annotated[
+        bool,
+        typer.Option(
+            "--explain",
+            help=(
+                "Also list every evaluated issue with its score and blockers, and every "
+                "repository that was skipped or could not be searched."
+            ),
+        ),
+    ] = False,
+) -> None:
     """Find the strongest current candidate without cloning or changing GitHub."""
 
     settings = _actionable_config(config)
@@ -145,6 +157,8 @@ def discover(config: ConfigOption = DEFAULT_CONFIG) -> None:
             outcome = DiscoveryService(settings, github, store).discover()
     except AutocontributeError as exc:
         _fail(str(exc))
+    if explain:
+        console.print(_render_discovery_explanation(outcome), markup=False, soft_wrap=True)
     if outcome.selection is None:
         console.print(f"[yellow]{outcome.no_candidate_reason}[/yellow]")
         return
@@ -155,6 +169,7 @@ def discover(config: ConfigOption = DEFAULT_CONFIG) -> None:
     console.print(f"Candidate readiness: {eligibility.score}/100")
     for name, evidence in eligibility.evidence.items():
         console.print(f"  {name}: {evidence}")
+    console.print(outcome.summary, markup=False)
 
 
 @app.command(name="run")
@@ -769,6 +784,27 @@ def _render_policy_snapshot(snapshot: PolicySnapshot, *, web_origin: str) -> str
             snapshot.organization_paths,
         ),
     ]
+    return "\n".join(lines)
+
+
+def _render_discovery_explanation(outcome: DiscoveryOutcome) -> str:
+    lines = ["Repositories skipped or failed:"]
+    lines.extend(f"  {name}: skipped: {reason}" for name, reason in outcome.skipped_repositories)
+    lines.extend(f"  {name}: error: {error}" for name, error in outcome.repository_errors)
+    if len(lines) == 1:
+        lines.append("  (none)")
+    lines.append("Issues:")
+    for evaluation in outcome.evaluations:
+        eligibility = evaluation.eligibility
+        verdict = "eligible" if eligibility.eligible else "blocked"
+        lines.append(
+            f"  {evaluation.issue.reference} (score {eligibility.score}, {verdict}): "
+            f"{evaluation.issue.title}"
+        )
+        lines.extend(f"    - {blocker}" for blocker in eligibility.blockers)
+    lines.extend(f"  {reference}: error: {error}" for reference, error in outcome.issue_errors)
+    if not outcome.evaluations and not outcome.issue_errors:
+        lines.append("  (none evaluated)")
     return "\n".join(lines)
 
 

@@ -9,7 +9,11 @@ from typer.testing import CliRunner
 import autocontribute.cli as cli
 from autocontribute.cli import app
 from autocontribute.config import load_config
-from autocontribute.discovery import LEGAL_REQUIREMENTS_EVIDENCE_KEY
+from autocontribute.discovery import (
+    LEGAL_REQUIREMENTS_EVIDENCE_KEY,
+    DiscoveryOutcome,
+    IssueEvaluation,
+)
 from autocontribute.domain import (
     CommandResult,
     CriticReview,
@@ -532,6 +536,121 @@ def test_runs_cancel_refuses_runs_that_are_not_awaiting_approval_or_publication(
     assert "only ready_for_approval or approved runs can be cancelled" in output
     assert store.get(manifest.run_id).status is status
     assert store.events(manifest.run_id) == events
+
+
+def _discovery_outcome(*, selected: bool) -> DiscoveryOutcome:
+    repository = _PolicyGitHub().get_repository("example/project")
+    now = datetime.now(UTC)
+
+    def evaluation(number: int, blockers: list[str], kinds: tuple[str, ...]) -> IssueEvaluation:
+        issue = IssueCandidate(
+            repository="example/project",
+            number=number,
+            title=f"Issue title {number}",
+            body="Expected 2, actual 1.",
+            html_url=f"https://github.com/example/project/issues/{number}",
+            state="open",
+            author="reporter",
+            labels=["help wanted"],
+            assignees=[],
+            comments=0,
+            created_at=now,
+            updated_at=now,
+        )
+        return IssueEvaluation(
+            issue=issue,
+            repository=repository,
+            eligibility=EligibilityResult(
+                eligible=not blockers,
+                score=70 if not blockers else 40,
+                evidence={"invitation": "25/25"},
+                blockers=blockers,
+            ),
+            blocker_kinds=kinds,
+        )
+
+    eligible = evaluation(42, [], ())
+    blocked = evaluation(
+        43,
+        ["issue is already assigned", "candidate score 40 is below the floor of 60"],
+        ("assigned", "low score"),
+    )
+    return DiscoveryOutcome(
+        selection=(
+            (eligible.issue, eligible.repository, eligible.eligibility) if selected else None
+        ),
+        evaluations=(eligible, blocked) if selected else (blocked,),
+        skipped_repositories=(("small/project", "repository is below the star floor"),),
+        repository_errors=(("broken/project", "Search timed out"),),
+        issue_errors=(("example/project#7", "Issue changed while it was fetched"),),
+    )
+
+
+@pytest.mark.parametrize("selected", [True, False])
+def test_discover_explain_lists_every_issue_skip_and_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    selected: bool,
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(
+        "github:\n"
+        "  repositories: [example/project]\n"
+        "validation:\n"
+        "  required_commands:\n"
+        "    example/project: [python -m pytest]\n"
+        f"storage:\n  path: {tmp_path / 'state'}\n",
+        encoding="utf-8",
+    )
+    outcome = _discovery_outcome(selected=selected)
+
+    class FakeDiscovery:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def discover(self) -> DiscoveryOutcome:
+            return outcome
+
+    monkeypatch.setattr(cli, "_github_client", lambda *_: _ReviewGitHub())
+    monkeypatch.setattr(cli, "DiscoveryService", FakeDiscovery)
+
+    plain = runner.invoke(app, ["discover", "--config", str(config)])
+    explained = runner.invoke(app, ["discover", "--explain", "--config", str(config)])
+
+    assert plain.exit_code == 0, plain.output
+    assert explained.exit_code == 0, explained.output
+    assert "Issue title 43" not in plain.output
+    assert "Search timed out" not in plain.output
+    explanation = explained.output.splitlines()
+    for line in (
+        "Repositories skipped or failed:",
+        "  small/project: skipped: repository is below the star floor",
+        "  broken/project: error: Search timed out",
+        "Issues:",
+        "  example/project#43 (score 40, blocked): Issue title 43",
+        "    - issue is already assigned",
+        "    - candidate score 40 is below the floor of 60",
+        "  example/project#7: error: Issue changed while it was fetched",
+    ):
+        assert line in explanation
+    if selected:
+        assert "  example/project#42 (score 70, eligible): Issue title 42" in explanation
+        summary = (
+            "2 issues evaluated, 1 eligible; 1 candidate failed discovery gates "
+            "(assigned 1, low score 1); 1 repository was skipped; 1 repository could not be "
+            "searched; 1 issue could not be evaluated."
+        )
+        assert "example/project#42" in plain.output
+        for output in (plain.output, explained.output):
+            assert summary in " ".join(output.split())
+    else:
+        reason = (
+            "No candidate is currently available: 1 candidate failed discovery gates "
+            "(assigned 1, low score 1); 1 repository was skipped; 1 repository could not be "
+            "searched; 1 issue could not be evaluated."
+        )
+        for output in (plain.output, explained.output):
+            assert reason in " ".join(output.split())
 
 
 def test_init_does_not_overwrite_without_force(tmp_path: Path) -> None:
