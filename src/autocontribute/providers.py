@@ -18,15 +18,20 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Generic, Literal, Protocol, TypeVar, cast
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
 
 from autocontribute.config import ModelProfile, validate_model_identifier
 from autocontribute.domain import ContributionPlan, CriticReview, PatchProposal
-from autocontribute.exceptions import ModelError, ModelRequestError, ModelTimeoutError
+from autocontribute.exceptions import (
+    ConfigurationError,
+    ModelError,
+    ModelRequestError,
+    ModelTimeoutError,
+)
 from autocontribute.model_retry import PROVIDER_ERROR_CODES
-from autocontribute.pricing import ModelUsage
+from autocontribute.pricing import Effort, ModelSpec, ModelUsage
 from autocontribute.redaction import redact_model_input
-from autocontribute.transcript import canonical_json
+from autocontribute.transcript import TranscriptKind, canonical_json
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 
@@ -80,6 +85,29 @@ class ModelProvider(Protocol):
         max_output_tokens: int | None = None,
         timeout_seconds: float | None = None,
     ) -> ModelResult[OutputT]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class TurnRequest:
+    """One model-turn request, as the worker hands it to a provider adapter."""
+
+    spec: ModelSpec
+    effort: Effort
+    instructions: str
+    kind: TranscriptKind
+    run_id: str
+    items: list[dict[str, JsonValue]]
+    max_output_tokens: int
+    timeout_seconds: float
+
+
+def _require_api_key(env_name: str) -> str:
+    value = os.environ.get(env_name)
+    if not value:
+        raise ConfigurationError(
+            f"Model credential is missing; set environment variable {env_name}"
+        )
+    return value
 
 
 def _validate_usage(usage: ModelUsage) -> ModelUsage:
