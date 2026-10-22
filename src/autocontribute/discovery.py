@@ -7,13 +7,20 @@ import hmac
 import json
 import re
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
+from typing import Literal, Protocol
 
 from autocontribute.config import AutocontributeConfig, LegalAttestation
-from autocontribute.domain import EligibilityResult, IssueCandidate, IssueComment, RepositoryInfo
+from autocontribute.domain import (
+    DomainModel,
+    EligibilityResult,
+    IssueCandidate,
+    IssueComment,
+    RepositoryInfo,
+)
 from autocontribute.exceptions import (
     AutocontributeError,
     GitHubError,
@@ -24,12 +31,6 @@ from autocontribute.exceptions import (
 from autocontribute.github import GitHubClient, LinkedPullRequest
 from autocontribute.store import CandidateAttemptState, RunStore
 
-_CLARITY_TERMS = re.compile(
-    r"\b(expected|actual|acceptance|should|reproduce|steps|behavior|documentation)\b", re.I
-)
-_REPRODUCTION_TERMS = re.compile(
-    r"\b(repro(?:duce|duction)?|traceback|error|fails?|incorrect|bug|typo|broken)\b", re.I
-)
 _DANGEROUS_TERMS = re.compile(
     r"\b(?:CVE-\d{4}-\d+|CWE-\d+|vulnerabilit(?:y|ies)|"
     r"(?:potential\s+)?security (?:issue|bug|impact)|timing attack|"
@@ -157,6 +158,41 @@ _MAX_SEARCH_PAGES = 3
 # or raise the score; every other gate already holds for the full issue.
 _DISCUSSION_DEPENDENT_BLOCKERS = frozenset({"no invitation", "low score"})
 _LINKED_PULL_REQUEST_ACTIVITY = timedelta(days=90)
+_MIN_CANDIDATE_SCORE = 60
+_TRIAGE_CANDIDATES = 5
+_RECENT_ACTIVITY = timedelta(days=90)
+_RECENT_CREATION = timedelta(days=730)
+_CODE_FENCE = re.compile(r"^[ \t]*(?:```|~~~)", re.M)
+_CODE_REFERENCE = re.compile(r"`[^`\n]+`|\b\w+\(\)")
+_SOURCE_FILE = re.compile(
+    r"(?<![\w/.-])(?:[\w.-]+/)*[\w-]+\."
+    r"(?:c|cc|cpp|cs|go|h|hpp|java|js|jsx|kt|php|py|pyi|rb|rs|scala|sh|swift|ts|tsx)\b"
+)
+_ERROR_OUTPUT = re.compile(
+    r"Traceback \(most recent call last\)|\b[A-Z]\w*(?:Error|Exception)\b|\bpanicked at\b"
+    r"|(?i:\berror(?:\[\w+\])?:)"
+)
+_EXPECTED_BEHAVIOR = re.compile(r"\b(?:expected|expect|should|desired)\b", re.I)
+_OBSERVED_BEHAVIOR = re.compile(
+    r"\b(?:actual(?:ly)?|instead|currently|got"
+    r"|but (?:it|the|this|returns?|raises?|fails?|gives?|is|was))\b",
+    re.I,
+)
+_REPRODUCTION = re.compile(
+    r"\b(?:steps? to reproduce|to reproduce|reproduc(?:e|es|ed|ible|ing|tion)|repro"
+    r"|minimal (?:example|reproducer|reproduction)|mcve)\b",
+    re.I,
+)
+_TEST_MENTION = re.compile(r"\b(?:tests?|testing|test_\w+|pytest|unittest|jest|vitest)\b", re.I)
+# Documentation and test issues have no faulty behavior to reproduce, so the bug-report signals
+# count as met for them.
+_DOCS_OR_TESTS_LABEL = re.compile(r"\b(?:docs?|documentation|typo|tests?|testing)\b")
+_DOCS_TITLE = re.compile(r"\b(?:typos?|docs?|documentation|docstrings?|readme|spelling)\b", re.I)
+_SMALL_LABEL = re.compile(
+    r"(?:(?:size|difficulty|effort|complexity)\s*[:/]?\s*)?(?:xs|s|small|easy|low|trivial|tiny)"
+    r"|e easy|typo"
+)
+_TYPO_TITLE = re.compile(r"\b(?:typos?|spelling)\b", re.I)
 _STOP_TARGET = (
     r"(?:(?:(?:ai|llm)[ -]generated|ai[ -]assisted|automated|bot[ -]authored|"
     r"community|external|outside|unsolicited)\s+)?"
@@ -396,6 +432,37 @@ class PolicySnapshot:
 DiscoverySelection = tuple[IssueCandidate, RepositoryInfo, EligibilityResult]
 
 
+class TriageVerdict(DomainModel):
+    """A triage model's judgement of one eligible issue, as its submit_triage call states it."""
+
+    suitable: bool
+    reasons: list[str]
+    already_fixed: bool
+    needs_design: bool
+    difficulty: Literal["small", "medium", "large"]
+
+    @property
+    def problems(self) -> list[str]:
+        """Why an agent should not take the issue; empty when it should."""
+
+        return [
+            problem
+            for problem, present in (
+                ("judged unsuitable", not self.suitable),
+                ("already fixed", self.already_fixed),
+                ("needs a design decision", self.needs_design),
+                ("too large", self.difficulty == "large"),
+            )
+            if present
+        ]
+
+
+class IssueTriage(Protocol):
+    """Judges whether an agent can fix an issue that passed every deterministic gate."""
+
+    def triage(self, issue: IssueCandidate, repository: RepositoryInfo) -> TriageVerdict: ...
+
+
 @dataclass(frozen=True, slots=True)
 class IssueEvaluation:
     """One assessed issue; each blocker has a short kind that discovery summaries count."""
@@ -509,10 +576,13 @@ class DiscoveryService:
         config: AutocontributeConfig,
         github: GitHubClient,
         store: RunStore,
+        *,
+        triage: IssueTriage | None = None,
     ) -> None:
         self.config = config
         self.github = github
         self.store = store
+        self.triage = triage
         self._remote_file_cache: dict[tuple[str, str, str], str | None] = {}
         self._policy_path_cache: dict[tuple[str, str], tuple[str, ...]] = {}
         self._repository_policy_refs: dict[str, str] = {}
@@ -616,11 +686,10 @@ class DiscoveryService:
             key=lambda evaluation: (evaluation.eligibility.score, evaluation.issue.updated_at),
             reverse=True,
         )
+        winner = self._select(eligible, evaluations, issue_errors)
         return DiscoveryOutcome(
             selection=(
-                (eligible[0].issue, eligible[0].repository, eligible[0].eligibility)
-                if eligible
-                else None
+                None if winner is None else (winner.issue, winner.repository, winner.eligibility)
             ),
             active_candidates=active_candidates,
             suppressed_candidates=suppressed_candidates,
@@ -629,6 +698,37 @@ class DiscoveryService:
             repository_errors=tuple(repository_errors),
             issue_errors=tuple(issue_errors),
         )
+
+    def _select(
+        self,
+        ranked: list[IssueEvaluation],
+        evaluations: list[IssueEvaluation],
+        issue_errors: list[tuple[str, str]],
+    ) -> IssueEvaluation | None:
+        """Pick the best-ranked issue, or with triage the best-ranked one triage accepts.
+
+        Triage sees at most the top five issues. Its verdicts replace their evaluations, so that
+        a rejection shows up as a blocker.
+        """
+
+        if self.triage is None:
+            return ranked[0] if ranked else None
+        for candidate in ranked[:_TRIAGE_CANDIDATES]:
+            try:
+                verdict = self.triage.triage(candidate.issue, candidate.repository)
+            except _FATAL_ERRORS:
+                raise
+            except _ISOLATED_ERRORS as exc:
+                issue_errors.append((candidate.issue.reference, f"triage failed: {exc}"))
+                continue
+            triaged = _with_triage(candidate, verdict)
+            position = next(
+                index for index, evaluation in enumerate(evaluations) if evaluation is candidate
+            )
+            evaluations[position] = triaged
+            if triaged.eligibility.eligible:
+                return triaged
+        return None
 
     def _search_labels(self, repository: str) -> tuple[list[str], list[str]]:
         """Name the repository's own labels that discovery searches for and leaves out."""
@@ -820,30 +920,22 @@ class DiscoveryService:
             f"loaded={len(issue.discussion)}/{issue.comments}, "
             f"maintainer_comments={len(maintainer_comments)}, claims={len(claimed_by)}"
         )
-        signal = 25 if invitation_labels or invited_in_discussion else 0
-        evidence["maintainer_signal"] = f"{signal}/25: labels={invitation_labels}"
-
-        body_length = len(issue.body.strip())
-        clarity = 10 if body_length >= 100 else 0
-        if body_length >= 300 and _CLARITY_TERMS.search(issue.body):
-            clarity = 20
-        elif _CLARITY_TERMS.search(issue.body):
-            clarity = max(clarity, 15)
-        evidence["clarity"] = f"{clarity}/20: body_length={body_length}"
-
-        issue_text = f"{issue.title}\n{issue.body}"
-        reproducibility = 20 if _REPRODUCTION_TERMS.search(issue_text) else 5
-        evidence["reproducibility"] = f"{reproducibility}/20"
-
-        scope_labels = {"good first issue", "small", "size/s", "documentation", "bug"}
-        scope = 15 if labels.keys() & scope_labels else 7
-        evidence["scope"] = f"{scope}/15"
-
-        activity = 10 if age <= 30 else 7 if age <= 90 else 3
-        evidence["activity"] = f"{activity}/10: updated_days_ago={age}"
-
-        policy_fit = 10 if not excluded else 0
-        evidence["policy_fit"] = f"{policy_fit}/10"
+        score, score_evidence = _suitability(
+            issue,
+            label_keys=labels.keys(),
+            invitation_labels=invitation_labels,
+            invited_in_discussion=invited_in_discussion,
+            maintainer_comments=maintainer_comments,
+            now=now,
+        )
+        evidence.update(score_evidence)
+        if score < _MIN_CANDIDATE_SCORE:
+            blockers.append(
+                (
+                    "low score",
+                    f"candidate score {score} is below the floor of {_MIN_CANDIDATE_SCORE}",
+                )
+            )
 
         if check_remote_policy:
             snapshot = self.policy_snapshot(
@@ -879,8 +971,6 @@ class DiscoveryService:
                         "no repository or organization contribution guidelines were found",
                     )
                 )
-                policy_fit = 0
-                evidence["policy_fit"] = "0/10: contribution guidelines missing"
             ai_policy = self._combined_existing_files(
                 repository.full_name,
                 snapshot.repository_ref,
@@ -899,8 +989,6 @@ class DiscoveryService:
                         "repository policy appears to prohibit AI-assisted contributions",
                     )
                 )
-                policy_fit = 0
-                evidence["policy_fit"] = "0/10: AI-assistance prohibition detected"
             elif combined_ai_policy and _AUTOMATION_PROHIBITION.search(combined_ai_policy):
                 blockers.append(
                     (
@@ -908,8 +996,6 @@ class DiscoveryService:
                         "repository policy appears to prohibit automated contributions",
                     )
                 )
-                policy_fit = 0
-                evidence["policy_fit"] = "0/10: contribution automation prohibition detected"
 
             if snapshot.legal_requirements:
                 evidence[LEGAL_REQUIREMENTS_EVIDENCE_KEY] = ",".join(snapshot.legal_requirements)
@@ -928,8 +1014,6 @@ class DiscoveryService:
                             + mismatch,
                         )
                     )
-                    policy_fit = 0
-                    evidence["policy_fit"] = "0/10: unresolved repository-bound legal attestation"
             else:
                 evidence[LEGAL_REQUIREMENTS_EVIDENCE_KEY] = "none"
 
@@ -969,10 +1053,6 @@ class DiscoveryService:
                 )
                 evidence["linked_pull_requests"] = f"{len(competing)} competing, {len(stale)} stale"
 
-        score = signal + clarity + reproducibility + scope + activity + policy_fit
-        threshold = self.config.quality.min_candidate_score
-        if score < threshold:
-            blockers.append(("low score", f"candidate score {score} is below required {threshold}"))
         return IssueEvaluation(
             issue=issue,
             repository=repository,
@@ -1589,6 +1669,118 @@ def _maintainer_stop_sentences(body: str) -> list[str]:
     return sentences
 
 
+def _suitability(
+    issue: IssueCandidate,
+    *,
+    label_keys: Collection[str],
+    invitation_labels: list[str],
+    invited_in_discussion: bool,
+    maintainer_comments: list[IssueComment],
+    now: datetime,
+) -> tuple[int, dict[str, str]]:
+    """Score, out of 100, how well an agent can fix the issue, with evidence for each part.
+
+    Parts: invitation 25, specificity 25, smallness 20, freshness 15, testability 15.
+    """
+
+    text = f"{issue.title}\n{issue.body}"
+    docs_or_tests = any(_DOCS_OR_TESTS_LABEL.search(key) for key in label_keys) or bool(
+        _DOCS_TITLE.search(issue.title)
+    )
+
+    if invited_in_discussion or any(_label_key(label) != "bug" for label in invitation_labels):
+        invitation = 25
+    elif invitation_labels:
+        invitation = 15
+    else:
+        invitation = 0
+
+    expected = docs_or_tests or bool(
+        _EXPECTED_BEHAVIOR.search(text) and _OBSERVED_BEHAVIOR.search(text)
+    )
+    code_block = bool(_CODE_FENCE.search(issue.body))
+    reference = bool(_CODE_REFERENCE.search(text) or _SOURCE_FILE.search(text))
+    reproduction = bool(_REPRODUCTION.search(text))
+    error_output = bool(_ERROR_OUTPUT.search(issue.body))
+    specific = {
+        "expected vs actual": (10, expected),
+        "code block": (5, code_block),
+        "code reference": (5, reference),
+        "reproduction or error": (5, docs_or_tests or reproduction or error_output),
+    }
+
+    files = {match.group(0) for match in _SOURCE_FILE.finditer(text)}
+    small_label = any(_SMALL_LABEL.fullmatch(key) for key in label_keys)
+    small = {
+        "small or typo label": (10, small_label or bool(_TYPO_TITLE.search(issue.title))),
+        "under 15 comments": (5, issue.comments < 15),
+        "one file or none named": (5, len(files) <= 1),
+    }
+
+    fresh = {
+        "created within 2 years": (5, now - issue.created_at <= _RECENT_CREATION),
+        "updated within 90 days": (5, now - issue.updated_at <= _RECENT_ACTIVITY),
+        "maintainer comment within 90 days": (
+            5,
+            any(now - comment.created_at <= _RECENT_ACTIVITY for comment in maintainer_comments),
+        ),
+    }
+
+    testable = {
+        "reproduction": (10, docs_or_tests or code_block or reproduction),
+        "tests named": (5, bool(_TEST_MENTION.search(text))),
+    }
+
+    evidence = {
+        "invitation": (
+            f"{invitation}/25: labels={invitation_labels}, "
+            f"maintainer invitation={'yes' if invited_in_discussion else 'no'}"
+        )
+    }
+    if docs_or_tests:
+        evidence["issue_kind"] = (
+            "documentation or tests: expected vs actual and reproduction count as met"
+        )
+    score = invitation
+    for name, maximum, signals in (
+        ("specificity", 25, specific),
+        ("smallness", 20, small),
+        ("freshness", 15, fresh),
+        ("testability", 15, testable),
+    ):
+        points = sum(weight for weight, present in signals.values() if present)
+        met = [signal for signal, (_, present) in signals.items() if present]
+        evidence[name] = f"{points}/{maximum}: {', '.join(met) or 'none'}"
+        score += points
+    return score, evidence
+
+
+def _with_triage(evaluation: IssueEvaluation, verdict: TriageVerdict) -> IssueEvaluation:
+    """Record the verdict as evidence, and as a blocker when triage turns the issue down."""
+
+    reasons = "; ".join(verdict.reasons)
+    summary = f"{verdict.difficulty}, {', '.join(verdict.problems) or 'suitable'}"
+    if reasons:
+        summary += f": {reasons}"
+    eligibility = evaluation.eligibility
+    evidence = {**eligibility.evidence, "triage": summary}
+    if not verdict.problems:
+        return replace(
+            evaluation, eligibility=eligibility.model_copy(update={"evidence": evidence})
+        )
+    return replace(
+        evaluation,
+        eligibility=eligibility.model_copy(
+            update={
+                "eligible": False,
+                "evidence": evidence,
+                "blockers": [*eligibility.blockers, f"triage turned the issue down: {summary}"],
+            }
+        ),
+        blocker_kinds=(*evaluation.blocker_kinds, "triage"),
+    )
+
+
 def _label_key(name: str) -> str:
     """Compare labels as people spell them, ignoring case, hyphens, and underscores."""
 
@@ -1737,7 +1929,9 @@ __all__ = [
     "DiscoverySelection",
     "DiscoveryService",
     "IssueEvaluation",
+    "IssueTriage",
     "PolicySnapshot",
+    "TriageVerdict",
     "apply_legal_commit_message",
     "competing_pull_requests",
     "legal_attestation_fingerprint",

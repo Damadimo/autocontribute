@@ -78,7 +78,6 @@ policy:
     review is implied.
 
 quality:
-  min_candidate_score: 85
   min_readiness_score: 90
   min_dimension_score: 80
   max_files_changed: 8
