@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from autocontribute.config import ModelProfile, validate_model_identifier
 from autocontribute.domain import ContributionPlan, CriticReview, PatchProposal
 from autocontribute.exceptions import ModelError, ModelRequestError, ModelTimeoutError
+from autocontribute.pricing import ModelUsage
 from autocontribute.redaction import redact_model_input
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
@@ -47,16 +48,6 @@ _WORKER_ENV_ALLOWLIST = (
     "SSL_CERT_DIR",
     "SSL_CERT_FILE",
 )
-
-
-@dataclass(frozen=True)
-class ModelUsage:
-    input_tokens: int = 0
-    cached_input_tokens: int = 0
-    cache_write_tokens: int = 0
-    output_tokens: int = 0
-    reasoning_tokens: int = 0
-    total_tokens: int = 0
 
 
 @dataclass(frozen=True)
