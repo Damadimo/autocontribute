@@ -243,7 +243,7 @@ class SandboxRunner:
                 cwd=workspace,
                 timeout_seconds=self.config.command_timeout_seconds,
                 environment=self._docker_environment,
-                timeout_cleanup=cleanup,
+                cleanup=cleanup,
             )
 
     def _run_local(self, workspace: Path, command: str) -> CommandResult:
@@ -267,7 +267,7 @@ class SandboxRunner:
             cwd=workspace,
             timeout_seconds=self.config.command_timeout_seconds,
             environment=environment,
-            timeout_cleanup=None,
+            cleanup=None,
         )
 
 
@@ -287,8 +287,10 @@ def _execute(
     cwd: Path,
     timeout_seconds: int,
     environment: dict[str, str] | None,
-    timeout_cleanup: Callable[[], None] | None,
+    cleanup: Callable[[], None] | None,
 ) -> CommandResult:
+    """Run one bounded command; ``cleanup`` stops its sandbox when it is abandoned."""
+
     started = time.monotonic()
     try:
         process = subprocess.Popen(
@@ -317,15 +319,12 @@ def _execute(
         exit_code = process.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
-        if timeout_cleanup is not None:
-            timeout_cleanup()
-        _kill_process_group(process)
-        try:
-            exit_code = process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            exit_code = process.wait()
+        _abandon(process, cleanup)
         exit_code = 124
+    except BaseException:
+        # Ctrl-C or a termination signal must not leave the command running.
+        _abandon(process, cleanup)
+        raise
     finally:
         stdout_thread.join(timeout=5)
         stderr_thread.join(timeout=5)
@@ -530,6 +529,20 @@ def _read_container_id(cidfile: Path) -> str | None:
     if value and all(character in "0123456789abcdefABCDEF" for character in value):
         return value
     return None
+
+
+def _abandon(process: subprocess.Popen[bytes], cleanup: Callable[[], None] | None) -> None:
+    # Killing the Docker client alone leaves the command running in the container.
+    try:
+        if cleanup is not None:
+            cleanup()
+    finally:
+        _kill_process_group(process)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
 
 
 def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
