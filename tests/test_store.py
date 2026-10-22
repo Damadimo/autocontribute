@@ -811,15 +811,14 @@ def test_pr_open_transition_and_save_reject_semantic_candidate_mutation(
 
 
 @pytest.mark.parametrize("tamper", ("revision", "manifest"))
-def test_restore_snapshot_rejects_issue_revision_tampering(
+def test_reopen_rejects_issue_revision_tampering(
     tmp_path: Path,
     tamper: str,
 ) -> None:
-    source = RunStore(tmp_path / "source")
-    run = _candidate_run(source)
-    snapshot = source.create_snapshot(tmp_path / "backup" / "state.sqlite3")
-    with closing(sqlite3.connect(snapshot)) as connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
+    root = tmp_path / "state"
+    store = RunStore(root)
+    run = _candidate_run(store)
+    with closing(sqlite3.connect(store.database_path)) as connection:
         if tamper == "revision":
             connection.execute(
                 "UPDATE runs SET issue_revision = ? WHERE run_id = ?",
@@ -837,12 +836,9 @@ def test_restore_snapshot_rejects_issue_revision_tampering(
                 (json.dumps(payload, separators=(",", ":")), run.run_id),
             )
         connection.commit()
-    target = tmp_path / "target"
 
     with pytest.raises(StateError, match="issue revision"):
-        RunStore.restore_snapshot(target, snapshot)
-
-    assert not (target / "state.sqlite3").exists()
+        RunStore(root)
 
 
 @pytest.mark.parametrize(
@@ -856,25 +852,26 @@ def test_restore_snapshot_rejects_issue_revision_tampering(
         ("orphan_override", "lacks durable authorization"),
     ),
 )
-def test_restore_snapshot_rejects_tampered_or_orphaned_candidate_retry_evidence(
+def test_reopen_rejects_tampered_or_orphaned_candidate_retry_evidence(
     tmp_path: Path,
     tamper: str,
     message: str,
 ) -> None:
-    source = RunStore(tmp_path / "source")
+    root = tmp_path / "state"
+    store = RunStore(root)
     candidate = _issue_candidate()
-    _candidate_run(source, candidate=candidate, status=RunStatus.REJECTED)
-    retry = source.create_run()
-    _set_status(source, retry, RunStatus.DISCOVERING)
+    _candidate_run(store, candidate=candidate, status=RunStatus.REJECTED)
+    retry = store.create_run()
+    _set_status(store, retry, RunStatus.DISCOVERING)
     retry.candidate = candidate.model_copy(deep=True)
-    lease = source.acquire_lease(
+    lease = store.acquire_lease(
         "autocontribute.run",
-        "snapshot-retry-worker",
+        "reopen-retry-worker",
         ttl=timedelta(minutes=5),
     )
     assert lease is not None
     try:
-        source.claim_candidate(
+        store.claim_candidate(
             retry,
             lease=lease,
             retry_authorization=CandidateRetryAuthorization(
@@ -883,11 +880,9 @@ def test_restore_snapshot_rejects_tampered_or_orphaned_candidate_retry_evidence(
             ),
         )
     finally:
-        assert source.release_lease(lease.name, lease.owner, lease.generation)
-    snapshot = source.create_snapshot(tmp_path / "backup" / f"{tamper}.sqlite3")
+        assert store.release_lease(lease.name, lease.owner, lease.generation)
 
-    with closing(sqlite3.connect(snapshot)) as connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
+    with closing(sqlite3.connect(store.database_path)) as connection:
         if tamper == "authorization":
             connection.execute(
                 """
@@ -917,7 +912,7 @@ def test_restore_snapshot_rejects_tampered_or_orphaned_candidate_retry_evidence(
         elif tamper == "override":
             event = next(
                 event
-                for event in source.events(retry.run_id)
+                for event in store.events(retry.run_id)
                 if event["event_type"] == "candidate.retry_override"
             )
             details = json.loads(event["details"])
@@ -941,26 +936,22 @@ def test_restore_snapshot_rejects_tampered_or_orphaned_candidate_retry_evidence(
             )
         connection.commit()
 
-    target = tmp_path / f"target-{tamper}"
     with pytest.raises(StateError, match=message):
-        RunStore.restore_snapshot(target, snapshot)
-
-    assert not (target / "state.sqlite3").exists()
+        RunStore(root)
 
 
-def test_restore_snapshot_rejects_semantically_tampered_candidate_selection(
+def test_reopen_rejects_semantically_tampered_candidate_selection(
     tmp_path: Path,
 ) -> None:
-    source = RunStore(tmp_path / "source")
-    run = _candidate_run(source, status=RunStatus.DISCOVERING)
-    snapshot = source.create_snapshot(tmp_path / "backup" / "selection.sqlite3")
+    root = tmp_path / "state"
+    store = RunStore(root)
+    run = _candidate_run(store, status=RunStatus.DISCOVERING)
     event = next(
-        event for event in source.events(run.run_id) if event["event_type"] == "candidate.selected"
+        event for event in store.events(run.run_id) if event["event_type"] == "candidate.selected"
     )
     details = json.loads(event["details"])
     details["issue"] = "example/other#999"
-    with closing(sqlite3.connect(snapshot)) as connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
+    with closing(sqlite3.connect(store.database_path)) as connection:
         _rewrite_tail_event_details(
             connection,
             run_id=run.run_id,
@@ -968,34 +959,27 @@ def test_restore_snapshot_rejects_semantically_tampered_candidate_selection(
             details=details,
         )
         connection.commit()
-    target = tmp_path / "target"
 
     with pytest.raises(StateError, match="candidate selection disagrees"):
-        RunStore.restore_snapshot(target, snapshot)
-
-    assert not (target / "state.sqlite3").exists()
+        RunStore(root)
 
 
-def test_restore_snapshot_rejects_candidate_without_selection_provenance(
+def test_reopen_rejects_candidate_without_selection_provenance(
     tmp_path: Path,
 ) -> None:
-    source = RunStore(tmp_path / "source")
-    run = _candidate_run(source, status=RunStatus.DISCOVERING)
-    snapshot = source.create_snapshot(tmp_path / "backup" / "missing-selection.sqlite3")
-    with closing(sqlite3.connect(snapshot)) as connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
+    root = tmp_path / "state"
+    store = RunStore(root)
+    run = _candidate_run(store, status=RunStatus.DISCOVERING)
+    with closing(sqlite3.connect(store.database_path)) as connection:
         _delete_tail_event(
             connection,
             run_id=run.run_id,
             event_type="candidate.selected",
         )
         connection.commit()
-    target = tmp_path / "target"
 
     with pytest.raises(StateError, match="candidate evidence without selection provenance"):
-        RunStore.restore_snapshot(target, snapshot)
-
-    assert not (target / "state.sqlite3").exists()
+        RunStore(root)
 
 
 def test_future_older_or_malformed_schema_fails_closed(tmp_path: Path) -> None:
@@ -1048,143 +1032,28 @@ def test_older_development_state_asks_for_a_fresh_state_directory(
         assert connection.execute("SELECT run_id FROM runs").fetchall() == [(run.run_id,)]
 
 
-@pytest.mark.parametrize(
-    ("schema_version", "expected_error"),
-    (
-        (7, "older development version of Autocontribute \\(schema 7\\)"),
-        (8, "older development version of Autocontribute \\(schema 8\\)"),
-        (10, "State snapshot schema 10 is newer than supported schema 9"),
-    ),
-)
-def test_restore_names_snapshots_this_release_cannot_open(
-    tmp_path: Path,
-    schema_version: int,
-    expected_error: str,
-) -> None:
-    source = RunStore(tmp_path / "source")
-    source.create_run()
-    snapshot = source.create_snapshot(tmp_path / "backup" / "state.sqlite3")
-    with closing(sqlite3.connect(snapshot)) as connection, connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.execute(
-            "UPDATE schema_metadata SET schema_version = ? WHERE singleton = 1",
-            (schema_version,),
-        )
-    target = tmp_path / "target"
-
-    with pytest.raises(StateError, match=expected_error):
-        RunStore.restore_snapshot(target, snapshot)
-    assert not (target / "state.sqlite3").exists()
-
-
-def test_snapshot_is_consistent_includes_wal_and_requires_explicit_overwrite(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    writer = sqlite3.connect(store.database_path)
-    try:
-        writer.execute("PRAGMA journal_mode = WAL")
-        writer.execute("PRAGMA wal_autocheckpoint = 0")
-        store.transition(run, RunStatus.DISCOVERING, reason="committed in the WAL")
-
-        destination = tmp_path / "backups" / "state.sqlite3"
-        assert store.create_snapshot(destination) == destination.resolve()
-        with sqlite3.connect(destination) as backup:
-            assert backup.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-            assert backup.execute(
-                "SELECT status FROM runs WHERE run_id = ?",
-                (run.run_id,),
-            ).fetchone() == (RunStatus.DISCOVERING.value,)
-
-        with pytest.raises(StateError, match="already exists"):
-            store.create_snapshot(destination)
-        assert store.create_snapshot(destination, overwrite=True) == destination.resolve()
-    finally:
-        writer.close()
-
-
-def test_snapshot_backup_rejects_event_tail_truncation(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
+def test_reopen_rejects_event_tail_truncation(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = RunStore(root)
     run = store.create_run()
     store.transition(run, RunStatus.DISCOVERING, reason="fixture")
-    with sqlite3.connect(store.database_path) as connection:
+    with closing(sqlite3.connect(store.database_path)) as connection, connection:
         connection.execute(
             "DELETE FROM events WHERE run_id = ? AND event_type = 'run.transitioned'",
             (run.run_id,),
         )
-    destination = tmp_path / "backups" / "state.sqlite3"
 
     with pytest.raises(StateError, match="Event ledger anchor mismatch"):
-        store.create_snapshot(destination)
-
-    assert not destination.exists()
+        RunStore(root)
 
 
-def test_snapshot_rejects_symlinks_and_live_database_paths(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    sentinel = tmp_path / "sentinel"
-    sentinel.write_text("unchanged", encoding="utf-8")
-    symlink = tmp_path / "backup-link"
-    symlink.symlink_to(sentinel)
-
-    with pytest.raises(StateError, match="symbolic link"):
-        store.create_snapshot(symlink)
-    assert sentinel.read_text(encoding="utf-8") == "unchanged"
-
-    for target in (
-        store.database_path,
-        Path(f"{store.database_path}-wal"),
-        Path(f"{store.database_path}-shm"),
-        Path(f"{store.database_path}-journal"),
-    ):
-        with pytest.raises(StateError, match="live SQLite"):
-            store.create_snapshot(target, overwrite=True)
-
-
-def test_restore_snapshot_validates_before_atomic_promotion(tmp_path: Path) -> None:
-    source_store = RunStore(tmp_path / "source")
-    run = source_store.create_run()
-    snapshot = source_store.create_snapshot(tmp_path / "backup" / "state.sqlite3")
-    restored_root = tmp_path / "restored"
-
-    restored = RunStore.restore_snapshot(restored_root, snapshot)
-
-    assert restored == (restored_root / "state.sqlite3").resolve()
-    assert RunStore(restored_root).get(run.run_id).run_id == run.run_id
-    with pytest.raises(StateError, match="existing live SQLite"):
-        RunStore.restore_snapshot(restored_root, snapshot)
-
-
-def test_restore_snapshot_rejects_event_tail_truncation_before_promotion(
+def test_reopen_rejects_trigger_that_can_clear_circuit_breaker(
     tmp_path: Path,
 ) -> None:
-    source_store = RunStore(tmp_path / "source")
-    run = source_store.create_run()
-    source_store.transition(run, RunStatus.DISCOVERING, reason="fixture")
-    snapshot = source_store.create_snapshot(tmp_path / "backup" / "state.sqlite3")
-    with sqlite3.connect(snapshot) as connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.execute(
-            "DELETE FROM events WHERE run_id = ? AND event_type = 'run.transitioned'",
-            (run.run_id,),
-        )
-    target = tmp_path / "target"
-
-    with pytest.raises(StateError, match="Event ledger anchor mismatch"):
-        RunStore.restore_snapshot(target, snapshot)
-
-    assert not (target / "state.sqlite3").exists()
-
-
-def test_restore_snapshot_rejects_trigger_that_can_clear_circuit_breaker(
-    tmp_path: Path,
-) -> None:
-    source_store = RunStore(tmp_path / "source")
-    source_store.trip_circuit_breaker(source="security", reason="stop", trigger_hash="danger")
-    snapshot = source_store.create_snapshot(tmp_path / "backup" / "state.sqlite3")
-    with sqlite3.connect(snapshot) as connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
+    root = tmp_path / "state"
+    store = RunStore(root)
+    store.trip_circuit_breaker(source="security", reason="stop", trigger_hash="danger")
+    with closing(sqlite3.connect(store.database_path)) as connection, connection:
         connection.executescript(
             """
             CREATE TRIGGER circuit_breaker_auto_clear
@@ -1200,51 +1069,46 @@ def test_restore_snapshot_rejects_trigger_that_can_clear_circuit_breaker(
         assert connection.execute(
             "SELECT is_tripped FROM circuit_breaker WHERE singleton = 1"
         ).fetchone() == (0,)
-    target = tmp_path / "target"
 
     with pytest.raises(StateError, match="canonical manifest"):
-        RunStore.restore_snapshot(target, snapshot)
-    assert not (target / "state.sqlite3").exists()
+        RunStore(root)
 
 
-def test_snapshot_restore_preserves_complete_active_breaker_revision(tmp_path: Path) -> None:
-    source_store = RunStore(tmp_path / "source")
-    source_store.trip_circuit_breaker(
+def test_reopen_preserves_complete_active_breaker_revision(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = RunStore(root)
+    store.trip_circuit_breaker(
         source="maintainer",
         reason="stop requested",
         trigger_hash="signal-a",
     )
-    source_store.trip_circuit_breaker(
+    store.trip_circuit_breaker(
         source="security",
         reason="secret detected",
         trigger_hash="signal-b",
     )
-    expected = source_store.circuit_breaker_status()
-    snapshot = source_store.create_snapshot(tmp_path / "backup" / "state.sqlite3")
+    expected = store.circuit_breaker_status()
 
-    RunStore.restore_snapshot(tmp_path / "restored", snapshot)
-    restored = RunStore(tmp_path / "restored").circuit_breaker_status()
+    reopened = RunStore(root).circuit_breaker_status()
 
-    assert restored.active_revision == expected.active_revision
-    assert restored.active_triggers == expected.active_triggers
-    assert restored.trigger_hash == "signal-b"
+    assert reopened.active_revision == expected.active_revision
+    assert reopened.active_triggers == expected.active_triggers
+    assert reopened.trigger_hash == "signal-b"
 
 
-def test_snapshot_restore_rejects_missing_active_breaker_evidence(tmp_path: Path) -> None:
-    source_store = RunStore(tmp_path / "source")
-    source_store.trip_circuit_breaker(
+def test_reopen_rejects_missing_active_breaker_evidence(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = RunStore(root)
+    store.trip_circuit_breaker(
         source="security",
         reason="stop",
         trigger_hash="signal-a",
     )
-    snapshot = source_store.create_snapshot(tmp_path / "backup" / "state.sqlite3")
-    with sqlite3.connect(snapshot) as connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
+    with closing(sqlite3.connect(store.database_path)) as connection, connection:
         connection.execute("DELETE FROM circuit_breaker_events WHERE event_type = 'trip'")
 
     with pytest.raises(StateError, match="disagrees with its active evidence"):
-        RunStore.restore_snapshot(tmp_path / "restored", snapshot)
-    assert not (tmp_path / "restored" / "state.sqlite3").exists()
+        RunStore(root)
 
 
 @pytest.mark.parametrize(
@@ -1269,55 +1133,14 @@ def test_snapshot_restore_rejects_missing_active_breaker_evidence(tmp_path: Path
         "altered-check-constraint",
     ],
 )
-def test_restore_snapshot_rejects_altered_schema_objects(tmp_path: Path, tamper_sql: str) -> None:
-    source_store = RunStore(tmp_path / "source")
-    snapshot = source_store.create_snapshot(tmp_path / "backup" / "state.sqlite3")
-    with sqlite3.connect(snapshot) as connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
+def test_reopen_rejects_altered_schema_objects(tmp_path: Path, tamper_sql: str) -> None:
+    root = tmp_path / "state"
+    store = RunStore(root)
+    with closing(sqlite3.connect(store.database_path)) as connection, connection:
         connection.executescript(tamper_sql)
 
     with pytest.raises(StateError, match="canonical manifest"):
-        RunStore.restore_snapshot(tmp_path / "target", snapshot)
-    assert not (tmp_path / "target" / "state.sqlite3").exists()
-
-
-def test_restore_snapshot_rejects_invalid_or_unsafe_input_without_live_state(
-    tmp_path: Path,
-) -> None:
-    invalid = tmp_path / "invalid.sqlite3"
-    invalid.write_bytes(b"")
-    target = tmp_path / "target"
-
-    with pytest.raises(StateError, match="missing or unsupported tables"):
-        RunStore.restore_snapshot(target, invalid)
-    assert not (target / "state.sqlite3").exists()
-
-    symlink = tmp_path / "snapshot-link"
-    symlink.symlink_to(invalid)
-    with pytest.raises(StateError, match="symbolic link"):
-        RunStore.restore_snapshot(target, symlink)
-
-
-def test_restore_snapshot_closes_source_descriptor_when_fdopen_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source_store = RunStore(tmp_path / "source")
-    snapshot = source_store.create_snapshot(tmp_path / "backup" / "state.sqlite3")
-    failed_descriptors: list[int] = []
-
-    def fail_fdopen(descriptor: int, mode: str):  # type: ignore[no-untyped-def]
-        failed_descriptors.append(descriptor)
-        raise OSError("injected fdopen failure")
-
-    monkeypatch.setattr("autocontribute.store.os.fdopen", fail_fdopen)
-
-    with pytest.raises(StateError, match="injected fdopen failure"):
-        RunStore.restore_snapshot(tmp_path / "target", snapshot)
-
-    assert len(failed_descriptors) == 1
-    with pytest.raises(OSError):
-        os.fstat(failed_descriptors[0])
-    assert not (tmp_path / "target" / "state.sqlite3").exists()
+        RunStore(root)
 
 
 def test_open_pull_request_remains_an_active_candidate(tmp_path: Path) -> None:

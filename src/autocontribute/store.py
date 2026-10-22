@@ -8,11 +8,9 @@ import json
 import os
 import re
 import sqlite3
-import stat
-import tempfile
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -38,7 +36,6 @@ _CANDIDATE_REPOSITORY: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _REQUIRED_STORAGE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT"
 _REQUIRED_WORKSPACE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_WORKSPACE_ROOT"
-_OFFLINE_VERIFICATION: Final = object()
 _INITIAL_EVENT_HASH: Final = "0" * 64
 _METADATA_COLUMNS: Final = {"singleton", "schema_version", "migrated_at"}
 _RUN_COLUMNS: Final = {
@@ -833,27 +830,18 @@ class _PublicationIntent:
 class RunStore:
     """Owns local state; model and repository code receive no database handle."""
 
-    def __init__(self, root: Path, *, _mode: object | None = None) -> None:
+    def __init__(self, root: Path) -> None:
         self.root = root.expanduser().resolve()
         self.runs_dir = self.root / "runs"
         self.workspaces_dir = self.root / "workspaces"
         self.database_path = self.root / "state.sqlite3"
-        if _mode is None:
-            self._validate_required_storage_root()
-            self._validate_required_workspace_root()
-        elif _mode is not _OFFLINE_VERIFICATION:
-            raise TypeError("Unsupported run store construction mode")
+        self._validate_required_storage_root()
+        self._validate_required_workspace_root()
         self.root.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self.workspaces_dir.mkdir(parents=True, exist_ok=True)
         self._initialize()
         self.synchronize_manifest_artifacts()
-
-    @classmethod
-    def _for_offline_verification(cls, root: Path) -> RunStore:
-        """Open private staging state without applying live-deployment path bindings."""
-
-        return cls(root, _mode=_OFFLINE_VERIFICATION)
 
     def _validate_required_storage_root(self) -> None:
         """Bind a hardened deployment to its preflight-verified durable-state mount."""
@@ -1255,24 +1243,6 @@ class RunStore:
         _verify_manifest_artifact_sync(connection)
         _verify_publication_state(connection)
         _verify_issue_revision_evidence(connection)
-
-    @classmethod
-    def _validate_restorable_schema(cls, connection: sqlite3.Connection) -> None:
-        """Validate a snapshot before restore, naming state that this release cannot open."""
-
-        version = cls._detect_schema_version(connection)
-        if version > CURRENT_SCHEMA_VERSION:
-            raise StateError(
-                f"State snapshot schema {version} is newer than supported schema "
-                f"{CURRENT_SCHEMA_VERSION}"
-            )
-        if cls._is_development_schema(connection, version):
-            raise StateError(
-                "State snapshot was created by an older development version of Autocontribute "
-                f"(schema {version}) and cannot be restored; start from a fresh state directory "
-                "instead"
-            )
-        cls._validate_current_schema(connection)
 
     @property
     def schema_version(self) -> int:
@@ -3072,159 +3042,6 @@ class RunStore:
                 ]
             ).encode()
         ).hexdigest()
-
-    def create_snapshot(self, destination: Path, *, overwrite: bool = False) -> Path:
-        """Atomically write a consistent SQLite backup, including committed WAL pages."""
-
-        self.synchronize_manifest_artifacts()
-        requested_target = destination.expanduser()
-        if requested_target.is_symlink():
-            raise StateError("Snapshot destination cannot be a symbolic link")
-        target = requested_target.resolve()
-        live_paths = {
-            self.database_path,
-            Path(f"{self.database_path}-wal"),
-            Path(f"{self.database_path}-shm"),
-            Path(f"{self.database_path}-journal"),
-        }
-        if target in live_paths:
-            raise StateError("Snapshot destination cannot replace live SQLite state")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() and not target.is_file():
-            raise StateError("Snapshot destination must be a regular file path")
-        if target.exists() and not overwrite:
-            raise StateError("Snapshot destination already exists; pass overwrite explicitly")
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
-        )
-        os.close(descriptor)
-        temporary = Path(temporary_name)
-        source: sqlite3.Connection | None = None
-        backup: sqlite3.Connection | None = None
-        try:
-            source = sqlite3.connect(self.database_path, timeout=30)
-            backup = sqlite3.connect(temporary, timeout=30)
-            source.backup(backup)
-            row = backup.execute("PRAGMA integrity_check").fetchone()
-            if row is None or row[0] != "ok":
-                raise StateError("SQLite rejected the completed state snapshot")
-            backup.row_factory = sqlite3.Row
-            self._validate_current_schema(backup)
-            backup.close()
-            backup = None
-            source.close()
-            source = None
-            with temporary.open("rb") as snapshot_file:
-                os.fsync(snapshot_file.fileno())
-            if overwrite:
-                os.replace(temporary, target)
-            else:
-                try:
-                    os.link(temporary, target, follow_symlinks=False)
-                except FileExistsError as exc:
-                    raise StateError("Snapshot destination appeared during backup") from exc
-                temporary.unlink()
-            _fsync_directory(target.parent)
-            return target
-        except (OSError, sqlite3.Error) as exc:
-            raise StateError(f"Could not create state snapshot: {exc}") from exc
-        finally:
-            if backup is not None:
-                backup.close()
-            if source is not None:
-                source.close()
-            temporary.unlink(missing_ok=True)
-
-    @classmethod
-    def restore_snapshot(cls, root: Path, source: Path) -> Path:
-        """Validate and atomically promote a standalone snapshot before opening live state."""
-
-        requested_source = source.expanduser()
-        if requested_source.is_symlink():
-            raise StateError("State snapshot source cannot be a symbolic link")
-        try:
-            snapshot = requested_source.resolve(strict=True)
-        except OSError as exc:
-            raise StateError(f"State snapshot source is unavailable: {exc}") from exc
-        if not snapshot.is_file():
-            raise StateError("State snapshot source must be a regular file")
-
-        requested_root = root.expanduser()
-        if requested_root.is_symlink():
-            raise StateError("State storage root cannot be a symbolic link during restore")
-        target_root = requested_root.resolve()
-        target_root.mkdir(parents=True, exist_ok=True)
-        target = target_root / "state.sqlite3"
-        live_paths = (
-            target,
-            Path(f"{target}-wal"),
-            Path(f"{target}-shm"),
-            Path(f"{target}-journal"),
-        )
-        if any(path.exists() or path.is_symlink() for path in live_paths):
-            raise StateError("Refusing to restore over existing live SQLite state")
-        if snapshot == target:
-            raise StateError("State snapshot source cannot be the live database path")
-
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".state.sqlite3.", suffix=".restore", dir=target_root
-        )
-        temporary = Path(temporary_name)
-        validation: sqlite3.Connection | None = None
-        source_descriptor = -1
-        try:
-            source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            source_descriptor = os.open(snapshot, source_flags)
-            try:
-                source_file = os.fdopen(source_descriptor, "rb")
-            except BaseException:
-                with suppress(OSError):
-                    os.close(source_descriptor)
-                source_descriptor = -1
-                raise
-            source_descriptor = -1
-            with source_file:
-                destination_file = os.fdopen(descriptor, "wb")
-                descriptor = -1
-                with destination_file:
-                    if not stat.S_ISREG(os.fstat(source_file.fileno()).st_mode):
-                        raise StateError("State snapshot source must be a regular file")
-                    while chunk := source_file.read(1024 * 1024):
-                        destination_file.write(chunk)
-                    destination_file.flush()
-                    os.fsync(destination_file.fileno())
-
-            validation = sqlite3.connect(
-                f"{temporary.resolve().as_uri()}?mode=ro&immutable=1", uri=True
-            )
-            row = validation.execute("PRAGMA integrity_check").fetchone()
-            if row is None or row[0] != "ok":
-                raise StateError("SQLite rejected the restored state snapshot")
-            validation.row_factory = sqlite3.Row
-            cls._validate_restorable_schema(validation)
-            validation.close()
-            validation = None
-            try:
-                os.link(temporary, target, follow_symlinks=False)
-            except FileExistsError as exc:
-                raise StateError("Live state appeared while the snapshot was restored") from exc
-            temporary.unlink()
-            _fsync_directory(target_root)
-            return target
-        except StateError:
-            raise
-        except (OSError, sqlite3.Error) as exc:
-            raise StateError(f"Could not restore state snapshot: {exc}") from exc
-        finally:
-            if validation is not None:
-                validation.close()
-            if descriptor >= 0:
-                with suppress(OSError):
-                    os.close(descriptor)
-            if source_descriptor >= 0:
-                with suppress(OSError):
-                    os.close(source_descriptor)
-            temporary.unlink(missing_ok=True)
 
     def artifact_dir(self, run_id: str) -> Path:
         path = self.runs_dir / run_id

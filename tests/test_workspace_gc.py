@@ -10,7 +10,6 @@ import yaml
 from typer.testing import CliRunner
 
 import autocontribute.workspace_gc as workspace_gc
-from autocontribute.backup import create_state_bundle
 from autocontribute.cli import app
 from autocontribute.config import AutocontributeConfig
 from autocontribute.domain import (
@@ -289,7 +288,6 @@ def test_execute_deletes_only_workspace_and_preserves_durable_state(tmp_path: Pa
     assert store.get(run.run_id) == run
     assert store.events(run.run_id) == events_before
     assert store.runs_dir.joinpath(run.run_id, "manifest.json").is_file()
-    create_state_bundle(store, tmp_path / "complete.bundle.zip")
 
 
 def test_nonterminal_and_submitting_publication_workspaces_are_never_candidates(
@@ -387,7 +385,6 @@ def test_complete_published_run_is_workspace_independent(
     assert report.errors == 0
     assert report.items[0].status == RunStatus.PR_OPEN
     assert not store.workspaces_dir.joinpath(run.run_id).exists()
-    create_state_bundle(store, tmp_path / "published.bundle.zip")
 
 
 def test_complete_ready_for_review_run_is_workspace_independent(tmp_path: Path) -> None:
