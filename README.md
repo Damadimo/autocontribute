@@ -33,7 +33,7 @@ This installs the `autocontribute` command. There is no PyPI release yet. To wor
 ## Set up
 
 1. Run `autocontribute init`. It writes `autocontribute.yml`, which commands read from the current directory unless you pass `--config PATH`.
-2. Edit the file. Replace `your-org/your-repo` in `github.repositories` and `validation.required_commands` with the public repositories you want to contribute to, lower `github.min_stars` (1000) if one has fewer stars, and replace the `example.invalid` image in `sandbox.image`. `config validate`, `doctor`, `discover`, and `run` refuse to start while a placeholder remains.
+2. Edit the file. Replace `your-org/your-repo` in `github.repositories` and `validation.required_commands` with the public repositories you want to contribute to, and replace the `example.invalid` image in `sandbox.image`. `config validate`, `doctor`, `discover`, and `run` refuse to start while a placeholder remains.
 3. Build a sandbox image that already contains every tool and dependency your validation commands need, because checks run offline. Pin it by digest and `docker pull` it: see [docs/sandbox-image.md](docs/sandbox-image.md).
 4. Run `gh auth login` (or set `github.auth: token` and export `AUTOCONTRIBUTE_GITHUB_TOKEN`), export `OPENAI_API_KEY`, then run `autocontribute doctor` and fix each failed check. `doctor` sends one small paid model request per distinct model profile (two with the defaults), each capped at 1,024 output tokens.
 
@@ -42,7 +42,6 @@ This installs the `autocontribute` command. There is no PyPI release yet. To wor
 ```yaml
 github:
   repositories: [your-name/your-project]
-  min_stars: 0                     # the default, 1000, also skips repositories you list
 validation:
   required_commands:               # run in the sandbox after every change
     your-name/your-project:
@@ -60,7 +59,7 @@ budget:
   max_model_cost_usd_per_run: 50   # needs pricing on all three roles
 ```
 
-This is a complete file for one repository: replace the names and the image digest with your own. Every key you leave out keeps its default, listed in [docs/configuration.md](docs/configuration.md). Discovery only considers issues labeled `help wanted` or `good first issue`, and needs a CONTRIBUTING file in the repository or in the owner's `.github` repository.
+This is a complete file for one repository: replace the names and the image digest with your own. Every key you leave out keeps its default, listed in [docs/configuration.md](docs/configuration.md). Discovery only considers issues with an invitation label such as `help wanted` or a maintainer comment inviting a PR, leaves `good first issue` issues to newcomers, and needs a CONTRIBUTING file in the repository or in the owner's `.github` repository.
 
 ## Use it
 
