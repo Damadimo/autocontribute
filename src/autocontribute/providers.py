@@ -26,6 +26,7 @@ from autocontribute.exceptions import ModelError, ModelRequestError, ModelTimeou
 from autocontribute.model_retry import PROVIDER_ERROR_CODES
 from autocontribute.pricing import ModelUsage
 from autocontribute.redaction import redact_model_input
+from autocontribute.transcript import canonical_json
 
 OutputT = TypeVar("OutputT", bound=BaseModel)
 
@@ -145,13 +146,7 @@ def _output_schema_type(schema_id: str) -> type[BaseModel]:
 
 def _canonical_json_bytes(value: object) -> bytes:
     try:
-        return json.dumps(
-            value,
-            ensure_ascii=True,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        return canonical_json(value)
     except (TypeError, ValueError) as exc:
         raise ModelError("Model worker IPC value was not canonical JSON") from exc
 
