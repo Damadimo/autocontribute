@@ -45,6 +45,7 @@ from autocontribute.github import (
     CommitStatusDetails,
     ForkIdentity,
     GitHubComment,
+    LinkedPullRequest,
     PullRequestDetails,
     PullRequestReference,
     PullRequestReview,
@@ -1561,6 +1562,35 @@ def test_issue_or_repository_drift_after_push_compensates_before_pull_request(
     assert "publication.policy_stale_before_pull_request" in event_types
     assert "publication.compensation.verified" in event_types
     assert not store.circuit_breaker_status().is_tripped
+
+
+@pytest.mark.parametrize(
+    ("updated_days_ago", "closes_issue", "competes"),
+    [(3, False, True), (120, False, False), (120, True, True)],
+)
+def test_mutation_boundary_uses_the_discovery_linked_pull_request_rule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    updated_days_ago: int,
+    closes_issue: bool,
+    competes: bool,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    linked = LinkedPullRequest(
+        html_url="https://github.com/example/project/pull/77",
+        updated_at=datetime.now(UTC) - timedelta(days=updated_days_ago),
+        closes_issue=closes_issue,
+    )
+    monkeypatch.setattr(github, "search_competing_pull_requests", lambda *_: [linked])
+
+    if competes:
+        with pytest.raises(PolicyError, match="pull/77"):
+            publisher._check_mutation_boundary_freshness(manifest)
+    else:
+        publisher._check_mutation_boundary_freshness(manifest)
 
 
 @pytest.mark.parametrize("drift", ["organization_ref", "maintainer_stop"])

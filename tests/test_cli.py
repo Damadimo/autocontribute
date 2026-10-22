@@ -567,6 +567,11 @@ def _discovery_outcome(*, selected: bool) -> DiscoveryOutcome:
                 blockers=blockers,
             ),
             blocker_kinds=kinds,
+            notes=(
+                ("stale linked PR, not blocking: https://github.com/example/project/pull/9",)
+                if blockers
+                else ()
+            ),
         )
 
     eligible = evaluation(42, [], ())
@@ -630,6 +635,7 @@ def test_discover_explain_lists_every_issue_skip_and_error(
         "  example/project#43 (score 40, blocked): Issue title 43",
         "    - issue is already assigned",
         "    - candidate score 40 is below the floor of 60",
+        "    note: stale linked PR, not blocking: https://github.com/example/project/pull/9",
         "  example/project#7: error: Issue changed while it was fetched",
     ):
         assert line in explanation

@@ -7,7 +7,7 @@ import hmac
 import json
 import re
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
@@ -21,7 +21,7 @@ from autocontribute.exceptions import (
     PolicyError,
     StateError,
 )
-from autocontribute.github import GitHubClient
+from autocontribute.github import GitHubClient, LinkedPullRequest
 from autocontribute.store import CandidateAttemptState, RunStore
 
 _CLARITY_TERMS = re.compile(
@@ -140,6 +140,7 @@ _AUTOMATION_TERMS = re.compile(
     re.I,
 )
 _CLAIM_WINDOW = timedelta(days=30)
+_LINKED_PULL_REQUEST_ACTIVITY = timedelta(days=90)
 _STOP_TARGET = (
     r"(?:(?:(?:ai|llm)[ -]generated|ai[ -]assisted|automated|bot[ -]authored|"
     r"community|external|outside|unsolicited)\s+)?"
@@ -387,6 +388,7 @@ class IssueEvaluation:
     repository: RepositoryInfo
     eligibility: EligibilityResult
     blocker_kinds: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
     repository_hold: str | None = None
 
 
@@ -827,21 +829,41 @@ class DiscoveryService:
             else:
                 evidence[LEGAL_REQUIREMENTS_EVIDENCE_KEY] = "none"
 
-        if check_competing_pull_requests:
-            competing = self.github.search_competing_pull_requests(
-                repository.full_name,
-                issue.number,
-            )
-            if competing:
+        notes: list[str] = []
+        # The linked-PR search costs several GitHub calls; skip it once the issue is blocked.
+        if check_competing_pull_requests and not blockers:
+            try:
+                linked = self.github.search_competing_pull_requests(
+                    repository.full_name,
+                    issue.number,
+                )
+            except GitHubSafetyError:
+                raise
+            except GitHubError as exc:
                 blockers.append(
                     (
                         "linked pull request",
-                        f"possible competing pull request already exists: {competing[0]}",
+                        f"linked pull requests could not be checked completely: {exc}",
                     )
                 )
-                evidence["no_duplicate"] = f"0/required: {len(competing)} possible duplicate(s)"
+                evidence["linked_pull_requests"] = "unknown"
             else:
-                evidence["no_duplicate"] = "passed: no open PR references the issue"
+                competing = competing_pull_requests(linked, now=now)
+                stale = [pull_request for pull_request in linked if pull_request not in competing]
+                if competing:
+                    blockers.append(
+                        (
+                            "linked pull request",
+                            "possible competing pull request already exists: "
+                            f"{competing[0].html_url}",
+                        )
+                    )
+                notes.extend(
+                    f"stale linked PR, not blocking: {pull_request.html_url} "
+                    f"(updated {pull_request.updated_at.date().isoformat()})"
+                    for pull_request in stale
+                )
+                evidence["linked_pull_requests"] = f"{len(competing)} competing, {len(stale)} stale"
 
         score = signal + clarity + reproducibility + scope + activity + policy_fit
         threshold = self.config.quality.min_candidate_score
@@ -857,6 +879,7 @@ class DiscoveryService:
                 blockers=[reason for _, reason in blockers],
             ),
             blocker_kinds=tuple(kind for kind, _ in blockers),
+            notes=tuple(notes),
             repository_hold=repository_hold,
         )
 
@@ -1561,6 +1584,21 @@ def _is_policy_path(path: str) -> bool:
     return any(marker in name for marker in markers)
 
 
+def competing_pull_requests(
+    linked: Sequence[LinkedPullRequest],
+    *,
+    now: datetime,
+) -> list[LinkedPullRequest]:
+    """Keep the linked pull requests that still compete: recently active or closing the issue."""
+
+    return [
+        pull_request
+        for pull_request in linked
+        if pull_request.closes_issue
+        or now - pull_request.updated_at <= _LINKED_PULL_REQUEST_ACTIVITY
+    ]
+
+
 def parse_issue_reference(value: str) -> tuple[str, int]:
     """Parse `owner/repository#123` without accepting URLs or ambiguous shorthand."""
 
@@ -1591,6 +1629,7 @@ __all__ = [
     "IssueEvaluation",
     "PolicySnapshot",
     "apply_legal_commit_message",
+    "competing_pull_requests",
     "legal_attestation_fingerprint",
     "parse_issue_reference",
     "validate_legal_publication",

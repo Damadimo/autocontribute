@@ -18,6 +18,7 @@ from autocontribute.discovery import (
     DiscoveryService,
     PolicySnapshot,
     apply_legal_commit_message,
+    competing_pull_requests,
     parse_issue_reference,
     validate_legal_publication,
 )
@@ -34,6 +35,7 @@ from autocontribute.exceptions import (
     PolicyError,
     StateError,
 )
+from autocontribute.github import LinkedPullRequest
 from autocontribute.store import (
     CandidateAttemptDisposition,
     CandidateAttemptState,
@@ -45,7 +47,9 @@ ORGANIZATION_REF = "b" * 40
 
 
 class FakeGitHub:
-    def search_competing_pull_requests(self, repository: str, issue_number: int) -> list[str]:
+    def search_competing_pull_requests(
+        self, repository: str, issue_number: int
+    ) -> list[LinkedPullRequest]:
         return []
 
     def get_file(
@@ -677,6 +681,100 @@ def test_safety_stops_and_state_errors_still_end_discovery(
 
     with pytest.raises(type(failure)):
         service.discover()
+
+
+class LinkedPullRequestGitHub(FakeGitHub):
+    def __init__(self, linked: list[LinkedPullRequest] | Exception) -> None:
+        self.linked = linked
+        self.searches = 0
+
+    def search_competing_pull_requests(
+        self, repository: str, issue_number: int
+    ) -> list[LinkedPullRequest]:
+        del repository, issue_number
+        self.searches += 1
+        if isinstance(self.linked, Exception):
+            raise self.linked
+        return self.linked
+
+
+def _linked(number: int, *, days_ago: int, closes_issue: bool = False) -> LinkedPullRequest:
+    return LinkedPullRequest(
+        html_url=f"https://github.com/example/project/pull/{number}",
+        updated_at=datetime.now(UTC) - timedelta(days=days_ago),
+        closes_issue=closes_issue,
+    )
+
+
+def test_recent_or_closing_linked_pull_requests_compete_and_stale_ones_do_not() -> None:
+    recent = _linked(1, days_ago=89)
+    stale = _linked(2, days_ago=91)
+    stale_closing = _linked(3, days_ago=400, closes_issue=True)
+
+    assert competing_pull_requests([recent, stale, stale_closing], now=datetime.now(UTC)) == [
+        recent,
+        stale_closing,
+    ]
+
+
+def test_stale_linked_pull_request_is_reported_without_blocking(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    stale = _linked(7, days_ago=120)
+    service = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), LinkedPullRequestGitHub([stale]), RunStore(tmp_path)
+    )
+
+    evaluation = service._assess(_issue(), _repository())
+
+    assert evaluation.eligibility.eligible, evaluation.eligibility.blockers
+    assert evaluation.notes == (
+        "stale linked PR, not blocking: https://github.com/example/project/pull/7 "
+        f"(updated {stale.updated_at.date().isoformat()})",
+    )
+    assert evaluation.eligibility.evidence["linked_pull_requests"] == "0 competing, 1 stale"
+
+
+def test_active_linked_pull_request_blocks_the_issue(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(),
+        LinkedPullRequestGitHub([_linked(8, days_ago=3), _linked(9, days_ago=200)]),
+        RunStore(tmp_path),
+    )
+
+    evaluation = service._assess(_issue(), _repository())
+
+    assert evaluation.blocker_kinds == ("linked pull request",)
+    assert evaluation.eligibility.blockers == [
+        "possible competing pull request already exists: https://github.com/example/project/pull/8"
+    ]
+    assert len(evaluation.notes) == 1
+
+
+def test_incomplete_linked_pull_request_evidence_blocks_only_that_issue(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = LinkedPullRequestGitHub(
+        GitHubError(
+            "Issue timeline exceeded 1,000 events; duplicate pull-request status is ambiguous"
+        )
+    )
+    service = DiscoveryService(AutocontributeConfig(), github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    evaluation = service._assess(_issue(), _repository())
+
+    assert evaluation.blocker_kinds == ("linked pull request",)
+    assert evaluation.eligibility.blockers == [
+        "linked pull requests could not be checked completely: Issue timeline exceeded 1,000 "
+        "events; duplicate pull-request status is ambiguous"
+    ]
+
+
+def test_linked_pull_requests_are_not_searched_for_an_already_blocked_issue(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = LinkedPullRequestGitHub([])
+    service = DiscoveryService(AutocontributeConfig(), github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    result = service.evaluate(_issue(assignees=["someone"]), _repository())
+
+    assert not result.eligible
+    assert github.searches == 0
+    assert "linked_pull_requests" not in result.evidence
 
 
 def _comment(
