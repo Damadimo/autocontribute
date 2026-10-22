@@ -50,6 +50,8 @@ Issues = "https://github.com/Damadimo/autocontribute/issues"
 [tool.uv]
 # Dependency-update PRs may advance this snapshot only to a timestamp at least seven days old.
 exclude-newer = "2026-07-15T00:00:00Z"
+# Security fixes may admit one newer package: certifi 2026.10.19 fixes PYSEC-2026-4320.
+exclude-newer-package = { certifi = "2026-10-21T00:00:00Z" }
 
 [[tool.uv.index]]
 name = "pypi"
