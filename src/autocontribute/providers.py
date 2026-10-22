@@ -712,7 +712,7 @@ class SubprocessModelProvider:
     """Run one built-in provider call in a killable, isolated process group."""
 
     def __init__(self, profile: ModelProfile) -> None:
-        if os.name != "posix":  # pragma: no cover - production is the systemd/Linux deployment
+        if os.name != "posix":  # pragma: no cover - supported hosts are POSIX
             raise ModelError("Hard model deadlines require a POSIX process-group runtime")
         profile.require_api_key()
         self.profile = profile.model_copy(deep=True)

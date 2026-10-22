@@ -12,7 +12,6 @@ from autocontribute.config import AutocontributeConfig, SandboxConfig
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     GitHubSafetyError,
-    PolicyError,
 )
 from autocontribute.github import GitHubClient
 from autocontribute.store import RunStore
@@ -89,95 +88,6 @@ class _RateLimitedDoctorGitHub:
         )
         self._safety_trigger_handler(trigger)  # type: ignore[operator]
         raise GitHubSafetyError("GitHub activated the global safety stop", trigger=trigger)
-
-
-def test_required_systemd_asset_mismatch_stops_doctor_before_other_probes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS", "1")
-    monkeypatch.setattr(
-        doctor,
-        "verify_installed_systemd_assets",
-        lambda: (_ for _ in ()).throw(PolicyError("release assets differ")),
-    )
-    monkeypatch.setattr(
-        doctor,
-        "_run_doctor",
-        lambda *_args, **_kwargs: pytest.fail("deployment mismatch must stop all other probes"),
-    )
-
-    checks = doctor.run_doctor(_config())
-
-    assert len(checks) == 1
-    assert checks[0].name == "systemd deployment assets"
-    assert not checks[0].passed
-    assert "release assets differ" in checks[0].detail
-
-
-def test_required_systemd_asset_error_uses_doctor_credential_redaction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config()
-    secret = "opaque-systemd-verification-secret"
-    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS", "1")
-    monkeypatch.setenv(config.models.scout.api_key_env, secret)
-    monkeypatch.setattr(
-        doctor,
-        "verify_installed_systemd_assets",
-        lambda: (_ for _ in ()).throw(PolicyError(f"unsafe asset echoed {secret}")),
-    )
-    monkeypatch.setattr(
-        doctor,
-        "_run_doctor",
-        lambda *_args, **_kwargs: pytest.fail("deployment mismatch must stop all other probes"),
-    )
-
-    checks = doctor.run_doctor(config)
-
-    assert len(checks) == 1
-    assert secret not in checks[0].detail
-    assert "[REDACTED:CREDENTIAL]" in checks[0].detail
-
-
-def test_required_systemd_asset_check_is_first_when_it_passes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS", "1")
-    monkeypatch.setattr(
-        doctor,
-        "verify_installed_systemd_assets",
-        lambda: SimpleNamespace(
-            checked_assets=22,
-            manifest_sha256="a" * 64,
-        ),
-    )
-    monkeypatch.setattr(
-        doctor,
-        "_run_doctor",
-        lambda *_args, **_kwargs: [doctor.DoctorCheck("later probe", True, "ready")],
-    )
-
-    checks = doctor.run_doctor(_config())
-
-    assert [check.name for check in checks] == ["systemd deployment assets", "later probe"]
-    assert checks[0].passed
-
-
-def test_required_systemd_asset_marker_rejects_noncanonical_values(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTOCONTRIBUTE_REQUIRE_SYSTEMD_ASSETS", "true")
-    monkeypatch.setattr(
-        doctor,
-        "verify_installed_systemd_assets",
-        lambda: pytest.fail("invalid marker must fail before verification"),
-    )
-
-    checks = doctor.run_doctor(_config())
-
-    assert len(checks) == 1
-    assert not checks[0].passed
-    assert "must be exactly 1" in checks[0].detail
 
 
 def test_active_breaker_skips_billed_model_and_github_probes(

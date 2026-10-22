@@ -9,7 +9,6 @@ from typing import Any
 import pytest
 
 from autocontribute.config import AutocontributeConfig
-from autocontribute.deployment import compute_deployment_fingerprint
 from autocontribute.domain import (
     CommandResult,
     ContributionPlan,
@@ -391,7 +390,6 @@ def test_full_prepare_pipeline_reaches_exact_approval_boundary(tmp_path: Path, m
         )
 
     assert manifest.status == RunStatus.READY_FOR_APPROVAL
-    assert manifest.deployment_fingerprint == compute_deployment_fingerprint(config)
     assert manifest.quality and manifest.quality.ready
     assert manifest.model_calls == 3
     assert manifest.model_input_tokens == 30

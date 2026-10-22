@@ -18,7 +18,6 @@ from autocontribute.config import (
     LegalAttestation,
 )
 from autocontribute.coordination import LeaseHeartbeatGuard
-from autocontribute.deployment import compute_deployment_fingerprint
 from autocontribute.discovery import DiscoveryService, apply_legal_commit_message
 from autocontribute.domain import (
     CommandResult,
@@ -220,7 +219,7 @@ def _ready_run(
         }
         config = AutocontributeConfig.model_validate(config.model_dump(mode="python"))
         store = RunStore(config.storage.path)
-    run = store.create_run(deployment_fingerprint=compute_deployment_fingerprint(config))
+    run = store.create_run()
     store.transition(run, RunStatus.DISCOVERING, reason="fixture started")
     workspace = RepositoryWorkspace.clone(
         str(source),
@@ -912,20 +911,6 @@ def test_publisher_rejects_patch_that_differs_from_preparation_seal(tmp_path: Pa
     store.write_artifact(run_id, "contribution.patch", "tampered patch\n")
 
     with pytest.raises(PolicyError, match="Preparation fingerprint"):
-        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
-
-    assert github.calls == []
-    assert not github.mutated
-
-
-def test_publisher_rejects_run_from_another_deployment(tmp_path: Path) -> None:
-    config, store, run_id, issue = _ready_run(tmp_path)
-    manifest = store.get(run_id)
-    manifest.deployment_fingerprint = "0" * 64
-    store.save(manifest, event="fixture.deployment_changed", details={})
-    github = FakePublishingGitHub(issue, manifest.base_sha or "")
-
-    with pytest.raises(PolicyError, match="differs from its immutable creation evidence"):
         Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
 
     assert github.calls == []

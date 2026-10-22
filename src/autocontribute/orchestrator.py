@@ -24,7 +24,6 @@ from autocontribute.context import (
     render_text_matches,
 )
 from autocontribute.coordination import LeaseHeartbeatGuard
-from autocontribute.deployment import compute_deployment_fingerprint
 from autocontribute.discovery import (
     DiscoveryService,
     apply_legal_commit_message,
@@ -256,9 +255,7 @@ class Orchestrator:
                 )
                 self.store.remove_finished_workspaces()
                 self._assert_operational()
-                manifest = self.store.create_run(
-                    deployment_fingerprint=compute_deployment_fingerprint(self.config)
-                )
+                manifest = self.store.create_run()
                 commands: list[CommandResult] = []
                 try:
                     manifest = self._prepare(

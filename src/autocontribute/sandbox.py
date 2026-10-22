@@ -24,11 +24,8 @@ _CONTAINER_WORKSPACE: Final = "/workspace"
 _MAX_CAPTURE_BYTES: Final = 2_000_000
 _TRUNCATED_MARKER: Final = b"\n[output truncated by autocontribute]\n"
 _SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-_MIN_DOCKER_DATA_AVAILABLE_BYTES: Final = 1_073_741_824
-_MIN_DOCKER_DATA_AVAILABLE_INODES: Final = 16_384
 _DOCKER_RUNTIME_INFO_FORMAT: Final = (
     '{"security_options":{{json .SecurityOptions}},'
-    '"docker_root_dir":{{json .DockerRootDir}},'
     '"cgroup_version":{{json .CgroupVersion}},'
     '"cgroup_driver":{{json .CgroupDriver}},'
     '"memory_limit":{{json .MemoryLimit}},'
@@ -40,7 +37,6 @@ _DOCKER_RUNTIME_INFO_FORMAT: Final = (
 _DOCKER_RUNTIME_INFO_KEYS: Final = frozenset(
     {
         "security_options",
-        "docker_root_dir",
         "cgroup_version",
         "cgroup_driver",
         "memory_limit",
@@ -58,7 +54,6 @@ _DOCKER_RESOURCE_CAPABILITIES: Final = (
     "pids_limit",
 )
 _DOCKER_CLIENT_ENV_NAMES: Final = (
-    "AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT",
     "DOCKER_API_VERSION",
     "DOCKER_CERT_PATH",
     "DOCKER_CONFIG",
@@ -469,28 +464,6 @@ def detect_docker_daemon_mode(
     options = runtime_info["security_options"]
     if not isinstance(options, list) or not all(isinstance(option, str) for option in options):
         raise SandboxError("Docker daemon returned malformed runtime information")
-    docker_root_dir = runtime_info["docker_root_dir"]
-    if (
-        not isinstance(docker_root_dir, str)
-        or not docker_root_dir.startswith("/")
-        or len(docker_root_dir) > 4_096
-        or any(ord(character) < 32 or ord(character) == 127 for character in docker_root_dir)
-    ):
-        raise SandboxError("Docker daemon returned malformed runtime information")
-    required_docker_root = client_environment.get("AUTOCONTRIBUTE_REQUIRED_DOCKER_ROOT")
-    if required_docker_root is not None:
-        if (
-            not required_docker_root.startswith("/")
-            or os.path.normpath(required_docker_root) != required_docker_root
-            or len(required_docker_root) > 4_096
-            or any(
-                ord(character) < 32 or ord(character) == 127 for character in required_docker_root
-            )
-        ):
-            raise SandboxError("Required Docker data-root path is invalid")
-        if docker_root_dir != required_docker_root:
-            raise SandboxError("Docker daemon is outside the required bounded data-root")
-        _verify_docker_data_headroom(required_docker_root)
     cgroup_driver = runtime_info["cgroup_driver"]
     if (
         runtime_info["cgroup_version"] != "2"
@@ -506,24 +479,6 @@ def detect_docker_daemon_mode(
     if any(option == "name=userns" for option in options):
         raise SandboxError("Docker daemon user namespace remapping is unsupported")
     return "rootless" if rootless_count == 1 else "rootful"
-
-
-def _verify_docker_data_headroom(path: str) -> None:
-    """Fail before launch when the systemd-bounded daemon store is nearly exhausted."""
-
-    try:
-        filesystem = os.statvfs(path)
-    except OSError as exc:
-        raise SandboxError("Could not verify bounded Docker data-root headroom") from exc
-    fragment_size = filesystem.f_frsize
-    available_blocks = filesystem.f_bavail
-    available_inodes = filesystem.f_favail
-    if fragment_size <= 0 or available_blocks < 0 or available_inodes < 0:
-        raise SandboxError("Docker data-root returned invalid headroom information")
-    if available_blocks * fragment_size < _MIN_DOCKER_DATA_AVAILABLE_BYTES:
-        raise SandboxError("Docker data-root is below the required free byte headroom")
-    if available_inodes < _MIN_DOCKER_DATA_AVAILABLE_INODES:
-        raise SandboxError("Docker data-root is below the required free inode headroom")
 
 
 def docker_client_environment() -> dict[str, str]:
