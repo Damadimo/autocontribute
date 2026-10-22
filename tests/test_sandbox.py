@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -174,6 +177,71 @@ def test_each_isolated_command_receives_a_fresh_workspace_copy(tmp_path: Path) -
 
     assert all(result.passed for result in results)
     assert not (workspace / "command-one-generated").exists()
+
+
+def _record_client_kills(
+    monkeypatch: pytest.MonkeyPatch,
+    events: list[str],
+) -> None:
+    kill_process_group = sandbox._kill_process_group
+
+    def recording_kill(process: subprocess.Popen[bytes]) -> None:
+        events.append("kill client")
+        kill_process_group(process)
+
+    monkeypatch.setattr(sandbox, "_kill_process_group", recording_kill)
+
+
+def test_timed_out_command_stops_its_sandbox_before_the_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _record_client_kills(monkeypatch, events)
+
+    result = sandbox._execute(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        command="sleep 30",
+        cwd=tmp_path,
+        timeout_seconds=1,
+        environment=None,
+        cleanup=lambda: events.append("stop sandbox"),
+    )
+
+    assert result.timed_out
+    assert result.exit_code == 124
+    assert events == ["stop sandbox", "kill client"]
+
+
+def test_interrupted_command_stops_its_sandbox_and_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    _record_client_kills(monkeypatch, events)
+    clients: list[subprocess.Popen[bytes]] = []
+
+    class InterruptedPopen(subprocess.Popen[bytes]):
+        def wait(self, timeout: float | None = None) -> int:
+            if not clients:
+                clients.append(self)
+                raise KeyboardInterrupt
+            return super().wait(timeout)
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", InterruptedPopen)
+
+    with pytest.raises(KeyboardInterrupt):
+        sandbox._execute(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            command="sleep 30",
+            cwd=tmp_path,
+            timeout_seconds=30,
+            environment=None,
+            cleanup=lambda: events.append("stop sandbox"),
+        )
+
+    assert events == ["stop sandbox", "kill client"]
+    assert clients[0].returncode == -signal.SIGKILL
 
 
 def test_workspace_symlink_is_rejected(tmp_path: Path) -> None:
