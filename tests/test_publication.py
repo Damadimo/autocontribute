@@ -1027,6 +1027,31 @@ def test_ai_disclosure_inside_fenced_code_is_rejected(tmp_path: Path, fence: str
         )
 
 
+def test_publication_text_rejects_tokens_from_the_shared_credential_patterns(
+    tmp_path: Path,
+) -> None:
+    _config, store, run_id, _ = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    assert manifest.proposal is not None
+    # A Slack token, assembled at runtime so the repository secret scan does not report it.
+    token = "xoxb-" + "1234567890-abcdef"
+    manifest.proposal.pull_request_title = f"Rotate {token} before release"
+
+    with pytest.raises(PolicyError, match="appears to contain a credential") as error:
+        validate_publication_text(manifest)
+
+    assert token not in str(error.value)
+
+
+def test_publication_text_ignores_key_prefixes_inside_words(tmp_path: Path) -> None:
+    _config, store, run_id, _ = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    assert manifest.proposal is not None
+    manifest.proposal.pull_request_title = "Fix the task-scheduler-retry-on-timeout loop"
+
+    validate_publication_text(manifest)
+
+
 def test_tripped_circuit_breaker_blocks_publisher_entry_before_github_work(
     tmp_path: Path,
 ) -> None:

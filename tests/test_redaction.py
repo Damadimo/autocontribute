@@ -3,12 +3,58 @@ from __future__ import annotations
 import pytest
 
 from autocontribute.redaction import (
+    HIGH_CONFIDENCE_TOKEN_PATTERNS,
     MAX_ARTIFACT_CHARACTERS,
     MODEL_INPUT_REDACTION,
     SENSITIVE_FILE_REDACTION,
+    contains_high_confidence_token,
+    contains_host_secret,
+    host_secret_values,
     redact_model_input,
+    redact_text,
+    scrub_for_model,
     truncate_artifact,
 )
+
+# Token-shaped fixtures are assembled at runtime so the repository secret scan does not report
+# this file.
+_TOKENS = {
+    "GitHub token": "ghp_" + "A1b2" * 9,
+    "OpenAI API key": "sk-" + "test-0123456789abcdefghijkl",
+    "AWS access key": "ASIA" + "ABCDEFGHIJKLMNOP",
+    "Google API key": "AIza" + "B" * 35,
+    "GitLab token": "glpat-" + "c" * 20,
+    "npm token": "npm_" + "d" * 36,
+    "Slack token": "xoxb-" + "1234567890-abcdef",
+    "Stripe live key": "sk_live_" + "e" * 24,
+    "JSON Web Token": ".".join(
+        (
+            "eyJ" + "hbGciOiJIUzI1NiJ9",
+            "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIn0",
+            "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+        )
+    ),
+    "private key": "-----BEGIN " + "EC PRIVATE KEY-----\nMHcCAQEE\n-----END EC PRIVATE KEY-----",
+}
+# Probe rows from the phase 2 provider review: routine repository content that the model must
+# see exactly as written.
+_ROUTINE_LINES = (
+    'DATABASE_URL = "postgresql://user:password@localhost:5432/test"',
+    'BROKER = "amqp://guest:guest@localhost//"',
+    'url = f"postgresql://{user}:{password}@{host}/{db}"',
+    'REDIS = "redis://:s3cretpass@localhost:6379/0"',
+    'url = "https://alice:example@db.example.test"',
+    "password = " + '"testpassword123"',
+    'password = "hunter2"',
+    "connect(password=" + '"correcthorse12")',
+    'headers = {"Authorization": "Bearer abcdef123456"}',
+    'headers = {"Authorization": f"Bearer {token}"}',
+    "git clone ssh://git@github.com:22/org/repo.git",
+    "pip install --index-url https://__token__:pypi-AgEIcHlwaS5vcmc@upload.pypi.org/legacy/",
+    f'password = "{MODEL_INPUT_REDACTION}"',
+)
+_HOST_TOKEN = "-".join(("host", "github", "token", "8813"))
+_HOST_MODEL_KEY = "-".join(("host", "model", "key", "5521"))
 
 
 def test_model_input_redacts_credentials_but_preserves_obvious_examples(
@@ -54,3 +100,60 @@ def test_artifact_truncation_boundary_uses_the_exported_limit() -> None:
 
     assert truncate_artifact(exact) == exact
     assert truncate_artifact(exact + "y").endswith("[truncated 1 characters]")
+
+
+def test_host_secret_values_cover_named_and_secret_like_variables() -> None:
+    environ = {
+        "GH_PAT": _HOST_TOKEN,
+        "ANTHROPIC_API_KEY": _HOST_MODEL_KEY,
+        "DATABASE_PASSWORD": "database-password-value",
+        "SHORT_TOKEN": "seven77",
+        "EMPTY_SECRET": "",
+        "HOME": "/home/runner/work",
+        "LANG": "C.UTF-8",
+    }
+
+    values = host_secret_values(["GH_PAT", "UNSET_NAME"], environ)
+
+    assert values == frozenset({_HOST_TOKEN, _HOST_MODEL_KEY, "database-password-value"})
+
+
+@pytest.mark.parametrize("line", _ROUTINE_LINES)
+def test_routine_urls_and_test_passwords_reach_the_model_unchanged(line: str) -> None:
+    host_values = frozenset({_HOST_TOKEN, _HOST_MODEL_KEY})
+
+    assert scrub_for_model(line, host_values) == line
+    assert not contains_host_secret(line, host_values)
+    assert not contains_high_confidence_token(line)
+
+
+def test_every_high_confidence_pattern_has_a_fixture() -> None:
+    assert [label for label, _pattern in HIGH_CONFIDENCE_TOKEN_PATTERNS] == list(_TOKENS)
+
+
+@pytest.mark.parametrize("label", list(_TOKENS))
+def test_high_confidence_tokens_are_replaced_in_model_input_and_artifacts(label: str) -> None:
+    token = _TOKENS[label]
+    text = f"before {token} after\n"
+
+    scrubbed = scrub_for_model(text, frozenset())
+
+    assert contains_high_confidence_token(text)
+    assert scrubbed == f"before {MODEL_INPUT_REDACTION} after\n"
+    assert token not in redact_text(text)
+    assert not contains_host_secret(text, frozenset({_HOST_TOKEN}))
+
+
+def test_exact_host_values_are_replaced_wherever_they_appear() -> None:
+    longer = _HOST_TOKEN + "-rotated"
+    text = f"https://x-access-token:{longer}@github.com/o/r.git and {_HOST_TOKEN}"
+    host_values = frozenset({_HOST_TOKEN, longer})
+
+    scrubbed = scrub_for_model(text, host_values)
+
+    assert contains_host_secret(text, host_values)
+    assert scrubbed == (
+        f"https://x-access-token:{MODEL_INPUT_REDACTION}@github.com/o/r.git "
+        f"and {MODEL_INPUT_REDACTION}"
+    )
+    assert not contains_host_secret(scrubbed, host_values)

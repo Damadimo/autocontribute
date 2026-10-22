@@ -1,28 +1,50 @@
-"""Best-effort credential scrubbing for artifacts and model-bound text."""
+"""Best-effort credential scrubbing for artifacts and model-bound text.
+
+``scrub_for_model`` replaces exact host secret values and high-confidence token patterns.
+``redact_text``, for artifacts and logs, also replaces URL credentials, authorization headers and
+password-style assignments.
+"""
 
 from __future__ import annotations
 
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import PurePosixPath
 from typing import Final
 
 MODEL_INPUT_REDACTION = "[REDACTED:SENSITIVE_MODEL_INPUT]"
 SENSITIVE_FILE_REDACTION = "[REDACTED:SENSITIVE_FILE_CONTENT]"
 MAX_ARTIFACT_CHARACTERS: Final = 100_000
+# Shorter environment values match ordinary text too often to be treated as secrets.
+_MIN_SECRET_VALUE_LENGTH: Final = 8
 
-_TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
-    re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bnpm_[A-Za-z0-9]{20,}\b"),
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
-    re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b"),
-    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S),
+# The one credential pattern set shared by scrubbing, the diff scanner and publication checks.
+HIGH_CONFIDENCE_TOKEN_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    (
+        "GitHub token",
+        re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
+    ),
+    ("OpenAI API key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
+    ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("GitLab token", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}\b")),
+    ("npm token", re.compile(r"\bnpm_[A-Za-z0-9]{20,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("Stripe live key", re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b")),
+    (
+        "JSON Web Token",
+        re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
+    ),
+    # A whole key block when its end marker is present, otherwise the header alone.
+    (
+        "private key",
+        re.compile(
+            r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+            r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY-----)?",
+            re.S,
+        ),
+    ),
 )
 _AUTHORIZATION_VALUE = re.compile(
     r"(?im)(?P<prefix>\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)"
@@ -61,13 +83,43 @@ _SENSITIVE_FILE_NAMES = {
 _SENSITIVE_FILE_SUFFIXES = {".jks", ".key", ".keystore", ".p12", ".pem", ".pfx"}
 
 
+def host_secret_values(env_names: Iterable[str], environ: Mapping[str, str]) -> frozenset[str]:
+    """Return the values of the named variables and of every variable with a secret-like name."""
+
+    names = {*env_names, *(name for name in environ if _SENSITIVE_ENV_NAME.search(name))}
+    return frozenset(
+        value for name in names if len(value := environ.get(name, "")) >= _MIN_SECRET_VALUE_LENGTH
+    )
+
+
+def scrub_for_model(text: str, host_values: frozenset[str]) -> str:
+    """Replace exact host secret values and high-confidence tokens in text bound for a model.
+
+    URL credentials and password assignments in repository content and tool output are almost
+    always fixtures; rewriting them would change code the model has to read and edit exactly.
+    """
+
+    scrubbed = _replace_host_values(text, host_values)
+    for _label, pattern in HIGH_CONFIDENCE_TOKEN_PATTERNS:
+        scrubbed = pattern.sub(MODEL_INPUT_REDACTION, scrubbed)
+    return scrubbed
+
+
+def contains_host_secret(text: str, host_values: frozenset[str]) -> bool:
+    return any(value in text for value in host_values)
+
+
+def contains_high_confidence_token(text: str) -> bool:
+    return any(pattern.search(text) for _label, pattern in HIGH_CONFIDENCE_TOKEN_PATTERNS)
+
+
 def redact_text(text: str, *, secret_env_names: Iterable[str] = ()) -> str:
     redacted = text
     for name in secret_env_names:
         value = os.environ.get(name)
-        if value and len(value) >= 8:
+        if value and len(value) >= _MIN_SECRET_VALUE_LENGTH:
             redacted = redacted.replace(value, f"[REDACTED:{name}]")
-    for pattern in _TOKEN_PATTERNS:
+    for _label, pattern in HIGH_CONFIDENCE_TOKEN_PATTERNS:
         redacted = pattern.sub("[REDACTED:CREDENTIAL]", redacted)
     redacted = _AUTHORIZATION_VALUE.sub(_redact_named_value, redacted)
     redacted = _URL_PASSWORD.sub(_redact_named_value, redacted)
@@ -101,14 +153,15 @@ def redact_model_input(
     if source_path is not None and is_sensitive_path(source_path):
         return SENSITIVE_FILE_REDACTION
 
-    redacted = text
-    names = set(secret_env_names)
-    names.update(name for name in os.environ if _SENSITIVE_ENV_NAME.search(name))
-    for name in names:
-        value = os.environ.get(name)
-        if value and len(value) >= 8:
-            redacted = redacted.replace(value, MODEL_INPUT_REDACTION)
+    redacted = _replace_host_values(text, host_secret_values(secret_env_names, os.environ))
     return redact_text(redacted)
+
+
+def _replace_host_values(text: str, host_values: frozenset[str]) -> str:
+    # Longest first, so a value that contains another is replaced whole.
+    for value in sorted(host_values, key=lambda value: (-len(value), value)):
+        text = text.replace(value, MODEL_INPUT_REDACTION)
+    return text
 
 
 def _redact_named_value(match: re.Match[str]) -> str:
@@ -144,12 +197,17 @@ def truncate_artifact(text: str, *, limit: int = MAX_ARTIFACT_CHARACTERS) -> str
 
 
 __all__ = [
+    "HIGH_CONFIDENCE_TOKEN_PATTERNS",
     "MAX_ARTIFACT_CHARACTERS",
     "MODEL_INPUT_REDACTION",
     "SENSITIVE_FILE_REDACTION",
     "contains_credential_material",
+    "contains_high_confidence_token",
+    "contains_host_secret",
+    "host_secret_values",
     "is_sensitive_path",
     "redact_model_input",
     "redact_text",
+    "scrub_for_model",
     "truncate_artifact",
 ]
