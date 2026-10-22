@@ -19,6 +19,7 @@ from autocontribute.domain import (
     PatchProposal,
     RepositoryInfo,
     ReviewScores,
+    RunManifest,
     RunStatus,
 )
 from autocontribute.exceptions import (
@@ -2031,6 +2032,19 @@ def test_builder_edit_entering_unseen_agents_scope_fails_before_workspace_mutati
         }
     )
     store = RunStore(config.storage.path)
+    contents_at_failure: list[str] = []
+    transition = store.transition
+
+    def record_contents_at_failure(
+        manifest: RunManifest, target: RunStatus, *, reason: str
+    ) -> RunManifest:
+        if target == RunStatus.FAILED:
+            workspace = store.workspaces_dir / manifest.run_id / "repository"
+            opaque = workspace / "other" / "opaque.py"
+            contents_at_failure.append(opaque.read_text(encoding="utf-8"))
+        return transition(manifest, target, reason=reason)
+
+    monkeypatch.setattr(store, "transition", record_contents_at_failure)
 
     with Orchestrator(
         config,
@@ -2048,8 +2062,8 @@ def test_builder_edit_entering_unseen_agents_scope_fails_before_workspace_mutati
     assert "other/AGENTS.md" in (manifest.error or "")
     assert providers["builder"].calls == 1
     assert providers["critic"].calls == 0
-    workspace = store.workspace_dir(manifest.run_id) / "repository"
-    assert (workspace / "other" / "opaque.py").read_text(encoding="utf-8") == "answer = 1\n"
+    assert contents_at_failure == ["answer = 1\n"]
+    assert not (store.workspaces_dir / manifest.run_id).exists()
 
 
 def test_excess_global_guidance_fails_before_any_model_call(
@@ -2339,6 +2353,36 @@ def test_ineligible_explicit_issue_skips_without_spending_model_tokens(tmp_path:
     assert manifest.status == RunStatus.SKIPPED
     assert "already assigned" in (manifest.skip_reason or "")
     assert all(provider.calls == 0 for provider in providers.values())
+
+
+def test_run_deletes_workspaces_left_by_finished_runs(tmp_path: Path) -> None:
+    sha = "a" * 40
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    finished = store.create_run()
+    store.transition(finished, RunStatus.FAILED, reason="an earlier run failed")
+    (store.workspace_dir(finished.run_id) / "repository").mkdir()
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(assigned=True), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=_providers(),  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
+
+    assert manifest.status == RunStatus.SKIPPED
+    assert not (store.workspaces_dir / finished.run_id).exists()
+    assert (store.runs_dir / finished.run_id / "manifest.json").is_file()
 
 
 def test_candidate_claim_failure_cannot_attach_candidate_through_failure_record(

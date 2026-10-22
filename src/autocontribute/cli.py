@@ -7,7 +7,7 @@ import json
 import os
 import re
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
@@ -16,7 +16,6 @@ import typer
 import yaml
 from rich.console import Console
 from rich.table import Table
-from rich.text import Text
 
 from autocontribute import __version__
 from autocontribute.config import (
@@ -54,7 +53,6 @@ from autocontribute.systemd_assets import (
     verify_installed_systemd_assets,
     verify_source_systemd_assets,
 )
-from autocontribute.workspace_gc import WorkspaceGCReport, collect_terminal_workspaces
 
 app = typer.Typer(
     name="autocontribute",
@@ -63,10 +61,6 @@ app = typer.Typer(
 )
 runs_app = typer.Typer(help="List, show, or cancel contribution runs.", no_args_is_help=True)
 config_app = typer.Typer(help="Inspect configuration safely.", no_args_is_help=True)
-state_app = typer.Typer(
-    help="Clean up disposable repository workspaces.",
-    no_args_is_help=True,
-)
 lifecycle_app = typer.Typer(
     help="Observe published pull requests and persist maintainer/CI safety signals.",
     no_args_is_help=True,
@@ -85,7 +79,6 @@ deployment_app = typer.Typer(
 )
 app.add_typer(runs_app, name="runs")
 app.add_typer(config_app, name="config")
-app.add_typer(state_app, name="state")
 app.add_typer(lifecycle_app, name="lifecycle")
 app.add_typer(safety_app, name="safety")
 app.add_typer(policy_app, name="policy")
@@ -617,61 +610,6 @@ def attest_policy(
     console.print(yaml.safe_dump(snippet, sort_keys=False), markup=False)
 
 
-@state_app.command(name="gc-workspaces")
-def gc_workspaces(
-    config: ConfigOption = DEFAULT_CONFIG,
-    older_than_days: Annotated[
-        int,
-        typer.Option(
-            "--older-than-days",
-            min=1,
-            max=3_650,
-            help="Only inspect terminal workspaces older than this many days.",
-        ),
-    ] = 7,
-    limit: Annotated[
-        int,
-        typer.Option(
-            min=1,
-            max=1_000,
-            help=(
-                "Maximum actionable deletions in this invocation; retained entries are "
-                "reported without consuming this budget."
-            ),
-        ),
-    ] = 25,
-    execute: Annotated[
-        bool,
-        typer.Option(
-            "--execute",
-            help="Delete entries that pass every safety check; the default is a dry run.",
-        ),
-    ] = False,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Emit the machine-readable cleanup report."),
-    ] = False,
-) -> None:
-    """Report or safely remove old terminal repository workspaces."""
-
-    settings = _config(config)
-    try:
-        report = collect_terminal_workspaces(
-            RunStore(settings.storage.path),
-            older_than=timedelta(days=older_than_days),
-            limit=limit,
-            execute=execute,
-        )
-    except (AutocontributeError, ValueError) as exc:
-        _fail(str(exc))
-    if json_output:
-        console.print(report.model_dump_json(indent=2), markup=False, soft_wrap=True)
-    else:
-        _print_workspace_gc_report(report)
-    if report.errors:
-        raise typer.Exit(2)
-
-
 @lifecycle_app.command(name="sync")
 def lifecycle_sync(config: ConfigOption = DEFAULT_CONFIG) -> None:
     """Poll every durable open pull request and activate any hard safety stop."""
@@ -1002,38 +940,6 @@ def _print_lifecycle_result(result: LifecycleSyncResult) -> None:
                 f"{signal.reason} ({signal.source_url})",
                 markup=False,
             )
-
-
-def _print_workspace_gc_report(report: WorkspaceGCReport) -> None:
-    mode = "EXECUTE" if report.execute else "DRY RUN"
-    color = "green" if report.execute else "yellow"
-    console.print(
-        f"[{color}]Workspace cleanup: {mode}[/{color}] "
-        f"(terminal cutoff {report.cutoff.isoformat()}, deletion limit {report.limit})"
-    )
-    if report.items:
-        table = Table("Run", "Status", "Action", "Entries", "Bytes", "Reason")
-        for item in report.items:
-            table.add_row(
-                Text(json.dumps(item.run_id, ensure_ascii=True)[1:-1]),
-                item.status.value,
-                item.action,
-                f"{item.entries:,}",
-                f"{item.bytes:,}",
-                item.reason,
-                style="red" if item.error else None,
-            )
-        console.print(table)
-    console.print(
-        "Summary: "
-        f"{report.deleted} deleted, {report.would_delete} would delete, "
-        f"{report.retained} retained, {report.errors} error(s), "
-        f"{report.protected_nonterminal} nonterminal workspace(s) protected, "
-        f"{report.younger_terminal} terminal workspace(s) inside retention, "
-        f"{report.truncated} old terminal candidate(s) deferred, "
-        f"{report.stale_quarantines_deleted}/{report.stale_quarantines} "
-        "stale quarantine(s) reclaimed."
-    )
 
 
 def _refresh_contribution_stamp() -> None:
