@@ -1255,7 +1255,9 @@ def test_latest_replication_verification_rejects_ambiguous_or_symlinked_marker(
     marker = tmp_path / "health" / "worker-attempt"
     marker.parent.mkdir(mode=0o700)
     marker.touch(mode=0o600)
-    same_ns = bundle.stat().st_mtime_ns
+    same_ns = int(_NOW.timestamp() * 1_000_000_000) + 1_000_000_000
+    os.utime(bundle, ns=(same_ns, same_ns))
+    os.utime(receipt, ns=(same_ns + 1_000_000_000, same_ns + 1_000_000_000))
     os.utime(marker, ns=(same_ns, same_ns))
 
     with pytest.raises(StateError, match="not unambiguously newer"):
@@ -1267,6 +1269,7 @@ def test_latest_replication_verification_rejects_ambiguous_or_symlinked_marker(
             region="ca-central-1",
             prefix="autocontribute/production",
             required_after=marker,
+            now=_NOW + timedelta(seconds=3),
         )
 
     marker_link = marker.with_name("worker-attempt-link")
@@ -1280,6 +1283,7 @@ def test_latest_replication_verification_rejects_ambiguous_or_symlinked_marker(
             region="ca-central-1",
             prefix="autocontribute/production",
             required_after=marker_link,
+            now=_NOW + timedelta(seconds=3),
         )
 
 
