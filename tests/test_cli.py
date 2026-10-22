@@ -1375,7 +1375,7 @@ def test_manual_retry_unchanged_is_forwarded_to_orchestrator(
             self,
             *,
             issue_reference: str | None = None,
-            invocation_mode: RunInvocationMode = RunInvocationMode.AUTOMATIC,
+            invocation_mode: RunInvocationMode,
             retry_authorization: CandidateRetryAuthorization | None = None,
         ):
             assert issue_reference == "example/project#42"
@@ -1441,7 +1441,7 @@ def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monk
             self,
             *,
             issue_reference: str | None = None,
-            invocation_mode: RunInvocationMode = RunInvocationMode.AUTOMATIC,
+            invocation_mode: RunInvocationMode,
             retry_authorization: CandidateRetryAuthorization | None = None,
         ):
             assert issue_reference is None
@@ -1686,7 +1686,7 @@ def test_auto_path_resyncs_lifecycle_immediately_before_publisher(
             self,
             *,
             issue_reference: str | None = None,
-            invocation_mode: RunInvocationMode = RunInvocationMode.AUTOMATIC,
+            invocation_mode: RunInvocationMode,
             retry_authorization: CandidateRetryAuthorization | None = None,
         ):
             assert issue_reference is None
@@ -2116,7 +2116,7 @@ def test_lifecycle_sync_adopts_existing_pr_without_automatic_opt_in(
     config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
     settings = load_config(config)
     settings.publishing.mode = "auto"
-    monkeypatch.delenv(settings.publishing.auto_publish_env, raising=False)
+    monkeypatch.delenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", raising=False)
     store = RunStore(state)
     submitting = store.create_run()
     submitting.status = RunStatus.SUBMITTING
@@ -2127,14 +2127,14 @@ def test_lifecycle_sync_adopts_existing_pr_without_automatic_opt_in(
         def __init__(self, settings: object, store: RunStore, github: object) -> None:
             self.store = store
 
-        def reconcile_submitting(self, run_id: str) -> None:
+        def _reconcile_submitting(self, run_id: str, *, lease_guard: object) -> None:
             calls.append(f"reconcile:{run_id}")
             manifest = self.store.get(run_id)
             manifest.status = RunStatus.PR_OPEN
             manifest.pull_request_url = "https://github.com/example/project/pull/7"
             self.store.save(manifest, event="test.reconciled", details={})
 
-        def publish(self, run_id: str) -> None:
+        def _publish(self, run_id: str, *, lease_guard: object) -> None:
             pytest.fail(f"read-only reconciliation must not publish {run_id}")
 
     def fake_sync(
@@ -2167,11 +2167,10 @@ def test_lifecycle_sync_adopts_existing_pr_without_automatic_opt_in(
 
 
 @pytest.mark.parametrize(
-    ("mode", "auto_publish_env", "opt_in", "publishes", "failure"),
+    ("mode", "opt_in", "publishes", "failure"),
     [
         pytest.param(
             "review_required",
-            None,
             None,
             False,
             "publishing.mode is review_required",
@@ -2180,27 +2179,17 @@ def test_lifecycle_sync_adopts_existing_pr_without_automatic_opt_in(
         pytest.param(
             "auto",
             None,
-            None,
             False,
             "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH is not enabled",
             id="auto-opt-in-missing",
         ),
-        pytest.param("auto", None, "yes", True, None, id="auto-opt-in-enabled"),
-        pytest.param(
-            "auto",
-            "CI",
-            "true",
-            False,
-            "CI is not enabled as the dedicated automatic-publication switch",
-            id="generic-ci-variable-is-not-opt-in",
-        ),
+        pytest.param("auto", "yes", True, None, id="auto-opt-in-enabled"),
     ],
 )
 def test_scheduled_lifecycle_resumes_only_with_live_automatic_authorization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     mode: str,
-    auto_publish_env: str | None,
     opt_in: str | None,
     publishes: bool,
     failure: str | None,
@@ -2210,12 +2199,10 @@ def test_scheduled_lifecycle_resumes_only_with_live_automatic_authorization(
     config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
     settings = load_config(config)
     settings.publishing.mode = mode  # type: ignore[assignment]
-    if auto_publish_env is not None:
-        settings.publishing.auto_publish_env = auto_publish_env
     if opt_in is not None:
-        monkeypatch.setenv(settings.publishing.auto_publish_env, opt_in)
+        monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", opt_in)
     elif mode == "auto":
-        monkeypatch.delenv(settings.publishing.auto_publish_env, raising=False)
+        monkeypatch.delenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", raising=False)
         monkeypatch.setenv("CI", "true")
     store = RunStore(state)
     submitting = store.create_run()
@@ -2227,11 +2214,11 @@ def test_scheduled_lifecycle_resumes_only_with_live_automatic_authorization(
         def __init__(self, settings: object, store: RunStore, github: object) -> None:
             pass
 
-        def reconcile_submitting(self, run_id: str) -> None:
+        def _reconcile_submitting(self, run_id: str, *, lease_guard: object) -> None:
             calls.append(f"reconcile:{run_id}")
             raise PublicationResumeRequired("no remote pull request yet")
 
-        def publish(self, run_id: str) -> None:
+        def _publish(self, run_id: str, *, lease_guard: object) -> None:
             calls.append(f"publish:{run_id}")
 
     def fake_sync(
@@ -2294,7 +2281,7 @@ def test_lifecycle_sync_reconciles_target_submitting_run_before_exact_publicatio
         def __init__(self, settings: object, store: RunStore, github: object) -> None:
             pass
 
-        def reconcile_submitting(self, run_id: str) -> None:
+        def _reconcile_submitting(self, run_id: str, *, lease_guard: object) -> None:
             calls.append(f"reconcile:{run_id}")
 
     def fake_sync(
@@ -2336,7 +2323,7 @@ def test_lifecycle_sync_reuses_one_publication_lease_for_recovery_and_observatio
     config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
     settings = load_config(config)
     settings.publishing.mode = "auto"
-    monkeypatch.setenv(settings.publishing.auto_publish_env, "1")
+    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
     store = RunStore(state)
     submitting = store.create_run()
     submitting.status = RunStatus.SUBMITTING
@@ -2346,12 +2333,6 @@ def test_lifecycle_sync_reuses_one_publication_lease_for_recovery_and_observatio
     class FakePublisher:
         def __init__(self, settings: object, owned_store: RunStore, github: object) -> None:
             assert owned_store is store
-
-        def reconcile_submitting(self, run_id: str) -> None:
-            pytest.fail(f"nested public reconciliation attempted for {run_id}")
-
-        def publish(self, run_id: str) -> None:
-            pytest.fail(f"nested public publication attempted for {run_id}")
 
         def _reconcile_submitting(self, run_id: str, *, lease_guard: object) -> None:
             assert store.get_lease("autocontribute.publish") is not None
@@ -2416,11 +2397,11 @@ def test_lifecycle_sync_resumes_only_the_explicit_manual_retry_target(
         def __init__(self, settings: object, store: RunStore, github: object) -> None:
             pass
 
-        def reconcile_submitting(self, run_id: str) -> None:
+        def _reconcile_submitting(self, run_id: str, *, lease_guard: object) -> None:
             calls.append(f"reconcile:{run_id}")
             raise PublicationResumeRequired("no remote pull request yet")
 
-        def publish(self, run_id: str) -> None:
+        def _publish(self, run_id: str, *, lease_guard: object) -> None:
             calls.append(f"publish:{run_id}")
 
     def fake_sync(
@@ -2474,7 +2455,7 @@ def test_lifecycle_sync_observes_and_continues_reconciliation_before_failing_clo
         def __init__(self, settings: object, store: RunStore, github: object) -> None:
             pass
 
-        def reconcile_submitting(self, run_id: str) -> None:
+        def _reconcile_submitting(self, run_id: str, *, lease_guard: object) -> None:
             calls.append(f"reconcile:{run_id}")
             if run_id == ambiguous.run_id:
                 raise StateError("publication remains ambiguous")
@@ -2524,7 +2505,7 @@ def test_lifecycle_sync_stops_reconciliation_after_lease_takeover(
         def __init__(self, settings: object, store: RunStore, github: object) -> None:
             pass
 
-        def reconcile_submitting(self, run_id: str) -> None:
+        def _reconcile_submitting(self, run_id: str, *, lease_guard: object) -> None:
             calls.append(f"reconcile:{run_id}")
             lease = store.get_lease("autocontribute.publish")
             assert lease is not None

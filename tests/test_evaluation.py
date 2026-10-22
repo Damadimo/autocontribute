@@ -392,7 +392,7 @@ def test_interrupted_anchored_record_can_be_recovered_with_exact_arguments(
         notes="No actionable issue was available.",
     )
     path = evaluations.root / f"{run.run_id}.json"
-    anchor = json.loads(store.evaluation_record_anchors()[0]["details"])
+    anchor = json.loads(store.evaluation_revision_anchors()[0]["details"])
     temporary = path.with_name(f"{run.run_id}.{anchor['evaluation_hash']}.json.tmp")
     path.replace(temporary)
 

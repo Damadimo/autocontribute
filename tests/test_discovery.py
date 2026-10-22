@@ -62,6 +62,10 @@ class FakeGitHub:
         del repository
         return ORGANIZATION_REF
 
+    def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
+        del repository, ref, max_files
+        return ["CONTRIBUTING.md"]
+
 
 class PolicyGitHub(FakeGitHub):
     def __init__(self, files: dict[tuple[str, str], str]) -> None:
@@ -77,6 +81,10 @@ class PolicyGitHub(FakeGitHub):
     ) -> str | None:
         del ref, max_bytes
         return self.files.get((repository, path))
+
+    def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
+        del ref, max_files
+        return [path for owner_repository, path in self.files if owner_repository == repository]
 
 
 class CandidateDiscoveryGitHub(FakeGitHub):
@@ -1335,6 +1343,10 @@ def test_present_but_unreadable_policy_file_stops_discovery(tmp_path) -> None:
                 max_bytes=max_bytes,
             )
 
+        def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
+            del repository, ref, max_files
+            return ["CONTRIBUTING.md", "SECURITY.md"]
+
     service = DiscoveryService(  # type: ignore[arg-type]
         AutocontributeConfig(), UnreadablePolicyGitHub(), RunStore(tmp_path)
     )
@@ -1420,6 +1432,10 @@ def test_policy_reader_rechecks_size_when_github_adapter_ignores_limit(tmp_path)
         ) -> str | None:
             del repository, path, ref, max_bytes
             return "x" * (MAX_POLICY_FILE_BYTES + 1)
+
+        def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
+            del repository, ref, max_files
+            return ["CONTRIBUTING.md"]
 
     service = DiscoveryService(  # type: ignore[arg-type]
         AutocontributeConfig(), OversizedPolicyGitHub({}), RunStore(tmp_path)

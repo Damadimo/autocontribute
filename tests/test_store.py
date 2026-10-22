@@ -13,11 +13,11 @@ import pytest
 
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.domain import IssueCandidate, RunManifest, RunStatus
+from autocontribute.evaluation import EvaluationStore
 from autocontribute.exceptions import StateError
 from autocontribute.github import PullRequestCommit, PullRequestDetails
 from autocontribute.issue_revision import compute_issue_revision
 from autocontribute.lifecycle import (
-    LifecycleHistoryCapability,
     PullRequestLifecycleSnapshot,
     parse_lifecycle_snapshot_json,
 )
@@ -105,198 +105,6 @@ def test_required_workspace_root_rejects_invalid_values(
         RunStore(tmp_path / "state")
 
 
-def _legacy_database(root: Path) -> RunManifest:
-    root.mkdir(parents=True, exist_ok=True)
-    now = datetime(2025, 1, 1, tzinfo=UTC)
-    run = RunManifest(
-        run_id="legacy-run",
-        status=RunStatus.QUEUED,
-        created_at=now,
-        updated_at=now,
-    )
-    with sqlite3.connect(root / "state.sqlite3") as connection:
-        connection.executescript(
-            """
-            CREATE TABLE runs (
-                run_id TEXT PRIMARY KEY,
-                status TEXT NOT NULL,
-                repository TEXT,
-                issue_number INTEGER,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                manifest_json TEXT NOT NULL
-            );
-            CREATE INDEX runs_status_idx ON runs(status);
-            CREATE INDEX runs_candidate_idx ON runs(repository, issue_number, status);
-            CREATE TABLE events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL REFERENCES runs(run_id),
-                occurred_at TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                details_json TEXT NOT NULL,
-                previous_hash TEXT NOT NULL,
-                event_hash TEXT NOT NULL UNIQUE
-            );
-            CREATE INDEX events_run_idx ON events(run_id, id);
-            """
-        )
-        connection.execute(
-            """
-            INSERT INTO runs(
-                run_id, status, created_at, updated_at, manifest_json
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                run.run_id,
-                run.status.value,
-                now.isoformat(),
-                now.isoformat(),
-                run.model_dump_json(),
-            ),
-        )
-        details_json = "{}"
-        previous_hash = "0" * 64
-        payload = json.dumps(
-            {
-                "run_id": run.run_id,
-                "occurred_at": now.isoformat(),
-                "event_type": "run.created",
-                "details": details_json,
-                "previous_hash": previous_hash,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        event_hash = hashlib.sha256(payload.encode()).hexdigest()
-        connection.execute(
-            """
-            INSERT INTO events(
-                run_id, occurred_at, event_type, details_json, previous_hash, event_hash
-            ) VALUES (?, ?, 'run.created', '{}', ?, ?)
-            """,
-            (run.run_id, now.isoformat(), previous_hash, event_hash),
-        )
-    return run
-
-
-def _downgrade_current_database_to_v7(database: Path) -> None:
-    """Remove the v8 objects, leaving the exact canonical v7 schema behind."""
-
-    connection = sqlite3.connect(database)
-    try:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.executescript(
-            """
-            DROP TABLE legacy_candidate_retry_overrides;
-            DROP TABLE candidate_retry_authorizations;
-            DROP INDEX runs_active_candidate_idx;
-            DROP INDEX runs_candidate_revision_idx;
-            CREATE INDEX runs_candidate_revision_idx
-            ON runs(repository, issue_number, issue_revision, status);
-            UPDATE schema_metadata SET schema_version = 7 WHERE singleton = 1;
-            """
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-
-def _downgrade_current_database_to_v6(database: Path) -> None:
-    """Remove issue revisions from canonical v7, leaving canonical v6 behind."""
-
-    _downgrade_current_database_to_v7(database)
-    connection = sqlite3.connect(database)
-    try:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.executescript(
-            """
-            DROP INDEX runs_candidate_revision_idx;
-            ALTER TABLE runs DROP COLUMN issue_revision;
-            UPDATE schema_metadata SET schema_version = 6 WHERE singleton = 1;
-            """
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-
-def _downgrade_current_database_to_v5(database: Path) -> None:
-    """Remove the v7/v6 fields, leaving the exact canonical v5 schema behind."""
-
-    _downgrade_current_database_to_v6(database)
-    connection = sqlite3.connect(database)
-    try:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.executescript(
-            """
-            ALTER TABLE publication_gate_holds DROP COLUMN outcome_corpus_cursor;
-            UPDATE schema_metadata SET schema_version = 5 WHERE singleton = 1;
-            """
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-
-def _downgrade_current_database_to_v4(database: Path) -> None:
-    """Remove the v7/v6/v5 objects, leaving the exact canonical v4 schema behind."""
-
-    _downgrade_current_database_to_v5(database)
-    connection = sqlite3.connect(database)
-    try:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.executescript(
-            """
-            DROP TABLE manifest_artifact_sync;
-            UPDATE schema_metadata SET schema_version = 4 WHERE singleton = 1;
-            """
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-
-def _downgrade_current_database_to_v3(database: Path) -> None:
-    """Remove only the v5/v4 objects, leaving the exact canonical v3 schema behind."""
-
-    _downgrade_current_database_to_v4(database)
-    connection = sqlite3.connect(database)
-    try:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.executescript(
-            """
-            DROP TABLE publication_gate_holds;
-            DROP TABLE lease_generations;
-            ALTER TABLE runs DROP COLUMN event_head_hash;
-            ALTER TABLE runs DROP COLUMN event_count;
-            UPDATE schema_metadata SET schema_version = 3 WHERE singleton = 1;
-            """
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-
-def _downgrade_current_database_to_v2(database: Path) -> None:
-    """Remove the v4 and v3 objects, leaving the exact canonical v2 schema behind."""
-
-    _downgrade_current_database_to_v3(database)
-    connection = sqlite3.connect(database)
-    try:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.executescript(
-            """
-            DROP INDEX publication_reservations_repository_idx;
-            DROP INDEX publication_reservations_reserved_at_idx;
-            DROP TABLE publication_reservations;
-            UPDATE schema_metadata SET schema_version = 2 WHERE singleton = 1;
-            """
-        )
-        connection.commit()
-    finally:
-        connection.close()
-
-
 def _set_status(store: RunStore, run: RunManifest, status: RunStatus) -> None:
     run.status = status
     store.save(run, event="test.status", details={"status": status.value})
@@ -348,20 +156,6 @@ def _lifecycle_snapshot(*, head_sha: str = "a" * 40) -> PullRequestLifecycleSnap
         timeline_events=(),
         references=(),
     )
-
-
-def _legacy_lifecycle_snapshot_json(*, include_pull_request_node_id: bool = True) -> str:
-    payload = json.loads(_lifecycle_snapshot().to_json())
-    del payload["commits"]
-    del payload["evidence_version"]
-    del payload["timeline_events"]
-    del payload["timeline_item_count"]
-    del payload["pull_request"]["commit_count"]
-    if not include_pull_request_node_id:
-        del payload["pull_request"]["node_id"]
-    for reference in payload["references"]:
-        del reference["node_id"]
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def _append_lifecycle_snapshot_event(
@@ -485,64 +279,6 @@ def _delete_tail_event(
         """,
         (row[1], run_id),
     )
-
-
-def _historical_v7_candidate_retry_database(
-    root: Path,
-) -> tuple[RunManifest, RunManifest, int, str]:
-    """Create canonical v7 state containing its historical four-field retry event."""
-
-    store = RunStore(root)
-    candidate = _issue_candidate()
-    prior = _candidate_run(store, candidate=candidate, status=RunStatus.REJECTED)
-    retry = store.create_run()
-    _set_status(store, retry, RunStatus.DISCOVERING)
-    retry.candidate = candidate.model_copy(deep=True)
-    lease = store.acquire_lease(
-        "autocontribute.run",
-        f"legacy-retry-fixture-{retry.run_id}",
-        ttl=timedelta(minutes=5),
-    )
-    assert lease is not None
-    try:
-        store.claim_candidate(
-            retry,
-            lease=lease,
-            retry_authorization=CandidateRetryAuthorization(
-                actor="historical-operator",
-                reason="Authorization was not durably structured before schema v8.",
-            ),
-        )
-    finally:
-        assert store.release_lease(lease.name, lease.owner, lease.generation)
-
-    revision = compute_issue_revision(candidate)
-    with closing(sqlite3.connect(store.database_path)) as connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        _rewrite_tail_event_details(
-            connection,
-            run_id=retry.run_id,
-            event_type="candidate.retry_override",
-            details={
-                "issue": candidate.reference,
-                "issue_revision": revision,
-                "prior_run_id": prior.run_id,
-                "prior_status": prior.status.value,
-            },
-        )
-        event = connection.execute(
-            """
-            SELECT id, event_hash FROM events
-            WHERE run_id = ? AND event_type = 'candidate.retry_override'
-            """,
-            (retry.run_id,),
-        ).fetchone()
-        assert event is not None
-        event_id, event_hash = event
-        connection.commit()
-
-    _downgrade_current_database_to_v7(store.database_path)
-    return prior, retry, event_id, event_hash
 
 
 def _reserve_gate(
@@ -1002,14 +738,19 @@ def test_fresh_database_has_current_version_and_all_v8_tables(tmp_path: Path) ->
                 "PRAGMA table_info(candidate_retry_authorizations)"
             ).fetchall()
         ]
-        legacy_override_columns = [
-            row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(legacy_candidate_retry_overrides)"
-            ).fetchall()
-        ]
+        gate_hold_not_null = {
+            row[1]: row[3]
+            for row in connection.execute("PRAGMA table_info(publication_gate_holds)").fetchall()
+        }
 
     assert store.schema_version == CURRENT_SCHEMA_VERSION == 8
+    assert gate_hold_not_null == {
+        "run_id": 0,
+        "deployment_fingerprint": 1,
+        "corpus_cursor": 1,
+        "held_at": 1,
+        "outcome_corpus_cursor": 1,
+    }
     assert "issue_revision" in run_columns
     assert [row[2] for row in revision_index] == [
         "repository",
@@ -1040,12 +781,6 @@ def test_fresh_database_has_current_version_and_all_v8_tables(tmp_path: Path) ->
         "reason",
         "authorized_at",
     ]
-    assert legacy_override_columns == [
-        "event_id",
-        "run_id",
-        "event_hash",
-        "migrated_at",
-    ]
     assert tables == {
         "schema_metadata",
         "runs",
@@ -1059,367 +794,7 @@ def test_fresh_database_has_current_version_and_all_v8_tables(tmp_path: Path) ->
         "publication_gate_holds",
         "manifest_artifact_sync",
         "candidate_retry_authorizations",
-        "legacy_candidate_retry_overrides",
     }
-
-
-def test_legacy_database_migrates_transactionally_without_losing_data(tmp_path: Path) -> None:
-    root = tmp_path / "state"
-    legacy = _legacy_database(root)
-
-    store = RunStore(root)
-
-    assert store.schema_version == CURRENT_SCHEMA_VERSION == 8
-    assert store.get(legacy.run_id) == legacy
-    assert len(store.events(legacy.run_id)) == 1
-    assert store.circuit_breaker_status().is_tripped is False
-    store.verify_event_chains()
-
-
-def test_v7_migration_preserves_rows_and_installs_fenced_candidate_claim_schema(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    candidate_run = _candidate_run(store, status=RunStatus.SKIPPED)
-    ordinary_run = store.create_run()
-    with closing(sqlite3.connect(store.database_path)) as connection:
-        expected_runs = connection.execute(
-            """
-            SELECT run_id, status, repository, issue_number, issue_revision,
-                   created_at, updated_at, manifest_json, event_count, event_head_hash
-            FROM runs ORDER BY run_id
-            """
-        ).fetchall()
-        expected_events = connection.execute(
-            """
-            SELECT id, run_id, occurred_at, event_type, details_json,
-                   previous_hash, event_hash
-            FROM events ORDER BY id
-            """
-        ).fetchall()
-    _downgrade_current_database_to_v7(store.database_path)
-
-    with closing(sqlite3.connect(store.database_path)) as connection:
-        assert connection.execute(
-            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-        ).fetchone() == (7,)
-        assert connection.execute(
-            """
-            SELECT count(*) FROM sqlite_master
-            WHERE name IN (
-                'candidate_retry_authorizations',
-                'legacy_candidate_retry_overrides',
-                'runs_active_candidate_idx'
-            )
-            """
-        ).fetchone() == (0,)
-        assert [
-            row[4]
-            for row in connection.execute(
-                "PRAGMA index_xinfo(runs_candidate_revision_idx)"
-            ).fetchall()
-            if row[5]
-        ] == ["BINARY", "BINARY", "BINARY", "BINARY"]
-
-    migrated = RunStore(root)
-
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
-    assert migrated.get(candidate_run.run_id) == candidate_run
-    assert migrated.get(ordinary_run.run_id) == ordinary_run
-    with sqlite3.connect(migrated.database_path) as connection:
-        assert (
-            connection.execute(
-                """
-            SELECT run_id, status, repository, issue_number, issue_revision,
-                   created_at, updated_at, manifest_json, event_count, event_head_hash
-            FROM runs ORDER BY run_id
-            """
-            ).fetchall()
-            == expected_runs
-        )
-        assert (
-            connection.execute(
-                """
-            SELECT id, run_id, occurred_at, event_type, details_json,
-                   previous_hash, event_hash
-            FROM events ORDER BY id
-            """
-            ).fetchall()
-            == expected_events
-        )
-        assert [
-            row[4]
-            for row in connection.execute(
-                "PRAGMA index_xinfo(runs_candidate_revision_idx)"
-            ).fetchall()
-            if row[5]
-        ] == ["NOCASE", "BINARY", "BINARY", "BINARY"]
-        indexes = {row[1]: row for row in connection.execute("PRAGMA index_list(runs)").fetchall()}
-        assert indexes["runs_active_candidate_idx"][2] == 1
-        assert indexes["runs_active_candidate_idx"][4] == 1
-        assert connection.execute(
-            "SELECT count(*) FROM candidate_retry_authorizations"
-        ).fetchone() == (0,)
-        assert connection.execute(
-            "SELECT count(*) FROM legacy_candidate_retry_overrides"
-        ).fetchone() == (0,)
-
-
-def test_v7_migration_marks_historical_retry_override_and_restores_it(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / "state"
-    prior, retry, event_id, event_hash = _historical_v7_candidate_retry_database(root)
-
-    migrated = RunStore(root)
-
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
-    assert migrated.get(prior.run_id) == prior
-    assert migrated.get(retry.run_id) == retry
-    with sqlite3.connect(migrated.database_path) as connection:
-        marker = connection.execute(
-            """
-            SELECT event_id, run_id, event_hash, migrated_at
-            FROM legacy_candidate_retry_overrides
-            """
-        ).fetchone()
-        authorization_count = connection.execute(
-            "SELECT count(*) FROM candidate_retry_authorizations"
-        ).fetchone()
-    assert marker is not None
-    assert marker[:3] == (event_id, retry.run_id, event_hash)
-    assert datetime.fromisoformat(marker[3]).tzinfo is not None
-    assert authorization_count == (0,)
-    migrated.verify_event_chains()
-
-    snapshot = migrated.create_snapshot(tmp_path / "backup" / "state.sqlite3")
-    restored_root = tmp_path / "restored"
-    assert RunStore.restore_snapshot(restored_root, snapshot) == restored_root / "state.sqlite3"
-    restored = RunStore(restored_root)
-
-    assert restored.get(prior.run_id) == prior
-    assert restored.get(retry.run_id) == retry
-    restored.verify_event_chains()
-
-
-@pytest.mark.parametrize(
-    "tamper",
-    ("issue", "revision", "prior_run", "prior_status"),
-)
-def test_v7_migration_rejects_tampered_historical_retry_override_transactionally(
-    tmp_path: Path,
-    tamper: str,
-) -> None:
-    root = tmp_path / "state"
-    _, retry, _, _ = _historical_v7_candidate_retry_database(root)
-    with closing(sqlite3.connect(root / "state.sqlite3")) as connection:
-        event = connection.execute(
-            """
-            SELECT details_json FROM events
-            WHERE run_id = ? AND event_type = 'candidate.retry_override'
-            """,
-            (retry.run_id,),
-        ).fetchone()
-        assert event is not None
-        details = json.loads(event[0])
-        if tamper == "issue":
-            details["issue"] = "example/other#999"
-        elif tamper == "revision":
-            details["issue_revision"] = "f" * 64
-        elif tamper == "prior_run":
-            details["prior_run_id"] = retry.run_id
-        else:
-            details["prior_status"] = RunStatus.SKIPPED.value
-        _rewrite_tail_event_details(
-            connection,
-            run_id=retry.run_id,
-            event_type="candidate.retry_override",
-            details=details,
-        )
-        connection.commit()
-
-    with pytest.raises(StateError, match="legacy candidate retry override"):
-        RunStore(root)
-
-    with sqlite3.connect(root / "state.sqlite3") as connection:
-        assert connection.execute(
-            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-        ).fetchone() == (7,)
-        assert connection.execute(
-            """
-            SELECT count(*) FROM sqlite_master
-            WHERE name IN (
-                'candidate_retry_authorizations',
-                'legacy_candidate_retry_overrides',
-                'runs_active_candidate_idx'
-            )
-            """
-        ).fetchone() == (0,)
-        assert RunStore._schema_manifest(connection) == RunStore._expected_schema_manifest(7)
-
-
-def test_v6_migration_backfills_issue_revision_and_accepts_publication_only_identity(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    candidate_run = _candidate_run(store, status=RunStatus.SKIPPED)
-    assert candidate_run.candidate is not None
-    expected_revision = compute_issue_revision(candidate_run.candidate)
-    publication_only = store.create_run()
-    with closing(sqlite3.connect(store.database_path)) as connection:
-        connection.execute(
-            "UPDATE runs SET repository = ? WHERE run_id = ?",
-            ("example/publication", publication_only.run_id),
-        )
-        connection.commit()
-    _downgrade_current_database_to_v6(store.database_path)
-
-    migrated = RunStore(root)
-
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
-    with sqlite3.connect(migrated.database_path) as connection:
-        candidate_row = connection.execute(
-            "SELECT issue_revision FROM runs WHERE run_id = ?",
-            (candidate_run.run_id,),
-        ).fetchone()
-        publication_row = connection.execute(
-            """
-            SELECT repository, issue_number, issue_revision FROM runs
-            WHERE run_id = ?
-            """,
-            (publication_only.run_id,),
-        ).fetchone()
-    assert candidate_row == (expected_revision,)
-    assert publication_row == ("example/publication", None, None)
-
-
-def test_v6_migration_rejects_malformed_manifest_transactionally(tmp_path: Path) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    run = _candidate_run(store)
-    _downgrade_current_database_to_v6(store.database_path)
-    with closing(sqlite3.connect(store.database_path)) as connection:
-        connection.execute(
-            "UPDATE runs SET manifest_json = '{' WHERE run_id = ?",
-            (run.run_id,),
-        )
-        connection.commit()
-
-    with pytest.raises(StateError, match="invalid manifest"):
-        RunStore(root)
-
-    with sqlite3.connect(store.database_path) as connection:
-        version = connection.execute(
-            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-        ).fetchone()
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
-        revision_index = connection.execute(
-            """
-            SELECT 1 FROM sqlite_master
-            WHERE type = 'index' AND name = 'runs_candidate_revision_idx'
-            """
-        ).fetchone()
-    assert version == (6,)
-    assert "issue_revision" not in columns
-    assert revision_index is None
-
-
-@pytest.mark.parametrize(
-    ("column", "value"),
-    (("repository", "example/other"), ("issue_number", 999)),
-)
-def test_v6_migration_rejects_candidate_row_identity_tampering(
-    tmp_path: Path,
-    column: str,
-    value: str | int,
-) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    run = _candidate_run(store)
-    _downgrade_current_database_to_v6(store.database_path)
-    with closing(sqlite3.connect(store.database_path)) as connection:
-        connection.execute(
-            f"UPDATE runs SET {column} = ? WHERE run_id = ?",
-            (value, run.run_id),
-        )
-        connection.commit()
-
-    with pytest.raises(StateError, match="candidate disagrees with its state row"):
-        RunStore(root)
-
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute(
-            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-        ).fetchone() == (6,)
-        assert "issue_revision" not in {
-            row[1] for row in connection.execute("PRAGMA table_info(runs)")
-        }
-
-
-def test_v7_migration_rejects_duplicate_active_candidate_attempts_transactionally(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    first = _candidate_run(
-        store,
-        candidate=_issue_candidate(number=41),
-        status=RunStatus.QUEUED,
-    )
-    second = _candidate_run(
-        store,
-        candidate=_issue_candidate(number=42),
-        status=RunStatus.QUEUED,
-    )
-    assert first.candidate is not None
-    first_revision = compute_issue_revision(first.candidate)
-    _downgrade_current_database_to_v7(store.database_path)
-    second.candidate = first.candidate.model_copy(deep=True)
-    with closing(sqlite3.connect(store.database_path)) as connection:
-        connection.execute(
-            """
-            UPDATE runs
-            SET repository = ?, issue_number = ?, issue_revision = ?, manifest_json = ?
-            WHERE run_id = ?
-            """,
-            (
-                second.candidate.repository,
-                second.candidate.number,
-                first_revision,
-                second.model_dump_json(),
-                second.run_id,
-            ),
-        )
-        connection.commit()
-
-    with pytest.raises(StateError, match="duplicate active attempts"):
-        RunStore(root)
-
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute(
-            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-        ).fetchone() == (7,)
-        assert "issue_revision" in {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
-        assert connection.execute(
-            """
-            SELECT count(*) FROM sqlite_master
-            WHERE name IN (
-                'candidate_retry_authorizations',
-                'legacy_candidate_retry_overrides',
-                'runs_active_candidate_idx'
-            )
-            """
-        ).fetchone() == (0,)
-        assert [
-            row[4]
-            for row in connection.execute(
-                "PRAGMA index_xinfo(runs_candidate_revision_idx)"
-            ).fetchall()
-            if row[5]
-        ] == ["BINARY", "BINARY", "BINARY", "BINARY"]
-        assert RunStore._schema_manifest(connection) == RunStore._expected_schema_manifest(7)
 
 
 def test_candidate_history_lookup_uses_nocase_revision_index(tmp_path: Path) -> None:
@@ -1732,158 +1107,6 @@ def test_restore_snapshot_rejects_tampered_or_orphaned_candidate_retry_evidence(
     assert not (target / "state.sqlite3").exists()
 
 
-@pytest.mark.parametrize(
-    "tamper",
-    (
-        "unmarked_event",
-        "orphan_marker",
-        "mismatched_run",
-        "mismatched_event",
-        "mismatched_hash",
-        "migration_time",
-        "pre_event_cutoff",
-        "event_details",
-    ),
-)
-def test_restore_snapshot_rejects_tampered_legacy_candidate_retry_marker(
-    tmp_path: Path,
-    tamper: str,
-) -> None:
-    source_root = tmp_path / "source"
-    prior, retry, _, _ = _historical_v7_candidate_retry_database(source_root)
-    source = RunStore(source_root)
-    ordinary = source.create_run()
-    snapshot = source.create_snapshot(tmp_path / "backup" / f"{tamper}.sqlite3")
-
-    with closing(sqlite3.connect(snapshot)) as connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        marker = connection.execute(
-            """
-            SELECT event_id, run_id, event_hash, migrated_at
-            FROM legacy_candidate_retry_overrides WHERE run_id = ?
-            """,
-            (retry.run_id,),
-        ).fetchone()
-        assert marker is not None
-        if tamper == "unmarked_event":
-            connection.execute(
-                "DELETE FROM legacy_candidate_retry_overrides WHERE run_id = ?",
-                (retry.run_id,),
-            )
-        elif tamper == "orphan_marker":
-            ordinary_event = connection.execute(
-                """
-                SELECT id, event_hash FROM events
-                WHERE run_id = ? AND event_type = 'run.created'
-                """,
-                (ordinary.run_id,),
-            ).fetchone()
-            assert ordinary_event is not None
-            connection.execute(
-                """
-                INSERT INTO legacy_candidate_retry_overrides(
-                    event_id, run_id, event_hash, migrated_at
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (ordinary_event[0], ordinary.run_id, ordinary_event[1], marker[3]),
-            )
-        elif tamper == "mismatched_run":
-            connection.execute(
-                """
-                UPDATE legacy_candidate_retry_overrides SET run_id = ?
-                WHERE run_id = ?
-                """,
-                (prior.run_id, retry.run_id),
-            )
-        elif tamper == "mismatched_event":
-            creation = connection.execute(
-                """
-                SELECT id, event_hash FROM events
-                WHERE run_id = ? AND event_type = 'run.created'
-                """,
-                (retry.run_id,),
-            ).fetchone()
-            assert creation is not None
-            connection.execute(
-                """
-                UPDATE legacy_candidate_retry_overrides
-                SET event_id = ?, event_hash = ? WHERE run_id = ?
-                """,
-                (creation[0], creation[1], retry.run_id),
-            )
-        elif tamper == "mismatched_hash":
-            connection.execute(
-                """
-                UPDATE legacy_candidate_retry_overrides SET event_hash = ?
-                WHERE run_id = ?
-                """,
-                ("f" * 64, retry.run_id),
-            )
-        elif tamper == "migration_time":
-            connection.execute(
-                """
-                UPDATE legacy_candidate_retry_overrides
-                SET migrated_at = '2999-01-01T00:00:00+00:00'
-                WHERE run_id = ?
-                """,
-                (retry.run_id,),
-            )
-        elif tamper == "pre_event_cutoff":
-            cutoff = "2000-01-01T00:00:00+00:00"
-            connection.execute(
-                """
-                UPDATE legacy_candidate_retry_overrides SET migrated_at = ?
-                WHERE run_id = ?
-                """,
-                (cutoff, retry.run_id),
-            )
-            connection.execute(
-                """
-                UPDATE schema_metadata SET migrated_at = ? WHERE singleton = 1
-                """,
-                (cutoff,),
-            )
-        else:
-            event = connection.execute(
-                """
-                SELECT details_json FROM events
-                WHERE run_id = ? AND event_type = 'candidate.retry_override'
-                """,
-                (retry.run_id,),
-            ).fetchone()
-            assert event is not None
-            details = json.loads(event[0])
-            details["prior_status"] = RunStatus.SKIPPED.value
-            _rewrite_tail_event_details(
-                connection,
-                run_id=retry.run_id,
-                event_type="candidate.retry_override",
-                details=details,
-            )
-            changed_hash = connection.execute(
-                """
-                SELECT event_hash FROM events
-                WHERE run_id = ? AND event_type = 'candidate.retry_override'
-                """,
-                (retry.run_id,),
-            ).fetchone()
-            assert changed_hash is not None
-            connection.execute(
-                """
-                UPDATE legacy_candidate_retry_overrides SET event_hash = ?
-                WHERE run_id = ?
-                """,
-                (changed_hash[0], retry.run_id),
-            )
-        connection.commit()
-
-    target = tmp_path / f"target-{tamper}"
-    with pytest.raises(StateError):
-        RunStore.restore_snapshot(target, snapshot)
-
-    assert not (target / "state.sqlite3").exists()
-
-
 def test_restore_snapshot_rejects_semantically_tampered_candidate_selection(
     tmp_path: Path,
 ) -> None:
@@ -1934,418 +1157,111 @@ def test_restore_snapshot_rejects_candidate_without_selection_provenance(
     assert not (target / "state.sqlite3").exists()
 
 
-def test_v3_migration_backfills_event_heads_and_active_lease_generation(tmp_path: Path) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    run = store.create_run()
-    store.transition(run, RunStatus.DISCOVERING, reason="migration fixture")
-    started = datetime(2025, 1, 1, tzinfo=UTC)
-    first = store.acquire_lease("scheduler", "worker-a", ttl=timedelta(seconds=10), now=started)
-    assert first is not None
-    takeover = store.acquire_lease(
-        "scheduler", "worker-b", ttl=timedelta(seconds=10), now=first.expires_at
-    )
-    assert takeover is not None and takeover.generation == 2
-    expected_events = store.events(run.run_id)
-    _downgrade_current_database_to_v3(store.database_path)
-
-    migrated = RunStore(root)
-
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
-    migrated.verify_event_chains()
-    with sqlite3.connect(migrated.database_path) as connection:
-        anchor = connection.execute(
-            "SELECT event_count, event_head_hash FROM runs WHERE run_id = ?",
-            (run.run_id,),
-        ).fetchone()
-        generation = connection.execute(
-            "SELECT generation FROM lease_generations WHERE lease_name = 'scheduler'"
-        ).fetchone()
-    assert anchor == (len(expected_events), expected_events[-1]["event_hash"])
-    assert generation == (takeover.generation,)
-
-
-def test_v3_migration_holds_every_reserved_submitting_run_at_the_exact_corpus(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    evaluated = store.create_run()
-    store.record_evaluation_anchor(evaluated.run_id, {"evaluation_hash": "a" * 64})
-    submitting = store.create_run()
-    second_submitting = store.create_run()
-    published = store.create_run()
-    store.reserve_publication(
-        submitting.run_id,
-        "example/submitting",
-        max_per_utc_day=10,
-        repository_cooldown=timedelta(0),
-    )
-    store.reserve_publication(
-        second_submitting.run_id,
-        "example/second-submitting",
-        max_per_utc_day=10,
-        repository_cooldown=timedelta(0),
-    )
-    store.reserve_publication(
-        published.run_id,
-        "example/published",
-        max_per_utc_day=10,
-        repository_cooldown=timedelta(0),
-    )
-    _set_status(store, submitting, RunStatus.SUBMITTING)
-    _set_status(store, second_submitting, RunStatus.SUBMITTING)
-    _set_status(store, published, RunStatus.PR_OPEN)
-    expected_cursor = store.evaluation_corpus_cursor()
-    _downgrade_current_database_to_v3(store.database_path)
-    migrated_at = datetime(2026, 7, 21, 13, tzinfo=UTC)
-    monkeypatch.setattr("autocontribute.store.utc_now", lambda: migrated_at)
-
-    migrated = RunStore(root)
-
-    with sqlite3.connect(migrated.database_path) as connection:
-        holds = connection.execute(
-            """
-            SELECT run_id, deployment_fingerprint, corpus_cursor, held_at
-            FROM publication_gate_holds ORDER BY run_id
-            """
-        ).fetchall()
-    assert holds == sorted(
-        [
-            (submitting.run_id, None, expected_cursor, migrated_at.isoformat()),
-            (
-                second_submitting.run_id,
-                None,
-                expected_cursor,
-                migrated_at.isoformat(),
-            ),
-        ]
-    )
-    for run in (submitting, second_submitting):
-        assert [
-            event["event_type"]
-            for event in migrated.events(run.run_id)
-            if event["event_type"] == "publication.gate.legacy"
-        ] == ["publication.gate.legacy"]
-
-
-def test_v4_migration_attests_a_legacy_gate_hold_and_keeps_it_active(tmp_path: Path) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    run = store.create_run()
-    store.reserve_publication(
-        run.run_id,
-        "example/project",
-        max_per_utc_day=10,
-        repository_cooldown=timedelta(0),
-    )
-    _set_status(store, run, RunStatus.SUBMITTING)
-    cursor = store.evaluation_corpus_cursor()
-    held_at = datetime(2026, 7, 21, 14, tzinfo=UTC).isoformat()
-    _downgrade_current_database_to_v4(store.database_path)
+def test_future_older_or_malformed_schema_fails_closed(tmp_path: Path) -> None:
+    newer_root = tmp_path / "v99"
+    store = RunStore(newer_root)
     with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            """
-            INSERT INTO publication_gate_holds(
-                run_id, deployment_fingerprint, corpus_cursor, held_at
-            ) VALUES (?, NULL, ?, ?)
-            """,
-            (run.run_id, cursor, held_at),
-        )
-
-    migrated = RunStore(root)
-
-    with sqlite3.connect(migrated.database_path) as connection:
-        assert connection.execute(
-            """
-            SELECT deployment_fingerprint, corpus_cursor, held_at
-            FROM publication_gate_holds WHERE run_id = ?
-            """,
-            (run.run_id,),
-        ).fetchone() == (None, cursor, held_at)
-    legacy = [
-        event
-        for event in migrated.events(run.run_id)
-        if event["event_type"] == "publication.gate.legacy"
-    ]
-    assert len(legacy) == 1
-    assert json.loads(legacy[0]["details"]) == {"corpus_cursor": cursor, "held_at": held_at}
-
-
-def test_v5_migration_fences_a_pre_outcome_hold_from_automatic_recovery(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    run = _publication_run(store, status=RunStatus.READY_FOR_APPROVAL)
-    _begin_publication(store, run, with_gate=False)
-    cursor = store.evaluation_corpus_cursor()
-    held_at = datetime(2026, 7, 21, 14, 30, tzinfo=UTC).isoformat()
-    with store._connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            """
-            INSERT INTO publication_gate_holds(
-                run_id, deployment_fingerprint, corpus_cursor,
-                outcome_corpus_cursor, held_at
-            ) VALUES (?, ?, ?, NULL, ?)
-            """,
-            (run.run_id, "d" * 64, cursor, held_at),
-        )
-        store._append_event(
-            connection,
-            run.run_id,
-            "publication.gate.held",
-            {
-                "deployment_fingerprint": "d" * 64,
-                "corpus_cursor": cursor,
-                "held_at": held_at,
-            },
-        )
-    _downgrade_current_database_to_v5(store.database_path)
-
-    migrated = RunStore(root)
-
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
-    with sqlite3.connect(migrated.database_path) as connection:
-        assert connection.execute(
-            """
-            SELECT outcome_corpus_cursor FROM publication_gate_holds
-            WHERE run_id = ?
-            """,
-            (run.run_id,),
-        ).fetchone() == (None,)
-    recovered = migrated.get(run.run_id)
-    with pytest.raises(StateError, match="predates schema-v6"):
-        _begin_publication(migrated, recovered, with_gate=False)
-
-
-def test_v4_migration_derives_released_legacy_hold_evidence_from_exact_release(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    run = store.create_run()
-    store.reserve_publication(
-        run.run_id,
-        "example/project",
-        max_per_utc_day=10,
-        repository_cooldown=timedelta(0),
-    )
-    cursor = store.evaluation_corpus_cursor()
-    held_at = datetime(2026, 7, 21, 15, tzinfo=UTC).isoformat()
-    with store._connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        store._append_event(
-            connection,
-            run.run_id,
-            "publication.gate.released",
-            {"outcome": "pr_open", "corpus_cursor": cursor, "held_at": held_at},
-        )
-    _downgrade_current_database_to_v4(store.database_path)
-
-    migrated = RunStore(root)
-
-    with sqlite3.connect(migrated.database_path) as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM publication_gate_holds WHERE run_id = ?", (run.run_id,)
-        ).fetchone() == (0,)
-    legacy = [
-        event
-        for event in migrated.events(run.run_id)
-        if event["event_type"] == "publication.gate.legacy"
-    ]
-    assert len(legacy) == 1
-    assert json.loads(legacy[0]["details"]) == {"corpus_cursor": cursor, "held_at": held_at}
-
-
-def test_v3_migration_rejects_a_corrupt_legacy_event_chain_transactionally(
-    tmp_path: Path,
-) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    run = store.create_run()
-    store.transition(run, RunStatus.DISCOVERING, reason="migration fixture")
-    _downgrade_current_database_to_v3(store.database_path)
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            """
-            UPDATE events SET details_json = '{"tampered":true}'
-            WHERE run_id = ? AND event_type = 'run.transitioned'
-            """,
-            (run.run_id,),
-        )
-
-    with pytest.raises(StateError, match="Event hash mismatch"):
-        RunStore(root)
-
-    with sqlite3.connect(store.database_path) as connection:
-        version = connection.execute(
-            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-        ).fetchone()
-        run_columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
-        generation_table = connection.execute(
-            """
-            SELECT 1 FROM sqlite_master
-            WHERE type = 'table' AND name = 'lease_generations'
-            """
-        ).fetchone()
-    assert version == (3,)
-    assert "event_count" not in run_columns
-    assert "event_head_hash" not in run_columns
-    assert generation_table is None
-
-
-def test_v2_migration_conservatively_backfills_active_publications(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    submitting = store.create_run()
-    published = store.create_run()
-    _set_status(store, submitting, RunStatus.SUBMITTING)
-    _set_status(store, published, RunStatus.PR_OPEN)
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            "UPDATE runs SET repository = 'Example/Project' WHERE run_id = ?",
-            (submitting.run_id,),
-        )
-        connection.execute(
-            "UPDATE runs SET repository = 'Other/Project' WHERE run_id = ?",
-            (published.run_id,),
-        )
-    connection.close()
-    _downgrade_current_database_to_v2(store.database_path)
-    migrated_at = datetime(2026, 7, 21, 12, tzinfo=UTC)
-    monkeypatch.setattr("autocontribute.store.utc_now", lambda: migrated_at)
-
-    migrated = RunStore(root)
-
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION
-    with sqlite3.connect(migrated.database_path) as connection:
-        reservations = connection.execute(
-            """
-            SELECT run_id, repository, reserved_at FROM publication_reservations
-            ORDER BY run_id
-            """
-        ).fetchall()
-        holds = connection.execute(
-            """
-            SELECT run_id, deployment_fingerprint, corpus_cursor, held_at
-            FROM publication_gate_holds ORDER BY run_id
-            """
-        ).fetchall()
-    assert reservations == sorted(
-        [
-            (submitting.run_id, "example/project", migrated_at.isoformat()),
-            (published.run_id, "other/project", migrated_at.isoformat()),
-        ]
-    )
-    assert holds == [
-        (
-            submitting.run_id,
-            None,
-            hashlib.sha256(b"[]").hexdigest(),
-            migrated_at.isoformat(),
-        )
-    ]
-    assert "publication.reservation.legacy" in {
-        event["event_type"] for event in migrated.events(submitting.run_id)
-    }
-    assert "publication.reservation.legacy" in {
-        event["event_type"] for event in migrated.events(published.run_id)
-    }
-    assert "publication.gate.legacy" in {
-        event["event_type"] for event in migrated.events(submitting.run_id)
-    }
-    migrated.transition(submitting, RunStatus.PR_OPEN, reason="migration fixture reconciled")
-    with pytest.raises(StateError, match="Daily publication reservation limit"):
-        migrated.reserve_publication(
-            migrated.create_run().run_id,
-            "third/project",
-            max_per_utc_day=1,
-            repository_cooldown=timedelta(days=7),
-            now=migrated_at,
-        )
-
-
-def test_v2_schema_is_validated_before_migration_sql_runs(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    _downgrade_current_database_to_v2(store.database_path)
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute("CREATE VIEW unexpected_state AS SELECT run_id FROM runs")
-    migration_called = False
-
-    def unexpected_migration(connection: sqlite3.Connection) -> None:
-        nonlocal migration_called
-        migration_called = True
-
-    monkeypatch.setattr(
-        RunStore,
-        "_migrate_2_to_3",
-        staticmethod(unexpected_migration),
-    )
-
-    with pytest.raises(StateError, match="canonical manifest"):
-        RunStore(root)
-
-    assert migration_called is False
-
-
-def test_failed_migration_rolls_back_every_schema_change(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = tmp_path / "state"
-    _legacy_database(root)
-
-    def fail_migration(connection: sqlite3.Connection) -> None:
-        connection.execute("CREATE TABLE partial_migration(value TEXT)")
-        raise RuntimeError("injected migration failure")
-
-    monkeypatch.setattr(RunStore, "_migrate_1_to_2", staticmethod(fail_migration))
-    with pytest.raises(RuntimeError, match="injected"):
-        RunStore(root)
-
-    with sqlite3.connect(root / "state.sqlite3") as connection:
-        tables = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-            )
-        }
-    assert tables == {"runs", "events"}
-
-
-def test_future_or_malformed_schema_fails_closed(tmp_path: Path) -> None:
-    future_root = tmp_path / "future"
-    _legacy_database(future_root)
-    with sqlite3.connect(future_root / "state.sqlite3") as connection:
-        connection.execute(
-            """
-            CREATE TABLE schema_metadata (
-                singleton INTEGER PRIMARY KEY,
-                schema_version INTEGER NOT NULL,
-                migrated_at TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute(
-            "INSERT INTO schema_metadata VALUES (1, 99, ?)",
-            (datetime.now(UTC).isoformat(),),
-        )
+        connection.execute("UPDATE schema_metadata SET schema_version = 99 WHERE singleton = 1")
     with pytest.raises(StateError, match="newer than supported"):
-        RunStore(future_root)
+        RunStore(newer_root)
+
+    unversioned_root = tmp_path / "unversioned"
+    store = RunStore(unversioned_root)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("DROP TABLE schema_metadata")
+    with pytest.raises(StateError, match="lacks schema metadata"):
+        RunStore(unversioned_root)
 
     malformed_root = tmp_path / "malformed"
-    _legacy_database(malformed_root)
-    with sqlite3.connect(malformed_root / "state.sqlite3") as connection:
+    store = RunStore(malformed_root)
+    with sqlite3.connect(store.database_path) as connection:
         connection.execute("DROP INDEX events_run_idx")
     with pytest.raises(StateError, match="required indexes"):
         RunStore(malformed_root)
+
+
+@pytest.mark.parametrize("development_layout", ("schema-7", "earlier-schema-8"))
+def test_older_development_state_asks_for_a_fresh_state_directory(
+    tmp_path: Path,
+    development_layout: str,
+) -> None:
+    root = tmp_path / "state"
+    store = RunStore(root)
+    run = store.create_run()
+    schema_version = 7 if development_layout == "schema-7" else CURRENT_SCHEMA_VERSION
+    with closing(sqlite3.connect(store.database_path)) as connection, connection:
+        connection.execute(
+            "UPDATE schema_metadata SET schema_version = ? WHERE singleton = 1",
+            (schema_version,),
+        )
+        if development_layout == "earlier-schema-8":
+            connection.execute(
+                """
+                CREATE TABLE legacy_candidate_retry_overrides (
+                    event_id INTEGER PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    event_hash TEXT NOT NULL,
+                    migrated_at TEXT NOT NULL
+                )
+                """
+            )
+
+    with pytest.raises(StateError) as error:
+        RunStore(root)
+
+    message = str(error.value)
+    assert "older development version" in message
+    assert f"delete the state directory {root.resolve()}" in message
+    with closing(sqlite3.connect(store.database_path)) as connection:
+        assert connection.execute("SELECT schema_version FROM schema_metadata").fetchone() == (
+            schema_version,
+        )
+        assert connection.execute("SELECT run_id FROM runs").fetchall() == [(run.run_id,)]
+
+
+@pytest.mark.parametrize(
+    ("snapshot_layout", "expected_error"),
+    (
+        ("schema-7", "older development version of Autocontribute \\(schema 7\\)"),
+        ("earlier-schema-8", "older development version of Autocontribute \\(schema 8\\)"),
+        ("schema-9", "State snapshot schema 9 is newer than supported schema 8"),
+    ),
+)
+def test_restore_names_snapshots_this_release_cannot_open(
+    tmp_path: Path,
+    snapshot_layout: str,
+    expected_error: str,
+) -> None:
+    source = RunStore(tmp_path / "source")
+    source.create_run()
+    snapshot = source.create_snapshot(tmp_path / "backup" / "state.sqlite3")
+    schema_version = {
+        "schema-7": 7,
+        "earlier-schema-8": CURRENT_SCHEMA_VERSION,
+        "schema-9": CURRENT_SCHEMA_VERSION + 1,
+    }[snapshot_layout]
+    with closing(sqlite3.connect(snapshot)) as connection, connection:
+        connection.execute("PRAGMA journal_mode = DELETE")
+        connection.execute(
+            "UPDATE schema_metadata SET schema_version = ? WHERE singleton = 1",
+            (schema_version,),
+        )
+        if snapshot_layout == "earlier-schema-8":
+            connection.execute(
+                """
+                CREATE TABLE legacy_candidate_retry_overrides (
+                    event_id INTEGER PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    event_hash TEXT NOT NULL,
+                    migrated_at TEXT NOT NULL
+                )
+                """
+            )
+    target = tmp_path / "target"
+
+    with pytest.raises(StateError, match=expected_error):
+        RunStore.restore_snapshot(target, snapshot)
+    assert not (target / "state.sqlite3").exists()
 
 
 def test_snapshot_is_consistent_includes_wal_and_requires_explicit_overwrite(
@@ -2452,24 +1368,6 @@ def test_restore_snapshot_rejects_event_tail_truncation_before_promotion(
         RunStore.restore_snapshot(target, snapshot)
 
     assert not (target / "state.sqlite3").exists()
-
-
-def test_restore_snapshot_accepts_exact_v2_then_initialization_migrates_it(
-    tmp_path: Path,
-) -> None:
-    source_store = RunStore(tmp_path / "source")
-    run = source_store.create_run()
-    snapshot = source_store.create_snapshot(tmp_path / "backup" / "state.sqlite3")
-    _downgrade_current_database_to_v2(snapshot)
-    restored_root = tmp_path / "restored"
-
-    restored = RunStore.restore_snapshot(restored_root, snapshot)
-
-    with sqlite3.connect(restored) as connection:
-        assert connection.execute("SELECT schema_version FROM schema_metadata").fetchone() == (2,)
-    migrated = RunStore(restored_root)
-    assert migrated.schema_version == CURRENT_SCHEMA_VERSION == 8
-    assert migrated.get(run.run_id).run_id == run.run_id
 
 
 def test_restore_snapshot_rejects_trigger_that_can_clear_circuit_breaker(
@@ -2629,18 +1527,18 @@ def test_restore_snapshot_closes_source_descriptor_when_fdopen_fails(
 
 def test_open_pull_request_remains_an_active_candidate(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    _set_status(store, run, RunStatus.PR_OPEN)
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            "UPDATE runs SET repository = 'example/project', issue_number = 7 WHERE run_id = ?",
-            (run.run_id,),
-        )
+    run = _candidate_run(store, status=RunStatus.PR_OPEN)
+    assert run.candidate is not None
 
-    assert store.has_active_candidate("example/project", 7) is True
+    disposition = store.candidate_attempt_disposition(run.candidate)
+    assert disposition.state is CandidateAttemptState.ACTIVE
+    assert disposition.prior_run_id == run.run_id
+    assert disposition.prior_status is RunStatus.PR_OPEN
 
     _set_status(store, run, RunStatus.FAILED)
-    assert store.has_active_candidate("example/project", 7) is False
+    assert (
+        store.candidate_attempt_disposition(run.candidate).state is CandidateAttemptState.AVAILABLE
+    )
 
 
 def test_concurrent_candidate_claims_have_exactly_one_active_winner(tmp_path: Path) -> None:
@@ -4528,52 +3426,6 @@ def test_verified_compensation_rejects_hold_row_tampering(tmp_path: Path) -> Non
     assert store.get(holder.run_id).status == RunStatus.SUBMITTING
 
 
-def test_verified_compensation_releases_a_legacy_pre_outcome_hold(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    holder = _publication_run(store, status=RunStatus.READY_FOR_APPROVAL)
-    _begin_publication(store, holder, with_gate=False)
-    reason = "verified cleanup of a fenced pre-v6 publication"
-    cursor = store.evaluation_corpus_cursor()
-    held_at = datetime(2026, 7, 21, 15, tzinfo=UTC).isoformat()
-    with store._connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        connection.execute(
-            """
-            INSERT INTO publication_gate_holds(
-                run_id, deployment_fingerprint, corpus_cursor,
-                outcome_corpus_cursor, held_at
-            ) VALUES (?, ?, ?, NULL, ?)
-            """,
-            (holder.run_id, "d" * 64, cursor, held_at),
-        )
-        store._append_event(
-            connection,
-            holder.run_id,
-            "publication.gate.held",
-            {
-                "deployment_fingerprint": "d" * 64,
-                "corpus_cursor": cursor,
-                "held_at": held_at,
-            },
-        )
-    evidence = _record_absent_compensation_evidence(store, holder, reason=reason)
-
-    finalized = store.finalize_publication_compensation(
-        holder,
-        reason=reason,
-        evidence=evidence,
-    )
-
-    assert finalized.status == RunStatus.FAILED
-    assert store.publication_gate_hold(holder.run_id) is None
-    assert json.loads(store.events(holder.run_id)[-1]["details"]) == {
-        "corpus_cursor": cursor,
-        "deployment_fingerprint": "d" * 64,
-        "held_at": held_at,
-        "outcome": "verified_compensation",
-    }
-
-
 def test_evaluation_corpus_cursor_is_exact_ordered_and_bounded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4636,7 +3488,6 @@ def test_recovery_only_fails_safe_in_flight_stages_and_is_idempotent(tmp_path: P
         preserved[status] = run
     cutoff = datetime.now(UTC) + timedelta(minutes=1)
 
-    assert store.stale_run_ids(stale_before=cutoff) == [recoverable.run_id]
     recovered = store.recover_stale_runs(
         stale_before=cutoff,
         reason="worker lease expired",
@@ -4786,7 +3637,9 @@ def test_heartbeat_guard_releases_its_fenced_lease(tmp_path: Path) -> None:
         ttl=timedelta(seconds=10),
         heartbeat_interval=timedelta(seconds=1),
     ) as guard:
-        assert guard.assert_owned().generation == guard.generation
+        lease = store.get_lease("scheduler")
+        assert lease is not None
+        assert guard.assert_owned().generation == lease.generation
         assert store.get_lease("scheduler") is not None
 
     assert store.get_lease("scheduler") is None
@@ -4803,7 +3656,7 @@ def test_heartbeat_guard_surfaces_fencing_takeover(tmp_path: Path) -> None:
     )
 
     with pytest.raises(StateError, match="no longer owned"), guard:
-        first = guard.lease
+        first = guard.assert_owned()
         takeover = store.acquire_lease(
             "scheduler",
             "worker-b",
@@ -4837,43 +3690,24 @@ def test_lifecycle_snapshots_are_immutable_and_deduplicated(tmp_path: Path) -> N
     assert store.events(run.run_id)[-1]["event_type"] == "lifecycle.snapshot.recorded"
 
 
-@pytest.mark.parametrize("schema_version", (2, 3, 4, 5, 6, 7, 8))
-@pytest.mark.parametrize("include_pull_request_node_id", (False, True))
-def test_pre_history_lifecycle_snapshot_restores_from_every_supported_schema(
-    tmp_path: Path,
-    schema_version: int,
-    include_pull_request_node_id: bool,
-) -> None:
+def test_lifecycle_snapshot_restores_from_the_current_schema(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "source")
     run = store.create_run()
-    snapshot_json = _legacy_lifecycle_snapshot_json(
-        include_pull_request_node_id=include_pull_request_node_id
-    )
-    fingerprint = hashlib.sha256(snapshot_json.encode()).hexdigest()
+    current = _lifecycle_snapshot()
+    snapshot_json = current.to_json()
+    fingerprint = current.fingerprint()
     store.record_lifecycle_snapshot(run.run_id, fingerprint, snapshot_json)
-    snapshot = store.create_snapshot(tmp_path / "snapshots" / f"v{schema_version}.sqlite3")
-    if schema_version == 2:
-        _downgrade_current_database_to_v2(snapshot)
-    elif schema_version == 3:
-        _downgrade_current_database_to_v3(snapshot)
-    elif schema_version == 4:
-        _downgrade_current_database_to_v4(snapshot)
-    elif schema_version == 5:
-        _downgrade_current_database_to_v5(snapshot)
-    elif schema_version == 6:
-        _downgrade_current_database_to_v6(snapshot)
-    elif schema_version == 7:
-        _downgrade_current_database_to_v7(snapshot)
+    snapshot = store.create_snapshot(tmp_path / "snapshots" / "state.sqlite3")
 
-    restored_root = tmp_path / f"restored-v{schema_version}"
+    restored_root = tmp_path / "restored"
     restored = RunStore.restore_snapshot(restored_root, snapshot)
     with sqlite3.connect(restored) as connection:
         assert connection.execute(
             "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-        ).fetchone() == (schema_version,)
+        ).fetchone() == (CURRENT_SCHEMA_VERSION,)
 
-    migrated = RunStore(restored_root)
-    rows = migrated.lifecycle_snapshots(run.run_id)
+    reopened = RunStore(restored_root)
+    rows = reopened.lifecycle_snapshots(run.run_id)
     assert len(rows) == 1
     parsed = parse_lifecycle_snapshot_json(
         rows[0].snapshot_json,
@@ -4881,9 +3715,6 @@ def test_pre_history_lifecycle_snapshot_restores_from_every_supported_schema(
     )
     assert parsed.to_json() == snapshot_json
     assert parsed.fingerprint() == fingerprint
-    assert parsed.history_capability is LifecycleHistoryCapability.LEGACY_PARTIAL
-    assert not parsed.has_complete_upstream_history
-    assert bool(parsed.pull_request.node_id) is include_pull_request_node_id
 
 
 def test_lifecycle_snapshot_rejects_noncanonical_and_structurally_invalid_json(
@@ -4971,25 +3802,6 @@ def test_lifecycle_snapshot_read_recomputes_fingerprint_after_content_tamper(
         connection.execute(
             "UPDATE lifecycle_snapshots SET snapshot_json = ? WHERE run_id = ?",
             (changed.to_json(), run.run_id),
-        )
-
-    with pytest.raises(StateError, match="fingerprint mismatch"):
-        store.lifecycle_snapshots(run.run_id)
-
-
-def test_legacy_lifecycle_snapshot_read_rejects_content_tamper(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    snapshot_json = _legacy_lifecycle_snapshot_json()
-    fingerprint = hashlib.sha256(snapshot_json.encode()).hexdigest()
-    store.record_lifecycle_snapshot(run.run_id, fingerprint, snapshot_json)
-    payload = json.loads(snapshot_json)
-    payload["pull_request"]["title"] = "Tampered legacy lifecycle evidence"
-    tampered = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            "UPDATE lifecycle_snapshots SET snapshot_json = ? WHERE run_id = ?",
-            (tampered, run.run_id),
         )
 
     with pytest.raises(StateError, match="fingerprint mismatch"):
@@ -5114,17 +3926,22 @@ def test_evaluation_anchors_are_atomic_bounded_and_do_not_rewrite_manifests(
     store.record_evaluation_anchor(second.run_id, second_details)
 
     assert store.get(first.run_id) == original_manifest
-    assert store.evaluation_record_anchors() == [
-        {"run_id": first.run_id, "details": json.dumps(first_details, separators=(",", ":"))},
+    assert store.evaluation_revision_anchors() == [
+        {
+            "run_id": first.run_id,
+            "event_type": "evaluation.recorded",
+            "details": json.dumps(first_details, separators=(",", ":")),
+        },
         {
             "run_id": second.run_id,
+            "event_type": "evaluation.recorded",
             "details": json.dumps(second_details, separators=(",", ":")),
         },
     ]
     with pytest.raises(StateError, match="already has"):
         store.record_evaluation_anchor(first.run_id, first_details)
     with pytest.raises(StateError, match="exceeds"):
-        store.evaluation_record_anchors(limit=1)
+        store.evaluation_revision_anchors(limit=1)
     with pytest.raises(StateError, match="Unknown run"):
         store.record_evaluation_anchor("missing", first_details)
 
@@ -5144,7 +3961,7 @@ def test_evaluation_anchor_is_exactly_once_under_contention(tmp_path: Path) -> N
         results = list(executor.map(record, ["a" * 64, "b" * 64]))
 
     assert sorted(results) == ["blocked", "recorded"]
-    assert len(store.evaluation_record_anchors()) == 1
+    assert len(store.evaluation_revision_anchors()) == 1
 
 
 def test_evaluation_amendment_anchor_requires_the_current_predecessor(tmp_path: Path) -> None:
@@ -5231,11 +4048,18 @@ def test_evaluation_anchor_enumeration_rejects_malformed_or_duplicate_rows(
             (malformed_run.run_id,),
         )
     with pytest.raises(StateError, match="malformed details"):
-        malformed_store.evaluation_record_anchors()
+        malformed_store.evaluation_revision_anchors()
 
     duplicate_store = RunStore(tmp_path / "duplicate")
     duplicate_run = duplicate_store.create_run()
-    duplicate_store.record_evaluation_anchor(duplicate_run.run_id, {"digest": "a" * 64})
+    initial_anchor = {
+        "agent_prepared": "false",
+        "evaluation_hash": "a" * 64,
+        "evaluation_schema_version": "2",
+        "subject_hash": "c" * 64,
+        "verdict": "correct_abstention",
+    }
+    duplicate_store.record_evaluation_anchor(duplicate_run.run_id, initial_anchor)
     with sqlite3.connect(duplicate_store.database_path) as connection:
         connection.execute(
             """
@@ -5246,13 +4070,13 @@ def test_evaluation_anchor_enumeration_rejects_malformed_or_duplicate_rows(
             (
                 duplicate_run.run_id,
                 datetime.now(UTC).isoformat(),
-                '{"digest":"b"}',
+                json.dumps(initial_anchor, separators=(",", ":")),
                 "a" * 64,
                 "b" * 64,
             ),
         )
-    with pytest.raises(StateError, match="Duplicate evaluation record anchor"):
-        duplicate_store.evaluation_record_anchors()
+    with pytest.raises(StateError, match="multiple initial evaluation anchors"):
+        EvaluationStore(duplicate_store)._anchors_by_run()
 
 
 def test_circuit_breaker_is_persistent_deduplicated_and_requires_audited_resume(

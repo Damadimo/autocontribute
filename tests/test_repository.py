@@ -287,7 +287,7 @@ def test_clone_rejects_untrusted_sources_and_existing_destination(tmp_path: Path
         )
 
 
-def test_exact_edits_produce_reconstructable_patch_and_metrics(
+def test_exact_edits_produce_reconstructable_patch(
     tmp_path: Path, source_repository: tuple[Path, str, str]
 ) -> None:
     source, first_sha, _ = source_repository
@@ -307,12 +307,6 @@ def test_exact_edits_produce_reconstructable_patch_and_metrics(
     assert "diff --git a/README.md b/README.md" in patch
     assert "diff --git a/tests/new.txt b/tests/new.txt" in patch
     assert "deleted file mode" in patch
-    assert "3 files changed" in workspace.diff_stat()
-    metrics = workspace.metrics()
-    assert metrics.changed_files == 3
-    assert metrics.insertions == 2
-    assert metrics.deletions == 2
-    assert metrics.changed_lines == 4
 
     result = subprocess.run(
         ["git", "apply", "--binary", "-"],

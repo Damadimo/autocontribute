@@ -493,7 +493,6 @@ jobs:
               "pluggy",
               "pytest",
               "pytest-cov",
-              "respx",
               "ruff",
               "trove-classifiers",
               "types-pyyaml",

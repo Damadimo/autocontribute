@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import zipfile
 from datetime import timedelta
@@ -346,6 +347,42 @@ def test_complete_bundle_restore_rejects_checksummed_empty_database(tmp_path: Pa
 
     with pytest.raises(StateError, match="missing or unsupported tables"):
         restore_state_bundle(tmp_path / "restored", empty)
+    assert not (tmp_path / "restored").exists()
+
+
+def test_complete_bundle_restore_names_an_older_development_database(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "source")
+    store.create_run()
+    original = create_state_bundle(store, tmp_path / "original.zip")
+    database = tmp_path / "development.sqlite3"
+    with zipfile.ZipFile(original) as source:
+        database.write_bytes(source.read("state.sqlite3"))
+    connection = sqlite3.connect(database)
+    try:
+        with connection:
+            connection.execute("PRAGMA journal_mode = DELETE")
+            connection.execute("UPDATE schema_metadata SET schema_version = 7 WHERE singleton = 1")
+    finally:
+        connection.close()
+    development = tmp_path / "development.zip"
+    data = database.read_bytes()
+    with zipfile.ZipFile(original) as source, zipfile.ZipFile(development, "w") as target:
+        manifest = json.loads(source.read("bundle-manifest.json"))
+        manifest["files"]["state.sqlite3"] = {
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "size": len(data),
+        }
+        for info in source.infolist():
+            if info.filename == "bundle-manifest.json":
+                member = (json.dumps(manifest, indent=2) + "\n").encode()
+            elif info.filename == "state.sqlite3":
+                member = data
+            else:
+                member = source.read(info)
+            target.writestr(info, member)
+
+    with pytest.raises(StateError, match="older development version of Autocontribute"):
+        restore_state_bundle(tmp_path / "restored", development)
     assert not (tmp_path / "restored").exists()
 
 

@@ -18,9 +18,6 @@ on:
       key_prefix:
         required: true
         type: string
-      legacy_claim_intent:
-        required: true
-        type: string
       lineage_variable:
         required: true
         type: string
@@ -85,7 +82,6 @@ jobs:
           EXPECTED_CLAIM: ${{ inputs.expected_claim }}
           GH_TOKEN: ${{ secrets.state_token }}
           KEY_PREFIX: ${{ inputs.key_prefix }}
-          LEGACY_CLAIM_INTENT: ${{ inputs.legacy_claim_intent }}
           LINEAGE_VARIABLE: ${{ inputs.lineage_variable }}
           RECOVERY_ACTION: ${{ inputs.recovery_action }}
           RECOVERY_REASON: ${{ inputs.recovery_reason }}
@@ -124,38 +120,14 @@ jobs:
           fi
 
           IFS=: read -r -a claim_parts <<<"$current"
-          claim_format=""
-          final_prefix=""
           if [[ "${#claim_parts[@]}" -eq 7 &&
                 "${claim_parts[0]}" == "in-progress" &&
                 "${claim_parts[1]}" == "v2" ]]; then
-            claim_format="v2"
             final_prefix="${claim_parts[2]}"
             claim_run_id="${claim_parts[3]}"
             claim_run_attempt="${claim_parts[4]}"
             parent_key="${claim_parts[5]}"
             candidate_key="${claim_parts[6]}"
-            if [[ "$LEGACY_CLAIM_INTENT" != "reject" ]]; then
-              echo "A v2 claim already binds finalization intent; reject legacy override input" >&2
-              exit 1
-            fi
-          elif [[ "${#claim_parts[@]}" -eq 4 &&
-                  "${claim_parts[0]}" == "in-progress" ]]; then
-            claim_format="legacy"
-            claim_run_id="${claim_parts[1]}"
-            claim_run_attempt="${claim_parts[2]}"
-            parent_key="${claim_parts[3]}"
-            candidate_key="${KEY_PREFIX}v5-${RUNNER_OS}-${REPOSITORY_ID}-${claim_run_id}-${claim_run_attempt}"
-            if [[ "$RECOVERY_ACTION" == "promote_claimed" ]]; then
-              if [[ "$LEGACY_CLAIM_INTENT" != "committed" &&
-                    "$LEGACY_CLAIM_INTENT" != "handoff" ]]; then
-                echo "Promoting a legacy claim requires an explicit committed or handoff intent" >&2
-                exit 1
-              fi
-              final_prefix="$LEGACY_CLAIM_INTENT"
-            else
-              final_prefix="committed"
-            fi
           else
             echo "Hosted-state lineage is not a supported in-progress claim" >&2
             exit 1
@@ -170,7 +142,7 @@ jobs:
             echo "Hosted-state claim has an invalid run identity" >&2
             exit 1
           fi
-          candidate_pattern="^${KEY_PREFIX}v(5|6|7|8)-${RUNNER_OS}-${REPOSITORY_ID}-${claim_run_id}-${claim_run_attempt}$"
+          candidate_pattern="^${KEY_PREFIX}v(8)-${RUNNER_OS}-${REPOSITORY_ID}-${claim_run_id}-${claim_run_attempt}$"
           if [[ ! "$candidate_key" =~ $candidate_pattern ]]; then
             echo "Hosted-state claim destination is not the exact claimant generation" >&2
             exit 1
@@ -179,7 +151,7 @@ jobs:
 
           if [[ "$parent_key" == "bootstrap" ]]; then
             parent_schema="bootstrap"
-          elif [[ "$parent_key" =~ ^${KEY_PREFIX}v(3|4|5|6|7|8)-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$ ]]; then
+          elif [[ "$parent_key" =~ ^${KEY_PREFIX}v(8)-${RUNNER_OS}-${REPOSITORY_ID}-[1-9][0-9]*-[1-9][0-9]*$ ]]; then
             parent_schema="v${BASH_REMATCH[1]}"
           else
             echo "Hosted-state claim has an unsupported parent generation" >&2
@@ -205,7 +177,6 @@ jobs:
           {
             echo "candidate_key=$candidate_key"
             echo "candidate_schema=$candidate_schema"
-            echo "claim_format=$claim_format"
             echo "claim_run_id=$claim_run_id"
             echo "final_prefix=$final_prefix"
             echo "parent_key=$parent_key"
@@ -385,11 +356,7 @@ jobs:
               raise SystemExit("Recovery configuration points at a different storage root")
           if settings.publishing.mode != "review_required":
               raise SystemExit("Hosted recovery requires publishing.mode: review_required")
-          if (
-              settings.sandbox.backend != "docker"
-              or settings.sandbox.network != "none"
-              or settings.sandbox.allow_unsafe_local
-          ):
+          if settings.sandbox.backend != "docker" or settings.sandbox.allow_unsafe_local:
               raise SystemExit("Hosted recovery requires the isolated Docker configuration")
 
           source_schema = (
@@ -400,11 +367,6 @@ jobs:
           if source_schema == "bootstrap":
               raise SystemExit(0)
           expected_schema = {
-              "v3": 3,
-              "v4": 4,
-              "v5": 5,
-              "v6": 6,
-              "v7": 7,
               "v8": 8,
           }.get(source_schema)
           if expected_schema is None:

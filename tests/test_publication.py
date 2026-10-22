@@ -134,6 +134,10 @@ class _FixtureEligibilityGitHub:
         del repository
         return "b" * 40
 
+    def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
+        del repository, ref, max_files
+        return ["CONTRIBUTING.md"]
+
 
 def _ready_run(
     tmp_path: Path,
@@ -844,6 +848,10 @@ class FakePublishingGitHub:
         self.calls.append("default_branch_sha_if_exists")
         return "b" * 40
 
+    def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
+        del repository, ref, max_files
+        return ["CONTRIBUTING.md"]
+
     def ensure_fork(
         self,
         repository: str,
@@ -947,7 +955,7 @@ def _strand_automatic_publication_after_gate_hold(
     _remove_human_publication_context(manifest)
     manifest.status = RunStatus.READY_FOR_APPROVAL
     store.save(manifest, event="fixture.auto", details={})
-    monkeypatch.setenv(config.publishing.auto_publish_env, "1")
+    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
     _install_fixture_rollout_gate(monkeypatch)
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
@@ -2205,6 +2213,13 @@ def test_benign_policy_source_drift_stops_before_any_github_mutation(
         return original_get_file(repository, path, ref=ref, max_bytes=max_bytes)
 
     monkeypatch.setattr(github, "get_file", changed_policy)
+    monkeypatch.setattr(
+        github,
+        "list_repository_files",
+        lambda repository, *, ref, max_files: (
+            ["AI_POLICY.md"] if repository == "example/.github" else ["CONTRIBUTING.md"]
+        ),
+    )
 
     with pytest.raises(PolicyError, match="contribution policy changed"):
         Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
@@ -2787,7 +2802,7 @@ def test_review_required_preparation_cannot_be_replayed_in_auto_mode(
     manifest.status = RunStatus.READY_FOR_APPROVAL
     store.save(manifest, event="fixture.ready_without_approval", details={})
     _enable_guarded_auto_mode(config)
-    monkeypatch.setenv(config.publishing.auto_publish_env, "1")
+    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
 
     with pytest.raises(PolicyError, match="publishing configuration changed"):
@@ -2803,7 +2818,7 @@ def test_auto_mode_requires_every_measured_rollout_gate(tmp_path: Path, monkeypa
     _remove_human_publication_context(manifest)
     manifest.status = RunStatus.READY_FOR_APPROVAL
     store.save(manifest, event="fixture.auto", details={})
-    monkeypatch.setenv(config.publishing.auto_publish_env, "1")
+    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
 
     with pytest.raises(
@@ -2831,7 +2846,7 @@ def test_auto_mode_publishes_only_after_every_measured_rollout_gate(
     manifest.status = RunStatus.READY_FOR_APPROVAL
     store.save(manifest, event="fixture.auto", details={})
     _install_fixture_rollout_gate(monkeypatch)
-    monkeypatch.setenv(config.publishing.auto_publish_env, "1")
+    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
     monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
@@ -2988,7 +3003,7 @@ def test_reconcile_submitting_adopts_existing_pull_request_despite_cursor_drift(
     manifest.status = RunStatus.READY_FOR_APPROVAL
     store.save(manifest, event="fixture.auto", details={})
     _install_fixture_rollout_gate(monkeypatch)
-    monkeypatch.setenv(config.publishing.auto_publish_env, "1")
+    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
     original_save = store.save
@@ -3187,7 +3202,7 @@ def test_disabling_auto_publish_blocks_each_constructive_mutation(
     monkeypatch: pytest.MonkeyPatch,
     boundary: str,
 ) -> None:
-    config, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
+    _config, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
         tmp_path,
         monkeypatch,
     )
@@ -3196,7 +3211,7 @@ def test_disabling_auto_publish_blocks_each_constructive_mutation(
     def disable_auto_publish() -> None:
         nonlocal switched_off
         switched_off = True
-        monkeypatch.setenv(config.publishing.auto_publish_env, "0")
+        monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "0")
 
     pushes: list[str] = []
 
@@ -3276,7 +3291,7 @@ def test_disabling_auto_publish_during_repository_identity_validation_blocks_pus
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
+    _config, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
         tmp_path,
         monkeypatch,
     )
@@ -3297,7 +3312,7 @@ def test_disabling_auto_publish_during_repository_identity_validation_blocks_pus
             expected_node_id=expected_node_id,
         )
         if full_name.casefold() == "octocat/project":
-            monkeypatch.setenv(config.publishing.auto_publish_env, "0")
+            monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "0")
             switched_off = True
         return identity
 
@@ -3484,7 +3499,7 @@ def test_automatic_ready_retry_observes_current_run_and_blocks_on_new_adverse_ev
     _remove_human_publication_context(manifest)
     manifest.status = RunStatus.READY_FOR_APPROVAL
     store.save(manifest, event="fixture.auto", details={})
-    monkeypatch.setenv(config.publishing.auto_publish_env, "1")
+    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
     _install_fixture_rollout_gate(monkeypatch)
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
@@ -5136,7 +5151,7 @@ def test_marked_pre_pr_compensation_recovers_after_restart_despite_all_construct
         reason="exercise exposure-reducing recovery",
         trigger_hash="f" * 64,
     )
-    monkeypatch.setenv(config.publishing.auto_publish_env, "0")
+    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "0")
 
     reopened = RunStore(config.storage.path)
     publisher = Publisher(config, reopened, github)  # type: ignore[arg-type]
@@ -5317,7 +5332,7 @@ def test_unsupported_durable_compensation_reason_fails_as_state_error(
         "publication_compensation_reason",
         "unsupported_fixture_reason",
     )
-    monkeypatch.setattr(store, "get", lambda requested_run_id: durable)
+    monkeypatch.setattr(store, "get", lambda _requested_run_id: durable)
 
     with pytest.raises(StateError, match="Unsupported publication compensation reason"):
         publisher.publish(run_id)

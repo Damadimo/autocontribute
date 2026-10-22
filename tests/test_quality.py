@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from autocontribute.config import AutocontributeConfig
-from autocontribute.domain import CommandResult, CriticReview, ReviewScores
+from autocontribute.domain import CommandResult, CriticReview, QualityReport, ReviewScores
 from autocontribute.quality import (
+    QualityEvaluator,
     actionable_validation_failure_reason,
-    evaluate_quality,
     infrastructure_failure_reason,
 )
+
+
+def evaluate_quality(*, config: AutocontributeConfig, **arguments: Any) -> QualityReport:
+    return QualityEvaluator(config).evaluate(**arguments)
 
 
 def _review(

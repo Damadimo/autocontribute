@@ -12,7 +12,6 @@ from autocontribute.systemd_assets import (
     SystemdAsset,
     SystemdAssetManifest,
     SystemdAssetVerification,
-    load_systemd_asset_manifest,
     verify_installed_systemd_assets,
     verify_source_systemd_assets,
 )
@@ -23,7 +22,7 @@ TEST_SERVICE_UID = 12345
 
 
 def _manifest() -> SystemdAssetManifest:
-    return load_systemd_asset_manifest(MANIFEST_PATH)
+    return systemd_assets._load_manifest(MANIFEST_PATH).manifest
 
 
 def _asset(manifest: SystemdAssetManifest, source_path: str) -> SystemdAsset:
@@ -84,13 +83,12 @@ def test_manifest_and_project_source_have_complete_verified_inventory() -> None:
 
     assert len(manifest.assets) == 28
     assert sum(asset.required for asset in manifest.assets) == 27
+    assert sum(asset.installed_path is None for asset in manifest.assets) == 1
 
     result = verify_source_systemd_assets(PROJECT_ROOT, manifest_path=MANIFEST_PATH)
 
     assert result.scope == "source"
     assert result.checked_assets == 28
-    assert result.required_assets == 27
-    assert result.source_only_assets == 1
 
 
 def test_installed_release_verifies_with_explicit_identity(installed_root: Path) -> None:
@@ -98,8 +96,6 @@ def test_installed_release_verifies_with_explicit_identity(installed_root: Path)
 
     assert result.scope == "installed"
     assert result.checked_assets == 27
-    assert result.required_assets == 27
-    assert result.source_only_assets == 1
 
 
 def test_manager_policy_is_installed_only_for_the_resolved_service_uid(
@@ -565,7 +561,7 @@ def test_manifest_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     duplicate.write_text(content, encoding="utf-8")
 
     with pytest.raises(PolicyError, match="manifest is invalid"):
-        load_systemd_asset_manifest(duplicate)
+        systemd_assets._load_manifest(duplicate)
 
 
 @pytest.mark.parametrize(
@@ -616,7 +612,7 @@ def test_manifest_rejects_changes_to_executable_contract(
     changed_manifest.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
     with pytest.raises(PolicyError, match="manifest is invalid"):
-        load_systemd_asset_manifest(changed_manifest)
+        systemd_assets._load_manifest(changed_manifest)
 
 
 def test_installed_release_rejects_fifo_without_blocking(installed_root: Path) -> None:

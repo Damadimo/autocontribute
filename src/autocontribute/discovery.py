@@ -307,18 +307,6 @@ _PULL_REQUEST_TEMPLATE_PATHS = (
     ".github/PULL_REQUEST_TEMPLATE.md",
     "docs/PULL_REQUEST_TEMPLATE.md",
 )
-_ALL_POLICY_PATHS = tuple(
-    sorted(
-        {
-            *_GUIDANCE_PATHS,
-            *_AI_POLICY_PATHS,
-            *_LEGAL_POLICY_PATHS,
-            *_SECURITY_POLICY_PATHS,
-            *_PULL_REQUEST_TEMPLATE_PATHS,
-        },
-        key=str.casefold,
-    )
-)
 POLICY_SOURCES_EVIDENCE_KEY = "policy_sources_sha256"
 POLICY_REPOSITORY_REF_EVIDENCE_KEY = "policy_repository_ref"
 POLICY_ORGANIZATION_REF_EVIDENCE_KEY = "policy_organization_ref"
@@ -413,9 +401,6 @@ class DiscoveryService:
         self.config = config
         self.github = github
         self.store = store
-        bind_safety = getattr(github, "bind_safety_trigger_handler", None)
-        if callable(bind_safety):
-            bind_safety(store.trip_circuit_breaker_trigger)
         self._remote_file_cache: dict[tuple[str, str, str], str | None] = {}
         self._policy_path_cache: dict[tuple[str, str], tuple[str, ...]] = {}
         self._repository_policy_refs: dict[str, str] = {}
@@ -853,10 +838,7 @@ class DiscoveryService:
         key = repository.casefold()
         if key in self._organization_policy_refs:
             return self._organization_policy_refs[key]
-        resolve = getattr(self.github, "default_branch_sha_if_exists", None)
-        if not callable(resolve):
-            raise GitHubError("GitHub client cannot resolve an immutable organization-policy ref")
-        resolved = resolve(repository)
+        resolved = self.github.default_branch_sha_if_exists(repository)
         immutable_ref = (
             None if resolved is None else _immutable_ref(resolved, field="organization policy ref")
         )
@@ -929,32 +911,28 @@ class DiscoveryService:
         key = (repository.casefold(), ref)
         if key in self._policy_path_cache:
             return self._policy_path_cache[key]
-        list_files = getattr(self.github, "list_repository_files", None)
-        if not callable(list_files):
-            paths = _ALL_POLICY_PATHS
-        else:
-            listed = list_files(
-                repository,
-                ref=ref,
-                max_files=MAX_POLICY_INVENTORY_FILES,
+        listed = self.github.list_repository_files(
+            repository,
+            ref=ref,
+            max_files=MAX_POLICY_INVENTORY_FILES,
+        )
+        if not isinstance(listed, list) or any(not isinstance(path, str) for path in listed):
+            raise GitHubError("GitHub returned an invalid repository policy-file inventory")
+        if len(listed) > MAX_POLICY_INVENTORY_FILES:
+            raise GitHubError(
+                "Repository policy-file inventory exceeds the safe repository file limit"
             )
-            if not isinstance(listed, list) or any(not isinstance(path, str) for path in listed):
-                raise GitHubError("GitHub returned an invalid repository policy-file inventory")
-            if len(listed) > MAX_POLICY_INVENTORY_FILES:
-                raise GitHubError(
-                    "Repository policy-file inventory exceeds the safe repository file limit"
-                )
-            paths = tuple(
-                sorted(
-                    (path for path in listed if _is_policy_path(path)),
-                    key=str.casefold,
-                )
+        paths = tuple(
+            sorted(
+                (path for path in listed if _is_policy_path(path)),
+                key=str.casefold,
             )
-            folded = [path.casefold() for path in paths]
-            if len(folded) != len(set(folded)):
-                raise GitHubError(
-                    "Repository policy paths differ only by case; policy precedence is ambiguous"
-                )
+        )
+        folded = [path.casefold() for path in paths]
+        if len(folded) != len(set(folded)):
+            raise GitHubError(
+                "Repository policy paths differ only by case; policy precedence is ambiguous"
+            )
         if len(paths) > MAX_POLICY_FILES_PER_REPOSITORY:
             raise GitHubError(
                 f"Repository has more than {MAX_POLICY_FILES_PER_REPOSITORY} policy files; "

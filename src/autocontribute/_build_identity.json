@@ -1,6 +1,6 @@
 {
   "project": "autocontribute",
-  "pyproject_sha256": "3524d9b14f63c0ceeb90749e7458aa96d581e67d4a7912681db23730c04ed483",
+  "pyproject_sha256": "a223631d887212df0ae48b1200ef6d5ac00bc276b3e620bc257ebf6841d53257",
   "schema_version": 1,
-  "uv_lock_sha256": "f3f3241373dc166ccf189a804f9f4800fcb276c96d0231aa56506c651fe7ac9c"
+  "uv_lock_sha256": "82ff0ec5708f59ab0fedfd13b9efc44c59d9388d68b580b3e04ca0593f7f6a1b"
 }

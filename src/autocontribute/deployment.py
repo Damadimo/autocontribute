@@ -169,9 +169,8 @@ def compute_deployment_fingerprint(
 
     publishing = config.publishing.model_dump(mode="json")
     # The exact same calibrated deployment must be able to move from review-only to the guarded
-    # auto mode. Kill-switch variable names likewise do not change contribution quality.
+    # auto mode.
     publishing.pop("mode", None)
-    publishing.pop("auto_publish_env", None)
 
     try:
         package_version = version("autocontribute")

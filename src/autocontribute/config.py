@@ -46,7 +46,7 @@ _GUARDED_AUTO_FORBIDDEN_PATHS = frozenset(
     }
 )
 _AUTO_PUBLISH_ENABLED_VALUES = frozenset({"1", "true", "yes"})
-_DEDICATED_AUTO_PUBLISH_ENV = "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH"
+AUTO_PUBLISH_ENV = "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH"
 
 CLA_ATTESTATION_STATEMENT = (
     "I attest that the GitHub account named by attested_by has completed every account-level "
@@ -279,7 +279,6 @@ class ModelsConfig(StrictModel):
 class SandboxConfig(StrictModel):
     backend: Literal["docker", "local"] = "docker"
     image: str = _DEFAULT_SANDBOX_IMAGE
-    network: Literal["none"] = "none"
     command_timeout_seconds: int = Field(default=900, ge=10, le=3_600)
     memory: str = "4g"
     cpus: float = Field(default=2.0, gt=0, le=16)
@@ -554,7 +553,6 @@ class QualityConfig(StrictModel):
     max_changed_lines: int = Field(default=400, ge=1, le=10_000)
     max_context_files: int = Field(default=20, ge=1, le=100)
     max_context_characters: int = Field(default=160_000, ge=10_000, le=2_000_000)
-    require_validation_commands: Literal[True] = True
     require_regression_evidence_for_bugfix: bool = True
     forbidden_paths: list[str] = Field(
         default_factory=lambda: [
@@ -577,14 +575,6 @@ class PublishingConfig(StrictModel):
     max_new_pull_requests_per_day: int = Field(default=1, ge=1, le=5)
     max_open_pull_requests: int = Field(default=2, ge=1, le=20)
     repository_cooldown_days: int = Field(default=7, ge=0, le=365)
-    auto_publish_env: str = _DEDICATED_AUTO_PUBLISH_ENV
-
-    @field_validator("auto_publish_env")
-    @classmethod
-    def auto_publish_env_is_a_name(cls, value: str) -> str:
-        if not _ENV_NAME.fullmatch(value):
-            raise ValueError("auto_publish_env must be an environment variable name")
-        return value
 
     @model_validator(mode="after")
     def ready_transition_starts_from_a_draft(self) -> PublishingConfig:
@@ -595,13 +585,10 @@ class PublishingConfig(StrictModel):
         return self
 
 
-def auto_publish_opt_in_enabled(config: PublishingConfig) -> bool:
+def auto_publish_opt_in_enabled() -> bool:
     """Return whether the operator's live automatic-publication switch is enabled."""
 
-    return (
-        config.auto_publish_env == _DEDICATED_AUTO_PUBLISH_ENV
-        and os.environ.get(config.auto_publish_env, "").casefold() in _AUTO_PUBLISH_ENABLED_VALUES
-    )
+    return os.environ.get(AUTO_PUBLISH_ENV, "").casefold() in _AUTO_PUBLISH_ENABLED_VALUES
 
 
 class BudgetConfig(StrictModel):
@@ -786,10 +773,6 @@ class AutocontributeConfig(StrictModel):
                 auto_violations.append("publishing.max_open_pull_requests must equal 1")
             if self.publishing.repository_cooldown_days < 7:
                 auto_violations.append("publishing.repository_cooldown_days must be at least 7")
-            if self.publishing.auto_publish_env != _DEDICATED_AUTO_PUBLISH_ENV:
-                auto_violations.append(
-                    "publishing.auto_publish_env must equal " + _DEDICATED_AUTO_PUBLISH_ENV
-                )
             if self.sandbox.backend != "docker":
                 auto_violations.append("sandbox.backend must be docker")
             if not self.github.require_unassigned:
@@ -969,7 +952,6 @@ sandbox:
   # image fails doctor. Build, digest-pin, and pre-pull your own: see docs/sandbox-image.md.
   image: >-
     example.invalid/sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000
-  network: none
   command_timeout_seconds: 900
   memory: 4g
   cpus: 2
@@ -1001,7 +983,6 @@ quality:
   min_dimension_score: 80
   max_files_changed: 8
   max_changed_lines: 400
-  require_validation_commands: true
   require_regression_evidence_for_bugfix: true
 
 publishing:
@@ -1012,7 +993,6 @@ publishing:
   max_new_pull_requests_per_day: 1
   max_open_pull_requests: 2
   repository_cooldown_days: 7
-  auto_publish_env: AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH
 
 budget:
   max_model_calls_per_run: 9
@@ -1028,6 +1008,7 @@ storage:
 
 
 __all__ = [
+    "AUTO_PUBLISH_ENV",
     "CLA_ATTESTATION_STATEMENT",
     "DCO_ATTESTATION_STATEMENT",
     "AutocontributeConfig",

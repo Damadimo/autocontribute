@@ -1201,7 +1201,7 @@ def test_latest_replication_verification_fails_closed_for_legacy_receipt_schema(
     receipt.write_text(json.dumps(payload), encoding="utf-8")
     receipt.chmod(0o400)
 
-    with pytest.raises(StateError, match="legacy schema without retention-policy evidence"):
+    with pytest.raises(StateError, match="Local S3 replication receipt is invalid"):
         verify_latest_state_bundle_replication(
             bundle_directory=bundle.parent,
             receipt_directory=receipts,

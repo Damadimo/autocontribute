@@ -523,28 +523,6 @@ class QualityEvaluator:
         )
 
 
-def evaluate_quality(
-    *,
-    diff: str,
-    command_results: Sequence[CommandResult],
-    required_commands: Sequence[str],
-    review: CriticReview,
-    config: AutocontributeConfig,
-    baseline_result: CommandResult | None = None,
-    contribution_kind: str | None = None,
-) -> QualityReport:
-    """Convenience wrapper for callers that do not retain an evaluator."""
-
-    return QualityEvaluator(config).evaluate(
-        diff=diff,
-        command_results=command_results,
-        required_commands=required_commands,
-        review=review,
-        baseline_result=baseline_result,
-        contribution_kind=contribution_kind,
-    )
-
-
 def infrastructure_failure_reason(result: CommandResult) -> str | None:
     """Explain why a failed command is not actionable repository-code evidence."""
 
@@ -775,7 +753,6 @@ def _path_evidence(kind: str, paths: Sequence[str]) -> str:
 __all__ = [
     "QualityEvaluator",
     "actionable_validation_failure_reason",
-    "evaluate_quality",
     "infrastructure_failure_reason",
     "secret_findings",
 ]

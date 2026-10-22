@@ -133,6 +133,10 @@ class FakeGitHub:
         del repository
         return "b" * 40
 
+    def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
+        del repository, ref, max_files
+        return ["CONTRIBUTING.md"]
+
 
 class CountingGitHub(FakeGitHub):
     def __init__(self, issue: IssueCandidate, repository: RepositoryInfo, sha: str) -> None:
@@ -215,8 +219,6 @@ class PassingSandbox:
         self,
         workspace: RepositoryWorkspace,
         commands: list[str],
-        *,
-        stop_on_failure: bool = True,
     ) -> list[CommandResult]:
         self.validation_batches.append(list(commands))
         self.remaining_commands -= len(commands)
@@ -253,8 +255,6 @@ class SequenceSandbox(PassingSandbox):
         self,
         workspace: RepositoryWorkspace,
         commands: list[str],
-        *,
-        stop_on_failure: bool = True,
     ) -> list[CommandResult]:
         del workspace
         self.validation_batches.append(list(commands))
@@ -271,7 +271,7 @@ class SequenceSandbox(PassingSandbox):
             )
             results.append(result)
             self.remaining_commands -= 1
-            if stop_on_failure and not result.passed:
+            if not result.passed:
                 break
         return results
 
@@ -279,7 +279,7 @@ class SequenceSandbox(PassingSandbox):
 def _take_over_run_lease(orchestrator: Orchestrator, store: RunStore) -> Lease:
     guard = orchestrator._lease_guard
     assert guard is not None
-    current = guard.lease
+    current = guard.assert_owned()
     takeover = store.acquire_lease(
         "autocontribute.run",
         "takeover-worker",
@@ -1229,9 +1229,7 @@ def test_breaker_blocks_before_github_or_model_work(tmp_path: Path) -> None:
     assert all(provider.calls == 0 for provider in providers.values())
 
 
-@pytest.mark.parametrize(
-    "invocation_mode", [RunInvocationMode.AUTOMATIC, RunInvocationMode.SCHEDULED]
-)
+@pytest.mark.parametrize("invocation_mode", [RunInvocationMode.SCHEDULED])
 @pytest.mark.parametrize("with_retry_authorization", [False, True])
 def test_nonmanual_invocation_cannot_pin_or_authorize_an_issue_before_external_work(
     tmp_path: Path,
@@ -1274,9 +1272,7 @@ def test_nonmanual_invocation_cannot_pin_or_authorize_an_issue_before_external_w
     assert all(provider.calls == 0 for provider in providers.values())
 
 
-@pytest.mark.parametrize(
-    "invocation_mode", [RunInvocationMode.AUTOMATIC, RunInvocationMode.SCHEDULED]
-)
+@pytest.mark.parametrize("invocation_mode", [RunInvocationMode.SCHEDULED])
 def test_nonmanual_invocation_cannot_supply_retry_authorization_without_an_issue(
     tmp_path: Path,
     invocation_mode: RunInvocationMode,
@@ -1806,6 +1802,11 @@ def test_organization_default_pull_request_template_is_a_hard_gate(
             if repository == "example/.github" and path == "PULL_REQUEST_TEMPLATE.md":
                 return "## Organization verification\n"
             return super().get_file(repository, path, ref=ref, max_bytes=max_bytes)
+
+        def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
+            if repository == "example/.github":
+                return ["PULL_REQUEST_TEMPLATE.md"]
+            return super().list_repository_files(repository, ref=ref, max_files=max_files)
 
     monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
     config = AutocontributeConfig.model_validate(
@@ -2466,7 +2467,7 @@ def test_unpinned_discovery_exhausts_suppressed_revision_without_model_work(
         prior = orchestrator.run(
             issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
         )
-        discovered = orchestrator.run()
+        discovered = orchestrator.run(invocation_mode=RunInvocationMode.SCHEDULED)
 
     assert prior.status == RunStatus.SKIPPED
     assert discovered.status == RunStatus.SKIPPED

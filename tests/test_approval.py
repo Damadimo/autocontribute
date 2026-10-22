@@ -6,7 +6,6 @@ import pytest
 
 from autocontribute.approval import (
     ApprovalManifest,
-    approval_is_valid,
     build_approval_manifest,
     create_approval,
     hash_diff,
@@ -62,8 +61,7 @@ def test_approval_is_valid_only_during_configured_window() -> None:
     assert approval.approved_at == NOW
     assert approval.expires_at == NOW + timedelta(hours=2)
     validate_approval(approval, manifest, now=NOW)
-    assert approval_is_valid(approval, manifest, now=NOW + timedelta(minutes=119))
-    assert not approval_is_valid(approval, manifest, now=approval.expires_at)
+    validate_approval(approval, manifest, now=NOW + timedelta(minutes=119))
     with pytest.raises(PolicyError, match="expired"):
         validate_approval(approval, manifest, now=approval.expires_at)
 

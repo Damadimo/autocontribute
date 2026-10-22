@@ -131,7 +131,6 @@ def _transient_model_failure(exc: ModelError) -> bool:
 
 
 class RunInvocationMode(StrEnum):
-    AUTOMATIC = "automatic"
     MANUAL = "manual"
     SCHEDULED = "scheduled"
 
@@ -224,8 +223,8 @@ class Orchestrator:
     def run(
         self,
         *,
+        invocation_mode: RunInvocationMode,
         issue_reference: str | None = None,
-        invocation_mode: RunInvocationMode = RunInvocationMode.AUTOMATIC,
         retry_authorization: CandidateRetryAuthorization | None = None,
     ) -> RunManifest:
         if not isinstance(invocation_mode, RunInvocationMode):
@@ -1064,7 +1063,7 @@ class Orchestrator:
                 f"Complete validation suite requires {len(commands)} command(s), but only "
                 f"{remaining} sandbox command(s) remain; refusing to truncate validation"
             )
-        results = self.sandbox.run_all_isolated(workspace, commands, stop_on_failure=True)
+        results = self.sandbox.run_all_isolated(workspace, commands)
         scrubbed_commands = tuple(self._scrub_command(result) for result in results)
         scrubbed_results = tuple(command.result for command in scrubbed_commands)
         failed_commands = sum(not result.passed for result in results)
