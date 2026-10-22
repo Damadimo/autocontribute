@@ -65,16 +65,16 @@ from autocontribute.preparation import (
     validate_preparation_fingerprint,
     validate_validation_artifact,
 )
-from autocontribute.redaction import contains_credential_material, redact_text
+from autocontribute.redaction import (
+    contains_credential_material,
+    contains_high_confidence_token,
+    redact_text,
+)
 from autocontribute.repository import RepositoryWorkspace
 from autocontribute.store import RunStore
 
 _SAFE_SLUG = re.compile(r"[^a-z0-9-]+")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
-_SECRET = re.compile(
-    r"(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
-    r"sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
-)
 _GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -123,7 +123,7 @@ def validate_publication_text(
             raise PolicyError(f"{name} cannot be blank")
         if len(value) > limits[name]:
             raise PolicyError(f"{name} exceeds the {limits[name]}-character limit")
-        if _SECRET.search(value):
+        if contains_high_confidence_token(value):
             raise PolicyError(f"{name} appears to contain a credential")
         if "@everyone" in value.casefold() or "@here" in value.casefold():
             raise PolicyError(f"{name} contains a broadcast mention")
