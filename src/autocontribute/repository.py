@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from autocontribute.domain import FileEdit
 from autocontribute.exceptions import RepositoryError
+from autocontribute.host_environment import proxy_environment
 from autocontribute.redaction import is_sensitive_path
 
 _FULL_SHA: Final = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
@@ -26,31 +27,19 @@ _DEFAULT_MAX_FILE_BYTES: Final = 1_000_000
 
 # Git runs with no repository credentials and executes no repository hooks or
 # filters. Inherit only the operator-controlled process settings needed to find
-# Git, reach a public HTTPS remote through a proxy/custom CA, and create
-# temporary files. In particular, do not copy the model, GitHub, cloud, Python,
-# or dynamic-loader variables that commonly coexist in the worker process.
+# Git and create temporary files, plus the proxy and CA settings that reach a
+# public HTTPS remote. In particular, do not copy the model, GitHub, cloud,
+# Python, or dynamic-loader variables that commonly coexist in the worker process.
 _GIT_HOST_ENVIRONMENT_ALLOWLIST: Final[frozenset[str]] = frozenset(
     {
-        "ALL_PROXY",
         "COMSPEC",
-        "GIT_SSL_CAINFO",
-        "GIT_SSL_CAPATH",
-        "HTTPS_PROXY",
-        "HTTP_PROXY",
-        "NO_PROXY",
         "PATH",
         "PATHEXT",
-        "SSL_CERT_DIR",
-        "SSL_CERT_FILE",
         "SYSTEMROOT",
         "TEMP",
         "TMP",
         "TMPDIR",
         "WINDIR",
-        "all_proxy",
-        "http_proxy",
-        "https_proxy",
-        "no_proxy",
     }
 )
 
@@ -831,6 +820,7 @@ def _git_environment() -> dict[str, str]:
         for name in _GIT_HOST_ENVIRONMENT_ALLOWLIST
         if (value := os.environ.get(name)) is not None
     }
+    environment.update(proxy_environment())
     environment.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",

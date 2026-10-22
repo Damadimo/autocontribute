@@ -142,6 +142,7 @@ def test_git_environment_inherits_only_transport_and_runtime_allowlist(
         "NO_PROXY": "localhost,127.0.0.1",
         "PATH": "/operator/bin:/usr/bin:/bin",
         "PATHEXT": ".COM;.EXE;.BAT;.CMD",
+        "REQUESTS_CA_BUNDLE": "/operator/requests-ca.pem",
         "SSL_CERT_DIR": "/system/certs",
         "SSL_CERT_FILE": "/system/ca.pem",
         "SYSTEMROOT": "C:/Windows",
@@ -189,7 +190,6 @@ def test_git_environment_inherits_only_transport_and_runtime_allowlist(
         "PYTHONPATH": "/attacker/modules",
         "PYTHONSTARTUP": "/attacker/startup.py",
         "PYTHONWARNINGS": "error",
-        "REQUESTS_CA_BUNDLE": "/attacker/requests-ca.pem",
         "VIRTUAL_ENV": "/attacker/venv",
     }
     monkeypatch.setattr(repository_module.os, "environ", {**inherited, **denied})
