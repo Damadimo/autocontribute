@@ -52,11 +52,22 @@ class ModelRequestError(ModelError):
 
     ``status_code`` is the provider's HTTP status when one was observed (4xx/5xx),
     or ``None`` for network-level failures where no response arrived.
+    ``provider_code`` is an allowlisted provider error code such as ``insufficient_quota``, and
+    ``retry_after_seconds`` the wait the provider asked for, when it sent either.
     """
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        provider_code: str | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.provider_code = provider_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class ModelTimeoutError(ModelError):

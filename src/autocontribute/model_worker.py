@@ -15,6 +15,7 @@ from pydantic import BaseModel, ValidationError
 
 from autocontribute.config import ModelProfile
 from autocontribute.exceptions import ModelError, ModelRequestError
+from autocontribute.model_retry import PROVIDER_ERROR_CODES
 from autocontribute.providers import (
     _MAX_MODEL_REQUEST_BYTES,
     _MAX_MODEL_RESULT_BYTES,
@@ -118,7 +119,14 @@ def _safe_provider_message(error: ModelError) -> str:
     return "Model provider request failed"
 
 
-def _error_result(error_code: str, message: str, *, http_status: int | None = None) -> bytes:
+def _error_result(
+    error_code: str,
+    message: str,
+    *,
+    http_status: int | None = None,
+    provider_code: str | None = None,
+    retry_after_seconds: float | None = None,
+) -> bytes:
     envelope: dict[str, object] = {
         "protocol": _MODEL_WORKER_PROTOCOL,
         "status": "error",
@@ -127,7 +135,30 @@ def _error_result(error_code: str, message: str, *, http_status: int | None = No
     }
     if http_status is not None:
         envelope["http_status"] = http_status
+    if provider_code is not None:
+        envelope["provider_code"] = provider_code
+    if retry_after_seconds is not None:
+        envelope["retry_after_seconds"] = retry_after_seconds
     return _canonical_json_bytes(envelope)
+
+
+def _request_error_result(error: ModelRequestError) -> bytes:
+    """Serialize a request failure, dropping details the parent would reject."""
+
+    status_code = error.status_code
+    if not (type(status_code) is int and 400 <= status_code <= 599):
+        status_code = None
+    provider_code = error.provider_code if error.provider_code in PROVIDER_ERROR_CODES else None
+    retry_after = error.retry_after_seconds
+    if retry_after is not None and not (math.isfinite(retry_after) and retry_after >= 0):
+        retry_after = None
+    return _error_result(
+        "provider_request_error",
+        _safe_provider_message(error),
+        http_status=status_code,
+        provider_code=provider_code,
+        retry_after_seconds=retry_after,
+    )
 
 
 def _execute(payload: bytes) -> bytes:
@@ -189,14 +220,7 @@ def main() -> int:
             payload = _read_bounded(arguments.request_fd)
             response = _execute(payload)
         except ModelRequestError as exc:
-            status_code = exc.status_code
-            if not (type(status_code) is int and 400 <= status_code <= 599):
-                status_code = None
-            response = _error_result(
-                "provider_request_error",
-                _safe_provider_message(exc),
-                http_status=status_code,
-            )
+            response = _request_error_result(exc)
         except ModelError as exc:
             response = _error_result("provider_error", _safe_provider_message(exc))
         except Exception:

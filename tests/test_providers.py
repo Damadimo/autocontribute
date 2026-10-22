@@ -6,12 +6,12 @@ from unittest.mock import Mock
 
 import httpx
 import pytest
-from openai import BadRequestError
+from openai import BadRequestError, RateLimitError
 from pydantic import BaseModel
 
 import autocontribute.providers as providers
 from autocontribute.config import ModelProfile
-from autocontribute.exceptions import ConfigurationError, ModelError
+from autocontribute.exceptions import ConfigurationError, ModelError, ModelRequestError
 from autocontribute.providers import ModelUsage, OpenAICompatibleProvider, OpenAIResponsesProvider
 from autocontribute.redaction import MODEL_INPUT_REDACTION
 
@@ -81,6 +81,25 @@ def _bad_request_error(
             "param": param,
             "message": f"provider body echoed {api_key} and private prompt",
         },
+    )
+
+
+def _rate_limit_error(
+    *,
+    code: object,
+    error_type: object,
+    headers: dict[str, str],
+) -> RateLimitError:
+    request = httpx.Request("POST", "https://api.openai.com/v1/responses")
+    response = httpx.Response(
+        429,
+        request=request,
+        headers={"x-request-id": "req_safe_to_log", **headers},
+    )
+    return RateLimitError(
+        "provider rate-limit message",
+        response=response,
+        body={"type": error_type, "code": code, "message": "provider rate-limit message"},
     )
 
 
@@ -474,6 +493,51 @@ def test_provider_request_error_never_renders_provider_controlled_error_fields(
         "OpenAI Responses request failed (HTTP 400; request ID: req_safe_to_log)"
     )
     assert private_sentinel not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("code", "error_type", "headers", "provider_code", "retry_after"),
+    [
+        (
+            "project_spend_limit_exceeded",
+            "insufficient_quota",
+            {"retry-after-ms": "2500", "retry-after": "3"},
+            "project_spend_limit_exceeded",
+            2.5,
+        ),
+        ("billing_cap_reached", "insufficient_quota", {}, "insufficient_quota", None),
+        ("rate_limit_exceeded", "requests", {"retry-after": "3"}, None, 3.0),
+    ],
+    ids=["specific-code", "quota-type", "unlisted-code"],
+)
+def test_provider_request_error_keeps_allowlisted_code_and_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+    error_type: str,
+    headers: dict[str, str],
+    provider_code: str | None,
+    retry_after: float | None,
+) -> None:
+    response = _responses_response(
+        SimpleNamespace(type="output_text", parsed=Verdict(accepted=True, summary="not reached"))
+    )
+    provider, client, _ = _responses_provider(monkeypatch, response)
+    client.responses.parse.side_effect = _rate_limit_error(
+        code=code,
+        error_type=error_type,
+        headers=headers,
+    )
+
+    with pytest.raises(ModelRequestError) as raised:
+        provider.generate(instructions="Private.", prompt="Secret.", output_type=Verdict)
+
+    code_detail = f"code: {provider_code}; " if provider_code else ""
+    assert str(raised.value) == (
+        f"OpenAI Responses request failed (HTTP 429; {code_detail}request ID: req_safe_to_log)"
+    )
+    assert raised.value.status_code == 429
+    assert raised.value.provider_code == provider_code
+    assert raised.value.retry_after_seconds == retry_after
 
 
 @pytest.mark.parametrize("status_code", [True, "401", 399, 600])

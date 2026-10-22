@@ -10,7 +10,7 @@ from pydantic import BaseModel
 import autocontribute.providers as providers
 from autocontribute.config import ModelProfile
 from autocontribute.domain import ContributionPlan
-from autocontribute.exceptions import ModelError, ModelTimeoutError
+from autocontribute.exceptions import ModelError, ModelRequestError, ModelTimeoutError
 from autocontribute.providers import ModelResult, ModelUsage, SubprocessModelProvider
 
 _API_KEY_ENV = "AUTOCONTRIBUTE_MODEL_PROCESS_TEST_KEY"
@@ -301,7 +301,18 @@ def test_worker_result_rejects_invalid_provider_http_status(http_status: object)
         )
 
 
-def test_worker_result_rejects_http_status_on_other_error_codes() -> None:
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("http_status", 503),
+        ("provider_code", "insufficient_quota"),
+        ("retry_after_seconds", 1.0),
+    ],
+)
+def test_worker_result_rejects_request_details_on_other_error_codes(
+    key: str,
+    value: object,
+) -> None:
     from autocontribute.providers import (
         _MODEL_WORKER_PROTOCOL,
         _canonical_json_bytes,
@@ -315,7 +326,7 @@ def test_worker_result_rejects_http_status_on_other_error_codes() -> None:
             "status": "error",
             "error_code": "provider_error",
             "message": "Model provider request failed",
-            "http_status": 503,
+            key: value,
         }
     )
 
@@ -327,17 +338,13 @@ def test_worker_result_rejects_http_status_on_other_error_codes() -> None:
         )
 
 
-def test_worker_main_serializes_provider_request_error_with_status(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _worker_main_payload(monkeypatch: pytest.MonkeyPatch, error: Exception) -> bytes:
     import os
 
     from autocontribute import model_worker
-    from autocontribute.exceptions import ModelRequestError
-    from autocontribute.providers import _output_schema_id, _worker_result
 
     def failing_execute(_payload: bytes) -> bytes:
-        raise ModelRequestError("OpenAI Responses request failed (HTTP 429)", status_code=429)
+        raise error
 
     monkeypatch.setattr(model_worker, "_execute", failing_execute)
     request_read, request_write = os.pipe()
@@ -354,10 +361,137 @@ def test_worker_main_serializes_provider_request_error_with_status(
 
     payload = os.read(result_read, 65_536)
     os.close(result_read)
+    return payload
+
+
+def _request_error_from(payload: bytes) -> ModelRequestError:
+    from autocontribute.providers import _output_schema_id, _worker_result
+
     with pytest.raises(ModelRequestError) as raised:
         _worker_result(
             payload,
             output_type=ContributionPlan,
             output_schema=_output_schema_id(ContributionPlan),
         )
-    assert raised.value.status_code == 429
+    return raised.value
+
+
+def test_worker_main_serializes_provider_request_error_with_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _worker_main_payload(
+        monkeypatch,
+        ModelRequestError("OpenAI Responses request failed (HTTP 429)", status_code=429),
+    )
+
+    assert _request_error_from(payload).status_code == 429
+
+
+def test_worker_main_forwards_allowlisted_code_and_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _worker_main_payload(
+        monkeypatch,
+        ModelRequestError(
+            "OpenAI Responses request failed (HTTP 429; code: credit_balance_exhausted)",
+            status_code=429,
+            provider_code="credit_balance_exhausted",
+            retry_after_seconds=4.0,
+        ),
+    )
+
+    error = _request_error_from(payload)
+    assert error.status_code == 429
+    assert error.provider_code == "credit_balance_exhausted"
+    assert error.retry_after_seconds == 4.0
+
+
+def test_worker_main_drops_request_details_the_parent_would_reject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _worker_main_payload(
+        monkeypatch,
+        ModelRequestError(
+            "OpenAI Responses request failed (HTTP 429)",
+            status_code=429,
+            provider_code="confidentialmergercodename",
+            retry_after_seconds=-1.0,
+        ),
+    )
+
+    assert b"confidentialmergercodename" not in payload
+    error = _request_error_from(payload)
+    assert error.status_code == 429
+    assert error.provider_code is None
+    assert error.retry_after_seconds is None
+
+
+def test_worker_error_envelope_round_trips_provider_code_and_retry_after() -> None:
+    from autocontribute import model_worker
+
+    payload = model_worker._error_result(
+        "provider_request_error",
+        "OpenAI Responses request failed (HTTP 429; code: insufficient_quota)",
+        http_status=429,
+        provider_code="insufficient_quota",
+        retry_after_seconds=2.5,
+    )
+
+    error = _request_error_from(payload)
+    assert error.status_code == 429
+    assert error.provider_code == "insufficient_quota"
+    assert error.retry_after_seconds == 2.5
+
+
+@pytest.mark.parametrize("provider_code", ["rate_limit_exceeded", 7, None, ["cyber_policy"]])
+def test_worker_result_rejects_unknown_provider_codes(provider_code: object) -> None:
+    from autocontribute.providers import (
+        _MODEL_WORKER_PROTOCOL,
+        _canonical_json_bytes,
+        _output_schema_id,
+        _worker_result,
+    )
+
+    payload = _canonical_json_bytes(
+        {
+            "protocol": _MODEL_WORKER_PROTOCOL,
+            "status": "error",
+            "error_code": "provider_request_error",
+            "message": "OpenAI Responses request failed",
+            "provider_code": provider_code,
+        }
+    )
+
+    with pytest.raises(ModelError, match="unknown provider error code"):
+        _worker_result(
+            payload,
+            output_type=ContributionPlan,
+            output_schema=_output_schema_id(ContributionPlan),
+        )
+
+
+@pytest.mark.parametrize("retry_after", [-1, -0.5, "5", True, None, [1]])
+def test_worker_result_rejects_invalid_retry_after(retry_after: object) -> None:
+    from autocontribute.providers import (
+        _MODEL_WORKER_PROTOCOL,
+        _canonical_json_bytes,
+        _output_schema_id,
+        _worker_result,
+    )
+
+    payload = _canonical_json_bytes(
+        {
+            "protocol": _MODEL_WORKER_PROTOCOL,
+            "status": "error",
+            "error_code": "provider_request_error",
+            "message": "OpenAI Responses request failed",
+            "retry_after_seconds": retry_after,
+        }
+    )
+
+    with pytest.raises(ModelError, match="invalid Retry-After value"):
+        _worker_result(
+            payload,
+            output_type=ContributionPlan,
+            output_schema=_output_schema_id(ContributionPlan),
+        )

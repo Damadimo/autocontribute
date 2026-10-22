@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from autocontribute.config import ModelProfile, validate_model_identifier
 from autocontribute.domain import ContributionPlan, CriticReview, PatchProposal
 from autocontribute.exceptions import ModelError, ModelRequestError, ModelTimeoutError
+from autocontribute.model_retry import PROVIDER_ERROR_CODES, retry_after_seconds
 from autocontribute.pricing import ModelUsage
 from autocontribute.redaction import redact_model_input
 
@@ -38,6 +39,7 @@ _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _MODEL_WORKER_PROTOCOL = "autocontribute.model-call.v1"
 _MAX_MODEL_REQUEST_BYTES = 8 * 1024 * 1024
 _MAX_MODEL_RESULT_BYTES = 8 * 1024 * 1024
+_REQUEST_ERROR_DETAIL_KEYS = frozenset({"http_status", "provider_code", "retry_after_seconds"})
 _WORKER_TERM_GRACE_SECONDS = 0.25
 _WORKER_POLL_SECONDS = 0.05
 _WORKER_ENV_ALLOWLIST = (
@@ -171,18 +173,28 @@ def _request_error(
 ) -> ModelRequestError:
     """Create a useful error without echoing provider bodies, prompts, or credentials.
 
-    Preserve only a numeric status from a genuine OpenAI SDK HTTP exception. All response-body
-    fields remain intentionally unavailable because a compatible endpoint can place arbitrary
-    prompt or credential material in otherwise token-shaped error metadata.
+    Preserve only a numeric status, an allowlisted error code and the Retry-After wait from a
+    genuine OpenAI SDK HTTP exception. All other response-body fields remain intentionally
+    unavailable because a compatible endpoint can place arbitrary prompt or credential material
+    in otherwise token-shaped error metadata.
     """
 
     details: list[str] = []
     http_status: int | None = None
+    provider_code: str | None = None
+    retry_after: float | None = None
     if isinstance(exc, APIStatusError):
         status_code = getattr(exc, "status_code", None)
         if type(status_code) is int and 400 <= status_code <= 599:
             http_status = status_code
             details.append(f"HTTP {status_code}")
+        # Billing errors can carry a specific code while their type stays insufficient_quota.
+        for candidate in (getattr(exc, "code", None), getattr(exc, "type", None)):
+            if isinstance(candidate, str) and candidate in PROVIDER_ERROR_CODES:
+                provider_code = candidate
+                details.append(f"code: {candidate}")
+                break
+        retry_after = retry_after_seconds(exc.response.headers)
 
     request_id = getattr(exc, "request_id", None)
     if isinstance(request_id, str) and _SAFE_REQUEST_ID.fullmatch(request_id):
@@ -193,7 +205,12 @@ def _request_error(
         else:
             details.append(f"request ID: {request_id}")
     detail_suffix = f" ({'; '.join(details)})" if details else ""
-    return ModelRequestError(f"{provider} request failed{detail_suffix}", status_code=http_status)
+    return ModelRequestError(
+        f"{provider} request failed{detail_suffix}",
+        status_code=http_status,
+        provider_code=provider_code,
+        retry_after_seconds=retry_after,
+    )
 
 
 def _model_output_strings(value: object) -> Iterator[str]:
@@ -608,6 +625,39 @@ def _strict_worker_envelope(payload: bytes) -> dict[str, object]:
     return envelope
 
 
+def _request_error_details(
+    envelope: dict[str, object],
+) -> tuple[int | None, str | None, float | None]:
+    http_status: int | None = None
+    if "http_status" in envelope:
+        raw_status = envelope["http_status"]
+        if (
+            isinstance(raw_status, bool)
+            or not isinstance(raw_status, int)
+            or not 400 <= raw_status <= 599
+        ):
+            raise ModelError("Model worker returned an invalid provider HTTP status")
+        http_status = raw_status
+    provider_code: str | None = None
+    if "provider_code" in envelope:
+        raw_code = envelope["provider_code"]
+        if not isinstance(raw_code, str) or raw_code not in PROVIDER_ERROR_CODES:
+            raise ModelError("Model worker returned an unknown provider error code")
+        provider_code = raw_code
+    retry_after: float | None = None
+    if "retry_after_seconds" in envelope:
+        raw_wait = envelope["retry_after_seconds"]
+        if (
+            isinstance(raw_wait, bool)
+            or not isinstance(raw_wait, (int, float))
+            or not math.isfinite(raw_wait)
+            or raw_wait < 0
+        ):
+            raise ModelError("Model worker returned an invalid Retry-After value")
+        retry_after = float(raw_wait)
+    return http_status, provider_code, retry_after
+
+
 def _worker_result(
     payload: bytes,
     *,
@@ -621,17 +671,8 @@ def _worker_result(
     if status == "error":
         error_code = envelope.get("error_code")
         expected_keys = {"protocol", "status", "error_code", "message"}
-        http_status: int | None = None
-        if error_code == "provider_request_error" and "http_status" in envelope:
-            expected_keys = expected_keys | {"http_status"}
-            raw_status = envelope.get("http_status")
-            if (
-                isinstance(raw_status, bool)
-                or not isinstance(raw_status, int)
-                or not 400 <= raw_status <= 599
-            ):
-                raise ModelError("Model worker returned an invalid provider HTTP status")
-            http_status = raw_status
+        if error_code == "provider_request_error":
+            expected_keys |= _REQUEST_ERROR_DETAIL_KEYS & envelope.keys()
         if set(envelope) != expected_keys:
             raise ModelError("Model worker returned an invalid error envelope")
         message = envelope.get("message")
@@ -645,7 +686,13 @@ def _worker_result(
         ):
             raise ModelError("Model worker returned an invalid error message")
         if error_code == "provider_request_error":
-            raise ModelRequestError(message, status_code=http_status)
+            http_status, provider_code, retry_after = _request_error_details(envelope)
+            raise ModelRequestError(
+                message,
+                status_code=http_status,
+                provider_code=provider_code,
+                retry_after_seconds=retry_after,
+            )
         raise ModelError(message)
     expected_keys = {
         "protocol",
