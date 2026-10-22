@@ -13,14 +13,8 @@ import pytest
 
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.domain import IssueCandidate, RunManifest, RunStatus
-from autocontribute.evaluation import EvaluationStore
 from autocontribute.exceptions import StateError
-from autocontribute.github import PullRequestCommit, PullRequestDetails
 from autocontribute.issue_revision import compute_issue_revision
-from autocontribute.lifecycle import (
-    PullRequestLifecycleSnapshot,
-    parse_lifecycle_snapshot_json,
-)
 from autocontribute.store import (
     CURRENT_SCHEMA_VERSION,
     CandidateAttemptDisposition,
@@ -110,101 +104,6 @@ def _set_status(store: RunStore, run: RunManifest, status: RunStatus) -> None:
     store.save(run, event="test.status", details={"status": status.value})
 
 
-def _lifecycle_snapshot(*, head_sha: str = "a" * 40) -> PullRequestLifecycleSnapshot:
-    observed_at = datetime(2026, 7, 21, 12, tzinfo=UTC)
-    return PullRequestLifecycleSnapshot(
-        observed_at=observed_at,
-        expected_head_sha="a" * 40,
-        pull_request=PullRequestDetails(
-            repository="example/project",
-            number=7,
-            html_url="https://github.com/example/project/pull/7",
-            state="open",
-            draft=True,
-            merged=False,
-            updated_at=observed_at,
-            merged_at=None,
-            closed_at=None,
-            merge_commit_sha=None,
-            head_sha=head_sha,
-            base_sha="b" * 40,
-            head_repository="example/project",
-            issue_comment_count=0,
-            review_comment_count=0,
-            commit_count=1,
-            title="Fix lifecycle evidence",
-            body="",
-            base_ref="main",
-            head_ref="fix-lifecycle",
-            head_label="example:fix-lifecycle",
-            node_id="PR_fixture_node_7",
-        ),
-        commits=(
-            PullRequestCommit(
-                position=1,
-                sha=head_sha,
-                node_id=f"C_{head_sha}",
-                parent_shas=("b" * 40,),
-            ),
-        ),
-        reviews=(),
-        issue_comments=(),
-        review_comments=(),
-        check_runs=(),
-        commit_statuses=(),
-        timeline_item_count=0,
-        timeline_events=(),
-        references=(),
-    )
-
-
-def _append_lifecycle_snapshot_event(
-    connection: sqlite3.Connection,
-    *,
-    run_id: str,
-    fingerprint: str,
-) -> None:
-    previous = connection.execute(
-        """
-        SELECT event_count, event_head_hash FROM runs WHERE run_id = ?
-        """,
-        (run_id,),
-    ).fetchone()
-    assert previous is not None
-    occurred_at = datetime(2026, 7, 22, 12, tzinfo=UTC).isoformat()
-    details_json = json.dumps(
-        {"fingerprint": fingerprint},
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    payload = json.dumps(
-        {
-            "run_id": run_id,
-            "occurred_at": occurred_at,
-            "event_type": "lifecycle.snapshot.recorded",
-            "details": details_json,
-            "previous_hash": previous[1],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    event_hash = hashlib.sha256(payload.encode()).hexdigest()
-    connection.execute(
-        """
-        INSERT INTO events(
-            run_id, occurred_at, event_type, details_json, previous_hash, event_hash
-        ) VALUES (?, ?, 'lifecycle.snapshot.recorded', ?, ?, ?)
-        """,
-        (run_id, occurred_at, details_json, previous[1], event_hash),
-    )
-    connection.execute(
-        """
-        UPDATE runs SET event_count = ?, event_head_hash = ? WHERE run_id = ?
-        """,
-        (previous[0] + 1, event_hash, run_id),
-    )
-
-
 def _rewrite_tail_event_details(
     connection: sqlite3.Connection,
     *,
@@ -278,35 +177,6 @@ def _delete_tail_event(
         WHERE run_id = ?
         """,
         (row[1], run_id),
-    )
-
-
-def _reserve_gate(
-    store: RunStore,
-    run: RunManifest,
-    *,
-    cursor: str | None = None,
-    fingerprint: str = "d" * 64,
-) -> None:
-    run.publishing_login = "octocat"
-    run.publishing_api_origin = "https://api.github.com"
-    store.save(run, event="test.publication_context", details={})
-    outcome_cursor = store.upstream_outcome_corpus_cursor(
-        fingerprint,
-        "octocat",
-        "https://api.github.com",
-        exclude_run_id=run.run_id,
-    )
-    store.reserve_publication(
-        run.run_id,
-        "example/project",
-        max_per_utc_day=100,
-        repository_cooldown=timedelta(0),
-        evaluation_corpus_cursor=cursor or store.evaluation_corpus_cursor(),
-        evaluation_deployment_fingerprint=fingerprint,
-        outcome_corpus_cursor=outcome_cursor,
-        publishing_login="octocat",
-        publishing_api_origin="https://api.github.com",
     )
 
 
@@ -388,22 +258,10 @@ def _begin_publication(
     *,
     branch_name: str = "autocontribute/fix-exact-bug",
     publication_draft: bool = True,
-    with_gate: bool = True,
     max_per_utc_day: int = 100,
     repository_cooldown: timedelta = timedelta(0),
     now: datetime | None = None,
 ) -> RunManifest:
-    cursor = store.evaluation_corpus_cursor() if with_gate else None
-    outcome_cursor = (
-        store.upstream_outcome_corpus_cursor(
-            "d" * 64,
-            "octocat",
-            "https://api.github.com",
-            exclude_run_id=run.run_id,
-        )
-        if with_gate
-        else None
-    )
     return store.begin_publication(
         run,
         "example/project",
@@ -418,9 +276,6 @@ def _begin_publication(
         max_per_utc_day=max_per_utc_day,
         repository_cooldown=repository_cooldown,
         now=now,
-        evaluation_corpus_cursor=cursor,
-        evaluation_deployment_fingerprint="d" * 64 if with_gate else None,
-        outcome_corpus_cursor=outcome_cursor,
     )
 
 
@@ -702,7 +557,7 @@ def test_artifact_path_cannot_escape_run_directory(tmp_path: Path) -> None:
         store.write_artifact(run.run_id, "../secret", "no")
 
 
-def test_fresh_database_has_current_version_and_all_v8_tables(tmp_path: Path) -> None:
+def test_fresh_database_has_current_version_and_all_tables(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
 
     with sqlite3.connect(store.database_path) as connection:
@@ -738,19 +593,8 @@ def test_fresh_database_has_current_version_and_all_v8_tables(tmp_path: Path) ->
                 "PRAGMA table_info(candidate_retry_authorizations)"
             ).fetchall()
         ]
-        gate_hold_not_null = {
-            row[1]: row[3]
-            for row in connection.execute("PRAGMA table_info(publication_gate_holds)").fetchall()
-        }
 
-    assert store.schema_version == CURRENT_SCHEMA_VERSION == 8
-    assert gate_hold_not_null == {
-        "run_id": 0,
-        "deployment_fingerprint": 1,
-        "corpus_cursor": 1,
-        "held_at": 1,
-        "outcome_corpus_cursor": 1,
-    }
+    assert store.schema_version == CURRENT_SCHEMA_VERSION == 9
     assert "issue_revision" in run_columns
     assert [row[2] for row in revision_index] == [
         "repository",
@@ -787,11 +631,9 @@ def test_fresh_database_has_current_version_and_all_v8_tables(tmp_path: Path) ->
         "events",
         "leases",
         "lease_generations",
-        "lifecycle_snapshots",
         "circuit_breaker",
         "circuit_breaker_events",
         "publication_reservations",
-        "publication_gate_holds",
         "manifest_artifact_sync",
         "candidate_retry_authorizations",
     }
@@ -946,7 +788,6 @@ def test_pr_open_transition_and_save_reject_semantic_candidate_mutation(
     assert run.status is RunStatus.SUBMITTING
     assert run.updated_at == original_updated_at
     assert store.get(run.run_id).candidate == original_candidate
-    assert store.publication_gate_hold(run.run_id) is not None
 
     run.candidate = original_candidate
     store.transition(run, RunStatus.PR_OPEN, reason="pull request created")
@@ -1180,37 +1021,25 @@ def test_future_older_or_malformed_schema_fails_closed(tmp_path: Path) -> None:
         RunStore(malformed_root)
 
 
-@pytest.mark.parametrize("development_layout", ("schema-7", "earlier-schema-8"))
+@pytest.mark.parametrize("schema_version", (7, 8))
 def test_older_development_state_asks_for_a_fresh_state_directory(
     tmp_path: Path,
-    development_layout: str,
+    schema_version: int,
 ) -> None:
     root = tmp_path / "state"
     store = RunStore(root)
     run = store.create_run()
-    schema_version = 7 if development_layout == "schema-7" else CURRENT_SCHEMA_VERSION
     with closing(sqlite3.connect(store.database_path)) as connection, connection:
         connection.execute(
             "UPDATE schema_metadata SET schema_version = ? WHERE singleton = 1",
             (schema_version,),
         )
-        if development_layout == "earlier-schema-8":
-            connection.execute(
-                """
-                CREATE TABLE legacy_candidate_retry_overrides (
-                    event_id INTEGER PRIMARY KEY,
-                    run_id TEXT NOT NULL,
-                    event_hash TEXT NOT NULL,
-                    migrated_at TEXT NOT NULL
-                )
-                """
-            )
 
     with pytest.raises(StateError) as error:
         RunStore(root)
 
     message = str(error.value)
-    assert "older development version" in message
+    assert f"older development version of Autocontribute (schema {schema_version})" in message
     assert f"delete the state directory {root.resolve()}" in message
     with closing(sqlite3.connect(store.database_path)) as connection:
         assert connection.execute("SELECT schema_version FROM schema_metadata").fetchone() == (
@@ -1220,43 +1049,27 @@ def test_older_development_state_asks_for_a_fresh_state_directory(
 
 
 @pytest.mark.parametrize(
-    ("snapshot_layout", "expected_error"),
+    ("schema_version", "expected_error"),
     (
-        ("schema-7", "older development version of Autocontribute \\(schema 7\\)"),
-        ("earlier-schema-8", "older development version of Autocontribute \\(schema 8\\)"),
-        ("schema-9", "State snapshot schema 9 is newer than supported schema 8"),
+        (7, "older development version of Autocontribute \\(schema 7\\)"),
+        (8, "older development version of Autocontribute \\(schema 8\\)"),
+        (10, "State snapshot schema 10 is newer than supported schema 9"),
     ),
 )
 def test_restore_names_snapshots_this_release_cannot_open(
     tmp_path: Path,
-    snapshot_layout: str,
+    schema_version: int,
     expected_error: str,
 ) -> None:
     source = RunStore(tmp_path / "source")
     source.create_run()
     snapshot = source.create_snapshot(tmp_path / "backup" / "state.sqlite3")
-    schema_version = {
-        "schema-7": 7,
-        "earlier-schema-8": CURRENT_SCHEMA_VERSION,
-        "schema-9": CURRENT_SCHEMA_VERSION + 1,
-    }[snapshot_layout]
     with closing(sqlite3.connect(snapshot)) as connection, connection:
         connection.execute("PRAGMA journal_mode = DELETE")
         connection.execute(
             "UPDATE schema_metadata SET schema_version = ? WHERE singleton = 1",
             (schema_version,),
         )
-        if snapshot_layout == "earlier-schema-8":
-            connection.execute(
-                """
-                CREATE TABLE legacy_candidate_retry_overrides (
-                    event_id INTEGER PRIMARY KEY,
-                    run_id TEXT NOT NULL,
-                    event_hash TEXT NOT NULL,
-                    migrated_at TEXT NOT NULL
-                )
-                """
-            )
     target = tmp_path / "target"
 
     with pytest.raises(StateError, match=expected_error):
@@ -1273,22 +1086,16 @@ def test_snapshot_is_consistent_includes_wal_and_requires_explicit_overwrite(
     try:
         writer.execute("PRAGMA journal_mode = WAL")
         writer.execute("PRAGMA wal_autocheckpoint = 0")
-        lifecycle_snapshot = _lifecycle_snapshot()
-        fingerprint = lifecycle_snapshot.fingerprint()
-        assert store.record_lifecycle_snapshot(
-            run.run_id,
-            fingerprint,
-            lifecycle_snapshot.to_json(),
-        )
+        store.transition(run, RunStatus.DISCOVERING, reason="committed in the WAL")
 
         destination = tmp_path / "backups" / "state.sqlite3"
         assert store.create_snapshot(destination) == destination.resolve()
         with sqlite3.connect(destination) as backup:
             assert backup.execute("PRAGMA integrity_check").fetchone() == ("ok",)
             assert backup.execute(
-                "SELECT count(*) FROM lifecycle_snapshots WHERE fingerprint = ?",
-                (fingerprint,),
-            ).fetchone() == (1,)
+                "SELECT status FROM runs WHERE run_id = ?",
+                (run.run_id,),
+            ).fetchone() == (RunStatus.DISCOVERING.value,)
 
         with pytest.raises(StateError, match="already exists"):
             store.create_snapshot(destination)
@@ -1455,23 +1262,11 @@ def test_snapshot_restore_rejects_missing_active_breaker_evidence(tmp_path: Path
         WHERE type = 'table' AND name = 'circuit_breaker';
         PRAGMA writable_schema = OFF;
         """,
-        """
-        PRAGMA writable_schema = ON;
-        UPDATE sqlite_master
-        SET sql = replace(
-            sql,
-            'length(corpus_cursor) = 64',
-            'length(corpus_cursor) = 63'
-        )
-        WHERE type = 'table' AND name = 'publication_gate_holds';
-        PRAGMA writable_schema = OFF;
-        """,
     ],
     ids=[
         "unexpected-view",
         "altered-index",
         "altered-check-constraint",
-        "altered-publication-hold-constraint",
     ],
 )
 def test_restore_snapshot_rejects_altered_schema_objects(tmp_path: Path, tamper_sql: str) -> None:
@@ -1913,7 +1708,7 @@ def test_candidate_attempt_disposition_releases_suppression_after_issue_change(
     assert disposition.prior_status is None
 
 
-def test_begin_publication_atomically_persists_intent_reservation_hold_and_status(
+def test_begin_publication_atomically_persists_intent_reservation_and_status(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
@@ -1937,20 +1732,17 @@ def test_begin_publication_atomically_persists_intent_reservation_hold_and_statu
     with sqlite3.connect(store.database_path) as connection:
         durable = connection.execute(
             """
-            SELECT runs.status, publication_reservations.repository,
-                   publication_gate_holds.deployment_fingerprint
+            SELECT runs.status, publication_reservations.repository
             FROM runs
             JOIN publication_reservations USING(run_id)
-            JOIN publication_gate_holds USING(run_id)
             WHERE runs.run_id = ?
             """,
             (run.run_id,),
         ).fetchone()
-    assert durable == (RunStatus.SUBMITTING.value, "example/project", "d" * 64)
+    assert durable == (RunStatus.SUBMITTING.value, "example/project")
     event_types = [event["event_type"] for event in store.events(run.run_id)]
-    assert event_types[-4:] == [
+    assert event_types[-3:] == [
         "publication.reserved",
-        "publication.gate.held",
         "run.transitioned",
         "publication.intent.begun",
     ]
@@ -1959,7 +1751,7 @@ def test_begin_publication_atomically_persists_intent_reservation_hold_and_statu
     assert intent["draft"] == "true"
 
 
-def test_begin_publication_rolls_back_hold_and_reservation_if_intent_cannot_commit(
+def test_begin_publication_rolls_back_reservation_if_intent_cannot_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1967,17 +1759,17 @@ def test_begin_publication_rolls_back_hold_and_reservation_if_intent_cannot_comm
     run = _publication_run(store)
     original_append = store._append_event
 
-    def fail_after_hold(
+    def fail_after_reservation(
         connection: sqlite3.Connection,
         run_id: str,
         event_type: str,
         details: dict[str, str],
     ) -> None:
         original_append(connection, run_id, event_type, details)
-        if event_type == "publication.gate.held":
-            raise RuntimeError("injected failure after hold")
+        if event_type == "publication.reserved":
+            raise RuntimeError("injected failure after reservation")
 
-    monkeypatch.setattr(store, "_append_event", fail_after_hold)
+    monkeypatch.setattr(store, "_append_event", fail_after_reservation)
 
     with pytest.raises(RuntimeError, match="injected failure"):
         _begin_publication(store, run)
@@ -1990,19 +1782,16 @@ def test_begin_publication_rolls_back_hold_and_reservation_if_intent_cannot_comm
         assert connection.execute("SELECT count(*) FROM publication_reservations").fetchone() == (
             0,
         )
-        assert connection.execute("SELECT count(*) FROM publication_gate_holds").fetchone() == (0,)
-    assert "publication.gate.held" not in {
-        event["event_type"] for event in store.events(run.run_id)
-    }
+    assert "publication.reserved" not in {event["event_type"] for event in store.events(run.run_id)}
 
 
-def test_begin_publication_review_mode_and_no_hold_compensation_are_durable(
+def test_begin_publication_and_verified_compensation_are_durable(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
     run = _publication_run(store, status=RunStatus.READY_FOR_APPROVAL)
 
-    _begin_publication(store, run, with_gate=False, publication_draft=False)
+    _begin_publication(store, run, publication_draft=False)
 
     assert run.status == RunStatus.SUBMITTING
     assert run.publication_draft is False
@@ -2010,9 +1799,8 @@ def test_begin_publication_review_mode_and_no_hold_compensation_are_durable(
         assert connection.execute("SELECT count(*) FROM publication_reservations").fetchone() == (
             1,
         )
-        assert connection.execute("SELECT count(*) FROM publication_gate_holds").fetchone() == (0,)
 
-    reason = "verified review-mode cleanup"
+    reason = "verified cleanup"
     evidence = _record_absent_compensation_evidence(store, run, reason=reason)
     finalized = store.finalize_publication_compensation(
         run,
@@ -2060,7 +1848,7 @@ def test_begin_publication_recovers_complete_legacy_submitting_intent_but_reject
     store = RunStore(tmp_path / "state")
     incomplete = _publication_run(store, status=RunStatus.SUBMITTING)
     with pytest.raises(StateError, match="incomplete durable publication intent"):
-        _begin_publication(store, incomplete, with_gate=False)
+        _begin_publication(store, incomplete)
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute(
             "SELECT count(*) FROM publication_reservations WHERE run_id = ?",
@@ -2081,34 +1869,13 @@ def test_begin_publication_recovers_complete_legacy_submitting_intent_but_reject
     store.save(legacy, event="test.legacy_publication_intent", details={})
     previous_updated_at = legacy.updated_at
 
-    _begin_publication(store, legacy, with_gate=False)
+    _begin_publication(store, legacy)
 
     assert legacy.updated_at == previous_updated_at
     event_types = [event["event_type"] for event in store.events(legacy.run_id)]
     assert event_types.count("publication.reserved") == 1
     assert event_types.count("publication.intent.begun") == 1
     assert event_types.count("run.transitioned") == 0
-
-
-def test_begin_publication_rejects_another_runs_hold_without_mutating_intent(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    other = store.create_run(deployment_fingerprint="d" * 64)
-    _reserve_gate(store, other)
-    run = _publication_run(store)
-
-    with pytest.raises(StateError, match="held by another run"):
-        _begin_publication(store, run, with_gate=False)
-
-    assert run.status == RunStatus.APPROVED
-    assert run.branch_name is None
-    assert run.publication_draft is None
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM publication_reservations WHERE run_id = ?",
-            (run.run_id,),
-        ).fetchone() == (0,)
 
 
 def test_begin_publication_rejects_stale_or_capacity_blocked_manifest_atomically(
@@ -2126,7 +1893,6 @@ def test_begin_publication_rejects_stale_or_capacity_blocked_manifest_atomically
         assert connection.execute("SELECT count(*) FROM publication_reservations").fetchone() == (
             0,
         )
-        assert connection.execute("SELECT count(*) FROM publication_gate_holds").fetchone() == (0,)
 
     capacity_store = RunStore(tmp_path / "capacity")
     occupied = capacity_store.create_run()
@@ -2143,7 +1909,6 @@ def test_begin_publication_rejects_stale_or_capacity_blocked_manifest_atomically
         _begin_publication(
             capacity_store,
             blocked,
-            with_gate=False,
             max_per_utc_day=1,
             now=reserved_at,
         )
@@ -2157,46 +1922,24 @@ def test_begin_publication_rejects_stale_or_capacity_blocked_manifest_atomically
         ).fetchone() == (0,)
 
 
-def test_begin_publication_recovers_an_approved_same_run_hold_without_duplication(
+def test_begin_publication_reuses_an_existing_same_run_reservation(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
     run = _publication_run(store)
-    _reserve_gate(store, run)
+    store.reserve_publication(
+        run.run_id,
+        "example/project",
+        max_per_utc_day=100,
+        repository_cooldown=timedelta(0),
+    )
 
-    _begin_publication(store, run)
+    _begin_publication(store, run, max_per_utc_day=1)
 
     assert run.status == RunStatus.SUBMITTING
     event_types = [event["event_type"] for event in store.events(run.run_id)]
     assert event_types.count("publication.reserved") == 1
-    assert event_types.count("publication.gate.held") == 1
     assert event_types.count("publication.intent.begun") == 1
-
-
-def test_compensation_without_a_same_run_hold_rejects_any_other_active_hold(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    review_run = _publication_run(store)
-    _begin_publication(store, review_run, with_gate=False)
-    reason = "verified cleanup cannot release another run"
-    evidence = _record_absent_compensation_evidence(store, review_run, reason=reason)
-    other = store.create_run(deployment_fingerprint="d" * 64)
-    _reserve_gate(store, other)
-
-    with pytest.raises(StateError, match="held by another run"):
-        store.finalize_publication_compensation(
-            review_run,
-            reason=reason,
-            evidence=evidence,
-        )
-
-    assert review_run.status == RunStatus.SUBMITTING
-    assert store.get(review_run.run_id).status == RunStatus.SUBMITTING
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute("SELECT run_id FROM publication_gate_holds").fetchone() == (
-            other.run_id,
-        )
 
 
 def test_publication_reservations_are_idempotent_and_enforce_local_limits(
@@ -2322,441 +2065,15 @@ def test_publication_reservation_limit_is_transactional_under_contention(
         )
 
 
-def test_publication_gate_reservation_is_paired_exact_and_does_not_bypass_existing_rows(
+def test_failed_transition_cannot_be_finalized_as_verified_compensation(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    blocked = store.create_run(deployment_fingerprint="d" * 64)
-    cursor = store.evaluation_corpus_cursor()
-    fingerprint = "d" * 64
-    holder.publishing_login = "octocat"
-    holder.publishing_api_origin = "https://api.github.com"
-    store.save(holder, event="test.publication_context", details={})
-    outcome_cursor = store.upstream_outcome_corpus_cursor(
-        fingerprint,
-        "octocat",
-        "https://api.github.com",
-        exclude_run_id=holder.run_id,
-    )
-    scope = {
-        "outcome_corpus_cursor": outcome_cursor,
-        "publishing_login": "octocat",
-        "publishing_api_origin": "https://api.github.com",
-    }
-
-    with pytest.raises(ValueError, match="provided together"):
-        store.reserve_publication(
-            holder.run_id,
-            "example/project",
-            max_per_utc_day=100,
-            repository_cooldown=timedelta(0),
-            evaluation_corpus_cursor=cursor,
-        )
-    with pytest.raises(StateError, match="corpus changed"):
-        store.reserve_publication(
-            holder.run_id,
-            "example/project",
-            max_per_utc_day=100,
-            repository_cooldown=timedelta(0),
-            evaluation_corpus_cursor="0" * 64,
-            evaluation_deployment_fingerprint=fingerprint,
-            **scope,
-        )
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute("SELECT count(*) FROM publication_reservations").fetchone() == (
-            0,
-        )
-
-    reservation = store.reserve_publication(
-        holder.run_id,
-        "example/project",
-        max_per_utc_day=100,
-        repository_cooldown=timedelta(0),
-        evaluation_corpus_cursor=cursor,
-        evaluation_deployment_fingerprint=fingerprint,
-        **scope,
-    )
-    assert (
-        store.reserve_publication(
-            holder.run_id,
-            "EXAMPLE/PROJECT",
-            max_per_utc_day=1,
-            repository_cooldown=timedelta(days=365),
-            evaluation_corpus_cursor=cursor,
-            evaluation_deployment_fingerprint=fingerprint,
-            **scope,
-        )
-        == reservation
-    )
-    with pytest.raises(StateError, match="different deployment"):
-        store.reserve_publication(
-            holder.run_id,
-            "example/project",
-            max_per_utc_day=100,
-            repository_cooldown=timedelta(0),
-            evaluation_corpus_cursor=cursor,
-            evaluation_deployment_fingerprint="b" * 64,
-            outcome_corpus_cursor=outcome_cursor,
-            publishing_login="octocat",
-            publishing_api_origin="https://api.github.com",
-        )
-    blocked.publishing_login = "octocat"
-    blocked.publishing_api_origin = "https://api.github.com"
-    store.save(blocked, event="test.publication_context", details={})
-    blocked_outcome_cursor = store.upstream_outcome_corpus_cursor(
-        fingerprint,
-        "octocat",
-        "https://api.github.com",
-        exclude_run_id=blocked.run_id,
-    )
-    with pytest.raises(StateError, match="held by another run"):
-        store.reserve_publication(
-            blocked.run_id,
-            "other/project",
-            max_per_utc_day=100,
-            repository_cooldown=timedelta(0),
-            evaluation_corpus_cursor=cursor,
-            evaluation_deployment_fingerprint=fingerprint,
-            outcome_corpus_cursor=blocked_outcome_cursor,
-            publishing_login="octocat",
-            publishing_api_origin="https://api.github.com",
-        )
-
-    with sqlite3.connect(store.database_path) as connection:
-        hold = connection.execute(
-            """
-            SELECT run_id, deployment_fingerprint, corpus_cursor
-            FROM publication_gate_holds
-            """
-        ).fetchone()
-    assert hold == (holder.run_id, fingerprint, cursor)
-    assert [event["event_type"] for event in store.events(holder.run_id)].count(
-        "publication.gate.held"
-    ) == 1
-
-
-def test_existing_reservation_can_only_gain_a_gate_hold_after_cursor_validation(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run(deployment_fingerprint="c" * 64)
-    reservation = store.reserve_publication(
-        run.run_id,
-        "example/project",
-        max_per_utc_day=1,
-        repository_cooldown=timedelta(0),
-    )
-    cursor = store.evaluation_corpus_cursor()
-    run.publishing_login = "octocat"
-    run.publishing_api_origin = "https://api.github.com"
-    store.save(run, event="test.publication_context", details={})
-    outcome_cursor = store.upstream_outcome_corpus_cursor(
-        "c" * 64,
-        "octocat",
-        "https://api.github.com",
-        exclude_run_id=run.run_id,
-    )
-
-    upgraded = store.reserve_publication(
-        run.run_id,
-        "example/project",
-        max_per_utc_day=1,
-        repository_cooldown=timedelta(0),
-        evaluation_corpus_cursor=cursor,
-        evaluation_deployment_fingerprint="c" * 64,
-        outcome_corpus_cursor=outcome_cursor,
-        publishing_login="octocat",
-        publishing_api_origin="https://api.github.com",
-    )
-
-    assert upgraded == reservation
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute(
-            "SELECT corpus_cursor FROM publication_gate_holds WHERE run_id = ?",
-            (run.run_id,),
-        ).fetchone() == (cursor,)
-
-
-def test_gate_hold_and_evaluation_write_are_serialized_without_a_race_window(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    evaluated = store.create_run()
-    cursor = store.evaluation_corpus_cursor()
-    barrier = threading.Barrier(2)
-
-    def reserve() -> str:
-        barrier.wait()
-        try:
-            _reserve_gate(store, holder, cursor=cursor)
-        except StateError:
-            return "cursor-blocked"
-        return "held"
-
-    def record() -> str:
-        barrier.wait()
-        try:
-            store.record_evaluation_anchor(evaluated.run_id, {"evaluation_hash": "a" * 64})
-        except StateError:
-            return "evaluation-blocked"
-        return "recorded"
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        reserve_future = executor.submit(reserve)
-        record_future = executor.submit(record)
-        results = {reserve_future.result(), record_future.result()}
-
-    assert results in (
-        {"held", "evaluation-blocked"},
-        {"cursor-blocked", "recorded"},
-    )
-    with sqlite3.connect(store.database_path) as connection:
-        reservations = connection.execute(
-            "SELECT count(*) FROM publication_reservations"
-        ).fetchone()
-        holds = connection.execute("SELECT count(*) FROM publication_gate_holds").fetchone()
-        evaluations = connection.execute(
-            "SELECT count(*) FROM events WHERE event_type = 'evaluation.recorded'"
-        ).fetchone()
-    if "held" in results:
-        assert (reservations, holds, evaluations) == ((1,), (1,), (0,))
-    else:
-        assert (reservations, holds, evaluations) == ((0,), (0,), (1,))
-
-
-def test_gate_hold_blocks_all_evaluation_writes_until_pr_open_is_durable(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    evaluated = store.create_run()
-    initial_hash = "a" * 64
-    store.record_evaluation_anchor(evaluated.run_id, {"evaluation_hash": initial_hash})
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    pending = store.create_run()
-    _reserve_gate(store, holder)
-
-    with pytest.raises(StateError, match="held by active publication"):
-        store.record_evaluation_anchor(pending.run_id, {"evaluation_hash": "b" * 64})
-    with pytest.raises(StateError, match="held by active publication"):
-        store.record_evaluation_amendment_anchor(
-            evaluated.run_id,
-            {
-                "evaluation_hash": "c" * 64,
-                "supersedes_evaluation_hash": initial_hash,
-            },
-            expected_previous_hash=initial_hash,
-        )
-
-    _set_status(store, holder, RunStatus.SUBMITTING)
-    store.transition(holder, RunStatus.PR_OPEN, reason="exact pull request persisted")
-
-    store.record_evaluation_anchor(pending.run_id, {"evaluation_hash": "b" * 64})
-    store.record_evaluation_amendment_anchor(
-        evaluated.run_id,
-        {
-            "evaluation_hash": "c" * 64,
-            "supersedes_evaluation_hash": initial_hash,
-        },
-        expected_previous_hash=initial_hash,
-    )
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute("SELECT count(*) FROM publication_gate_holds").fetchone() == (0,)
-    event_types = [event["event_type"] for event in store.events(holder.run_id)]
-    assert event_types.index("run.transitioned") < event_types.index("publication.gate.released")
-    assert json.loads(store.events(holder.run_id)[-1]["details"])["outcome"] == "pr_open"
-
-
-def test_publication_gate_hold_current_accepts_its_exact_scope(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    _reserve_gate(store, holder)
-
-    assert (
-        store.assert_publication_gate_hold_current(
-            holder.run_id,
-            deployment_fingerprint="d" * 64,
-            publishing_login="octocat",
-            publishing_api_origin="https://api.github.com",
-        )
-        is True
-    )
-
-
-def test_publication_gate_hold_current_rejects_evaluation_cursor_drift(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    evaluated = store.create_run()
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    _reserve_gate(store, holder)
-    with store._connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        store._append_event(
-            connection,
-            evaluated.run_id,
-            "evaluation.recorded",
-            {"evaluation_hash": "a" * 64},
-        )
-
-    with pytest.raises(StateError, match="evaluation corpus"):
-        store.assert_publication_gate_hold_current(
-            holder.run_id,
-            deployment_fingerprint="d" * 64,
-            publishing_login="octocat",
-            publishing_api_origin="https://api.github.com",
-        )
-
-
-def test_publication_gate_hold_current_rejects_upstream_outcome_cursor_drift(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    prior = store.create_run(deployment_fingerprint="d" * 64)
-    _set_status(store, prior, RunStatus.PR_OPEN)
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    _reserve_gate(store, holder)
-    store.save(prior, event="test.outcome_drift", details={"version": "later"})
-
-    with pytest.raises(StateError, match="upstream-outcome corpus"):
-        store.assert_publication_gate_hold_current(
-            holder.run_id,
-            deployment_fingerprint="d" * 64,
-            publishing_login="octocat",
-            publishing_api_origin="https://api.github.com",
-        )
-
-
-def test_publication_gate_hold_current_rejects_identity_mismatch(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    _reserve_gate(store, holder)
-
-    with pytest.raises(StateError, match="different publishing identity or scope"):
-        store.assert_publication_gate_hold_current(
-            holder.run_id,
-            deployment_fingerprint="d" * 64,
-            publishing_login="hubot",
-            publishing_api_origin="https://api.github.com",
-        )
-
-
-def test_publication_gate_hold_current_returns_cleanly_without_a_hold(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    manual = store.create_run(deployment_fingerprint="d" * 64)
-
-    assert (
-        store.assert_publication_gate_hold_current(
-            manual.run_id,
-            deployment_fingerprint="d" * 64,
-            publishing_login="octocat",
-            publishing_api_origin="https://api.github.com",
-        )
-        is False
-    )
-
-
-def test_publication_gate_hold_currency_is_scoped_to_the_calling_run(tmp_path: Path) -> None:
-    """One crashed run's drifted hold must not poison an unrelated holdless publication."""
-
-    store = RunStore(tmp_path / "state")
-    evaluated = store.create_run()
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    _reserve_gate(store, holder)
-    with store._connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        store._append_event(
-            connection,
-            evaluated.run_id,
-            "evaluation.recorded",
-            {"evaluation_hash": "a" * 64},
-        )
-    manual = store.create_run(deployment_fingerprint="d" * 64)
-
-    assert (
-        store.assert_publication_gate_hold_current(
-            manual.run_id,
-            deployment_fingerprint="d" * 64,
-            publishing_login="octocat",
-            publishing_api_origin="https://api.github.com",
-        )
-        is False
-    )
-    with pytest.raises(StateError, match="disagrees with the evaluation corpus"):
-        store.assert_publication_gate_hold_current(
-            holder.run_id,
-            deployment_fingerprint="d" * 64,
-            publishing_login="octocat",
-            publishing_api_origin="https://api.github.com",
-        )
-
-
-def test_publication_gate_hold_current_rejects_a_missing_durable_hold_row(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    _reserve_gate(store, holder)
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            "DELETE FROM publication_gate_holds WHERE run_id = ?",
-            (holder.run_id,),
-        )
-
-    with pytest.raises(StateError, match="publication gate hold row is missing"):
-        store.assert_publication_gate_hold_current(
-            holder.run_id,
-            deployment_fingerprint="d" * 64,
-            publishing_login="octocat",
-            publishing_api_origin="https://api.github.com",
-        )
-
-
-def test_pr_open_refuses_to_release_a_hold_for_a_different_corpus(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    _reserve_gate(store, holder)
-    _set_status(store, holder, RunStatus.SUBMITTING)
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            "UPDATE publication_gate_holds SET corpus_cursor = ? WHERE run_id = ?",
-            ("f" * 64, holder.run_id),
-        )
-
-    with pytest.raises(StateError, match="differs from the active publication gate hold"):
-        store.transition(holder, RunStatus.PR_OPEN, reason="must not release a different hold")
-
-    assert holder.status == RunStatus.SUBMITTING
-    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute(
-            "SELECT corpus_cursor FROM publication_gate_holds WHERE run_id = ?",
-            (holder.run_id,),
-        ).fetchone() == ("f" * 64,)
-    with pytest.raises(StateError, match="disagrees with the evaluation corpus"):
-        RunStore(store.root)
-
-
-def test_arbitrary_failed_transition_never_releases_a_publication_gate_hold(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    holder = store.create_run(deployment_fingerprint="d" * 64)
-    pending = store.create_run()
-    _reserve_gate(store, holder)
-    _set_status(store, holder, RunStatus.SUBMITTING)
+    holder = _publication_run(store)
+    _begin_publication(store, holder)
 
     store.transition(holder, RunStatus.FAILED, reason="unverified local failure")
 
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute("SELECT run_id FROM publication_gate_holds").fetchone() == (
-            holder.run_id,
-        )
-    with pytest.raises(StateError, match="held by active publication"):
-        store.record_evaluation_anchor(pending.run_id, {"evaluation_hash": "a" * 64})
     with pytest.raises(StateError, match="requires a SUBMITTING manifest"):
         store.finalize_publication_compensation(
             holder,
@@ -2765,7 +2082,7 @@ def test_arbitrary_failed_transition_never_releases_a_publication_gate_hold(
         )
 
 
-def test_verified_compensation_rejects_arbitrary_evidence_and_retains_hold(
+def test_verified_compensation_rejects_arbitrary_evidence_and_remains_submitting(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
@@ -2788,7 +2105,6 @@ def test_verified_compensation_rejects_arbitrary_evidence_and_retains_hold(
 
     assert holder.status == RunStatus.SUBMITTING
     assert store.get(holder.run_id).status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
 
 
 def test_verified_compensation_requires_latest_exact_absence_event(tmp_path: Path) -> None:
@@ -2815,7 +2131,6 @@ def test_verified_compensation_requires_latest_exact_absence_event(tmp_path: Pat
         )
 
     assert holder.status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
 
 
 @pytest.mark.parametrize(
@@ -2861,7 +2176,6 @@ def test_absence_compensation_rejects_wrong_origin_or_repository_identity(
         )
 
     assert holder.status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
 
 
 def test_absence_compensation_accepts_exact_bound_fork_identity(tmp_path: Path) -> None:
@@ -2880,13 +2194,12 @@ def test_absence_compensation_accepts_exact_bound_fork_identity(tmp_path: Path) 
     )
 
     assert finalized.status == RunStatus.FAILED
-    assert store.publication_gate_hold(holder.run_id) is None
 
 
 def test_absence_compensation_rejects_partial_fork_identity(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     holder = _publication_run(store, status=RunStatus.READY_FOR_APPROVAL)
-    _begin_publication(store, holder, with_gate=False)
+    _begin_publication(store, holder)
     holder.upstream_repository_id = 1001
     holder.upstream_repository_node_id = "R_upstream_fixture"
     holder.fork_repository_id = 2001
@@ -2930,7 +2243,6 @@ def test_absence_compensation_rejects_unbound_fork_after_remote_capable_stage(
 
     assert holder.status == RunStatus.SUBMITTING
     assert store.get(holder.run_id).status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
 
 
 def test_absence_proof_cannot_finalize_an_ambiguous_pull_request_post(tmp_path: Path) -> None:
@@ -2954,10 +2266,9 @@ def test_absence_proof_cannot_finalize_an_ambiguous_pull_request_post(tmp_path: 
         )
 
     assert holder.status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
 
 
-def test_verified_compensation_transition_and_exact_hold_release_are_atomic(
+def test_verified_compensation_transition_is_atomic(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
@@ -2980,10 +2291,7 @@ def test_verified_compensation_transition_and_exact_hold_release_are_atomic(
             reason=reason,
             evidence=evidence,
         )
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute("SELECT run_id FROM publication_gate_holds").fetchone() == (
-            holder.run_id,
-        )
+    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
 
     finalized = store.finalize_publication_compensation(
         current,
@@ -2996,12 +2304,9 @@ def test_verified_compensation_transition_and_exact_hold_release_are_atomic(
     assert persisted.branch_name == "autocontribute/fix-exact-bug"
     assert persisted.commit_sha == "1" * 40
     assert persisted.pull_request_url is None
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute("SELECT count(*) FROM publication_gate_holds").fetchone() == (0,)
-    assert [event["event_type"] for event in store.events(holder.run_id)][-3:] == [
+    assert [event["event_type"] for event in store.events(holder.run_id)][-2:] == [
         "publication.compensation.verified",
         "run.transitioned",
-        "publication.gate.released",
     ]
 
 
@@ -3048,7 +2353,6 @@ def test_created_pr_compensation_rejects_cleanup_evidence_before_its_marker(
         )
 
     assert holder.status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
 
 
 def test_created_pr_compensation_rejects_missing_cleanup_evidence(tmp_path: Path) -> None:
@@ -3071,7 +2375,6 @@ def test_created_pr_compensation_rejects_missing_cleanup_evidence(tmp_path: Path
         )
 
     assert holder.status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
 
 
 def test_created_pr_compensation_accepts_identical_crash_retry_evidence(
@@ -3095,7 +2398,6 @@ def test_created_pr_compensation_accepts_identical_crash_retry_evidence(
     )
 
     assert finalized.status == RunStatus.FAILED
-    assert store.publication_gate_hold(holder.run_id) is None
 
 
 def test_created_pr_compensation_rejects_conflicting_retry_evidence(
@@ -3135,91 +2437,15 @@ def test_created_pr_compensation_rejects_conflicting_retry_evidence(
         )
 
     assert holder.status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
 
 
-def test_restart_allows_exact_compensation_but_not_constructive_authority_after_cursor_drift(
+def test_merged_compensation_becomes_lifecycle_managed_after_restart(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    prior = store.create_run(deployment_fingerprint="d" * 64)
-    _set_status(store, prior, RunStatus.PR_OPEN)
-    evaluated = store.create_run()
-    holder = _publication_run(store)
-    _begin_publication(store, holder)
-    reason = "verified exact remote cleanup after rollout drift"
-    evidence = _record_absent_compensation_evidence(store, holder, reason=reason)
-    hold = store.publication_gate_hold(holder.run_id)
-    assert hold is not None and hold.outcome_corpus_cursor is not None
-
-    store.save(prior, event="test.outcome_drift", details={"version": "later"})
-    with store._connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        store._append_event(
-            connection,
-            evaluated.run_id,
-            "evaluation.recorded",
-            {"evaluation_hash": "a" * 64},
-        )
-
-    assert store.evaluation_corpus_cursor() != hold.corpus_cursor
-    assert (
-        store.upstream_outcome_corpus_cursor(
-            "d" * 64,
-            "octocat",
-            "https://api.github.com",
-            exclude_run_id=holder.run_id,
-        )
-        != hold.outcome_corpus_cursor
-    )
-
-    restarted = RunStore(store.root)
-    with pytest.raises(StateError, match="disagrees with the evaluation corpus"):
-        restarted.assert_publication_gate_hold_current(
-            holder.run_id,
-            deployment_fingerprint="d" * 64,
-            publishing_login="octocat",
-            publishing_api_origin="https://api.github.com",
-        )
-
-    recovered = restarted.get(holder.run_id)
-    finalized = restarted.finalize_publication_compensation(
-        recovered,
-        reason=reason,
-        evidence=evidence,
-    )
-
-    assert finalized.status == RunStatus.FAILED
-    assert restarted.publication_gate_hold(holder.run_id) is None
-    release = json.loads(restarted.events(holder.run_id)[-1]["details"])
-    assert release["outcome"] == "verified_compensation"
-    assert release["corpus_cursor"] == hold.corpus_cursor
-    assert release["outcome_corpus_cursor"] == hold.outcome_corpus_cursor
-    assert RunStore(store.root).get(holder.run_id).status == RunStatus.FAILED
-
-
-def test_merged_compensation_becomes_lifecycle_managed_despite_rollout_cursor_drift(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    prior = store.create_run(deployment_fingerprint="d" * 64)
-    _set_status(store, prior, RunStatus.PR_OPEN)
-    evaluated = store.create_run()
     holder = _publication_run(store)
     _begin_publication(store, holder)
     _record_merged_compensation_evidence(store, holder)
-    hold = store.publication_gate_hold(holder.run_id)
-    assert hold is not None and hold.outcome_corpus_cursor is not None
-
-    store.save(prior, event="test.outcome_drift", details={"version": "later"})
-    with store._connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        store._append_event(
-            connection,
-            evaluated.run_id,
-            "evaluation.recorded",
-            {"evaluation_hash": "a" * 64},
-        )
 
     restarted = RunStore(store.root)
     recovered = restarted.get(holder.run_id)
@@ -3232,13 +2458,8 @@ def test_merged_compensation_becomes_lifecycle_managed_despite_rollout_cursor_dr
     assert finalized.status == RunStatus.PR_OPEN
     assert finalized.publication_compensation_reason == "created_pr_base_moved"
     assert finalized.pull_request_url == "https://github.com/example/project/pull/7"
-    assert restarted.publication_gate_hold(holder.run_id) is None
-    event_types = [event["event_type"] for event in restarted.events(holder.run_id)]
-    assert event_types[-2:] == ["run.transitioned", "publication.gate.released"]
-    release = json.loads(restarted.events(holder.run_id)[-1]["details"])
-    assert release["outcome"] == "pr_open"
-    assert release["corpus_cursor"] == hold.corpus_cursor
-    assert release["outcome_corpus_cursor"] == hold.outcome_corpus_cursor
+    assert restarted.events(holder.run_id)[-1]["event_type"] == "run.transitioned"
+    assert RunStore(store.root).get(holder.run_id).status == RunStatus.PR_OPEN
 
 
 def test_merged_compensation_requires_exact_remote_evidence_in_same_run(
@@ -3267,7 +2488,6 @@ def test_merged_compensation_requires_exact_remote_evidence_in_same_run(
 
     assert holder.status == RunStatus.SUBMITTING
     assert store.get(holder.run_id).status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
 
 
 def test_merged_compensation_requires_latest_remote_reconciliation(tmp_path: Path) -> None:
@@ -3290,7 +2510,6 @@ def test_merged_compensation_requires_latest_remote_reconciliation(tmp_path: Pat
 
     assert holder.status == RunStatus.SUBMITTING
     assert store.get(holder.run_id).status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
 
 
 def test_merged_compensation_requires_exact_marker_and_durable_pull_request_url(
@@ -3324,152 +2543,6 @@ def test_merged_compensation_requires_exact_marker_and_durable_pull_request_url(
 
     assert holder.status == RunStatus.SUBMITTING
     assert store.get(holder.run_id).status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(holder.run_id) is not None
-
-
-def test_merged_compensation_rejects_tampered_same_run_hold(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    holder = _publication_run(store)
-    _begin_publication(store, holder)
-    holder.publication_compensation_reason = "created_pr_base_moved"
-    holder.pull_request_url = "https://github.com/example/project/pull/7"
-    store.save(
-        holder,
-        event="publication.compensation.started",
-        details={"reason": "created_pr_base_moved", "url": holder.pull_request_url},
-    )
-    hold = store.publication_gate_hold(holder.run_id)
-    assert hold is not None and hold.outcome_corpus_cursor is not None
-    tampered_cursor = "0" * 64 if hold.outcome_corpus_cursor != "0" * 64 else "1" * 64
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            """
-            UPDATE publication_gate_holds SET outcome_corpus_cursor = ?
-            WHERE run_id = ?
-            """,
-            (tampered_cursor, holder.run_id),
-        )
-
-    with pytest.raises(StateError, match="hold disagrees with ledger evidence"):
-        store.finalize_merged_publication_compensation(
-            holder,
-            pull_request_url=holder.pull_request_url,
-            reason="must not adopt a PR through tampered gate evidence",
-        )
-
-    assert holder.status == RunStatus.SUBMITTING
-    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
-
-
-def test_pr_open_release_succeeds_after_evaluation_cursor_drift(tmp_path: Path) -> None:
-    """Corpus drift after the held mutations completed must not wedge a finished publication.
-
-    Constructive authority is revalidated immediately before every remote mutation; a release
-    grants nothing, so it validates identity and scope and copies the hold's anchored cursors
-    into its ledger evidence verbatim.
-    """
-
-    store = RunStore(tmp_path / "state")
-    evaluated = store.create_run()
-    holder = _publication_run(store)
-    _begin_publication(store, holder)
-    hold = store.publication_gate_hold(holder.run_id)
-    assert hold is not None
-    with store._connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        store._append_event(
-            connection,
-            evaluated.run_id,
-            "evaluation.recorded",
-            {"evaluation_hash": "a" * 64},
-        )
-    assert store.evaluation_corpus_cursor() != hold.corpus_cursor
-
-    store.transition(holder, RunStatus.PR_OPEN, reason="pull request created")
-
-    assert holder.status == RunStatus.PR_OPEN
-    assert store.get(holder.run_id).status == RunStatus.PR_OPEN
-    assert store.publication_gate_hold(holder.run_id) is None
-    releases = [
-        event
-        for event in store.events(holder.run_id)
-        if event["event_type"] == "publication.gate.released"
-    ]
-    assert len(releases) == 1
-    details = json.loads(releases[0]["details"])
-    assert details["outcome"] == "pr_open"
-    assert details["corpus_cursor"] == hold.corpus_cursor
-    assert details["outcome_corpus_cursor"] == hold.outcome_corpus_cursor
-    RunStore(store.root)
-
-
-def test_verified_compensation_rejects_hold_row_tampering(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    holder = _publication_run(store)
-    _begin_publication(store, holder)
-    reason = "must not release tampered hold evidence"
-    evidence = _record_absent_compensation_evidence(store, holder, reason=reason)
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            "UPDATE publication_gate_holds SET held_at = ? WHERE run_id = ?",
-            (datetime(2020, 1, 1, tzinfo=UTC).isoformat(), holder.run_id),
-        )
-
-    with pytest.raises(StateError, match="hold disagrees with ledger evidence"):
-        store.finalize_publication_compensation(
-            holder,
-            reason=reason,
-            evidence=evidence,
-        )
-
-    assert holder.status == RunStatus.SUBMITTING
-    assert store.get(holder.run_id).status == RunStatus.SUBMITTING
-
-
-def test_evaluation_corpus_cursor_is_exact_ordered_and_bounded(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    empty_cursor = hashlib.sha256(b"[]").hexdigest()
-    run = store.create_run()
-    assert store.evaluation_corpus_cursor() == empty_cursor
-    store.transition(run, RunStatus.DISCOVERING, reason="non-evaluation event")
-    assert store.evaluation_corpus_cursor() == empty_cursor
-    store.record_evaluation_anchor(run.run_id, {"evaluation_hash": "a" * 64})
-    store.record_evaluation_amendment_anchor(
-        run.run_id,
-        {
-            "evaluation_hash": "b" * 64,
-            "supersedes_evaluation_hash": "a" * 64,
-        },
-        expected_previous_hash="a" * 64,
-    )
-    with sqlite3.connect(store.database_path) as connection:
-        rows = connection.execute(
-            """
-            SELECT id, run_id, event_type, event_hash FROM events
-            WHERE event_type IN ('evaluation.recorded', 'evaluation.amended')
-            ORDER BY id
-            """
-        ).fetchall()
-    canonical = [
-        {
-            "id": row[0],
-            "run_id": row[1],
-            "event_type": row[2],
-            "event_hash": row[3],
-        }
-        for row in rows
-    ]
-    expected = hashlib.sha256(
-        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-    assert store.evaluation_corpus_cursor() == expected
-
-    monkeypatch.setattr("autocontribute.store._MAX_EVALUATION_EVENT_CORPUS", 1)
-    with pytest.raises(StateError, match="corpus exceeds"):
-        store.evaluation_corpus_cursor()
 
 
 def test_recovery_only_fails_safe_in_flight_stages_and_is_idempotent(tmp_path: Path) -> None:
@@ -3667,231 +2740,6 @@ def test_heartbeat_guard_surfaces_fencing_takeover(tmp_path: Path) -> None:
         guard.assert_owned()
 
 
-def test_lifecycle_snapshots_are_immutable_and_deduplicated(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    lifecycle_snapshot = _lifecycle_snapshot()
-    snapshot = lifecycle_snapshot.to_json()
-    fingerprint = lifecycle_snapshot.fingerprint()
-
-    assert store.record_lifecycle_snapshot(run.run_id, fingerprint, snapshot) is True
-    assert store.record_lifecycle_snapshot(run.run_id, fingerprint, snapshot) is False
-    changed = _lifecycle_snapshot(head_sha="c" * 40)
-    with pytest.raises(ValueError, match="fingerprint does not match"):
-        store.record_lifecycle_snapshot(run.run_id, fingerprint, changed.to_json())
-    with pytest.raises(StateError, match="Unknown run"):
-        store.record_lifecycle_snapshot("missing", fingerprint, snapshot)
-    with pytest.raises(ValueError, match="valid JSON"):
-        store.record_lifecycle_snapshot(run.run_id, "b" * 64, "not-json")
-
-    snapshots = store.lifecycle_snapshots(run.run_id)
-    assert len(snapshots) == 1
-    assert snapshots[0].snapshot_json == snapshot
-    assert store.events(run.run_id)[-1]["event_type"] == "lifecycle.snapshot.recorded"
-
-
-def test_lifecycle_snapshot_restores_from_the_current_schema(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "source")
-    run = store.create_run()
-    current = _lifecycle_snapshot()
-    snapshot_json = current.to_json()
-    fingerprint = current.fingerprint()
-    store.record_lifecycle_snapshot(run.run_id, fingerprint, snapshot_json)
-    snapshot = store.create_snapshot(tmp_path / "snapshots" / "state.sqlite3")
-
-    restored_root = tmp_path / "restored"
-    restored = RunStore.restore_snapshot(restored_root, snapshot)
-    with sqlite3.connect(restored) as connection:
-        assert connection.execute(
-            "SELECT schema_version FROM schema_metadata WHERE singleton = 1"
-        ).fetchone() == (CURRENT_SCHEMA_VERSION,)
-
-    reopened = RunStore(restored_root)
-    rows = reopened.lifecycle_snapshots(run.run_id)
-    assert len(rows) == 1
-    parsed = parse_lifecycle_snapshot_json(
-        rows[0].snapshot_json,
-        observed_at=rows[0].observed_at,
-    )
-    assert parsed.to_json() == snapshot_json
-    assert parsed.fingerprint() == fingerprint
-
-
-def test_lifecycle_snapshot_rejects_noncanonical_and_structurally_invalid_json(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    snapshot = _lifecycle_snapshot()
-    payload = json.loads(snapshot.to_json())
-    payload["unsupported"] = True
-
-    with pytest.raises(ValueError, match="canonical JSON"):
-        store.record_lifecycle_snapshot(
-            run.run_id,
-            snapshot.fingerprint(),
-            f" {snapshot.to_json()}",
-        )
-    with pytest.raises(ValueError, match="exact supported fields"):
-        store.record_lifecycle_snapshot(
-            run.run_id,
-            snapshot.fingerprint(),
-            json.dumps(payload, sort_keys=True, separators=(",", ":")),
-        )
-    duplicate_key = snapshot.to_json().replace(
-        '"check_runs":[]',
-        '"check_runs":[],"check_runs":[]',
-        1,
-    )
-    with pytest.raises(ValueError, match="duplicate JSON key"):
-        store.record_lifecycle_snapshot(run.run_id, snapshot.fingerprint(), duplicate_key)
-
-
-@pytest.mark.parametrize(
-    ("path", "value", "message"),
-    (
-        (("expected_head_sha",), "A" * 40, "full Git SHA"),
-        (("pull_request", "head_sha"), "short", "full Git SHA"),
-        (("pull_request", "merge_commit_sha"), "short", "full Git SHA"),
-        (("pull_request", "title"), "", "nonempty canonical string"),
-        (("pull_request", "base_ref"), "", "nonempty canonical string"),
-        (("pull_request", "node_id"), "bad\nnode", "bounded printable string"),
-        (("pull_request", "repository"), "example/project/extra", "owner/name"),
-        (
-            ("pull_request", "html_url"),
-            "https://github.com/example/other/pull/7",
-            "canonical repository and number",
-        ),
-    ),
-)
-def test_lifecycle_snapshot_rejects_impossible_github_evidence(
-    tmp_path: Path,
-    path: tuple[str, ...],
-    value: object,
-    message: str,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    payload = json.loads(_lifecycle_snapshot().to_json())
-    target = payload
-    for component in path[:-1]:
-        target = target[component]
-    target[path[-1]] = value
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-
-    with pytest.raises(ValueError, match=message):
-        store.record_lifecycle_snapshot(
-            run.run_id,
-            hashlib.sha256(encoded.encode()).hexdigest(),
-            encoded,
-        )
-
-
-def test_lifecycle_snapshot_read_recomputes_fingerprint_after_content_tamper(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    snapshot = _lifecycle_snapshot()
-    store.record_lifecycle_snapshot(run.run_id, snapshot.fingerprint(), snapshot.to_json())
-    changed = replace(
-        snapshot,
-        pull_request=replace(snapshot.pull_request, title="Tampered lifecycle evidence"),
-    )
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            "UPDATE lifecycle_snapshots SET snapshot_json = ? WHERE run_id = ?",
-            (changed.to_json(), run.run_id),
-        )
-
-    with pytest.raises(StateError, match="fingerprint mismatch"):
-        store.lifecycle_snapshots(run.run_id)
-
-
-def test_lifecycle_snapshot_read_rejects_missing_event_with_valid_ledger_anchor(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    snapshot = _lifecycle_snapshot()
-    store.record_lifecycle_snapshot(run.run_id, snapshot.fingerprint(), snapshot.to_json())
-    with sqlite3.connect(store.database_path) as connection:
-        event = connection.execute(
-            """
-            SELECT id, previous_hash FROM events
-            WHERE run_id = ? AND event_type = 'lifecycle.snapshot.recorded'
-            """,
-            (run.run_id,),
-        ).fetchone()
-        assert event is not None
-        connection.execute("DELETE FROM events WHERE id = ?", (event[0],))
-        connection.execute(
-            """
-            UPDATE runs SET event_count = event_count - 1, event_head_hash = ?
-            WHERE run_id = ?
-            """,
-            (event[1], run.run_id),
-        )
-
-    with pytest.raises(StateError, match="missing its ledger event"):
-        store.lifecycle_snapshots(run.run_id)
-
-
-def test_lifecycle_snapshot_read_rejects_duplicate_event_with_valid_hash_chain(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    snapshot = _lifecycle_snapshot()
-    fingerprint = snapshot.fingerprint()
-    store.record_lifecycle_snapshot(run.run_id, fingerprint, snapshot.to_json())
-    with sqlite3.connect(store.database_path) as connection:
-        _append_lifecycle_snapshot_event(
-            connection,
-            run_id=run.run_id,
-            fingerprint=fingerprint,
-        )
-
-    with pytest.raises(StateError, match="duplicate lifecycle snapshot ledger events"):
-        store.lifecycle_snapshots(run.run_id)
-
-
-def test_lifecycle_snapshot_read_rejects_orphan_event(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    snapshot = _lifecycle_snapshot()
-    store.record_lifecycle_snapshot(run.run_id, snapshot.fingerprint(), snapshot.to_json())
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute("DELETE FROM lifecycle_snapshots WHERE run_id = ?", (run.run_id,))
-
-    with pytest.raises(StateError, match="orphan lifecycle snapshot ledger event"):
-        store.lifecycle_snapshots(run.run_id)
-
-
-def test_backup_and_restore_validate_lifecycle_snapshot_integrity(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    snapshot = _lifecycle_snapshot()
-    store.record_lifecycle_snapshot(run.run_id, snapshot.fingerprint(), snapshot.to_json())
-    backup = store.create_snapshot(tmp_path / "backup.sqlite3")
-    with sqlite3.connect(backup) as connection:
-        connection.execute("PRAGMA journal_mode = DELETE")
-        connection.execute(
-            "UPDATE lifecycle_snapshots SET observed_at = ? WHERE run_id = ?",
-            ("2026-07-21T08:00:00-04:00", run.run_id),
-        )
-
-    with pytest.raises(StateError, match="canonical UTC timestamp"):
-        RunStore.restore_snapshot(tmp_path / "restored", backup)
-
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute("DELETE FROM lifecycle_snapshots WHERE run_id = ?", (run.run_id,))
-    destination = tmp_path / "rejected.sqlite3"
-    with pytest.raises(StateError, match="orphan lifecycle snapshot ledger event"):
-        store.create_snapshot(destination)
-    assert not destination.exists()
-
-
 def test_open_pull_request_enumeration_never_silently_truncates(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     first = store.create_run()
@@ -3912,171 +2760,25 @@ def test_open_pull_request_enumeration_never_silently_truncates(tmp_path: Path) 
     assert [run.run_id for run in store.list_submitting_runs()] == [submitting.run_id]
 
 
-def test_evaluation_anchors_are_atomic_bounded_and_do_not_rewrite_manifests(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    first = store.create_run()
-    second = store.create_run()
-    original_manifest = store.get(first.run_id)
-    first_details = {"digest": "a" * 64}
-    second_details = {"digest": "b" * 64}
-
-    store.record_evaluation_anchor(first.run_id, first_details)
-    store.record_evaluation_anchor(second.run_id, second_details)
-
-    assert store.get(first.run_id) == original_manifest
-    assert store.evaluation_revision_anchors() == [
-        {
-            "run_id": first.run_id,
-            "event_type": "evaluation.recorded",
-            "details": json.dumps(first_details, separators=(",", ":")),
-        },
-        {
-            "run_id": second.run_id,
-            "event_type": "evaluation.recorded",
-            "details": json.dumps(second_details, separators=(",", ":")),
-        },
-    ]
-    with pytest.raises(StateError, match="already has"):
-        store.record_evaluation_anchor(first.run_id, first_details)
-    with pytest.raises(StateError, match="exceeds"):
-        store.evaluation_revision_anchors(limit=1)
-    with pytest.raises(StateError, match="Unknown run"):
-        store.record_evaluation_anchor("missing", first_details)
-
-
-def test_evaluation_anchor_is_exactly_once_under_contention(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-
-    def record(digest: str) -> str:
-        try:
-            store.record_evaluation_anchor(run.run_id, {"digest": digest})
-        except StateError:
-            return "blocked"
-        return "recorded"
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(record, ["a" * 64, "b" * 64]))
-
-    assert sorted(results) == ["blocked", "recorded"]
-    assert len(store.evaluation_revision_anchors()) == 1
-
-
-def test_evaluation_amendment_anchor_requires_the_current_predecessor(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    initial_hash = "a" * 64
-    amended_hash = "b" * 64
-    store.record_evaluation_anchor(run.run_id, {"evaluation_hash": initial_hash})
-
-    store.record_evaluation_amendment_anchor(
-        run.run_id,
-        {
-            "evaluation_hash": amended_hash,
-            "revision": "2",
-            "supersedes_evaluation_hash": initial_hash,
-        },
-        expected_previous_hash=initial_hash,
-    )
-
-    with pytest.raises(StateError, match="evaluation changed"):
-        store.record_evaluation_amendment_anchor(
-            run.run_id,
-            {
-                "evaluation_hash": "c" * 64,
-                "revision": "2",
-                "supersedes_evaluation_hash": initial_hash,
-            },
-            expected_previous_hash=initial_hash,
-        )
-    assert store.evaluation_revision_anchors() == [
-        {
-            "run_id": run.run_id,
-            "event_type": "evaluation.recorded",
-            "details": json.dumps({"evaluation_hash": initial_hash}, separators=(",", ":")),
-        },
-        {
-            "run_id": run.run_id,
-            "event_type": "evaluation.amended",
-            "details": json.dumps(
-                {
-                    "evaluation_hash": amended_hash,
-                    "revision": "2",
-                    "supersedes_evaluation_hash": initial_hash,
-                },
-                separators=(",", ":"),
-            ),
-        },
-    ]
-
-
-def test_deleted_event_tail_cannot_be_replaced_with_a_new_evaluation_anchor(
+def test_deleted_event_tail_cannot_be_replaced_with_a_new_event(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
     run = store.create_run()
-    store.record_evaluation_anchor(run.run_id, {"digest": "a" * 64})
+    store.transition(run, RunStatus.DISCOVERING, reason="fixture")
     with sqlite3.connect(store.database_path) as connection:
         connection.execute(
             """
             DELETE FROM events
-            WHERE run_id = ? AND event_type = 'evaluation.recorded'
+            WHERE run_id = ? AND event_type = 'run.transitioned'
             """,
             (run.run_id,),
         )
 
     with pytest.raises(StateError, match="Event ledger anchor mismatch"):
-        store.record_evaluation_anchor(run.run_id, {"digest": "b" * 64})
+        store.save(run, event="test.replacement", details={"digest": "b" * 64})
     with pytest.raises(StateError, match="Event ledger anchor mismatch"):
         store.verify_event_chains(run_id=run.run_id)
-
-
-def test_evaluation_anchor_enumeration_rejects_malformed_or_duplicate_rows(
-    tmp_path: Path,
-) -> None:
-    malformed_store = RunStore(tmp_path / "malformed")
-    malformed_run = malformed_store.create_run()
-    malformed_store.record_evaluation_anchor(malformed_run.run_id, {"digest": "a" * 64})
-    with sqlite3.connect(malformed_store.database_path) as connection:
-        connection.execute(
-            """
-            UPDATE events SET details_json = '[]'
-            WHERE run_id = ? AND event_type = 'evaluation.recorded'
-            """,
-            (malformed_run.run_id,),
-        )
-    with pytest.raises(StateError, match="malformed details"):
-        malformed_store.evaluation_revision_anchors()
-
-    duplicate_store = RunStore(tmp_path / "duplicate")
-    duplicate_run = duplicate_store.create_run()
-    initial_anchor = {
-        "agent_prepared": "false",
-        "evaluation_hash": "a" * 64,
-        "evaluation_schema_version": "2",
-        "subject_hash": "c" * 64,
-        "verdict": "correct_abstention",
-    }
-    duplicate_store.record_evaluation_anchor(duplicate_run.run_id, initial_anchor)
-    with sqlite3.connect(duplicate_store.database_path) as connection:
-        connection.execute(
-            """
-            INSERT INTO events(
-                run_id, occurred_at, event_type, details_json, previous_hash, event_hash
-            ) VALUES (?, ?, 'evaluation.recorded', ?, ?, ?)
-            """,
-            (
-                duplicate_run.run_id,
-                datetime.now(UTC).isoformat(),
-                json.dumps(initial_anchor, separators=(",", ":")),
-                "a" * 64,
-                "b" * 64,
-            ),
-        )
-    with pytest.raises(StateError, match="multiple initial evaluation anchors"):
-        EvaluationStore(duplicate_store)._anchors_by_run()
 
 
 def test_circuit_breaker_is_persistent_deduplicated_and_requires_audited_resume(
@@ -4216,9 +2918,6 @@ def test_pr_open_manifest_write_failure_keeps_committed_state_and_repairs_on_reo
             "SELECT status FROM runs WHERE run_id = ?", (run.run_id,)
         ).fetchone() == (RunStatus.PR_OPEN.value,)
         assert connection.execute(
-            "SELECT count(*) FROM publication_gate_holds WHERE run_id = ?", (run.run_id,)
-        ).fetchone() == (0,)
-        assert connection.execute(
             "SELECT count(*) FROM manifest_artifact_sync WHERE run_id = ?", (run.run_id,)
         ).fetchone() == (1,)
 
@@ -4301,7 +3000,7 @@ def test_candidate_claim_manifest_write_failure_repairs_committed_outbox_on_reop
         ).fetchone() == (0,)
 
 
-def test_compensation_manifest_write_failure_repairs_without_reacquiring_the_hold(
+def test_compensation_manifest_write_failure_repairs_on_reopen(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4329,9 +3028,6 @@ def test_compensation_manifest_write_failure_repairs_without_reacquiring_the_hol
             "SELECT status FROM runs WHERE run_id = ?", (run.run_id,)
         ).fetchone() == (RunStatus.FAILED.value,)
         assert connection.execute(
-            "SELECT count(*) FROM publication_gate_holds WHERE run_id = ?", (run.run_id,)
-        ).fetchone() == (0,)
-        assert connection.execute(
             "SELECT count(*) FROM manifest_artifact_sync WHERE run_id = ?", (run.run_id,)
         ).fetchone() == (1,)
 
@@ -4347,8 +3043,8 @@ def test_compensation_manifest_write_failure_repairs_without_reacquiring_the_hol
     assert [
         event["event_type"]
         for event in repaired.events(run.run_id)
-        if event["event_type"] == "publication.gate.released"
-    ] == ["publication.gate.released"]
+        if event["event_type"] == "publication.compensation.verified"
+    ] == ["publication.compensation.verified"]
 
 
 def test_stale_manifest_publisher_cannot_overwrite_or_clear_a_newer_marker(
@@ -4456,50 +3152,6 @@ def test_missing_publication_reservation_is_reconstructed_without_a_second_event
     ] == ["publication.reserved"]
 
 
-def test_missing_automatic_hold_is_reconstructed_for_retry_and_still_blocks_evaluations(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    publisher = _publication_run(store)
-    _begin_publication(store, publisher)
-    other = store.create_run()
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            "DELETE FROM publication_gate_holds WHERE run_id = ?", (publisher.run_id,)
-        )
-
-    with pytest.raises(StateError, match="held by active publication run"):
-        store.record_evaluation_anchor(other.run_id, {"evaluation_hash": "a" * 64})
-
-    retry = store.get(publisher.run_id)
-    _begin_publication(store, retry, with_gate=False)
-
-    with sqlite3.connect(store.database_path) as connection:
-        assert connection.execute(
-            "SELECT run_id FROM publication_gate_holds WHERE run_id = ?", (publisher.run_id,)
-        ).fetchone() == (publisher.run_id,)
-    assert [
-        event["event_type"]
-        for event in store.events(publisher.run_id)
-        if event["event_type"] == "publication.gate.held"
-    ] == ["publication.gate.held"]
-
-
-def test_released_publication_hold_is_not_reconstructed(tmp_path: Path) -> None:
-    root = tmp_path / "state"
-    store = RunStore(root)
-    run = _publication_run(store)
-    _begin_publication(store, run)
-    store.transition(run, RunStatus.PR_OPEN, reason="pull request created")
-
-    reopened = RunStore(root)
-
-    with sqlite3.connect(reopened.database_path) as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM publication_gate_holds WHERE run_id = ?", (run.run_id,)
-        ).fetchone() == (0,)
-
-
 def test_publication_reservation_row_mismatch_fails_closed(tmp_path: Path) -> None:
     root = tmp_path / "state"
     store = RunStore(root)
@@ -4520,28 +3172,19 @@ def test_publication_reservation_row_mismatch_fails_closed(tmp_path: Path) -> No
         RunStore(root)
 
 
-@pytest.mark.parametrize(
-    "duplicate_event",
-    ["publication.reserved", "publication.gate.held", "publication.gate.released"],
-)
-def test_duplicate_publication_evidence_fails_closed(
-    tmp_path: Path,
-    duplicate_event: str,
-) -> None:
-    root = tmp_path / duplicate_event.rsplit(".", 1)[-1]
+def test_duplicate_publication_evidence_fails_closed(tmp_path: Path) -> None:
+    root = tmp_path / "state"
     store = RunStore(root)
     run = _publication_run(store)
     _begin_publication(store, run)
-    if duplicate_event == "publication.gate.released":
-        store.transition(run, RunStatus.PR_OPEN, reason="pull request created")
     details = next(
         json.loads(event["details"])
         for event in store.events(run.run_id)
-        if event["event_type"] == duplicate_event
+        if event["event_type"] == "publication.reserved"
     )
     with store._connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
-        store._append_event(connection, run.run_id, duplicate_event, details)
+        store._append_event(connection, run.run_id, "publication.reserved", details)
 
     with pytest.raises(StateError, match="duplicate publication"):
         RunStore(root)

@@ -17,18 +17,6 @@ from autocontribute.config import (
 from autocontribute.exceptions import ConfigurationError
 
 
-def _priced_models() -> dict[str, object]:
-    profile = {
-        "expected_response_model": "immutable-model-snapshot-v1",
-        "immutable_response_model_attested": True,
-        "pricing": {
-            "input_usd_per_million_tokens": "2",
-            "output_usd_per_million_tokens": "10",
-        },
-    }
-    return {role: profile for role in ("scout", "builder", "critic")}
-
-
 def _s3_replication() -> dict[str, object]:
     return {
         "bundle_directory": "/var/backups/autocontribute",
@@ -46,7 +34,6 @@ def test_example_config_is_valid() -> None:
 
     assert config.models.builder.model == "gpt-5.6"
     assert config.models.critic.reasoning_mode == "pro"
-    assert config.publishing.mode == "review_required"
     assert config.publishing.draft is True
     assert config.budget.max_model_cost_usd_per_run == Decimal("50")
     assert config.models.scout.pricing is not None
@@ -60,7 +47,6 @@ def test_shipped_example_configs_are_valid_and_self_consistent() -> None:
     for name in ("autocontribute.example.yml", "autocontribute.staging.example.yml"):
         raw = (root / name).read_text(encoding="utf-8")
         config = AutocontributeConfig.model_validate(yaml.safe_load(raw))
-        assert config.publishing.mode == "review_required"
         assert all(
             config.validation.commands_for(repository) for repository in config.github.repositories
         )
@@ -212,6 +198,11 @@ def test_s3_replication_configuration_rejects_unsafe_boundaries(
 
     with pytest.raises(ValueError, match=message):
         AutocontributeConfig.model_validate({"s3_replication": replication})
+
+
+def test_publishing_mode_is_not_a_setting() -> None:
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        AutocontributeConfig.model_validate({"publishing": {"mode": "review_required"}})
 
 
 def test_ready_for_review_requires_draft_staging() -> None:
@@ -407,219 +398,6 @@ def test_required_validation_commands_must_fit_the_sandbox_budget() -> None:
                     }
                 },
             }
-        )
-
-
-def test_guarded_auto_mode_accepts_one_repository_weekly_draft_pilot() -> None:
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"], "owners": []},
-            "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-            "publishing": {
-                "mode": "auto",
-                "draft": True,
-                "ready_for_review": True,
-                "max_new_pull_requests_per_day": 1,
-                "max_open_pull_requests": 1,
-                "repository_cooldown_days": 7,
-            },
-            "models": _priced_models(),
-            "budget": {"max_model_cost_usd_per_run": "25"},
-            "s3_replication": _s3_replication(),
-        }
-    )
-
-    assert config.publishing.mode == "auto"
-
-
-def test_guarded_auto_mode_requires_s3_replication_configuration() -> None:
-    with pytest.raises(ValueError, match="s3_replication must be configured"):
-        AutocontributeConfig.model_validate(
-            {
-                "github": {"repositories": ["example/project"], "owners": []},
-                "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-                "publishing": {
-                    "mode": "auto",
-                    "ready_for_review": True,
-                    "max_open_pull_requests": 1,
-                },
-                "models": _priced_models(),
-                "budget": {"max_model_cost_usd_per_run": "25"},
-            }
-        )
-
-
-@pytest.mark.parametrize(
-    ("github", "publishing", "message"),
-    [
-        ({"repositories": []}, {}, "exactly one explicit"),
-        (
-            {"repositories": ["example/one", "example/two"]},
-            {},
-            "exactly one explicit",
-        ),
-        (
-            {"repositories": ["example/project"], "owners": ["example"]},
-            {},
-            "github.owners must be empty",
-        ),
-        ({"repositories": ["example/project"]}, {"draft": False}, "draft must be true"),
-        (
-            {"repositories": ["example/project"]},
-            {"ready_for_review": False},
-            "ready_for_review must be true",
-        ),
-        (
-            {"repositories": ["example/project"]},
-            {"max_new_pull_requests_per_day": 2},
-            "max_new_pull_requests_per_day must equal 1",
-        ),
-        (
-            {"repositories": ["example/project"]},
-            {"repository_cooldown_days": 6},
-            "repository_cooldown_days must be at least 7",
-        ),
-        (
-            {"repositories": ["example/project"]},
-            {"max_open_pull_requests": 2},
-            "max_open_pull_requests must equal 1",
-        ),
-    ],
-)
-def test_guarded_auto_mode_rejects_broader_rollout(
-    github: dict[str, object], publishing: dict[str, object], message: str
-) -> None:
-    repositories = github.get("repositories", [])
-    assert isinstance(repositories, list)
-    required_commands = {
-        repository: ["python -m pytest"]
-        for repository in repositories
-        if isinstance(repository, str)
-    }
-
-    with pytest.raises(ValueError, match=message):
-        AutocontributeConfig.model_validate(
-            {
-                "github": github,
-                "validation": {"required_commands": required_commands},
-                "publishing": {
-                    "mode": "auto",
-                    "ready_for_review": True,
-                    **publishing,
-                },
-                "models": _priced_models(),
-                "budget": {"max_model_cost_usd_per_run": "25"},
-            }
-        )
-
-
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"sandbox": {"backend": "local", "allow_unsafe_local": True}}, "must be docker"),
-        (
-            {"policy": {"require_maintainer_signal": False}},
-            "require_maintainer_signal must be true",
-        ),
-        (
-            {"policy": {"allow_dependency_changes": True}},
-            "allow_dependency_changes must be false",
-        ),
-        ({"quality": {"min_readiness_score": 89}}, "min_readiness_score must be at least 90"),
-        ({"quality": {"max_changed_lines": 401}}, "max_changed_lines must be at most 400"),
-        ({"quality": {"forbidden_paths": []}}, "must retain guarded paths"),
-    ],
-)
-def test_guarded_auto_mode_rejects_unsafe_runtime_policy(
-    overrides: dict[str, object], message: str
-) -> None:
-    raw: dict[str, object] = {
-        "github": {"repositories": ["example/project"]},
-        "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-        "publishing": {
-            "mode": "auto",
-            "ready_for_review": True,
-            "max_open_pull_requests": 1,
-        },
-        "models": _priced_models(),
-        "budget": {"max_model_cost_usd_per_run": "25"},
-    }
-    raw.update(overrides)
-
-    with pytest.raises(ValueError, match=message):
-        AutocontributeConfig.model_validate(raw)
-
-
-def test_guarded_auto_requires_complete_pricing_and_usd_ceiling() -> None:
-    base = {
-        "github": {"repositories": ["example/project"]},
-        "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-        "publishing": {
-            "mode": "auto",
-            "ready_for_review": True,
-            "max_open_pull_requests": 1,
-        },
-    }
-
-    with pytest.raises(ValueError, match="pricing is required for every role"):
-        AutocontributeConfig.model_validate(base)
-    with pytest.raises(ValueError, match="max_model_cost_usd_per_run must be configured"):
-        AutocontributeConfig.model_validate({**base, "models": _priced_models()})
-
-
-def test_guarded_auto_requires_exact_provider_model_attestation_for_every_role() -> None:
-    models = _priced_models()
-    assert isinstance(models["critic"], dict)
-    models["critic"] = {
-        key: value
-        for key, value in models["critic"].items()
-        if key not in {"expected_response_model", "immutable_response_model_attested"}
-    }
-
-    with pytest.raises(ValueError, match=r"expected_response_model.*critic"):
-        AutocontributeConfig.model_validate(
-            {
-                "github": {"repositories": ["example/project"]},
-                "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-                "publishing": {
-                    "mode": "auto",
-                    "ready_for_review": True,
-                    "max_open_pull_requests": 1,
-                },
-                "models": models,
-                "budget": {"max_model_cost_usd_per_run": "25"},
-            }
-        )
-
-
-def test_guarded_auto_requires_explicit_immutable_model_identity_attestation() -> None:
-    models = _priced_models()
-    assert isinstance(models["critic"], dict)
-    models["critic"] = {
-        **models["critic"],
-        "immutable_response_model_attested": False,
-    }
-
-    with pytest.raises(ValueError, match=r"immutable_response_model_attested.*critic"):
-        AutocontributeConfig.model_validate(
-            {
-                "github": {"repositories": ["example/project"]},
-                "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-                "publishing": {
-                    "mode": "auto",
-                    "ready_for_review": True,
-                    "max_open_pull_requests": 1,
-                },
-                "models": models,
-                "budget": {"max_model_cost_usd_per_run": "25"},
-            }
-        )
-
-
-def test_immutable_model_identity_attestation_requires_an_expected_model() -> None:
-    with pytest.raises(ValueError, match="requires expected_response_model"):
-        AutocontributeConfig.model_validate(
-            {"models": {"scout": {"immutable_response_model_attested": True}}}
         )
 
 

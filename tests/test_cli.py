@@ -7,14 +7,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from rich.text import Text
 from typer.testing import CliRunner
 
 import autocontribute.cli as cli
 from autocontribute.backup_replication import PendingStateBundleReplication
 from autocontribute.cli import app
 from autocontribute.config import load_config
-from autocontribute.deployment import compute_deployment_fingerprint
 from autocontribute.discovery import LEGAL_REQUIREMENTS_EVIDENCE_KEY
 from autocontribute.domain import (
     CommandResult,
@@ -30,7 +28,6 @@ from autocontribute.domain import (
     ReviewScores,
     RunStatus,
 )
-from autocontribute.evaluation import EvaluationStore, EvaluationVerdict
 from autocontribute.exceptions import PublicationResumeRequired, StateError
 from autocontribute.lifecycle import LifecycleSyncResult
 from autocontribute.orchestrator import RunInvocationMode
@@ -51,46 +48,6 @@ _REVIEW_PATCH = (
     "-review_patch_old_marker = 1\n"
     "+review_patch_new_marker = 2\n"
 )
-
-
-def _guarded_auto_config_text(state: Path) -> str:
-    return (
-        "github:\n"
-        "  repositories: [example/project]\n"
-        "validation:\n"
-        "  required_commands:\n"
-        "    example/project: [python -m pytest]\n"
-        "publishing:\n"
-        "  mode: auto\n"
-        "  ready_for_review: true\n"
-        "  max_open_pull_requests: 1\n"
-        "models:\n"
-        "  scout:\n"
-        "    expected_response_model: gpt-5.6-2026-07-21\n"
-        "    immutable_response_model_attested: true\n"
-        "    pricing: &pricing\n"
-        "      input_usd_per_million_tokens: 1\n"
-        "      output_usd_per_million_tokens: 1\n"
-        "  builder:\n"
-        "    expected_response_model: gpt-5.6-2026-07-21\n"
-        "    immutable_response_model_attested: true\n"
-        "    pricing: *pricing\n"
-        "  critic:\n"
-        "    expected_response_model: gpt-5.6-2026-07-21\n"
-        "    immutable_response_model_attested: true\n"
-        "    pricing: *pricing\n"
-        "budget:\n"
-        "  max_model_cost_usd_per_run: 10\n"
-        "s3_replication:\n"
-        f"  bundle_directory: {state.parent / 'backups'}\n"
-        f"  receipt_directory: {state.parent / 'backups' / 'receipts'}\n"
-        f"  scratch_directory: {state.parent / 'backups' / 'scratch'}\n"
-        "  bucket: autocontribute-backup\n"
-        "  expected_bucket_owner: '123456789012'\n"
-        "  region: ca-central-1\n"
-        "  prefix: production/test\n"
-        f"storage:\n  path: {state}\n"
-    )
 
 
 class _ReviewGitHub:
@@ -691,225 +648,6 @@ def test_policy_attestation_requires_interactive_personal_confirmation(
     assert "legal_attestations:" not in result.output
 
 
-def test_expert_evaluation_cli_records_and_reports_shadow_gate(tmp_path: Path) -> None:
-    config = tmp_path / "autocontribute.yml"
-    state = tmp_path / "state"
-    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
-    settings = load_config(config)
-    store = RunStore(state)
-    run = store.create_run(deployment_fingerprint=compute_deployment_fingerprint(settings))
-    store.transition(run, RunStatus.DISCOVERING, reason="fixture")
-    store.transition(run, RunStatus.SKIPPED, reason="fixture")
-
-    recorded = runner.invoke(
-        app,
-        [
-            "eval",
-            "record",
-            run.run_id,
-            "--reviewer",
-            "expert",
-            "--verdict",
-            "correct_abstention",
-            "--yes",
-            "--config",
-            str(config),
-        ],
-    )
-    report = runner.invoke(app, ["eval", "report", "--config", str(config), "--json"])
-
-    assert recorded.exit_code == 0, recorded.output
-    assert "correct_abstention" in recorded.output
-    assert report.exit_code == 0, report.output
-    payload = json.loads(report.output)
-    assert payload["total_cases"] == 1
-    assert payload["shadow_gate_passed"] is False
-    assert payload["deployment_fingerprint"] == run.deployment_fingerprint
-
-
-def test_rollout_report_emits_complete_human_and_json_decisions(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = tmp_path / "autocontribute.yml"
-    state = tmp_path / "state"
-    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
-    calls: list[str] = []
-
-    class ReportGitHub(_ReviewGitHub):
-        def __enter__(self) -> _ReviewGitHub:
-            calls.append("enter")
-            return self
-
-        def __exit__(self, *_: object) -> None:
-            calls.append("close")
-
-    monkeypatch.setattr(cli, "_github_client", lambda *_: ReportGitHub())
-    monkeypatch.setattr(
-        cli,
-        "Orchestrator",
-        lambda *_args, **_kwargs: pytest.fail("a rollout report must not construct a model client"),
-    )
-
-    human = runner.invoke(app, ["rollout", "report", "--config", str(config)])
-    machine = runner.invoke(
-        app,
-        ["rollout", "report", "--config", str(config), "--json"],
-    )
-
-    assert human.exit_code == 0, human.output
-    assert "Combined autonomous rollout gate: NOT READY" in human.output
-    assert "fixed manual upstream cohort: blocked" in human.output
-    assert "prior automatic upstream outcomes: passed" in human.output
-    assert "octocat at https://api.github.com" in human.output
-    assert machine.exit_code == 0, machine.output
-    payload = json.loads(machine.output)
-    assert payload["overall_gate_passed"] is False
-    assert payload["manual_cohort_passed"] is False
-    assert payload["prior_automatic_passed"] is True
-    assert payload["scope"] == {
-        "deployment_fingerprint": compute_deployment_fingerprint(load_config(config)),
-        "publishing_login": "octocat",
-        "publishing_api_origin": "https://api.github.com",
-    }
-    assert calls == ["enter", "close", "enter", "close"]
-    assert RunStore(state).oldest_runs() == []
-
-
-def test_eval_record_previews_every_field_and_refusal_writes_nothing(tmp_path: Path) -> None:
-    config = tmp_path / "autocontribute.yml"
-    state = tmp_path / "state"
-    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
-    store = RunStore(state)
-    run = store.create_run()
-    store.transition(run, RunStatus.DISCOVERING, reason="fixture")
-    store.transition(run, RunStatus.SKIPPED, reason="fixture")
-
-    result = runner.invoke(
-        app,
-        [
-            "eval",
-            "record",
-            run.run_id,
-            "--reviewer",
-            "expert\x1b[2J",
-            "--verdict",
-            "correct_abstention",
-            "--notes",
-            "Exact evidence\u202e marker",
-            "--policy-failure",
-            "--config",
-            str(config),
-        ],
-        input="n\n",
-    )
-
-    output = Text.from_ansi(result.output).plain
-    assert result.exit_code == 1
-    assert "BEGIN COMPLETE EVALUATION JSON" in output
-    assert '"agent_prepared": false' in output
-    assert '"policy_failure": true' in output
-    assert '"security_failure": false' in output
-    assert '"etiquette_failure": false' in output
-    assert '"verdict": "correct_abstention"' in output
-    assert "\\u001b[2J" in output
-    assert "\\u202e" in output
-    assert "\x1b[2J" not in result.output
-    assert "\u202e" not in result.output
-    assert not store.evaluation_revision_anchors()
-    assert not list((state / "evaluations").glob("*.json"))
-
-
-def test_eval_record_rejects_subject_drift_after_confirmation_preview(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = tmp_path / "autocontribute.yml"
-    state = tmp_path / "state"
-    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
-    store = RunStore(state)
-    run = store.create_run()
-    store.transition(run, RunStatus.DISCOVERING, reason="fixture")
-    store.transition(run, RunStatus.SKIPPED, reason="fixture")
-
-    def mutate_subject_then_confirm(_: str, **__: object) -> bool:
-        changed = store.get(run.run_id)
-        changed.error = "Evidence changed during the confirmation prompt."
-        store.save(changed, event="fixture.evaluation_confirmation_race", details={})
-        return True
-
-    monkeypatch.setattr(cli.typer, "confirm", mutate_subject_then_confirm)
-    result = runner.invoke(
-        app,
-        [
-            "eval",
-            "record",
-            run.run_id,
-            "--reviewer",
-            "expert",
-            "--verdict",
-            "correct_abstention",
-            "--config",
-            str(config),
-        ],
-    )
-
-    assert result.exit_code == 1, result.output
-    assert "BEGIN COMPLETE EVALUATION JSON" in result.output
-    assert "subject no longer matches" in result.output
-    assert not store.evaluation_revision_anchors()
-
-
-def test_eval_amend_appends_a_confirmed_full_replacement(tmp_path: Path) -> None:
-    config = tmp_path / "autocontribute.yml"
-    state = tmp_path / "state"
-    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
-    store = RunStore(state)
-    run = store.create_run()
-    store.transition(run, RunStatus.DISCOVERING, reason="fixture")
-    store.transition(run, RunStatus.SKIPPED, reason="fixture")
-    evaluations = EvaluationStore(store)
-    initial = evaluations.record(
-        run.run_id,
-        reviewer="initial expert",
-        verdict=EvaluationVerdict.CORRECT_ABSTENTION,
-        policy_failure=True,
-        notes="This judgment contained a transcription error.",
-    )
-
-    result = runner.invoke(
-        app,
-        [
-            "eval",
-            "amend",
-            run.run_id,
-            "--reviewer",
-            "correcting expert",
-            "--verdict",
-            "incorrect_abstention",
-            "--reason",
-            "The original verdict and safety flag were transcribed incorrectly.",
-            "--notes",
-            "Second review found an actionable issue.",
-            "--yes",
-            "--config",
-            str(config),
-        ],
-    )
-
-    assert result.exit_code == 0, result.output
-    assert "Exact expert-evaluation preview (revision 2)" in result.output
-    assert '"amendment_reason"' in result.output
-    assert '"policy_failure": false' in result.output
-    assert "Appended revision 2" in result.output
-    history = evaluations.history(run.run_id)
-    assert history[0] == initial
-    assert len(history) == 2
-    assert history[-1].verdict == EvaluationVerdict.INCORRECT_ABSTENTION
-    assert not history[-1].policy_failure
-    assert evaluations.list() == [history[-1]]
-
-
 def test_state_backup_cli_creates_verified_snapshot_and_requires_overwrite(
     tmp_path: Path,
 ) -> None:
@@ -1244,7 +982,7 @@ def test_automated_s3_commands_fail_when_optional_review_configuration_is_disabl
     tmp_path: Path,
 ) -> None:
     config = tmp_path / "autocontribute.yml"
-    config.write_text("publishing:\n  mode: review_required\n", encoding="utf-8")
+    config.write_text("publishing:\n  draft: true\n", encoding="utf-8")
 
     for command in ("verify-latest-s3", "gc-bundles"):
         result = runner.invoke(app, ["state", command, "--config", str(config)])
@@ -1633,10 +1371,9 @@ def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monk
         store: RunStore,
         github: object,
         *,
-        resume_submitting_publications: bool = False,
         scheduled_preflight: bool = False,
     ) -> LifecycleSyncResult:
-        calls.append(f"sync:{resume_submitting_publications}:{scheduled_preflight}")
+        calls.append(f"sync:{scheduled_preflight}")
         return LifecycleSyncResult(observations=())
 
     monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
@@ -1646,7 +1383,7 @@ def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monk
     result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
 
     assert result.exit_code == 0, result.output
-    assert calls == ["sync:False:True", "run", "close"]
+    assert calls == ["sync:True", "run", "close"]
 
 
 def _install_run_outcome_fixture(
@@ -1831,217 +1568,6 @@ def test_alert_send_fails_closed_with_the_safe_error_message(
     assert "The alert webhook could not be reached" in result.output
 
 
-def test_auto_path_resyncs_lifecycle_immediately_before_publisher(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
-    config = tmp_path / "autocontribute.yml"
-    state = tmp_path / "state"
-    config.write_text(_guarded_auto_config_text(state), encoding="utf-8")
-    calls: list[str] = []
-
-    class FakeGitHub:
-        def __init__(self, *_: object, **__: object) -> None:
-            pass
-
-        def close(self) -> None:
-            calls.append("close")
-
-    class FakeOrchestrator:
-        def __init__(self, _: object, *, store: RunStore, github: object) -> None:
-            self.store = store
-
-        def __enter__(self):  # type: ignore[no-untyped-def]
-            return self
-
-        def __exit__(self, *_: object) -> None:
-            pass
-
-        def run(  # type: ignore[no-untyped-def]
-            self,
-            *,
-            issue_reference: str | None = None,
-            invocation_mode: RunInvocationMode,
-            retry_authorization: CandidateRetryAuthorization | None = None,
-        ):
-            assert issue_reference is None
-            assert invocation_mode == RunInvocationMode.SCHEDULED
-            assert retry_authorization is None
-            calls.append("run")
-            manifest = self.store.create_run()
-            manifest.status = RunStatus.READY_FOR_APPROVAL
-            self.store.save(manifest, event="test.ready", details={})
-            return manifest
-
-    class FakePublisher:
-        def __init__(self, _: object, store: RunStore, github: object) -> None:
-            self.store = store
-
-        def publish(self, run_id: str):  # type: ignore[no-untyped-def]
-            calls.append("publish")
-            manifest = self.store.get(run_id)
-            manifest.status = RunStatus.PR_OPEN
-            manifest.pull_request_url = "https://github.com/example/project/pull/7"
-            self.store.save(manifest, event="test.published", details={})
-            return manifest
-
-    def fake_sync(
-        settings: object,
-        store: RunStore,
-        github: object,
-        *,
-        resume_submitting_publications: bool = False,
-        scheduled_preflight: bool = False,
-    ) -> LifecycleSyncResult:
-        calls.append(f"sync:{resume_submitting_publications}:{scheduled_preflight}")
-        return LifecycleSyncResult(observations=())
-
-    def fake_rollout_summary(*_: object, **__: object) -> SimpleNamespace:
-        calls.append("gate")
-        return SimpleNamespace(
-            overall_gate_passed=True,
-            evaluation_gate_passed=True,
-            manual_cohort_passed=True,
-            prior_automatic_passed=True,
-            upstream_outcome_gate_passed=True,
-        )
-
-    monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
-    monkeypatch.setattr(cli, "Orchestrator", FakeOrchestrator)
-    monkeypatch.setattr(cli, "Publisher", FakePublisher)
-    monkeypatch.setattr(cli, "_sync_lifecycle", fake_sync)
-    monkeypatch.setattr(
-        cli,
-        "verify_latest_state_bundle_replication",
-        lambda **_kwargs: calls.append("replication"),
-    )
-    monkeypatch.setattr(cli, "_rollout_summary", fake_rollout_summary)
-    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
-
-    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
-
-    assert result.exit_code == 0, result.output
-    assert calls == [
-        "sync:True:True",
-        "replication",
-        "gate",
-        "run",
-        "sync:False:False",
-        "publish",
-        "close",
-    ]
-
-
-@pytest.mark.parametrize("corrupt_evidence", [False, True])
-def test_scheduled_auto_preflight_never_creates_a_run_or_model_session_when_blocked(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    corrupt_evidence: bool,
-) -> None:
-    config = tmp_path / "autocontribute.yml"
-    state = tmp_path / "state"
-    config.write_text(_guarded_auto_config_text(state), encoding="utf-8")
-    calls: list[str] = []
-
-    class FakeGitHub:
-        def __init__(self, *_: object, **__: object) -> None:
-            pass
-
-        def close(self) -> None:
-            calls.append("close")
-
-    class ForbiddenOrchestrator:
-        def __init__(self, *_: object, **__: object) -> None:
-            pytest.fail("a blocked preflight must not construct the model orchestrator")
-
-    def fake_sync(*_: object, **kwargs: object) -> LifecycleSyncResult:
-        assert kwargs["scheduled_preflight"] is True
-        calls.append("observe")
-        return LifecycleSyncResult(observations=())
-
-    def fake_rollout_summary(*_: object, **__: object) -> SimpleNamespace:
-        calls.append("gate")
-        if corrupt_evidence:
-            raise StateError("corrupt rollout evidence")
-        return SimpleNamespace(
-            overall_gate_passed=False,
-            evaluation_gate_passed=False,
-            manual_cohort_passed=False,
-            prior_automatic_passed=True,
-            upstream_outcome_gate_passed=False,
-        )
-
-    monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
-    monkeypatch.setattr(cli, "Orchestrator", ForbiddenOrchestrator)
-    monkeypatch.setattr(cli, "_sync_lifecycle", fake_sync)
-    monkeypatch.setattr(
-        cli,
-        "verify_latest_state_bundle_replication",
-        lambda **_kwargs: calls.append("replication"),
-    )
-    monkeypatch.setattr(cli, "_rollout_summary", fake_rollout_summary)
-    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
-
-    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
-
-    if corrupt_evidence:
-        assert result.exit_code == 1, result.output
-        assert "corrupt rollout evidence" in result.output
-    else:
-        assert result.exit_code == 0, result.output
-        assert "deferred before model use" in result.output
-    assert calls == ["observe", "replication", "gate", "close"]
-    assert RunStore(state).oldest_runs() == []
-
-
-def test_scheduled_auto_requires_replication_after_lifecycle_before_gate_or_model(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = tmp_path / "autocontribute.yml"
-    state = tmp_path / "state"
-    config.write_text(_guarded_auto_config_text(state), encoding="utf-8")
-    calls: list[str] = []
-
-    class FakeGitHub:
-        def __init__(self, *_: object, **__: object) -> None:
-            pass
-
-        def close(self) -> None:
-            calls.append("close")
-
-    def fake_sync(*_: object, **kwargs: object) -> LifecycleSyncResult:
-        assert kwargs["scheduled_preflight"] is True
-        calls.append("lifecycle")
-        return LifecycleSyncResult(observations=())
-
-    def fail_replication(**kwargs: object) -> None:
-        calls.append("replication")
-        assert kwargs["maximum_age"] == timedelta(hours=48)
-        assert kwargs["minimum_retention"] == timedelta(days=90)
-        raise StateError("latest complete bundle lacks exact off-host evidence")
-
-    monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
-    monkeypatch.setattr(cli, "_sync_lifecycle", fake_sync)
-    monkeypatch.setattr(cli, "verify_latest_state_bundle_replication", fail_replication)
-    monkeypatch.setattr(
-        cli,
-        "_rollout_summary",
-        lambda *_args, **_kwargs: pytest.fail("rollout gate must follow replication proof"),
-    )
-    monkeypatch.setattr(
-        cli,
-        "Orchestrator",
-        lambda *_args, **_kwargs: pytest.fail("model work must follow replication proof"),
-    )
-
-    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
-
-    assert result.exit_code == 1
-    assert "lacks exact off-host evidence" in result.output
-    assert calls == ["lifecycle", "replication", "close"]
-    assert RunStore(state).oldest_runs() == []
-
-
 @pytest.mark.parametrize("already_active", [False, True])
 def test_scheduled_preflight_fails_after_lifecycle_when_breaker_is_active(
     tmp_path: Path,
@@ -2050,7 +1576,7 @@ def test_scheduled_preflight_fails_after_lifecycle_when_breaker_is_active(
 ) -> None:
     config = tmp_path / "autocontribute.yml"
     state = tmp_path / "state"
-    config.write_text(_guarded_auto_config_text(state), encoding="utf-8")
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
     store = RunStore(state)
     calls: list[str] = []
 
@@ -2088,82 +1614,16 @@ def test_scheduled_preflight_fails_after_lifecycle_when_breaker_is_active(
             )
         return LifecycleSyncResult(observations=())
 
-    def unready_rollout(*_: object, **__: object) -> SimpleNamespace:
-        calls.append("gate")
-        return SimpleNamespace(
-            overall_gate_passed=False,
-            evaluation_gate_passed=True,
-            manual_cohort_passed=True,
-            prior_automatic_passed=False,
-            upstream_outcome_gate_passed=False,
-        )
-
     monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
     monkeypatch.setattr(cli, "Orchestrator", ForbiddenOrchestrator)
     monkeypatch.setattr(cli, "_sync_lifecycle", fake_sync)
-    monkeypatch.setattr(cli, "_rollout_summary", unready_rollout)
-    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
 
     result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
 
     assert result.exit_code == 1, result.output
     assert "Circuit breaker is tripped" in result.output
-    assert "deferred before model use" not in result.output
     assert calls == ["observe", "close"]
-    assert store.oldest_runs() == []
-
-
-def test_scheduled_auto_preflight_checks_gate_but_defers_when_live_switch_is_off(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = tmp_path / "autocontribute.yml"
-    state = tmp_path / "state"
-    config.write_text(_guarded_auto_config_text(state), encoding="utf-8")
-    calls: list[str] = []
-
-    class FakeGitHub:
-        def __init__(self, *_: object, **__: object) -> None:
-            pass
-
-        def close(self) -> None:
-            calls.append("close")
-
-    def fake_rollout_summary(*_: object, **__: object) -> SimpleNamespace:
-        calls.append("gate")
-        return SimpleNamespace(
-            overall_gate_passed=True,
-            evaluation_gate_passed=True,
-            manual_cohort_passed=True,
-            prior_automatic_passed=True,
-            upstream_outcome_gate_passed=True,
-        )
-
-    monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
-    monkeypatch.setattr(
-        cli,
-        "Orchestrator",
-        lambda *_args, **_kwargs: pytest.fail("model orchestration must remain disabled"),
-    )
-    monkeypatch.setattr(
-        cli,
-        "_sync_lifecycle",
-        lambda *_args, **_kwargs: LifecycleSyncResult(observations=()),
-    )
-    monkeypatch.setattr(
-        cli,
-        "verify_latest_state_bundle_replication",
-        lambda **_kwargs: calls.append("replication"),
-    )
-    monkeypatch.setattr(cli, "_rollout_summary", fake_rollout_summary)
-    monkeypatch.delenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", raising=False)
-
-    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
-
-    assert result.exit_code == 0, result.output
-    assert "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH" in result.output
-    assert calls == ["replication", "gate", "close"]
-    assert RunStore(state).oldest_runs() == []
+    assert store.list() == []
 
 
 def test_manual_publish_syncs_lifecycle_and_preserves_target_retry(
@@ -2282,15 +1742,13 @@ def test_manual_publish_returns_reconciled_target_without_a_new_publish_call(
     assert calls == ["reconcile", "close"]
 
 
-def test_lifecycle_sync_adopts_existing_pr_without_automatic_opt_in(
+def test_lifecycle_sync_adopts_existing_pr_without_publishing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = tmp_path / "autocontribute.yml"
     state = tmp_path / "state"
     config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
     settings = load_config(config)
-    settings.publishing.mode = "auto"
-    monkeypatch.delenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", raising=False)
     store = RunStore(state)
     submitting = store.create_run()
     submitting.status = RunStatus.SUBMITTING
@@ -2330,7 +1788,6 @@ def test_lifecycle_sync_adopts_existing_pr_without_automatic_opt_in(
         settings,
         store,
         object(),  # type: ignore[arg-type]
-        resume_submitting_publications=True,
     )
 
     assert result == LifecycleSyncResult(observations=())
@@ -2340,44 +1797,16 @@ def test_lifecycle_sync_adopts_existing_pr_without_automatic_opt_in(
     assert reconciled.pull_request_url == "https://github.com/example/project/pull/7"
 
 
-@pytest.mark.parametrize(
-    ("mode", "opt_in", "publishes", "failure"),
-    [
-        pytest.param(
-            "review_required",
-            None,
-            False,
-            "publishing.mode is review_required",
-            id="review-required",
-        ),
-        pytest.param(
-            "auto",
-            None,
-            False,
-            "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH is not enabled",
-            id="auto-opt-in-missing",
-        ),
-        pytest.param("auto", "yes", True, None, id="auto-opt-in-enabled"),
-    ],
-)
-def test_scheduled_lifecycle_resumes_only_with_live_automatic_authorization(
+@pytest.mark.parametrize("scheduled_preflight", [False, True])
+def test_lifecycle_sync_never_resumes_publication_without_an_explicit_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    mode: str,
-    opt_in: str | None,
-    publishes: bool,
-    failure: str | None,
+    scheduled_preflight: bool,
 ) -> None:
     config = tmp_path / "autocontribute.yml"
     state = tmp_path / "state"
     config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
     settings = load_config(config)
-    settings.publishing.mode = mode  # type: ignore[assignment]
-    if opt_in is not None:
-        monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", opt_in)
-    elif mode == "auto":
-        monkeypatch.delenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", raising=False)
-        monkeypatch.setenv("CI", "true")
     store = RunStore(state)
     submitting = store.create_run()
     submitting.status = RunStatus.SUBMITTING
@@ -2393,7 +1822,7 @@ def test_scheduled_lifecycle_resumes_only_with_live_automatic_authorization(
             raise PublicationResumeRequired("no remote pull request yet")
 
         def _publish(self, run_id: str, *, lease_guard: object) -> None:
-            calls.append(f"publish:{run_id}")
+            pytest.fail(f"lifecycle sync must not publish {run_id}")
 
     def fake_sync(
         github: object,
@@ -2410,28 +1839,23 @@ def test_scheduled_lifecycle_resumes_only_with_live_automatic_authorization(
     monkeypatch.setattr(cli, "Publisher", FakePublisher)
     monkeypatch.setattr(cli, "sync_open_pull_requests", fake_sync)
 
-    if publishes:
+    if scheduled_preflight:
         result = cli._sync_lifecycle(
             settings,
             store,
             object(),  # type: ignore[arg-type]
-            resume_submitting_publications=True,
+            scheduled_preflight=True,
         )
         assert result == LifecycleSyncResult(observations=())
     else:
-        assert failure is not None
-        with pytest.raises(PublicationResumeRequired, match=failure):
+        with pytest.raises(PublicationResumeRequired, match="requires publication resumption"):
             cli._sync_lifecycle(
                 settings,
                 store,
                 object(),  # type: ignore[arg-type]
-                resume_submitting_publications=True,
             )
 
-    expected = ["observe", f"reconcile:{submitting.run_id}"]
-    if publishes:
-        expected.append(f"publish:{submitting.run_id}")
-    assert calls == expected
+    assert calls == ["observe", f"reconcile:{submitting.run_id}"]
     assert store.get(submitting.run_id).status == RunStatus.SUBMITTING
 
 
@@ -2496,8 +1920,6 @@ def test_lifecycle_sync_reuses_one_publication_lease_for_recovery_and_observatio
     state = tmp_path / "state"
     config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
     settings = load_config(config)
-    settings.publishing.mode = "auto"
-    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
     store = RunStore(state)
     submitting = store.create_run()
     submitting.status = RunStatus.SUBMITTING
@@ -2540,7 +1962,7 @@ def test_lifecycle_sync_reuses_one_publication_lease_for_recovery_and_observatio
         settings,
         store,
         object(),  # type: ignore[arg-type]
-        resume_submitting_publications=True,
+        publication_retry_run_id=submitting.run_id,
     )
 
     assert result == LifecycleSyncResult(observations=())
@@ -2593,7 +2015,7 @@ def test_lifecycle_sync_resumes_only_the_explicit_manual_retry_target(
     monkeypatch.setattr(cli, "Publisher", FakePublisher)
     monkeypatch.setattr(cli, "sync_open_pull_requests", fake_sync)
 
-    with pytest.raises(PublicationResumeRequired, match=r"publishing\.mode is review_required"):
+    with pytest.raises(PublicationResumeRequired, match="requires publication resumption"):
         cli._sync_lifecycle(
             settings,
             store,
@@ -2734,7 +2156,7 @@ def test_lifecycle_sync_command_reports_bounded_summary(tmp_path: Path, monkeypa
     result = runner.invoke(app, ["lifecycle", "sync", "--config", str(config)])
 
     assert result.exit_code == 0, result.output
-    assert "Lifecycle sync: 0 PR(s), 0 new snapshot(s), 0 safety signal(s)" in result.output
+    assert "Lifecycle sync: 0 PR(s), 0 safety signal(s), 0 new trigger(s)" in result.output
 
 
 def test_deployment_asset_command_verifies_a_source_release(

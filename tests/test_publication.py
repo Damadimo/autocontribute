@@ -6,7 +6,6 @@ import shutil
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -17,7 +16,6 @@ from autocontribute.config import (
     DCO_ATTESTATION_STATEMENT,
     AutocontributeConfig,
     LegalAttestation,
-    ModelPricing,
 )
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.deployment import compute_deployment_fingerprint
@@ -36,9 +34,7 @@ from autocontribute.domain import (
     RunManifest,
     RunStatus,
 )
-from autocontribute.evaluation import EvaluationSummary
 from autocontribute.exceptions import (
-    AutomaticRolloutBlocked,
     GitHubError,
     GitHubRequestNotSentError,
     PolicyError,
@@ -50,10 +46,9 @@ from autocontribute.github import (
     CommitStatusDetails,
     ForkIdentity,
     GitHubComment,
-    PullRequestCommit,
     PullRequestDetails,
+    PullRequestReference,
     PullRequestReview,
-    PullRequestTimeline,
     RepositoryIdentity,
 )
 from autocontribute.preparation import (
@@ -68,9 +63,7 @@ from autocontribute.publication import (
     validate_publication_text,
 )
 from autocontribute.repository import RepositoryWorkspace
-from autocontribute.rollout import RolloutGate, RolloutSummary
 from autocontribute.store import RunStore
-from autocontribute.upstream_outcomes import UpstreamGateSummary, UpstreamPublicationScope
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -142,7 +135,6 @@ class _FixtureEligibilityGitHub:
 def _ready_run(
     tmp_path: Path,
     *,
-    guarded_auto: bool = False,
     ready_for_review: bool = False,
     legal_policy: str | None = None,
 ) -> tuple[AutocontributeConfig, RunStore, str, IssueCandidate]:
@@ -162,9 +154,7 @@ def _ready_run(
             },
         }
     )
-    if guarded_auto:
-        _enable_guarded_auto_mode(config)
-    elif ready_for_review:
+    if ready_for_review:
         config.publishing.ready_for_review = True
     store = RunStore(config.storage.path)
     source = tmp_path / "source"
@@ -349,161 +339,6 @@ def _ready_run(
     return config, store, run.run_id, issue
 
 
-class _FixtureRolloutCursorStore:
-    def __init__(self, evaluation_cursor: str, outcome_cursor: str) -> None:
-        self.evaluation_cursor = evaluation_cursor
-        self.outcome_cursor = outcome_cursor
-
-    def evaluation_corpus_cursor(self) -> str:
-        return self.evaluation_cursor
-
-    def upstream_outcome_corpus_cursor(
-        self,
-        deployment_fingerprint: str,
-        publishing_login: str,
-        publishing_api_origin: str,
-        *,
-        exclude_run_id: str | None = None,
-    ) -> str:
-        del deployment_fingerprint, publishing_login, publishing_api_origin, exclude_run_id
-        return self.outcome_cursor
-
-
-class _FixtureEvaluationGate:
-    def __init__(self, summary: EvaluationSummary) -> None:
-        self.result = summary
-
-    def summary(self, *, deployment_fingerprint: str) -> EvaluationSummary:
-        assert deployment_fingerprint == self.result.deployment_fingerprint
-        return self.result
-
-
-class _FixtureUpstreamGate:
-    def __init__(self, summary: UpstreamGateSummary) -> None:
-        self.result = summary
-
-    def summary(
-        self,
-        scope: UpstreamPublicationScope,
-        *,
-        exclude_run_id: str | None = None,
-    ) -> UpstreamGateSummary:
-        del exclude_run_id
-        assert scope == self.result.scope
-        return self.result
-
-
-class _FixtureRolloutGate:
-    """Produce validated combined summaries while controlling semantic gate results."""
-
-    def __init__(
-        self,
-        store: RunStore,
-        *,
-        evaluation_passed: bool = True,
-        manual_passed: bool = True,
-        automatic_passed: bool = True,
-        evaluation_cursor: str | None = None,
-        outcome_cursor: str | None = None,
-    ) -> None:
-        self.store = store
-        self.evaluation_passed = evaluation_passed
-        self.manual_passed = manual_passed
-        self.automatic_passed = automatic_passed
-        self.evaluation_cursor = evaluation_cursor
-        self.outcome_cursor = outcome_cursor
-
-    def summary(
-        self,
-        scope: UpstreamPublicationScope,
-        *,
-        exclude_run_id: str | None = None,
-    ) -> RolloutSummary:
-        evaluation_cursor = self.evaluation_cursor or self.store.evaluation_corpus_cursor()
-        outcome_cursor = self.outcome_cursor or self.store.upstream_outcome_corpus_cursor(
-            scope.deployment_fingerprint,
-            scope.publishing_login,
-            scope.publishing_api_origin,
-            exclude_run_id=exclude_run_id,
-        )
-        evaluation = EvaluationSummary(
-            deployment_fingerprint=scope.deployment_fingerprint,
-            corpus_cursor=evaluation_cursor,
-            total_cases=100,
-            prepared_cases=20,
-            accepted_as_is=20 if self.evaluation_passed else 19,
-            correct_abstentions=80,
-            incorrect_abstentions=0,
-            safety_failures=0,
-            accept_as_is_precision=1.0 if self.evaluation_passed else 0.95,
-            shadow_gate_passed=self.evaluation_passed,
-            gate_evidence=["fixture evaluation gate"],
-        )
-        upstream_passed = self.manual_passed and self.automatic_passed
-        upstream = UpstreamGateSummary(
-            scope=scope,
-            corpus_cursor=outcome_cursor,
-            decision_digest="a" * 64,
-            exact_manual_publications=20 if self.manual_passed else 0,
-            manual_cohort=(),
-            prior_automatic=(),
-            ambiguous=(),
-            manual_cohort_passed=self.manual_passed,
-            prior_automatic_passed=self.automatic_passed,
-            gate_passed=upstream_passed,
-            gate_evidence=("fixture upstream-outcome gate",),
-        )
-        cursor_store = _FixtureRolloutCursorStore(evaluation_cursor, outcome_cursor)
-        return RolloutGate(
-            cursor_store,  # type: ignore[arg-type]
-            _FixtureEvaluationGate(evaluation),
-            _FixtureUpstreamGate(upstream),
-        ).summary(scope, exclude_run_id=exclude_run_id)
-
-
-def _install_fixture_rollout_gate(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    evaluation_passed: bool = True,
-    manual_passed: bool = True,
-    automatic_passed: bool = True,
-    evaluation_cursor: str | None = None,
-    outcome_cursor: str | None = None,
-) -> None:
-    def for_store(cls: type[RolloutGate], store: RunStore) -> _FixtureRolloutGate:
-        del cls
-        return _FixtureRolloutGate(
-            store,
-            evaluation_passed=evaluation_passed,
-            manual_passed=manual_passed,
-            automatic_passed=automatic_passed,
-            evaluation_cursor=evaluation_cursor,
-            outcome_cursor=outcome_cursor,
-        )
-
-    monkeypatch.setattr(RolloutGate, "for_store", classmethod(for_store))
-
-
-def _enable_guarded_auto_mode(config: AutocontributeConfig) -> None:
-    pricing = ModelPricing(
-        input_usd_per_million_tokens="1",
-        output_usd_per_million_tokens="1",
-    )
-    config.models.scout.pricing = pricing
-    config.models.builder.pricing = pricing
-    config.models.critic.pricing = pricing
-    config.models.scout.expected_response_model = config.models.scout.model
-    config.models.builder.expected_response_model = config.models.builder.model
-    config.models.critic.expected_response_model = config.models.critic.model
-    config.models.scout.immutable_response_model_attested = True
-    config.models.builder.immutable_response_model_attested = True
-    config.models.critic.immutable_response_model_attested = True
-    config.budget.max_model_cost_usd_per_run = Decimal("10")
-    config.publishing.max_open_pull_requests = 1
-    config.publishing.ready_for_review = True
-    config.publishing.mode = "auto"
-
-
 def _remove_human_publication_context(manifest) -> None:  # type: ignore[no-untyped-def]
     manifest.approval = None
     manifest.publishing_login = None
@@ -645,7 +480,6 @@ class FakePublishingGitHub:
             head_sha=self.pull_request_head_sha or self.branch_sha or "d" * 40,
             issue_comment_count=0,
             review_comment_count=0,
-            commit_count=1,
             title=self.pull_request_title,
             body=self.pull_request_body,
             base_ref=self.pull_request_base,
@@ -655,27 +489,6 @@ class FakePublishingGitHub:
             head_repository=self.pull_request_head_repository,
             node_id=self.pull_request_node_id,
         )
-
-    def list_pull_request_commits(
-        self,
-        repository: str,
-        number: int,
-        *,
-        expected_count: int,
-        expected_head_sha: str,
-        max_commits: int = 250,
-    ) -> list[PullRequestCommit]:
-        del repository, number, max_commits
-        self.calls.append("list_pull_request_commits")
-        assert expected_count == 1
-        return [
-            PullRequestCommit(
-                position=1,
-                sha=expected_head_sha,
-                node_id=f"C_{expected_head_sha}",
-                parent_shas=(self.pull_request_base_sha,),
-            )
-        ]
 
     def list_pull_request_reviews(
         self,
@@ -736,16 +549,16 @@ class FakePublishingGitHub:
         self.calls.append("list_commit_statuses")
         return self.commit_statuses
 
-    def get_pull_request_timeline(
+    def list_pull_request_references(
         self,
         repository: str,
         number: int,
         *,
         max_events: int = 1_000,
-    ) -> PullRequestTimeline:
+    ) -> list[PullRequestReference]:
         del repository, number, max_events
-        self.calls.append("get_pull_request_timeline")
-        return PullRequestTimeline(item_count=0, events=(), references=())
+        self.calls.append("list_pull_request_references")
+        return []
 
     def authored_pull_requests(self, *args, **kwargs) -> list[str]:  # type: ignore[no-untyped-def]
         self.calls.append("authored_pull_requests")
@@ -944,35 +757,29 @@ class FakePublishingGitHub:
         return self._pull_request_details(repository, number)
 
 
-def _strand_automatic_publication_after_gate_hold(
+def _strand_review_publication_after_intent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[AutocontributeConfig, RunStore, str, FakePublishingGitHub, Publisher]:
-    """Crash after the dual-cursor hold is durable but before any GitHub mutation."""
+    """Crash after the approved publication intent is durable but before any GitHub mutation."""
 
-    config, store, run_id, issue = _ready_run(tmp_path, guarded_auto=True)
+    config, store, run_id, issue = _ready_run(tmp_path, ready_for_review=True)
     manifest = store.get(run_id)
-    _remove_human_publication_context(manifest)
-    manifest.status = RunStatus.READY_FOR_APPROVAL
-    store.save(manifest, event="fixture.auto", details={})
-    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
-    _install_fixture_rollout_gate(monkeypatch)
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
     original_find = github.find_pull_request
 
-    def crash_after_hold(repository: str, *, head: str) -> str | None:
+    def crash_after_intent(repository: str, *, head: str) -> str | None:
         del repository, head
         github.calls.append("find_pull_request")
-        raise RuntimeError("simulated crash after rollout hold")
+        raise RuntimeError("simulated crash after publication intent")
 
-    monkeypatch.setattr(github, "find_pull_request", crash_after_hold)
-    with pytest.raises(RuntimeError, match="crash after rollout hold"):
+    monkeypatch.setattr(github, "find_pull_request", crash_after_intent)
+    with pytest.raises(RuntimeError, match="crash after publication intent"):
         publisher.publish(run_id)
     monkeypatch.setattr(github, "find_pull_request", original_find)
 
     assert store.get(run_id).status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(run_id) is not None
     assert not github.mutated
     github.calls.clear()
     return config, store, run_id, github, publisher
@@ -1229,14 +1036,10 @@ def test_ai_disclosure_inside_fenced_code_is_rejected(tmp_path: Path, fence: str
         )
 
 
-@pytest.mark.parametrize("auto_mode", [False, True])
 def test_tripped_circuit_breaker_blocks_publisher_entry_before_github_work(
     tmp_path: Path,
-    auto_mode: bool,
 ) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
-    if auto_mode:
-        config.publishing.mode = "auto"
     manifest = store.get(run_id)
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
     store.trip_circuit_breaker(
@@ -2792,61 +2595,12 @@ def test_publication_behavior_drift_invalidates_human_approval(
     assert not github.mutated
 
 
-def test_review_required_preparation_cannot_be_replayed_in_auto_mode(
+def test_ready_for_review_publication_marks_the_exact_created_draft_ready(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config, store, run_id, issue = _ready_run(tmp_path)
+    config, store, run_id, issue = _ready_run(tmp_path, ready_for_review=True)
     manifest = store.get(run_id)
-    _remove_human_publication_context(manifest)
-    manifest.status = RunStatus.READY_FOR_APPROVAL
-    store.save(manifest, event="fixture.ready_without_approval", details={})
-    _enable_guarded_auto_mode(config)
-    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
-    github = FakePublishingGitHub(issue, manifest.base_sha or "")
-
-    with pytest.raises(PolicyError, match="publishing configuration changed"):
-        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
-
-    assert github.calls == []
-    assert not github.mutated
-
-
-def test_auto_mode_requires_every_measured_rollout_gate(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    config, store, run_id, issue = _ready_run(tmp_path, guarded_auto=True)
-    manifest = store.get(run_id)
-    _remove_human_publication_context(manifest)
-    manifest.status = RunStatus.READY_FOR_APPROVAL
-    store.save(manifest, event="fixture.auto", details={})
-    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
-    github = FakePublishingGitHub(issue, manifest.base_sha or "")
-
-    with pytest.raises(
-        AutomaticRolloutBlocked,
-        match=r"every measured rollout gate.*expert-evaluation.*fixed manual",
-    ):
-        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
-
-    assert github.calls == ["authenticated_login"]
-    blocked = store.get(run_id)
-    assert blocked.status == RunStatus.READY_FOR_APPROVAL
-    assert blocked.publishing_login == "octocat"
-    assert blocked.publishing_api_origin == "https://api.github.com"
-    assert store.publication_gate_hold(run_id) is None
-    assert not github.mutated
-
-
-def test_auto_mode_publishes_only_after_every_measured_rollout_gate(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config, store, run_id, issue = _ready_run(tmp_path, guarded_auto=True)
-    manifest = store.get(run_id)
-    _remove_human_publication_context(manifest)
-    manifest.status = RunStatus.READY_FOR_APPROVAL
-    store.save(manifest, event="fixture.auto", details={})
-    _install_fixture_rollout_gate(monkeypatch)
-    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
     monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
@@ -2881,129 +2635,14 @@ def test_auto_mode_publishes_only_after_every_measured_rollout_gate(
     assert completed < final_transition
 
 
-@pytest.mark.parametrize("changed_cursor", ["evaluation", "outcome"])
-def test_automatic_recovery_rebinds_hold_after_rollout_cursor_drift(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    changed_cursor: str,
-) -> None:
-    """Routine corpus drift during a crash window re-anchors the hold and recovery completes.
-
-    Lifecycle snapshots for other runs keep moving while a crashed publication awaits recovery,
-    so the durable hold's anchored cursors routinely lag the live corpus.  Recovery re-proves
-    current rollout authority on fresh evidence and rebinds the hold instead of wedging forever
-    on bit-identical cursor equality.
-    """
-
-    _, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
-        tmp_path,
-        monkeypatch,
-    )
-    hold = store.publication_gate_hold(run_id)
-    assert hold is not None
-    holder = store.get(run_id)
-    assert holder.deployment_fingerprint is not None
-    drift_subject = store.create_run(deployment_fingerprint=holder.deployment_fingerprint)
-    if changed_cursor == "evaluation":
-        with store._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            store._append_event(
-                connection,
-                drift_subject.run_id,
-                "evaluation.recorded",
-                {"evaluation_hash": "a" * 64},
-            )
-    else:
-        store.save(
-            drift_subject,
-            event="publication.fixture_outcome_drift",
-            details={"version": "later"},
-        )
-
-    def push(
-        workspace: Path,
-        fork: str,
-        branch: str,
-        commit_sha: str,
-        *,
-        before_mutation,  # type: ignore[no-untyped-def]
-    ) -> None:
-        before_mutation()
-        del workspace, fork, branch
-        github.branch_sha = commit_sha
-
-    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
-    monkeypatch.setattr(publisher, "_push", push)
-
-    published = publisher.publish(run_id)
-
-    assert published.status == RunStatus.PR_OPEN
-    assert published.pull_request_url == "https://github.com/example/project/pull/7"
-    assert store.publication_gate_hold(run_id) is None
-    events = store.events(run_id)
-    rebinds = [event for event in events if event["event_type"] == "publication.gate.rebound"]
-    assert len(rebinds) == 1
-    rebound_details = json.loads(rebinds[0]["details"])
-    assert rebound_details["deployment_fingerprint"] == hold.deployment_fingerprint
-    if changed_cursor == "evaluation":
-        assert rebound_details["corpus_cursor"] != hold.corpus_cursor
-    else:
-        assert rebound_details["outcome_corpus_cursor"] != hold.outcome_corpus_cursor
-    releases = [event for event in events if event["event_type"] == "publication.gate.released"]
-    assert len(releases) == 1
-    release_details = json.loads(releases[0]["details"])
-    assert release_details["outcome"] == "pr_open"
-    assert release_details["corpus_cursor"] == rebound_details["corpus_cursor"]
-    assert release_details["outcome_corpus_cursor"] == rebound_details["outcome_corpus_cursor"]
-    # The rebound ledger and released hold remain verifiable by a fresh process.
-    RunStore(store.root)
-
-
-def test_automatic_recovery_stays_anchored_when_rollout_gates_fail(
+def test_reconcile_submitting_adopts_existing_ready_pull_request_after_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failing rollout gate blocks recovery before the hold is re-anchored or GitHub touched."""
+    """Reconciliation adopts already-durable remote state without another GitHub write."""
 
-    _, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
-        tmp_path,
-        monkeypatch,
-    )
-    hold = store.publication_gate_hold(run_id)
-    assert hold is not None
-    holder = store.get(run_id)
-    assert holder.deployment_fingerprint is not None
-    drift_subject = store.create_run(deployment_fingerprint=holder.deployment_fingerprint)
-    store.save(
-        drift_subject,
-        event="publication.fixture_outcome_drift",
-        details={"version": "later"},
-    )
-    _install_fixture_rollout_gate(monkeypatch, manual_passed=False)
-
-    with pytest.raises(AutomaticRolloutBlocked, match="fixed manual upstream-outcome cohort"):
-        publisher.publish(run_id)
-
-    assert store.get(run_id).status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(run_id) == hold
-    assert not github.mutated
-    event_types = [event["event_type"] for event in store.events(run_id)]
-    assert "publication.gate.rebound" not in event_types
-
-
-def test_reconcile_submitting_adopts_existing_pull_request_despite_cursor_drift(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reconciliation adopts already-durable remote state without asserting cursor currency."""
-
-    config, store, run_id, issue = _ready_run(tmp_path, guarded_auto=True)
+    config, store, run_id, issue = _ready_run(tmp_path, ready_for_review=True)
     manifest = store.get(run_id)
-    _remove_human_publication_context(manifest)
-    manifest.status = RunStatus.READY_FOR_APPROVAL
-    store.save(manifest, event="fixture.auto", details={})
-    _install_fixture_rollout_gate(monkeypatch)
-    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
     original_save = store.save
@@ -3039,322 +2678,29 @@ def test_reconcile_submitting_adopts_existing_pull_request_despite_cursor_drift(
     stranded = store.get(run_id)
     assert stranded.status == RunStatus.SUBMITTING
     assert stranded.pull_request_url == "https://github.com/example/project/pull/7"
-    assert stranded.deployment_fingerprint is not None
-    hold = store.publication_gate_hold(run_id)
-    assert hold is not None
-    drift_subject = store.create_run(deployment_fingerprint=stranded.deployment_fingerprint)
-    with store._connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        store._append_event(
-            connection,
-            drift_subject.run_id,
-            "evaluation.recorded",
-            {"evaluation_hash": "a" * 64},
-        )
-    store.save(
-        drift_subject,
-        event="publication.fixture_outcome_drift",
-        details={"version": "later"},
-    )
+    github.calls.clear()
+    github.mutated = False
 
     reconciled = publisher.reconcile_submitting(run_id)
 
     assert reconciled.status == RunStatus.PR_OPEN
     assert reconciled.pull_request_ready_completed
-    assert store.publication_gate_hold(run_id) is None
-    events = store.events(run_id)
-    event_types = [event["event_type"] for event in events]
-    assert "publication.gate.rebound" not in event_types
-    releases = [event for event in events if event["event_type"] == "publication.gate.released"]
-    assert len(releases) == 1
-    release_details = json.loads(releases[0]["details"])
-    assert release_details["corpus_cursor"] == hold.corpus_cursor
-    assert release_details["outcome_corpus_cursor"] == hold.outcome_corpus_cursor
+    assert not github.mutated
+    assert "mark_pull_request_ready_for_review" not in github.calls
     RunStore(store.root)
 
 
-@pytest.mark.parametrize("changed_cursor", ["evaluation", "outcome"])
-@pytest.mark.parametrize(
-    "boundary",
-    ["ensure_fork", "push", "create_pull_request", "mark_ready"],
-)
-def test_automatic_rollout_cursor_drift_blocks_each_constructive_mutation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    changed_cursor: str,
-    boundary: str,
-) -> None:
-    _, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
-        tmp_path,
-        monkeypatch,
-    )
-    holder = store.get(run_id)
-    assert holder.deployment_fingerprint is not None
-    drift_subject = store.create_run(
-        deployment_fingerprint=holder.deployment_fingerprint,
-    )
-    drifted = False
-
-    def drift() -> None:
-        nonlocal drifted
-        if drifted:
-            return
-        drifted = True
-        if changed_cursor == "evaluation":
-            with store._connection() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                store._append_event(
-                    connection,
-                    drift_subject.run_id,
-                    "evaluation.recorded",
-                    {"evaluation_hash": "a" * 64},
-                )
-        else:
-            store.save(
-                drift_subject,
-                event="publication.fixture_outcome_drift",
-                details={"version": "later"},
-            )
-
-    pushes: list[str] = []
-
-    def push(
-        workspace: Path,
-        fork: str,
-        branch: str,
-        commit_sha: str,
-        *,
-        before_mutation,  # type: ignore[no-untyped-def]
-    ) -> None:
-        before_mutation()
-        del workspace, fork, branch
-        pushes.append(commit_sha)
-        github.branch_sha = commit_sha
-
-    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
-    monkeypatch.setattr(publisher, "_push", push)
-    if boundary == "ensure_fork":
-        original_ensure_fork = github.ensure_fork
-
-        def ensure_fork(*args, **kwargs) -> str:  # type: ignore[no-untyped-def]
-            drift()
-            return original_ensure_fork(*args, **kwargs)
-
-        monkeypatch.setattr(github, "ensure_fork", ensure_fork)
-    elif boundary == "push":
-
-        def check_freshness(manifest: RunManifest) -> None:
-            del manifest
-            drift()
-
-        monkeypatch.setattr(publisher, "_check_freshness", check_freshness)
-    elif boundary == "create_pull_request":
-        original_create_pull_request = github.create_pull_request
-
-        def create_pull_request(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
-            drift()
-            return original_create_pull_request(*args, **kwargs)
-
-        monkeypatch.setattr(github, "create_pull_request", create_pull_request)
-    else:
-        original_mark_ready = github.mark_pull_request_ready_for_review
-
-        def mark_ready(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
-            drift()
-            return original_mark_ready(*args, **kwargs)
-
-        monkeypatch.setattr(github, "mark_pull_request_ready_for_review", mark_ready)
-
-    expected_error = (
-        "evaluation corpus" if changed_cursor == "evaluation" else "upstream-outcome corpus"
-    )
-    with pytest.raises(StateError, match=expected_error):
-        publisher.publish(run_id)
-
-    assert drifted
-    durable = store.get(run_id)
-    assert durable.status == RunStatus.SUBMITTING
-    if boundary == "ensure_fork":
-        assert not github.mutated
-        assert "ensure_fork" not in github.calls
-        assert pushes == []
-    elif boundary == "push":
-        assert pushes == []
-        assert "create_pull_request" not in github.calls
-    elif boundary == "create_pull_request":
-        assert len(pushes) == 1
-        assert "create_pull_request" not in github.calls
-        assert durable.pull_request_url is None
-    else:
-        assert len(pushes) == 1
-        assert github.calls.count("create_pull_request") == 1
-        assert "mark_pull_request_ready_for_review" not in github.calls
-        assert durable.pull_request_url == "https://github.com/example/project/pull/7"
-        assert github.pull_request_draft
-
-
-@pytest.mark.parametrize(
-    "boundary",
-    ["ensure_fork", "push", "create_pull_request", "mark_ready"],
-)
-def test_disabling_auto_publish_blocks_each_constructive_mutation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    boundary: str,
-) -> None:
-    _config, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
-        tmp_path,
-        monkeypatch,
-    )
-    switched_off = False
-
-    def disable_auto_publish() -> None:
-        nonlocal switched_off
-        switched_off = True
-        monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "0")
-
-    pushes: list[str] = []
-
-    def push(
-        workspace: Path,
-        fork: str,
-        branch: str,
-        commit_sha: str,
-        *,
-        before_mutation,  # type: ignore[no-untyped-def]
-    ) -> None:
-        before_mutation()
-        del workspace, fork, branch
-        pushes.append(commit_sha)
-        github.branch_sha = commit_sha
-
-    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
-    monkeypatch.setattr(publisher, "_push", push)
-    if boundary == "ensure_fork":
-        original_ensure_fork = github.ensure_fork
-
-        def ensure_fork(*args, **kwargs) -> str:  # type: ignore[no-untyped-def]
-            disable_auto_publish()
-            return original_ensure_fork(*args, **kwargs)
-
-        monkeypatch.setattr(github, "ensure_fork", ensure_fork)
-    elif boundary == "push":
-
-        def check_freshness(manifest: RunManifest) -> None:
-            del manifest
-            disable_auto_publish()
-
-        monkeypatch.setattr(publisher, "_check_freshness", check_freshness)
-    elif boundary == "create_pull_request":
-        original_create_pull_request = github.create_pull_request
-
-        def create_pull_request(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
-            disable_auto_publish()
-            return original_create_pull_request(*args, **kwargs)
-
-        monkeypatch.setattr(github, "create_pull_request", create_pull_request)
-    else:
-        original_mark_ready = github.mark_pull_request_ready_for_review
-
-        def mark_ready(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
-            disable_auto_publish()
-            return original_mark_ready(*args, **kwargs)
-
-        monkeypatch.setattr(github, "mark_pull_request_ready_for_review", mark_ready)
-
-    with pytest.raises(AutomaticRolloutBlocked, match="disabled before the next remote mutation"):
-        publisher.publish(run_id)
-
-    assert switched_off
-    durable = store.get(run_id)
-    assert durable.status == RunStatus.SUBMITTING
-    if boundary == "ensure_fork":
-        assert not github.mutated
-        assert "ensure_fork" not in github.calls
-        assert pushes == []
-    elif boundary == "push":
-        assert pushes == []
-        assert "create_pull_request" not in github.calls
-    elif boundary == "create_pull_request":
-        assert len(pushes) == 1
-        assert "create_pull_request" not in github.calls
-        assert durable.pull_request_url is None
-    else:
-        assert len(pushes) == 1
-        assert github.calls.count("create_pull_request") == 1
-        assert "mark_pull_request_ready_for_review" not in github.calls
-        assert durable.pull_request_url == "https://github.com/example/project/pull/7"
-        assert github.pull_request_draft
-
-
-def test_disabling_auto_publish_during_repository_identity_validation_blocks_push(
+def test_tripped_circuit_breaker_blocks_submitting_recovery_before_github_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _config, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
+    _, store, run_id, github, publisher = _strand_review_publication_after_intent(
         tmp_path,
         monkeypatch,
     )
-    original_assert_identity = github.assert_repository_identity
-    switched_off = False
-    pushes: list[str] = []
-
-    def assert_identity_then_disable(
-        full_name: str,
-        *,
-        expected_database_id: int,
-        expected_node_id: str,
-    ) -> RepositoryIdentity:
-        nonlocal switched_off
-        identity = original_assert_identity(
-            full_name,
-            expected_database_id=expected_database_id,
-            expected_node_id=expected_node_id,
-        )
-        if full_name.casefold() == "octocat/project":
-            monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "0")
-            switched_off = True
-        return identity
-
-    def push(
-        workspace: Path,
-        fork: str,
-        branch: str,
-        commit_sha: str,
-        *,
-        before_mutation,  # type: ignore[no-untyped-def]
-    ) -> None:
-        before_mutation()
-        del workspace, fork, branch
-        pushes.append(commit_sha)
-
-    monkeypatch.setattr(github, "assert_repository_identity", assert_identity_then_disable)
-    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
-    monkeypatch.setattr(publisher, "_push", push)
-
-    with pytest.raises(AutomaticRolloutBlocked, match="disabled before the next remote mutation"):
-        publisher.publish(run_id)
-
-    assert switched_off
-    assert pushes == []
-    assert github.branch_sha is None
-    assert "create_pull_request" not in github.calls
-    assert store.get(run_id).status == RunStatus.SUBMITTING
-
-
-def test_breaker_resume_cannot_bypass_blocked_rollout_during_automatic_recovery(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
-        tmp_path,
-        monkeypatch,
-    )
-    hold = store.publication_gate_hold(run_id)
-    assert hold is not None
     store.trip_circuit_breaker(
         source="publication:test",
-        reason="exercise guarded automatic recovery",
+        reason="exercise submitting recovery",
         trigger_hash="b" * 64,
     )
 
@@ -3362,23 +2708,7 @@ def test_breaker_resume_cannot_bypass_blocked_rollout_during_automatic_recovery(
         publisher.publish(run_id)
 
     assert github.calls == []
-    breaker = store.circuit_breaker_status()
-    assert breaker.active_revision is not None
-    assert store.resume_circuit_breaker(
-        actor="operator",
-        reason="verify that rollout evidence is independently enforced",
-        expected_trigger_hash=breaker.active_revision,
-    )
-    _install_fixture_rollout_gate(monkeypatch, manual_passed=False)
-
-    with pytest.raises(
-        AutomaticRolloutBlocked,
-        match="fixed manual upstream-outcome cohort",
-    ):
-        publisher.publish(run_id)
-
     assert store.get(run_id).status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(run_id) == hold
     assert not github.mutated
     assert not {
         "ensure_fork",
@@ -3388,7 +2718,27 @@ def test_breaker_resume_cannot_bypass_blocked_rollout_during_automatic_recovery(
     }.intersection(github.calls)
 
 
-def test_submitting_without_gate_hold_or_exact_approval_fails_before_github_mutation(
+def test_exact_human_approval_exposes_ledger_bound_intent_time(tmp_path: Path) -> None:
+    config, store, run_id, _issue = _ready_run(tmp_path)
+    _begin_review_publication(config, store, store.get(run_id))
+    events = tuple(store.events(run_id))
+
+    authority = publication_module._classify_exact_human_approval(store.get(run_id), events)
+
+    assert authority is not None
+    approval = next(event for event in events if event["event_type"] == "approval.created")
+    intent = next(event for event in events if event["event_type"] == "publication.intent.begun")
+    assert authority.approval_event_hash == approval["event_hash"]
+    assert authority.publication_intent_at == datetime.fromisoformat(intent["occurred_at"])
+    without_intent = tuple(
+        event for event in events if event["event_type"] != "publication.intent.begun"
+    )
+    assert (
+        publication_module._classify_exact_human_approval(store.get(run_id), without_intent) is None
+    )
+
+
+def test_submitting_without_exact_approval_fails_before_github_mutation(
     tmp_path: Path,
 ) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
@@ -3486,21 +2836,16 @@ def test_initial_draft_to_ready_observes_adverse_lifecycle_before_mutation(
         publisher.publish(run_id)
 
     assert "mark_pull_request_ready_for_review" not in github.calls
-    assert len(store.lifecycle_snapshots(run_id)) == 1
+    assert "list_pull_request_reviews" in github.calls
     assert store.circuit_breaker_status().is_tripped
 
 
-def test_automatic_ready_retry_observes_current_run_and_blocks_on_new_adverse_evidence(
+def test_ready_retry_observes_current_run_and_blocks_on_new_adverse_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config, store, run_id, issue = _ready_run(tmp_path, guarded_auto=True)
+    config, store, run_id, issue = _ready_run(tmp_path, ready_for_review=True)
     manifest = store.get(run_id)
-    _remove_human_publication_context(manifest)
-    manifest.status = RunStatus.READY_FOR_APPROVAL
-    store.save(manifest, event="fixture.auto", details={})
-    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "1")
-    _install_fixture_rollout_gate(monkeypatch)
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
     monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
@@ -3526,7 +2871,7 @@ def test_automatic_ready_retry_observes_current_run_and_blocks_on_new_adverse_ev
     monkeypatch.setattr(github, "mark_pull_request_ready_for_review", lose_ready_response)
     with pytest.raises(PublicationResumeRequired, match="did not confirm ready-for-review"):
         publisher.publish(run_id)
-    assert len(store.lifecycle_snapshots(run_id)) == 1
+    assert github.calls.count("list_pull_request_reviews") == 1
 
     monkeypatch.setattr(github, "mark_pull_request_ready_for_review", original_mark_ready)
     github.reviews = [
@@ -3546,7 +2891,7 @@ def test_automatic_ready_retry_observes_current_run_and_blocks_on_new_adverse_ev
     with pytest.raises(StateError, match="Circuit breaker is tripped"):
         publisher.publish(run_id)
 
-    assert len(store.lifecycle_snapshots(run_id)) == 2
+    assert "list_pull_request_reviews" in github.calls
     assert "mark_pull_request_ready_for_review" not in github.calls
     assert not github.mutated
     assert store.circuit_breaker_status().is_tripped
@@ -3876,19 +3221,6 @@ def test_retry_recovers_exact_remote_push_without_ephemeral_workspace(
         branch_sha=manifest.commit_sha,
     )
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
-
-    def fail_if_rollout_gate_is_used(
-        cls: type[RolloutGate],
-        selected_store: RunStore,
-    ) -> _FixtureRolloutGate:
-        del cls, selected_store
-        raise AssertionError("review-required recovery must not consult the automatic gate")
-
-    monkeypatch.setattr(
-        RolloutGate,
-        "for_store",
-        classmethod(fail_if_rollout_gate_is_used),
-    )
     monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
     pushes: list[object] = []
     monkeypatch.setattr(
@@ -4484,37 +3816,14 @@ def test_malformed_post_response_retains_submitting_and_trips_breaker(
 
 
 @pytest.mark.parametrize("outcome", ["merged", "closed_unmerged"])
-def test_terminal_exact_pr_reconciliation_releases_gate_hold_for_lifecycle(
+def test_terminal_exact_pr_reconciliation_is_lifecycle_managed(
     tmp_path: Path,
     outcome: str,
 ) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
-    manifest = store.get(run_id)
-    assert manifest.deployment_fingerprint is not None
-    store.reserve_publication(
-        run_id,
-        issue.repository,
-        max_per_utc_day=100,
-        repository_cooldown=timedelta(0),
-        evaluation_corpus_cursor=store.evaluation_corpus_cursor(),
-        evaluation_deployment_fingerprint=manifest.deployment_fingerprint,
-        outcome_corpus_cursor=store.upstream_outcome_corpus_cursor(
-            manifest.deployment_fingerprint,
-            "octocat",
-            "https://api.github.com",
-            exclude_run_id=run_id,
-        ),
-        publishing_login="octocat",
-        publishing_api_origin="https://api.github.com",
-    )
-    manifest.status = RunStatus.SUBMITTING
-    manifest.branch_name = f"autocontribute/issue-42-{run_id[:8]}"
+    manifest = _begin_review_publication(config, store, store.get(run_id))
     manifest.commit_sha = "c" * 40
-    manifest.upstream_repository_id = 1001
-    manifest.upstream_repository_node_id = "R_upstream_fixture"
-    manifest.fork_repository_id = 2001
-    manifest.fork_repository_node_id = "R_fork_fixture"
-    store.save(manifest, event="fixture.submitting_with_gate", details={})
+    store.save(manifest, event="fixture.submitting_commit", details={})
     github = FakePublishingGitHub(
         issue,
         manifest.base_sha or "",
@@ -4530,7 +3839,6 @@ def test_terminal_exact_pr_reconciliation_releases_gate_hold_for_lifecycle(
     reconciled = publisher.reconcile_submitting(run_id)
 
     assert reconciled.status == RunStatus.PR_OPEN
-    assert any(event["event_type"] == "publication.gate.released" for event in store.events(run_id))
     assert store.circuit_breaker_status().is_tripped is (outcome == "closed_unmerged")
 
 
@@ -4981,13 +4289,13 @@ def test_lease_loss_after_compensation_delete_blocks_finalizer(
     )
 
 
-def _strand_automatic_pre_pr_base_compensation(
+def _strand_pre_pr_base_compensation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[AutocontributeConfig, RunStore, str, FakePublishingGitHub, Publisher]:
-    """Leave an exact automatic branch behind after its durable base-race marker."""
+    """Leave an exact recovered branch behind after its durable base-race marker."""
 
-    config, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
+    config, store, run_id, github, publisher = _strand_review_publication_after_intent(
         tmp_path,
         monkeypatch,
     )
@@ -5027,7 +4335,6 @@ def _strand_automatic_pre_pr_base_compensation(
     assert durable.status == RunStatus.SUBMITTING
     assert durable.publication_compensation_reason == "pre_pr_base_moved"
     assert durable.commit_sha == github.branch_sha
-    assert store.publication_gate_hold(run_id) is not None
     github.calls.clear()
     github.mutated = False
     return config, store, run_id, github, publisher
@@ -5037,12 +4344,12 @@ def _strand_created_pr_compensation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    automatic: bool = True,
+    recovered: bool = True,
 ) -> tuple[AutocontributeConfig, RunStore, str, FakePublishingGitHub, Publisher]:
     """Crash after an exact created PR receives its durable compensation marker."""
 
-    if automatic:
-        config, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
+    if recovered:
+        config, store, run_id, github, publisher = _strand_review_publication_after_intent(
             tmp_path,
             monkeypatch,
         )
@@ -5089,7 +4396,6 @@ def _strand_created_pr_compensation(
     assert durable.publication_compensation_reason == "created_pr_base_moved"
     assert durable.pull_request_url == "https://github.com/example/project/pull/7"
     assert durable.commit_sha == github.branch_sha == github.pull_request_head_sha
-    assert (store.publication_gate_hold(run_id) is not None) is automatic
     assert store.circuit_breaker_status().is_tripped
     github.calls.clear()
     github.mutated = False
@@ -5106,52 +4412,20 @@ def test_marked_pre_pr_compensation_recovers_after_restart_despite_all_construct
     branch_present: bool,
     entrypoint: str,
 ) -> None:
-    config, store, run_id, github, _ = _strand_automatic_pre_pr_base_compensation(
+    config, store, run_id, github, _ = _strand_pre_pr_base_compensation(
         tmp_path,
         monkeypatch,
     )
     durable = store.get(run_id)
-    assert durable.deployment_fingerprint is not None
     assert durable.commit_sha is not None
-    hold = store.publication_gate_hold(run_id)
-    assert hold is not None
-    assert hold.corpus_cursor is not None
-    assert hold.outcome_corpus_cursor is not None
     if not branch_present:
         github.branch_sha = None
 
-    drift_subject = store.create_run(
-        deployment_fingerprint=durable.deployment_fingerprint,
-    )
-    with store._connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        store._append_event(
-            connection,
-            drift_subject.run_id,
-            "evaluation.recorded",
-            {"evaluation_hash": "a" * 64},
-        )
-    store.save(
-        drift_subject,
-        event="publication.fixture_outcome_drift",
-        details={"version": "later"},
-    )
-    assert store.evaluation_corpus_cursor() != hold.corpus_cursor
-    assert (
-        store.upstream_outcome_corpus_cursor(
-            durable.deployment_fingerprint,
-            "octocat",
-            "https://api.github.com",
-            exclude_run_id=run_id,
-        )
-        != hold.outcome_corpus_cursor
-    )
     store.trip_circuit_breaker(
         source="publication:test",
         reason="exercise exposure-reducing recovery",
         trigger_hash="f" * 64,
     )
-    monkeypatch.setenv("AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH", "0")
 
     reopened = RunStore(config.storage.path)
     publisher = Publisher(config, reopened, github)  # type: ignore[arg-type]
@@ -5193,7 +4467,6 @@ def test_marked_pre_pr_compensation_recovers_after_restart_despite_all_construct
         recovered = publisher.reconcile_submitting(run_id)
 
     assert recovered.status == RunStatus.FAILED
-    assert reopened.publication_gate_hold(run_id) is None
     assert reopened.circuit_breaker_status().is_tripped
     assert deleted == (
         [("octocat/project", durable.branch_name, durable.commit_sha)] if branch_present else []
@@ -5216,7 +4489,7 @@ def test_marked_pre_pr_compensation_refuses_unbound_remote_state_without_mutatio
     monkeypatch: pytest.MonkeyPatch,
     anomaly: str,
 ) -> None:
-    _, store, run_id, github, publisher = _strand_automatic_pre_pr_base_compensation(
+    _, store, run_id, github, publisher = _strand_pre_pr_base_compensation(
         tmp_path,
         monkeypatch,
     )
@@ -5255,7 +4528,7 @@ def test_started_compensation_refuses_reused_repository_name_before_mutation(
     monkeypatch: pytest.MonkeyPatch,
     repository: str,
 ) -> None:
-    _, store, run_id, github, publisher = _strand_automatic_pre_pr_base_compensation(
+    _, store, run_id, github, publisher = _strand_pre_pr_base_compensation(
         tmp_path,
         monkeypatch,
     )
@@ -5299,7 +4572,7 @@ def test_legacy_started_compensation_without_immutable_ids_fails_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, store, run_id, github, publisher = _strand_automatic_pre_pr_base_compensation(
+    _, store, run_id, github, publisher = _strand_pre_pr_base_compensation(
         tmp_path,
         monkeypatch,
     )
@@ -5322,7 +4595,7 @@ def test_unsupported_durable_compensation_reason_fails_as_state_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, store, run_id, github, publisher = _strand_automatic_pre_pr_base_compensation(
+    _, store, run_id, github, publisher = _strand_pre_pr_base_compensation(
         tmp_path,
         monkeypatch,
     )
@@ -5404,7 +4677,6 @@ def test_created_pr_compensation_resumes_each_exact_remote_state(
     recovered = publisher.publish(run_id)
 
     assert recovered.status == expected_status
-    assert store.publication_gate_hold(run_id) is None
     if remote_state == "merged":
         assert "close_pull_request" not in github.calls
         assert deleted == []
@@ -5546,76 +4818,15 @@ def test_push_uses_expected_absent_remote_branch_lease(
     ]
 
 
-def test_cursor_drift_during_creation_marker_save_blocks_pull_request_post(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
-        tmp_path,
-        monkeypatch,
-    )
-    durable = store.get(run_id)
-    assert durable.deployment_fingerprint is not None
-    drift_subject = store.create_run(
-        deployment_fingerprint=durable.deployment_fingerprint,
-    )
-    original_save = store.save
-    drifted = False
-
-    def push(
-        workspace: Path,
-        fork: str,
-        branch: str,
-        commit_sha: str,
-        *,
-        before_mutation,  # type: ignore[no-untyped-def]
-    ) -> None:
-        before_mutation()
-        del workspace, fork, branch
-        github.branch_sha = commit_sha
-
-    def save_with_drift(*args, **kwargs):  # type: ignore[no-untyped-def]
-        nonlocal drifted
-        result = original_save(*args, **kwargs)
-        if kwargs.get("event") == "pull_request.creation.started":
-            with store._connection() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                store._append_event(
-                    connection,
-                    drift_subject.run_id,
-                    "evaluation.recorded",
-                    {"evaluation_hash": "b" * 64},
-                )
-            drifted = True
-        return result
-
-    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
-    monkeypatch.setattr(publisher, "_push", push)
-    monkeypatch.setattr(store, "save", save_with_drift)
-
-    with pytest.raises(StateError, match="evaluation corpus"):
-        publisher.publish(run_id)
-
-    stranded = store.get(run_id)
-    assert drifted
-    assert stranded.status == RunStatus.SUBMITTING
-    assert stranded.pull_request_creation_started
-    assert stranded.pull_request_url is None
-    assert github.branch_sha == stranded.commit_sha
-    assert "create_pull_request" not in github.calls
-    assert not store.circuit_breaker_status().is_tripped
-
-
-def test_manual_created_pr_compensation_adopts_exact_merged_pr_without_gate_hold(
+def test_fresh_created_pr_compensation_adopts_exact_merged_pr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, store, run_id, github, publisher = _strand_created_pr_compensation(
         tmp_path,
         monkeypatch,
-        automatic=False,
+        recovered=False,
     )
-    assert store.publication_gate_hold(run_id) is None
     github.pull_request_state = "closed"
     github.pull_request_merged = True
     github.pull_request_draft = False
@@ -5625,7 +4836,6 @@ def test_manual_created_pr_compensation_adopts_exact_merged_pr_without_gate_hold
 
     assert recovered.status == RunStatus.PR_OPEN
     assert recovered.pull_request_url == "https://github.com/example/project/pull/7"
-    assert store.publication_gate_hold(run_id) is None
     assert "close_pull_request" not in github.calls
     assert any(
         event["event_type"] == "pull_request.compensation.reconciled"
@@ -5642,7 +4852,7 @@ def test_created_pr_compensation_rejects_incomplete_or_tampered_base_race_eviden
     monkeypatch: pytest.MonkeyPatch,
     tampered_evidence: str,
 ) -> None:
-    _, store, run_id, github, publisher = _strand_automatic_publication_after_gate_hold(
+    _, store, run_id, github, publisher = _strand_review_publication_after_intent(
         tmp_path,
         monkeypatch,
     )
@@ -5710,7 +4920,7 @@ def test_pre_pr_compensation_rechecks_pr_absence_after_branch_absence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, store, run_id, github, publisher = _strand_automatic_pre_pr_base_compensation(
+    _, store, run_id, github, publisher = _strand_pre_pr_base_compensation(
         tmp_path,
         monkeypatch,
     )
@@ -5732,7 +4942,6 @@ def test_pre_pr_compensation_rechecks_pr_absence_after_branch_absence(
 
     assert find_calls == 3
     assert store.get(run_id).status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(run_id) is not None
     assert all(
         event["event_type"] != "publication.compensation.verified" for event in store.events(run_id)
     )
@@ -5742,7 +4951,7 @@ def test_pre_pr_compensation_retains_branch_when_pr_appears_before_delete(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, store, run_id, github, publisher = _strand_automatic_pre_pr_base_compensation(
+    _, store, run_id, github, publisher = _strand_pre_pr_base_compensation(
         tmp_path,
         monkeypatch,
     )
@@ -5876,7 +5085,6 @@ def test_created_pr_compensation_rechecks_pr_after_branch_absence(
 
     assert get_calls == 4
     assert store.get(run_id).status == RunStatus.SUBMITTING
-    assert store.publication_gate_hold(run_id) is not None
     assert github.branch_sha is None
     assert all(
         event["event_type"] != "publication.compensation.verified" for event in store.events(run_id)

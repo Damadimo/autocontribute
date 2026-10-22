@@ -26,7 +26,6 @@ from autocontribute.domain import (
     RunManifest,
     RunStatus,
 )
-from autocontribute.evaluation import EvaluationStore
 from autocontribute.preparation import (
     compute_preparation_fingerprint,
     render_validation_artifact,
@@ -359,50 +358,6 @@ def test_nonpublished_terminal_run_with_publication_intent_is_retained(tmp_path:
     assert report.retained == 1
     assert report.errors == 0
     assert "publication reconstruction evidence" in report.items[0].reason
-    assert store.workspaces_dir.joinpath(run.run_id).is_dir()
-
-
-def test_terminal_run_with_active_publication_hold_is_an_error_and_is_retained(
-    tmp_path: Path,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    deployment_fingerprint = "f" * 64
-    run = _prepared_run(store, deployment_fingerprint=deployment_fingerprint)
-    summary = EvaluationStore(store).summary(deployment_fingerprint=deployment_fingerprint)
-    run = store.begin_publication(
-        run,
-        "example/project",
-        branch_name=f"autocontribute/issue-42-{run.run_id}",
-        publication_draft=True,
-        publishing_login="octocat",
-        publishing_api_origin="https://api.github.com",
-        commit_author_name="Octocat",
-        commit_author_email="octocat@users.noreply.github.com",
-        commit_committer_name="Octocat",
-        commit_committer_email="octocat@users.noreply.github.com",
-        max_per_utc_day=10,
-        repository_cooldown=timedelta(0),
-        evaluation_corpus_cursor=summary.corpus_cursor,
-        evaluation_deployment_fingerprint=summary.deployment_fingerprint,
-        outcome_corpus_cursor=store.upstream_outcome_corpus_cursor(
-            summary.deployment_fingerprint,
-            "octocat",
-            "https://api.github.com",
-            exclude_run_id=run.run_id,
-        ),
-    )
-    run.status = RunStatus.FAILED
-    store.save(run, event="fixture.failed", details={"reason": "ambiguous publication"})
-
-    report = collect_terminal_workspaces(
-        store,
-        older_than=timedelta(days=7),
-        execute=True,
-        now=_future(run),
-    )
-
-    assert report.retained == report.errors == 1
-    assert "publication gate hold" in report.items[0].reason
     assert store.workspaces_dir.joinpath(run.run_id).is_dir()
 
 

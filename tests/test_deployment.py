@@ -29,14 +29,6 @@ def _fingerprint(payload: dict[str, object] | None = None) -> str:
     [
         {"models": {"builder": {"model": "different-builder"}}},
         {"models": {"builder": {"expected_response_model": "immutable-snapshot-v2"}}},
-        {
-            "models": {
-                "builder": {
-                    "expected_response_model": "immutable-snapshot-v2",
-                    "immutable_response_model_attested": True,
-                }
-            }
-        },
         {"budget": {"max_candidates_per_run": 24}},
         {"github": {"min_stars": 999}},
         {"sandbox": {"command_timeout_seconds": 899}},
@@ -52,14 +44,13 @@ def test_material_deployment_change_requires_new_fingerprint(
     assert _fingerprint(payload) != _fingerprint()
 
 
-def test_storage_credentials_identity_and_review_to_auto_transition_are_normalized() -> None:
+def test_storage_credentials_and_identity_are_normalized() -> None:
     base = AutocontributeConfig()
     changed = base.model_copy(deep=True)
     changed.storage.path = Path("/different/state")
     changed.identity.name = "Different Operator"
     changed.github.token_env = "OTHER_GITHUB_TOKEN"
     changed.models.builder.api_key_env = "OTHER_MODEL_KEY"
-    changed.publishing.mode = "auto"
 
     assert compute_deployment_fingerprint(
         base, source_digest=SOURCE_DIGEST
@@ -143,24 +134,6 @@ def test_runtime_environment_change_requires_new_fingerprint() -> None:
     )
 
     assert first != second
-
-
-def test_immutable_model_attestation_changes_the_deployment_fingerprint() -> None:
-    base = AutocontributeConfig.model_validate(
-        {"models": {"builder": {"expected_response_model": "immutable-snapshot-v2"}}}
-    )
-    attested = base.model_copy(deep=True)
-    attested.models.builder.immutable_response_model_attested = True
-
-    assert compute_deployment_fingerprint(
-        base,
-        source_digest=SOURCE_DIGEST,
-        runtime_digest="b" * 64,
-    ) != compute_deployment_fingerprint(
-        attested,
-        source_digest=SOURCE_DIGEST,
-        runtime_digest="b" * 64,
-    )
 
 
 def test_runtime_digest_changes_with_installed_dependency_version(

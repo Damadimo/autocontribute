@@ -35,7 +35,6 @@ def _profile(
         provider="openai_compatible" if compatible else "openai",
         model="test-model",
         expected_response_model=("compatible-model-v1" if compatible else "test-model-2026-07-21"),
-        immutable_response_model_attested=True,
         api_key_env=_API_KEY_ENV,
         base_url="https://models.example.test/v1" if compatible else None,
         reasoning_effort="high",
@@ -283,7 +282,6 @@ def test_review_only_profile_records_unpinned_provider_model(
     expected = Verdict(accepted=True, summary="shadow evidence")
     response = _responses_response(SimpleNamespace(type="output_text", parsed=expected))
     provider, _, _ = _responses_provider(monkeypatch, response)
-    provider.profile.immutable_response_model_attested = False
     provider.profile.expected_response_model = None
 
     result = provider.generate(

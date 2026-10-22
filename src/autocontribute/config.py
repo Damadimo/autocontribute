@@ -35,18 +35,6 @@ _AWS_ACCOUNT_ID = re.compile(r"^[0-9]{12}$")
 _DEFAULT_SANDBOX_IMAGE = (
     "python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a"
 )
-_GUARDED_AUTO_FORBIDDEN_PATHS = frozenset(
-    {
-        ".github/workflows/**",
-        ".github/actions/**",
-        "**/*.pem",
-        "**/*.key",
-        "**/generated/**",
-        "vendor/**",
-    }
-)
-_AUTO_PUBLISH_ENABLED_VALUES = frozenset({"1", "true", "yes"})
-AUTO_PUBLISH_ENV = "AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH"
 # Values the starter templates ship with; they parse, but no command may act on them.
 _STARTER_REPOSITORY = "your-org/your-repo"
 _STARTER_REGISTRY_HOST = "example.invalid"
@@ -192,7 +180,6 @@ class ModelProfile(StrictModel):
     provider: Literal["openai", "openai_compatible"] = "openai"
     model: str = "gpt-5.6"
     expected_response_model: str | None = None
-    immutable_response_model_attested: bool = False
     api_key_env: str = "OPENAI_API_KEY"
     base_url: HttpUrl | None = None
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = "high"
@@ -236,8 +223,6 @@ class ModelProfile(StrictModel):
                 "openai_compatible profiles cannot portably enforce pro reasoning mode; "
                 "use standard or null"
             )
-        if self.immutable_response_model_attested and self.expected_response_model is None:
-            raise ValueError("immutable_response_model_attested requires expected_response_model")
         return self
 
     def require_api_key(self) -> str:
@@ -250,7 +235,7 @@ class ModelProfile(StrictModel):
 
     @property
     def deployment_model(self) -> str | None:
-        """Exact provider-returned model ID authorized for autonomous publication."""
+        """Exact provider-returned model ID this profile accepts, when one is configured."""
 
         return self.expected_response_model
 
@@ -572,7 +557,6 @@ class QualityConfig(StrictModel):
 
 
 class PublishingConfig(StrictModel):
-    mode: Literal["review_required", "auto"] = "review_required"
     approval_expires_hours: int = Field(default=24, ge=1, le=168)
     branch_prefix: str = "autocontribute"
     draft: bool = True
@@ -588,12 +572,6 @@ class PublishingConfig(StrictModel):
                 "publishing.draft must be true when publishing.ready_for_review is enabled"
             )
         return self
-
-
-def auto_publish_opt_in_enabled() -> bool:
-    """Return whether the operator's live automatic-publication switch is enabled."""
-
-    return os.environ.get(AUTO_PUBLISH_ENV, "").casefold() in _AUTO_PUBLISH_ENABLED_VALUES
 
 
 class BudgetConfig(StrictModel):
@@ -757,114 +735,6 @@ class AutocontributeConfig(StrictModel):
                 "budget.max_model_cost_usd_per_run requires token pricing for model roles: "
                 + ", ".join(missing_pricing)
             )
-        if self.publishing.mode == "auto":
-            auto_violations: list[str] = []
-            missing_model_attestations = [
-                role for role, profile in profiles if profile.deployment_model is None
-            ]
-            unverified_model_identities = [
-                role for role, profile in profiles if not profile.immutable_response_model_attested
-            ]
-            if len(self.github.repositories) != 1:
-                auto_violations.append("exactly one explicit github.repositories entry")
-            if self.github.owners:
-                auto_violations.append("github.owners must be empty")
-            if not self.publishing.draft:
-                auto_violations.append("publishing.draft must be true")
-            if not self.publishing.ready_for_review:
-                auto_violations.append("publishing.ready_for_review must be true")
-            if self.publishing.max_new_pull_requests_per_day != 1:
-                auto_violations.append("publishing.max_new_pull_requests_per_day must equal 1")
-            if self.publishing.max_open_pull_requests != 1:
-                auto_violations.append("publishing.max_open_pull_requests must equal 1")
-            if self.publishing.repository_cooldown_days < 7:
-                auto_violations.append("publishing.repository_cooldown_days must be at least 7")
-            if self.sandbox.backend != "docker":
-                auto_violations.append("sandbox.backend must be docker")
-            if not self.github.require_unassigned:
-                auto_violations.append("github.require_unassigned must be true")
-            required_policy_values = (
-                (
-                    self.policy.require_maintainer_signal,
-                    "policy.require_maintainer_signal must be true",
-                ),
-                (
-                    self.policy.require_contribution_guidelines,
-                    "policy.require_contribution_guidelines must be true",
-                ),
-                (
-                    not self.policy.allow_assigned_issues,
-                    "policy.allow_assigned_issues must be false",
-                ),
-                (
-                    not self.policy.allow_security_issues,
-                    "policy.allow_security_issues must be false",
-                ),
-                (
-                    not self.policy.allow_dependency_changes,
-                    "policy.allow_dependency_changes must be false",
-                ),
-                (
-                    not self.policy.allow_workflow_changes,
-                    "policy.allow_workflow_changes must be false",
-                ),
-                (
-                    bool(self.policy.ai_disclosure.strip()),
-                    "policy.ai_disclosure must be non-empty",
-                ),
-            )
-            for satisfied, requirement in required_policy_values:
-                if not satisfied:
-                    auto_violations.append(requirement)
-            if self.quality.min_candidate_score < 85:
-                auto_violations.append("quality.min_candidate_score must be at least 85")
-            if self.quality.min_readiness_score < 90:
-                auto_violations.append("quality.min_readiness_score must be at least 90")
-            if self.quality.min_dimension_score < 80:
-                auto_violations.append("quality.min_dimension_score must be at least 80")
-            if self.quality.max_files_changed > 8:
-                auto_violations.append("quality.max_files_changed must be at most 8")
-            if self.quality.max_changed_lines > 400:
-                auto_violations.append("quality.max_changed_lines must be at most 400")
-            if not self.quality.require_regression_evidence_for_bugfix:
-                auto_violations.append(
-                    "quality.require_regression_evidence_for_bugfix must be true"
-                )
-            forbidden_paths = {path.casefold() for path in self.quality.forbidden_paths}
-            missing_forbidden_paths = sorted(
-                path
-                for path in _GUARDED_AUTO_FORBIDDEN_PATHS
-                if path.casefold() not in forbidden_paths
-            )
-            if missing_forbidden_paths:
-                auto_violations.append(
-                    "quality.forbidden_paths must retain guarded paths: "
-                    + ", ".join(missing_forbidden_paths)
-                )
-            if missing_pricing:
-                auto_violations.append(
-                    "model token pricing is required for every role; missing: "
-                    + ", ".join(missing_pricing)
-                )
-            if missing_model_attestations:
-                auto_violations.append(
-                    "models.<role>.expected_response_model is required for every role; missing: "
-                    + ", ".join(missing_model_attestations)
-                )
-            if unverified_model_identities:
-                auto_violations.append(
-                    "models.<role>.immutable_response_model_attested must be true for every role; "
-                    "unattested: " + ", ".join(unverified_model_identities)
-                )
-            if self.budget.max_model_cost_usd_per_run is None:
-                auto_violations.append("budget.max_model_cost_usd_per_run must be configured")
-            if self.s3_replication is None:
-                auto_violations.append("s3_replication must be configured")
-            if auto_violations:
-                raise ValueError(
-                    "publishing.mode=auto requires guarded pilot configuration: "
-                    + "; ".join(auto_violations)
-                )
         return self
 
     def model_for(self, role: Literal["scout", "builder", "critic"]) -> ModelProfile:
@@ -965,9 +835,8 @@ models:
   scout: &builder_model
     provider: openai
     model: gpt-5.6
-    # Required for auto mode; use the exact immutable model ID returned by the provider.
+    # Optional: refuse any response whose provider-reported model ID differs from this one.
     # expected_response_model: gpt-5.6-YYYY-MM-DD
-    # immutable_response_model_attested: true  # only after verifying the provider contract
     api_key_env: OPENAI_API_KEY
     reasoning_effort: high
     reasoning_mode: standard
@@ -1021,7 +890,6 @@ quality:
   require_regression_evidence_for_bugfix: true
 
 publishing:
-  mode: review_required             # guarded `auto` is limited to one explicit repository
   approval_expires_hours: 24
   draft: true
   ready_for_review: false
@@ -1043,7 +911,6 @@ storage:
 
 
 __all__ = [
-    "AUTO_PUBLISH_ENV",
     "CLA_ATTESTATION_STATEMENT",
     "DCO_ATTESTATION_STATEMENT",
     "AutocontributeConfig",
@@ -1054,7 +921,6 @@ __all__ = [
     "ModelPricing",
     "ModelProfile",
     "ValidationConfig",
-    "auto_publish_opt_in_enabled",
     "example_config",
     "load_config",
     "starter_placeholders",

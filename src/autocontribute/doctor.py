@@ -15,25 +15,20 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path, PurePosixPath
 from typing import cast
-from urllib.parse import quote
 
 import httpx
 from rich.markup import escape
 
 from autocontribute.backup_replication import verify_latest_state_bundle_replication
 from autocontribute.config import (
-    AUTO_PUBLISH_ENV,
     AutocontributeConfig,
     ModelProfile,
-    auto_publish_opt_in_enabled,
     validate_model_identifier,
 )
-from autocontribute.deployment import compute_deployment_fingerprint
 from autocontribute.exceptions import AutocontributeError, SandboxError
 from autocontribute.github import GitHubClient
 from autocontribute.providers import ModelCapabilityResponse, create_provider
 from autocontribute.redaction import redact_text
-from autocontribute.rollout import RolloutGate, RolloutSummary
 from autocontribute.sandbox import (
     DockerDaemonMode,
     DockerSandbox,
@@ -43,7 +38,6 @@ from autocontribute.sandbox import (
 )
 from autocontribute.store import RunStore
 from autocontribute.systemd_assets import verify_installed_systemd_assets
-from autocontribute.upstream_outcomes import UpstreamPublicationScope
 
 _DETAIL_LIMIT = 500
 _MODEL_PROBE_MAX_OUTPUT_TOKENS = 1_024
@@ -293,23 +287,13 @@ def _run_doctor(
             "configured" if has_targets else "add at least one repository or owner",
         )
     )
-    if config.publishing.mode == "auto":
-        enabled = auto_publish_opt_in_enabled()
-        checks.append(
-            DoctorCheck(
-                "automatic publication kill-switch",
-                enabled,
-                ("enabled" if enabled else f"set {AUTO_PUBLISH_ENV}=1 to allow GitHub writes"),
-            )
+    checks.append(
+        DoctorCheck(
+            "publication policy",
+            True,
+            "human approval required; scheduled runs cannot publish",
         )
-    else:
-        checks.append(
-            DoctorCheck(
-                "publication policy",
-                True,
-                "review_required; scheduled runs cannot publish",
-            )
-        )
+    )
     return checks
 
 
@@ -318,13 +302,9 @@ def _s3_replication_check(config: AutocontributeConfig) -> DoctorCheck:
     if replication is None:
         return DoctorCheck(
             "latest S3 backup replication",
-            config.publishing.mode == "review_required",
-            (
-                "not configured; optional while publishing.mode is review_required"
-                if config.publishing.mode == "review_required"
-                else "missing from automatic-publication configuration"
-            ),
-            warning=config.publishing.mode == "review_required",
+            True,
+            "not configured; optional",
+            warning=True,
         )
     try:
         verified = verify_latest_state_bundle_replication(
@@ -443,18 +423,7 @@ def _github_checks(
                 "GitHub authentication", True, _safe_detail(f"authenticated as {login}")
             )
             target_access = _github_target_access_check(config, github)
-            permissions = _github_permission_check(config, github, login=login, scopes=scopes)
-            rollout_checks: list[DoctorCheck] = []
-            if store is not None:
-                try:
-                    rollout_checks = _rollout_readiness_checks(
-                        config,
-                        store,
-                        publishing_login=login,
-                        publishing_api_origin=github.api_origin,
-                    )
-                except Exception as exc:
-                    rollout_checks = _rollout_readiness_error_checks(exc)
+            permissions = _github_permission_check(scopes=scopes)
     except Exception as exc:
         detail = _safe_detail(str(exc))
         return [
@@ -471,121 +440,10 @@ def _github_checks(
             ),
         ]
     else:
-        return [authentication, target_access, permissions, *rollout_checks]
+        return [authentication, target_access, permissions]
     finally:
         if github_token is not None:
             _DOCTOR_SECRET_VALUES.reset(github_token)
-
-
-def _rollout_readiness_checks(
-    config: AutocontributeConfig,
-    store: RunStore,
-    *,
-    publishing_login: str,
-    publishing_api_origin: str,
-) -> list[DoctorCheck]:
-    """Evaluate the exact production rollout scope without mutating durable state."""
-
-    scope = UpstreamPublicationScope(
-        deployment_fingerprint=compute_deployment_fingerprint(config),
-        publishing_login=publishing_login.strip().casefold(),
-        publishing_api_origin=publishing_api_origin,
-    )
-    summary = RolloutGate.for_store(store).summary(scope)
-    return _rollout_summary_checks(config, summary)
-
-
-def _rollout_summary_checks(
-    config: AutocontributeConfig,
-    summary: RolloutSummary,
-) -> list[DoctorCheck]:
-    """Render valid gate results as failures in auto and warnings while calibrating."""
-
-    evaluation = summary.evaluation
-    upstream = summary.upstream_outcomes
-    precision = (
-        "unavailable"
-        if evaluation.accept_as_is_precision is None
-        else f"{evaluation.accept_as_is_precision:.1%}"
-    )
-    manual_passed = sum(member.manual_member_passed for member in upstream.manual_cohort)
-    automatic_passed = sum(member.automatic_member_passed for member in upstream.prior_automatic)
-    components = (
-        (
-            "rollout evaluation gate",
-            summary.evaluation_gate_passed,
-            (
-                f"{evaluation.total_cases} evaluated deployment case(s), "
-                f"{evaluation.prepared_cases} prepared, {precision} accept-as-is precision, "
-                f"{evaluation.safety_failures} safety failure(s)"
-            ),
-        ),
-        (
-            "rollout fixed manual cohort",
-            summary.manual_cohort_passed,
-            (
-                f"{len(upstream.manual_cohort)}/{upstream.required_manual_publications} fixed "
-                f"manual publication(s) found; {manual_passed}/"
-                f"{upstream.required_manual_publications} have merged-as-is and expert "
-                "accept-as-is "
-                f"evidence ({upstream.exact_manual_publications} eligible publication(s) found)"
-            ),
-        ),
-        (
-            "rollout prior automatic outcomes",
-            summary.prior_automatic_passed,
-            (
-                f"{automatic_passed}/{len(upstream.prior_automatic)} prior automatic "
-                "publication(s) remain merged-as-is"
-            ),
-        ),
-        (
-            "rollout overall readiness",
-            summary.overall_gate_passed,
-            (
-                "combined expert-evaluation and upstream-outcome decision for "
-                f"{summary.scope.publishing_login} at "
-                f"{summary.scope.publishing_api_origin}; "
-                f"{len(upstream.ambiguous)} ambiguous publication(s)"
-            ),
-        ),
-    )
-    review_required = config.publishing.mode == "review_required"
-    checks: list[DoctorCheck] = []
-    for name, ready, detail in components:
-        if ready:
-            rendered_detail = f"ready; {detail}"
-        elif review_required:
-            rendered_detail = (
-                "not ready; review_required mode remains non-publishing while calibration "
-                f"continues; {detail}"
-            )
-        else:
-            rendered_detail = f"blocked; {detail}"
-        checks.append(
-            DoctorCheck(
-                name,
-                ready or review_required,
-                _safe_detail(rendered_detail),
-                warning=review_required and not ready,
-            )
-        )
-    return checks
-
-
-def _rollout_readiness_error_checks(error: Exception) -> list[DoctorCheck]:
-    """Fail every rollout check when the evidence corpus cannot be validated."""
-
-    detail = _safe_detail(f"rollout evidence could not be validated: {error}")
-    return [
-        DoctorCheck(name, False, detail)
-        for name in (
-            "rollout evaluation gate",
-            "rollout fixed manual cohort",
-            "rollout prior automatic outcomes",
-            "rollout overall readiness",
-        )
-    ]
 
 
 def _authenticated_login_and_scopes(
@@ -657,119 +515,33 @@ def _github_target_access_check(
     )
 
 
-def _github_permission_check(
-    config: AutocontributeConfig,
-    github: GitHubClient,
-    *,
-    login: str,
-    scopes: frozenset[str] | None,
-) -> DoctorCheck:
+def _github_permission_check(*, scopes: frozenset[str] | None) -> DoctorCheck:
     write_scopes = _CLASSIC_PUBLIC_WRITE_SCOPES.intersection(scopes or ())
     scope_text = ", ".join(sorted(scopes or ()))
-    if config.publishing.mode != "auto":
-        if write_scopes:
-            return DoctorCheck(
-                "GitHub permission boundary",
-                True,
-                _safe_detail(
-                    "read access was verified, but the classic token exposes write scope(s) "
-                    f"not needed for preparation: {', '.join(sorted(write_scopes))}"
-                ),
-                warning=True,
-            )
-        if scopes is None:
-            return DoctorCheck(
-                "GitHub permission boundary",
-                True,
-                "read access was verified; this token type does not expose classic OAuth scopes",
-                warning=True,
-            )
+    if write_scopes:
         return DoctorCheck(
             "GitHub permission boundary",
             True,
             _safe_detail(
-                "read access verified with no classic public-repository write scope"
-                + (f" (reported scopes: {scope_text})" if scope_text else "")
-            ),
-        )
-
-    source = config.github.repositories[0]
-    fork = f"{login}/{source.split('/', 1)[1]}"
-    try:
-        raw_fork = github._request(
-            "GET",
-            f"/repos/{quote(fork, safe='/')}",
-            allow_not_found=True,
-        )
-    except Exception as exc:
-        return DoctorCheck("GitHub permission boundary", False, _safe_detail(str(exc)))
-
-    if raw_fork is None:
-        if not write_scopes:
-            return DoctorCheck(
-                "GitHub permission boundary",
-                False,
-                _safe_detail(
-                    f"{fork} does not exist and this token exposes no verifiable classic "
-                    "public-repository write scope; create the fork manually or use a "
-                    "write-capable token"
-                ),
-            )
-        return DoctorCheck(
-            "GitHub permission boundary",
-            True,
-            _safe_detail(
-                f"classic {', '.join(sorted(write_scopes))} scope permits public repository "
-                f"writes; {fork} is absent and fork creation was intentionally not attempted"
+                "read access was verified, but the classic token exposes write scope(s) "
+                f"not needed for preparation: {', '.join(sorted(write_scopes))}"
             ),
             warning=True,
         )
-    if not isinstance(raw_fork, dict):
-        return DoctorCheck(
-            "GitHub permission boundary", False, "GitHub returned malformed fork metadata"
-        )
-    parent = raw_fork.get("parent")
-    permissions = raw_fork.get("permissions")
-    if (
-        raw_fork.get("fork") is not True
-        or not isinstance(parent, dict)
-        or str(parent.get("full_name", "")).casefold() != source.casefold()
-    ):
-        return DoctorCheck(
-            "GitHub permission boundary",
-            False,
-            _safe_detail(f"{fork} exists but is not the expected fork of {source}"),
-        )
-    if not isinstance(permissions, dict) or permissions.get("push") is not True:
-        return DoctorCheck(
-            "GitHub permission boundary",
-            False,
-            _safe_detail(f"the authenticated account cannot push to {fork}"),
-        )
-    if scopes is not None and not write_scopes:
-        return DoctorCheck(
-            "GitHub permission boundary",
-            False,
-            _safe_detail(
-                "the account can push to its fork, but the classic token lacks public_repo or "
-                "repo scope"
-            ),
-        )
     if scopes is None:
-        detail = (
-            f"read-only metadata reports account push access to {fork}; this token type does not "
-            "expose token-level fork or pull-request write permissions, and no write was sent"
-        )
-    else:
-        detail = (
-            f"read-only metadata reports account push access to {fork}, and classic scope "
-            "evidence infers public-repository write capability; no write was sent"
+        return DoctorCheck(
+            "GitHub permission boundary",
+            True,
+            "read access was verified; this token type does not expose classic OAuth scopes",
+            warning=True,
         )
     return DoctorCheck(
         "GitHub permission boundary",
         True,
-        _safe_detail(detail),
-        warning=True,
+        _safe_detail(
+            "read access verified with no classic public-repository write scope"
+            + (f" (reported scopes: {scope_text})" if scope_text else "")
+        ),
     )
 
 

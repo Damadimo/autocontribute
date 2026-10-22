@@ -17,7 +17,6 @@ from typing import Final
 from pydantic import BaseModel, ConfigDict, Field
 
 from autocontribute.domain import RunManifest, RunStatus
-from autocontribute.evaluation import EvaluationStore
 from autocontribute.exceptions import PolicyError, StateError
 from autocontribute.preparation import (
     validate_preparation_fingerprint,
@@ -102,7 +101,6 @@ def create_state_bundle(
         _validate_run_manifests(staged_store)
         _validate_workspace_independent_recovery(staged_store)
         _validate_prepared_run_artifacts(staged_store)
-        EvaluationStore(staged_store).list()
 
         files = _inventory(staging)
         manifest = BundleManifest(
@@ -194,7 +192,6 @@ def restore_state_bundle(root: Path, source: Path) -> Path:
         _validate_run_manifests(restored_store)
         _validate_workspace_independent_recovery(restored_store)
         _validate_prepared_run_artifacts(restored_store)
-        EvaluationStore(restored_store).list()
         os.rename(staging, target)
         _fsync_directory(target.parent)
         return target / "state.sqlite3"
