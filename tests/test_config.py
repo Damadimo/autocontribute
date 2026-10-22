@@ -12,6 +12,7 @@ from autocontribute.config import (
     ModelPricing,
     example_config,
     load_config,
+    starter_placeholders,
 )
 from autocontribute.exceptions import ConfigurationError
 
@@ -69,15 +70,96 @@ def test_shipped_example_configs_are_valid_and_self_consistent() -> None:
 
     example = (root / "autocontribute.example.yml").read_text(encoding="utf-8")
     staging = (root / "autocontribute.staging.example.yml").read_text(encoding="utf-8")
-    # The starter config names real repositories whose pytest commands need project dependencies.
-    # A pullable bare-interpreter image would pass config validation yet fail doctor, so the
-    # shipped image must be an unresolvable, unmistakable placeholder the operator has to replace.
+    # The starter repository's pytest command needs project dependencies. A pullable
+    # bare-interpreter image would pass config validation yet fail doctor, so the shipped image
+    # must be an unresolvable, unmistakable placeholder the operator has to replace.
     placeholder = "example.invalid/sandbox@sha256:" + "0" * 64
     assert placeholder in example
     assert placeholder in example_config()
     # The staging fixture's stdlib-only validation recipe is the one case a bare image satisfies.
     assert "python:3.12-bookworm@sha256:" in staging
     assert (root / "docs" / "sandbox-image.md").exists()
+
+
+def test_starter_configs_name_only_placeholders_that_commands_refuse() -> None:
+    root = Path(__file__).resolve().parents[1]
+    for raw in (
+        example_config(),
+        (root / "autocontribute.example.yml").read_text(encoding="utf-8"),
+    ):
+        config = AutocontributeConfig.model_validate(yaml.safe_load(raw))
+        # An empty identity falls back to the GitHub login and its noreply address.
+        assert config.identity.name == ""
+        assert config.identity.email == ""
+        assert config.github.repositories == ["your-org/your-repo"]
+        assert config.validation.commands_for("your-org/your-repo") == ["python -m pytest"]
+
+        placeholders = starter_placeholders(config)
+
+        assert len(placeholders) == 2
+        assert "your-org/your-repo" in placeholders[0]
+        assert "example.invalid" in placeholders[1]
+
+
+def test_starter_placeholders_list_every_template_value_still_present() -> None:
+    template = AutocontributeConfig.model_validate(
+        {
+            "identity": {
+                "name": "Your Name",
+                "email": "your-handle@users.noreply.github.com",
+            },
+            "github": {"repositories": ["example/project", "Your-Org/Your-Repo"]},
+            "validation": {
+                "required_commands": {
+                    "example/project": ["python -m pytest"],
+                    "Your-Org/Your-Repo": ["python -m pytest"],
+                }
+            },
+            "sandbox": {"image": "example.invalid:5000/sandbox@sha256:" + "0" * 64},
+        }
+    )
+
+    placeholders = starter_placeholders(template)
+
+    assert len(placeholders) == 4
+    assert "your-org/your-repo" in placeholders[0]
+    assert "example.invalid" in placeholders[1]
+    assert placeholders[2].startswith('identity.name is "Your Name"')
+    assert placeholders[3].startswith('identity.email is "your-handle@users.noreply.github.com"')
+
+    completed = template.model_copy(
+        update={
+            "identity": template.identity.model_copy(
+                update={"name": "Octo Cat", "email": "octocat@users.noreply.github.com"}
+            ),
+            "github": template.github.model_copy(update={"repositories": ["example/project"]}),
+            "sandbox": template.sandbox.model_copy(
+                update={"image": "ghcr.io/example/sandbox@sha256:" + "1" * 64}
+            ),
+        }
+    )
+    assert starter_placeholders(completed) == []
+    # Only the registry host is a placeholder; an image merely named after it is not.
+    renamed = completed.sandbox.model_copy(
+        update={"image": "ghcr.io/example.invalid/sandbox@sha256:" + "1" * 64}
+    )
+    assert starter_placeholders(completed.model_copy(update={"sandbox": renamed})) == []
+
+
+def test_starter_image_is_not_a_placeholder_for_the_local_backend() -> None:
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
+            "sandbox": {
+                "backend": "local",
+                "allow_unsafe_local": True,
+                "image": "example.invalid/sandbox@sha256:" + "0" * 64,
+            },
+        }
+    )
+
+    assert starter_placeholders(config) == []
 
 
 def test_defaults_disclose_autonomous_work_without_claiming_human_validation() -> None:
