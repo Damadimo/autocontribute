@@ -679,30 +679,114 @@ def test_safety_stops_and_state_errors_still_end_discovery(
         service.discover()
 
 
-def _comment(*, body: str, author: str = "contributor", association: str = "NONE") -> IssueComment:
-    now = datetime.now(UTC)
+def _comment(
+    *,
+    body: str,
+    author: str = "contributor",
+    association: str = "NONE",
+    days_ago: int = 0,
+) -> IssueComment:
+    created = datetime.now(UTC) - timedelta(days=days_ago)
     return IssueComment(
         author=author,
         author_association=association,
         body=body,
-        html_url=f"https://github.com/example/project/issues/42#{author}",
-        created_at=now,
-        updated_at=now,
+        html_url=f"https://github.com/example/project/issues/42#{author}-{days_ago}",
+        created_at=created,
+        updated_at=created,
     )
 
 
-def test_claimed_work_in_discussion_fails_closed(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "body",
+    [
+        "I'm working on this and will open a PR shortly.",
+        "I\u2019ll take this.",
+        "I'm working on this, OK?",
+        "Is anyone working on this? If not, I'll take it.",
+        "I started working on a fix last week.",
+        "Could you please assign this to me?",
+    ],
+)
+def test_claimed_work_in_discussion_fails_closed(tmp_path, body: str) -> None:  # type: ignore[no-untyped-def]
     config = AutocontributeConfig()
     service = DiscoveryService(config, FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
-    issue = _issue(
-        comments=1,
-        discussion=[_comment(body="I'm working on this and will open a PR shortly.")],
-    )
+    issue = _issue(comments=1, discussion=[_comment(body=body, author="claimant")])
 
     result = service.evaluate(issue, _repository())
 
     assert not result.eligible
-    assert "claimed work" in " ".join(result.blockers)
+    assert result.blockers == ["issue discussion indicates claimed work by claimant"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Is anyone working on a fix?",
+        "Nobody is working on a fix yet.",
+        "Not sure anyone is working on a fix.",
+        "I don't think anyone is working on a fix.",
+        "If you're working on a fix, please link the PR here.",
+        "Please don't assign this to me; I only reported it.",
+    ],
+)
+def test_questions_negations_and_conditions_are_not_claims(tmp_path, body: str) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    issue = _issue(comments=1, discussion=[_comment(body=body)])
+
+    result = service.evaluate(issue, _repository())
+
+    assert result.eligible, result.blockers
+
+
+def test_claims_lapse_after_thirty_days(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    claim = "I'm working on this now."
+
+    recent = service.evaluate(
+        _issue(comments=1, discussion=[_comment(body=claim, days_ago=29)]), _repository()
+    )
+    lapsed = service.evaluate(
+        _issue(comments=1, discussion=[_comment(body=claim, days_ago=31)]), _repository()
+    )
+
+    assert not recent.eligible
+    assert lapsed.eligible, lapsed.blockers
+
+
+@pytest.mark.parametrize(
+    ("invitation", "invitation_days_ago", "reopened"),
+    [
+        ("This is still open for anyone: feel free to open a PR.", 2, True),
+        ("PRs welcome!", 2, True),
+        ("@claimant thanks, feel free to open a PR.", 2, False),
+        ("Feel free to open a PR.", 20, False),
+        ("I don't think PRs are welcome here yet.", 2, False),
+    ],
+)
+def test_later_maintainer_invitation_reopens_claimed_work(
+    tmp_path,
+    invitation: str,
+    invitation_days_ago: int,
+    reopened: bool,
+) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    issue = _issue(
+        comments=2,
+        discussion=[
+            _comment(body="I'll take this.", author="claimant", days_ago=10),
+            _comment(
+                body=invitation,
+                author="maintainer",
+                association="MEMBER",
+                days_ago=invitation_days_ago,
+            ),
+        ],
+    )
+
+    result = service.evaluate(issue, _repository())
+
+    assert ("claimed work" in " ".join(result.blockers)) is not reopened
 
 
 @pytest.mark.parametrize(
@@ -770,7 +854,7 @@ def test_claimed_work_in_discussion_fails_closed(tmp_path) -> None:
         ),
     ],
 )
-def test_maintainer_stop_request_in_discussion_fails_closed(tmp_path, body: str) -> None:
+def test_maintainer_stop_request_in_discussion_blocks_only_that_issue(tmp_path, body: str) -> None:  # type: ignore[no-untyped-def]
     config = AutocontributeConfig()
     service = DiscoveryService(config, FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
     issue = _issue(
@@ -784,13 +868,101 @@ def test_maintainer_stop_request_in_discussion_fails_closed(tmp_path, body: str)
         ],
     )
 
-    with pytest.raises(StateError, match="global circuit breaker"):
-        service.evaluate(issue, _repository())
+    evaluation = service._assess(issue, _repository())
 
-    status = service.store.circuit_breaker_status()
-    assert status.is_tripped
-    assert status.source == "github_issue_discussion:example/project#42"
-    assert status.trigger_hash is not None
+    assert not evaluation.eligibility.eligible
+    assert "stop request" in evaluation.blocker_kinds
+    assert (
+        "a maintainer comment asks contributors to stop, hold off, or avoid a pull request: "
+        "https://github.com/example/project/issues/42#maintainer-0"
+    ) in evaluation.eligibility.blockers
+    assert (evaluation.repository_hold is not None) is (
+        body
+        in {
+            "We will not accept automated submissions.",
+            "AI-generated PRs will be closed.",
+            "LLM-generated PRs will be closed.",
+        }
+    )
+    assert not service.store.circuit_breaker_status().is_tripped
+
+
+def test_discussion_stop_is_reported_again_without_raising_on_every_discovery(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    stopped = _repository_issue(
+        "example/project",
+        41,
+        comments=1,
+        discussion=[
+            _comment(
+                body="Please hold off; no PR is needed until the design is settled.",
+                author="maintainer",
+                association="MEMBER",
+            )
+        ],
+    )
+    github = IsolationGitHub(
+        {"example/project": [stopped, _repository_issue("example/project", 42)]}
+    )
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project"), github, RunStore(tmp_path)
+    )
+
+    outcomes = [service.discover(), service.discover()]
+
+    for outcome in outcomes:
+        assert outcome.selection is not None
+        assert outcome.selection[0].number == 42
+        assert outcome.blocker_counts == [("stop request", 1)]
+        assert outcome.skipped_repositories == ()
+    assert not service.store.circuit_breaker_status().is_tripped
+
+
+def test_stop_aimed_at_automation_holds_the_repository_for_the_run(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    held = [
+        _repository_issue("example/project", 40),
+        _repository_issue(
+            "example/project",
+            41,
+            comments=1,
+            discussion=[
+                _comment(
+                    body="AI-generated PRs will be closed.",
+                    author="maintainer",
+                    association="OWNER",
+                )
+            ],
+        ),
+        _repository_issue("example/project", 42),
+    ]
+    github = IsolationGitHub(
+        {
+            "example/project": held,
+            "other/project": [_repository_issue("other/project", 7)],
+        }
+    )
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project", "other/project"), github, RunStore(tmp_path)
+    )
+
+    outcome = service.discover()
+
+    assert outcome.selection is not None
+    assert outcome.selection[0].reference == "other/project#7"
+    assert outcome.skipped_repositories == (
+        (
+            "example/project",
+            "a maintainer comment turns away automated or AI contributions: "
+            "https://github.com/example/project/issues/42#maintainer-0",
+        ),
+    )
+    assert [evaluation.issue.reference for evaluation in outcome.evaluations] == [
+        "example/project#40",
+        "example/project#41",
+        "other/project#7",
+    ]
+    assert not service.store.circuit_breaker_status().is_tripped
 
 
 def test_issue_description_stop_request_fails_closed_without_tripping_global_breaker(
@@ -824,7 +996,7 @@ def test_issue_description_stop_request_fails_closed_without_tripping_global_bre
         ),
     ],
 )
-def test_retired_quoted_stop_policy_does_not_trip_global_breaker(
+def test_retired_quoted_stop_policy_is_not_a_stop_request(
     tmp_path,
     body: str,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -837,7 +1009,6 @@ def test_retired_quoted_stop_policy_does_not_trip_global_breaker(
     result = service.evaluate(issue, _repository())
 
     assert result.eligible
-    assert not service.store.circuit_breaker_status().is_tripped
 
 
 @pytest.mark.parametrize(
@@ -920,7 +1091,7 @@ def test_retired_quoted_stop_policy_does_not_trip_global_breaker(
         ("Please hold off; no PR is needed.", "drive-by", "CONTRIBUTOR"),
     ],
 )
-def test_untrusted_or_negated_stop_text_does_not_trip_global_breaker(
+def test_untrusted_or_negated_stop_text_is_not_a_stop_request(
     tmp_path, body: str, author: str, association: str
 ) -> None:  # type: ignore[no-untyped-def]
     service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
@@ -929,9 +1100,10 @@ def test_untrusted_or_negated_stop_text_does_not_trip_global_breaker(
         discussion=[_comment(body=body, author=author, association=association)],
     )
 
-    service.evaluate(issue, _repository())
+    evaluation = service._assess(issue, _repository())
 
-    assert not service.store.circuit_breaker_status().is_tripped
+    assert "stop request" not in evaluation.blocker_kinds
+    assert evaluation.repository_hold is None
 
 
 def test_organization_ai_prohibition_fails_closed(tmp_path) -> None:

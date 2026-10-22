@@ -9,14 +9,13 @@ import re
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 
 from autocontribute.config import AutocontributeConfig, LegalAttestation
-from autocontribute.domain import EligibilityResult, IssueCandidate, RepositoryInfo
+from autocontribute.domain import EligibilityResult, IssueCandidate, IssueComment, RepositoryInfo
 from autocontribute.exceptions import (
     AutocontributeError,
-    CircuitBreakerTrigger,
     GitHubError,
     GitHubSafetyError,
     PolicyError,
@@ -109,13 +108,38 @@ _LEGAL_NEGATED_SUFFIX = re.compile(
     re.I,
 )
 _WORK_CLAIM = re.compile(
-    r"\b(?:(?:i(?:'m| am|\u2019m)|we(?:'re| are|\u2019re))\s+"
+    r"\b(?:(?:i(?:'m| am)|we(?:'re| are))\s+"
     r"(?:(?:already|currently)\s+)?working on (?:this|it)|"
     r"i(?:'ll| will) (?:take|work on) (?:this|it)|"
-    r"working on (?:a |the )?(?:fix|pull request|pr)|"
-    r"please assign (?:this|it) to me)\b",
+    r"working on (?:a |the )?(?:fix|pull request|pr))\b",
     re.I,
 )
+# Asking to be assigned claims the work even when it is phrased as a question.
+_ASSIGNMENT_REQUEST = re.compile(r"\bassign (?:this|it) to me\b", re.I)
+_WORK_INVITATION = re.compile(
+    r"\b(?:"
+    r"(?:prs?|pull\s+requests?|patch(?:es)?|contributions?|fix(?:es)?|help)\s+"
+    r"(?:(?:are|is|would\s+be)\s+)?(?:(?:very|always|more\s+than)\s+)?(?:welcome|appreciated)"
+    r"|help\s+wanted"
+    r"|feel\s+free\s+to\s+(?:open|submit|send|make|create|take|pick|work\s+on|tackle|grab)"
+    r"|happy\s+to\s+(?:review|accept|merge)"
+    r"|(?:would|will)\s+(?:gladly\s+|happily\s+)?(?:accept|review|merge)\s+(?:a|an|any)\s+"
+    r"(?:pr|pull\s+request|patch|fix|contribution)"
+    r"|up\s+for\s+grabs"
+    r"|open\s+(?:to|for)\s+(?:contributions|prs|pull\s+requests)"
+    r")\b",
+    re.I,
+)
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|[;\n]")
+_CLAUSE_BREAK = re.compile(r"[,:()\u2013\u2014]")
+_NEGATED_OR_CONDITIONAL = re.compile(
+    r"\b(?:not|no|never|nobody|none|no\s+one|if|unless|whether)\b|n't\b", re.I
+)
+_AUTOMATION_TERMS = re.compile(
+    r"\b(?:ai|llms?|bots?|automated|automation|agentic|machine[- ]generated|copilot|chatgpt)\b",
+    re.I,
+)
+_CLAIM_WINDOW = timedelta(days=30)
 _STOP_TARGET = (
     r"(?:(?:(?:ai|llm)[ -]generated|ai[ -]assisted|automated|bot[ -]authored|"
     r"community|external|outside|unsolicited)\s+)?"
@@ -363,6 +387,7 @@ class IssueEvaluation:
     repository: RepositoryInfo
     eligibility: EligibilityResult
     blocker_kinds: tuple[str, ...] = ()
+    repository_hold: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -556,6 +581,14 @@ class DiscoveryService:
                     issue_errors.append((snapshot.reference, str(exc)))
                     continue
                 evaluations.append(evaluation)
+                if evaluation.repository_hold is not None:
+                    skipped_repositories.append((repository.full_name, evaluation.repository_hold))
+                    eligible = [
+                        candidate
+                        for candidate in eligible
+                        if candidate.repository.full_name != repository.full_name
+                    ]
+                    break
                 if evaluation.eligibility.eligible:
                     eligible.append(evaluation)
         eligible.sort(
@@ -622,7 +655,8 @@ class DiscoveryService:
             self.config.policy.allow_assigned_issues or not self.config.github.require_unassigned
         ):
             blockers.append(("assigned", "issue is already assigned"))
-        age = (datetime.now(UTC) - issue.updated_at).days
+        now = datetime.now(UTC)
+        age = (now - issue.updated_at).days
         if age > self.config.github.max_issue_age_days:
             blockers.append(("stale", f"issue has not been updated for {age} days"))
         issue_discussion_text = (
@@ -645,59 +679,38 @@ class DiscoveryService:
                 )
             )
 
-        claimed_by = sorted(
-            {comment.author for comment in issue.discussion if _WORK_CLAIM.search(comment.body)}
-        )
+        maintainer_comments = [
+            comment for comment in issue.discussion if _is_trusted_maintainer(comment)
+        ]
+        claimed_by = _active_claimants(issue.discussion, maintainer_comments, now=now)
         if claimed_by:
             blockers.append(
                 ("claimed", f"issue discussion indicates claimed work by {', '.join(claimed_by)}")
             )
 
-        maintainer_stops = [
-            comment
-            for comment in issue.discussion
-            if comment.author_association in _MAINTAINER_ASSOCIATIONS
-            and not _BOT_LOGIN.search(comment.author)
-            and _is_maintainer_stop(comment.body)
-        ]
-        if maintainer_stops:
-            for comment in maintainer_stops:
-                trigger_evidence = {
-                    "author": comment.author,
-                    "author_association": comment.author_association,
-                    "body_sha256": hashlib.sha256(comment.body.encode()).hexdigest(),
-                    "html_url": comment.html_url,
-                    "issue": issue.reference.casefold(),
-                    "updated_at": comment.updated_at.isoformat(),
-                }
-                self.store.trip_circuit_breaker_trigger(
-                    CircuitBreakerTrigger(
-                        source=f"github_issue_discussion:{issue.reference}",
-                        reason=(
-                            "A trusted maintainer discussion comment asks contributors to stop, "
-                            f"hold off, or avoid a pull request for {issue.reference}; review "
-                            f"{comment.html_url[:1_000]}"
-                        ),
-                        trigger_hash=hashlib.sha256(
-                            json.dumps(
-                                trigger_evidence,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            ).encode()
-                        ).hexdigest(),
-                    )
+        # A stop in the discussion blocks this issue only. It also holds the whole repository
+        # when it turns away automated or AI contributions in general.
+        stops = [comment for comment in maintainer_comments if _is_maintainer_stop(comment.body)]
+        repository_hold: str | None = None
+        if stops:
+            blockers.append(
+                (
+                    "stop request",
+                    "a maintainer comment asks contributors to stop, hold off, or avoid a pull "
+                    f"request: {stops[-1].html_url}",
                 )
-            raise StateError(
-                "A trusted maintainer stop request activated the global circuit breaker"
             )
+            hold = next((comment for comment in stops if _targets_automation(comment.body)), None)
+            if hold is not None:
+                repository_hold = (
+                    f"a maintainer comment turns away automated or AI contributions: "
+                    f"{hold.html_url}"
+                )
 
         evidence: dict[str, str] = {}
-        maintainer_comments = sum(
-            comment.author_association in _MAINTAINER_ASSOCIATIONS for comment in issue.discussion
-        )
         evidence["discussion"] = (
             f"loaded={len(issue.discussion)}/{issue.comments}, "
-            f"maintainer_comments={maintainer_comments}, claims={len(claimed_by)}"
+            f"maintainer_comments={len(maintainer_comments)}, claims={len(claimed_by)}"
         )
         signal = 25 if labels.intersection(include) else 0
         evidence["maintainer_signal"] = (
@@ -844,6 +857,7 @@ class DiscoveryService:
                 blockers=[reason for _, reason in blockers],
             ),
             blocker_kinds=tuple(kind for kind, _ in blockers),
+            repository_hold=repository_hold,
         )
 
     def _repository_baseline(self, repository: RepositoryInfo) -> bool:
@@ -1417,9 +1431,20 @@ def _is_security_sensitive(text: str) -> bool:
 
 
 def _is_maintainer_stop(body: str) -> bool:
+    return bool(_maintainer_stop_sentences(body))
+
+
+def _targets_automation(body: str) -> bool:
+    return any(_AUTOMATION_TERMS.search(sentence) for sentence in _maintainer_stop_sentences(body))
+
+
+def _maintainer_stop_sentences(body: str) -> list[str]:
+    """Return the sentences that ask contributors to stop, hold off, or avoid a pull request."""
+
     normalized = body.replace("\u2018", "'").replace("\u2019", "'")
     without_invitations = _NON_STOP_DIRECTIVE.sub("", normalized)
     without_invitations = _NON_ACTIVE_WORK.sub("", without_invitations)
+    sentences: list[str] = []
     for raw_segment in re.split(r"(?<=[.!?])|[;\n]", without_invitations):
         is_question = "?" in raw_segment
         segment = raw_segment.strip(" \t\r\n.!?\"'\u201c\u201d")
@@ -1429,8 +1454,65 @@ def _is_maintainer_stop(body: str) -> bool:
             is_question or _CONDITIONAL_CLAIM.search(segment)
         ):
             segment = _ALREADY_WORKED_ON.sub("", segment)
-        for match in _MAINTAINER_STOP.finditer(segment):
-            if _RETIRED_STOP_PREFIX.search(segment[: match.start()]):
+        if any(
+            not _RETIRED_STOP_PREFIX.search(segment[: match.start()])
+            for match in _MAINTAINER_STOP.finditer(segment)
+        ):
+            sentences.append(segment)
+    return sentences
+
+
+def _is_trusted_maintainer(comment: IssueComment) -> bool:
+    return comment.author_association in _MAINTAINER_ASSOCIATIONS and not _BOT_LOGIN.search(
+        comment.author
+    )
+
+
+def _active_claimants(
+    discussion: list[IssueComment],
+    maintainer_comments: list[IssueComment],
+    *,
+    now: datetime,
+) -> list[str]:
+    """Name everyone with a recent, unanswered claim on the issue.
+
+    A claim lapses after 30 days, and a later maintainer invitation that does not address the
+    claimant reopens the work to everyone.
+    """
+
+    invitations = [
+        comment for comment in maintainer_comments if _stated(_WORK_INVITATION, comment.body)
+    ]
+    claimants: set[str] = set()
+    for comment in discussion:
+        if now - comment.created_at > _CLAIM_WINDOW or not (
+            _stated(_WORK_CLAIM, comment.body)
+            or _stated(_ASSIGNMENT_REQUEST, comment.body, questions_count=True)
+        ):
+            continue
+        mention = re.compile(rf"@{re.escape(comment.author)}(?![\w-])", re.I)
+        if any(
+            invitation.created_at > comment.created_at and not mention.search(invitation.body)
+            for invitation in invitations
+        ):
+            continue
+        claimants.add(comment.author)
+    return sorted(claimants)
+
+
+def _stated(pattern: re.Pattern[str], text: str, *, questions_count: bool = False) -> bool:
+    """Whether some sentence says the pattern outright, not negated or as a condition.
+
+    A match inside a question counts only when ``questions_count`` is set.
+    """
+
+    for sentence in _SENTENCE_BREAK.split(text.replace("\u2019", "'")):
+        for match in pattern.finditer(sentence):
+            clause_start = _CLAUSE_BREAK.split(sentence[: match.start()])[-1]
+            clause_end = _CLAUSE_BREAK.split(sentence[match.end() :])[0]
+            if _NEGATED_OR_CONDITIONAL.search(clause_start):
+                continue
+            if "?" in clause_end and not questions_count:
                 continue
             return True
     return False

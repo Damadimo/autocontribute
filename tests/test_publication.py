@@ -1560,7 +1560,7 @@ def test_issue_or_repository_drift_after_push_compensates_before_pull_request(
     assert "create_pull_request" not in github.calls
     assert "publication.policy_stale_before_pull_request" in event_types
     assert "publication.compensation.verified" in event_types
-    assert store.circuit_breaker_status().is_tripped is (drift == "maintainer_stop")
+    assert not store.circuit_breaker_status().is_tripped
 
 
 @pytest.mark.parametrize("drift", ["organization_ref", "maintainer_stop"])
@@ -1677,7 +1677,7 @@ def test_mutation_boundary_guard_compensates_drift_after_full_freshness_check(
     assert "pull_request.creation.started" not in event_types
     assert "publication.policy_stale_before_pull_request" in event_types
     assert "publication.compensation.verified" in event_types
-    assert store.circuit_breaker_status().is_tripped is (drift == "maintainer_stop")
+    assert not store.circuit_breaker_status().is_tripped
 
 
 @pytest.mark.parametrize(
