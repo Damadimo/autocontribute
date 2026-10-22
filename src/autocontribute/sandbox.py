@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -531,12 +531,46 @@ class SessionContainer:
         return None
 
     def _remove_container(self, name: str) -> None:
-        # Best effort: a container that survives this keeps the run and store labels
-        # that the leftover sweep looks for.
+        # Best effort: remove_leftover_containers finds a survivor by its labels.
         self._docker("rm", "--force", "--volumes", name)
 
     def _docker(self, *arguments: str) -> subprocess.CompletedProcess[str] | None:
         return _docker_control(self.docker_binary, arguments, self._docker_environment)
+
+
+def remove_leftover_containers(
+    store_root: Path,
+    unfinished_run_ids: Collection[str],
+    *,
+    docker_binary: str = "docker",
+) -> None:
+    """Remove this store's containers and networks whose run is finished or unknown.
+
+    Teardown removes them normally; this catches what a killed process left behind.
+    """
+
+    if not docker_binary or "\0" in docker_binary:
+        raise SandboxError("Docker binary is invalid")
+    environment = docker_client_environment()
+    store_filter = f"label={_STORE_LABEL}={_store_label(store_root)}"
+    row_format = '{{.ID}} {{.Label "' + _RUN_LABEL + '"}}'
+    # Containers first: Docker refuses to remove a network that a container still uses.
+    for listing, removal in (
+        (("ps", "--all", "--no-trunc"), ("rm", "--force", "--volumes")),
+        (("network", "ls", "--no-trunc"), ("network", "rm")),
+    ):
+        listed = _docker_control(
+            docker_binary,
+            [*listing, "--filter", store_filter, "--format", row_format],
+            environment,
+        )
+        if listed is None or listed.returncode != 0:
+            raise SandboxError("Could not list leftover sandbox containers and networks")
+        for line in listed.stdout.splitlines():
+            object_id, _, run_id = line.strip().partition(" ")
+            if _DOCKER_OBJECT_ID.fullmatch(object_id) and run_id not in unfinished_run_ids:
+                # Best effort, like workspace cleanup: the next sweep retries.
+                _docker_control(docker_binary, [*removal, object_id], environment)
 
 
 def _execute(
@@ -868,4 +902,5 @@ __all__ = [
     "docker_client_environment",
     "docker_container_identity",
     "docker_isolation_arguments",
+    "remove_leftover_containers",
 ]
