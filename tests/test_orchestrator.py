@@ -3126,7 +3126,7 @@ def test_provider_usage_above_forwarded_limit_is_charged_then_rejected(tmp_path:
     assert store.get(manifest.run_id).model_output_tokens == 1_001
 
 
-def test_review_mode_accepts_observed_provider_model_without_an_attestation(
+def test_provider_model_is_accepted_without_expected_response_model(
     tmp_path: Path,
 ) -> None:
     config = AutocontributeConfig.model_validate({"storage": {"path": tmp_path / "state"}})

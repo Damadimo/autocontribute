@@ -83,7 +83,6 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 class _ExactHumanApproval:
     """One ledger-bound approval that authorized an exact publication intent."""
 
-    approval_event_hash: str
     publication_intent_at: datetime
 
 
@@ -3947,17 +3946,11 @@ def _classify_exact_human_approval(
         intent_at = _event_time(intent["occurred_at"], field="publication intent time")
         if approval_index >= intent_index or not approved_at <= intent_at < expires_at:
             return None
-        approval_event_hash = _event_hash(
-            event["event_hash"],
-            field="approval event hash",
-        )
+        _event_hash(event["event_hash"], field="approval event hash")
         _event_hash(intent["event_hash"], field="publication intent event hash")
     except (StateError, TypeError, ValueError):
         return None
-    return _ExactHumanApproval(
-        approval_event_hash=approval_event_hash,
-        publication_intent_at=intent_at,
-    )
+    return _ExactHumanApproval(publication_intent_at=intent_at)
 
 
 def _validate_approval_values(
@@ -3972,7 +3965,7 @@ def _validate_approval_values(
         not approval.actor.strip()
         or not approval.attestation.strip()
         or manifest.publishing_login is None
-        or approval.actor != manifest.publishing_login
+        or approval.actor.strip().casefold() != manifest.publishing_login
         or details["actor"] != approval.actor
         or details["manifest_hash"] != approval.manifest_hash
         or details["expires_at"] != approval.expires_at.isoformat()

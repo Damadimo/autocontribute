@@ -257,8 +257,8 @@ def _response_identity(response: object) -> tuple[str, str]:
     return response_id, resolved_model
 
 
-def _require_deployment_model(profile: ModelProfile, model: str) -> None:
-    expected = profile.deployment_model
+def _require_expected_response_model(profile: ModelProfile, model: str) -> None:
+    expected = profile.expected_response_model
     if expected is not None and model != expected:
         raise ModelError(
             "Model provider resolved a different model ID than expected_response_model; "
@@ -363,7 +363,7 @@ class OpenAIResponsesProvider:
             raise ModelError("Model returned multiple schema-conforming outputs")
 
         response_id, model = _response_identity(response)
-        _require_deployment_model(self.profile, model)
+        _require_expected_response_model(self.profile, model)
         return ModelResult(
             output=parsed_candidates[0],
             response_id=response_id,
@@ -456,7 +456,7 @@ class OpenAICompatibleProvider:
             raise ModelError("Compatible provider returned invalid structured output") from exc
 
         response_id, model = _response_identity(response)
-        _require_deployment_model(self.profile, model)
+        _require_expected_response_model(self.profile, model)
         return ModelResult(
             output=parsed,
             response_id=response_id,
@@ -822,7 +822,7 @@ class SubprocessModelProvider:
                     output_type=output_type,
                     output_schema=output_schema,
                 )
-                _require_deployment_model(self.profile, result.model)
+                _require_expected_response_model(self.profile, result.model)
             except ModelError:
                 if time.monotonic() >= deadline:
                     raise ModelTimeoutError(

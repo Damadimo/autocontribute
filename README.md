@@ -76,16 +76,16 @@ autocontribute publish RUN_ID               # fork, push one branch, open the PR
 
 Many runs end `skipped` or `rejected`: no issue passed the rules, the plan found nothing safe to change, a check failed, or the critic objected. These are normal outcomes; `failed` means an error stopped the run. Each run's evidence is in `.autocontribute/runs/RUN_ID/` next to your config file (set by `storage.path`): the patch, every command's output, the model-call records, and a `report.md` summary.
 
-`approve` shows the full issue discussion, patch, check output, and commit and PR text; the approval covers exactly that and expires after 24 hours. To drop a run that is ready for approval or approved, run `runs cancel RUN_ID --reason TEXT`; this releases its issue. An issue whose last run ended `skipped`, `rejected`, or `cancelled` is not retried until it changes; to retry it anyway, add `--retry-unchanged --retry-actor NAME --retry-reason TEXT` to `run --issue`.
+`approve` shows the full issue discussion, patch, check output, and commit and PR text; the approval covers exactly that and expires after 24 hours. To drop a run that is ready for approval or approved, run `runs cancel RUN_ID --reason TEXT`. An issue whose last run ended `skipped`, `rejected`, or `cancelled` is not retried until it changes; [Run states](docs/how-it-works.md#run-states) shows how to retry it anyway.
 
 ## Safety defaults
 
 - **Review required.** Nothing reaches GitHub until you approve the exact diff, and `publish` asks again before it writes. It never comments, reviews, reacts, merges, or opens issues.
 - **Isolated checks.** Repository commands run in Docker with no network, no credentials, no Linux capabilities, and CPU, memory, process, and time limits. Model calls run in a separate process that never sees your GitHub token.
 - **Disclosure.** Every PR body includes the `policy.ai_disclosure` text, and PRs open as drafts.
-- **Limits.** At most 1 new PR per UTC day and 2 open PRs, and no new PR to a repository where your account has an open PR or a closed one updated in the last 7 days. Every PR your account authored counts, including ones you opened yourself.
+- **Limits.** At most 1 new PR per UTC day and 2 open PRs, and none to a repository where your account has an open PR or a closed one updated in the last 7 days ([details](docs/configuration.md#publishing)).
 - **Repository policies.** It skips repositories whose policy files appear to prohibit AI-assisted or automated contributions, and repositories that require a CLA or DCO until you attest with `policy attest` ([details](docs/configuration.md#legal-attestations)).
-- **Stops.** `lifecycle sync` checks the PRs Autocontribute opened and stops all work after a maintainer requests changes or asks you to stop, CI fails, the PR branch changes, or a PR is closed unmerged or reverted; `publish` syncs first. A maintainer's stop request on a candidate issue, repeated GitHub abuse-limit responses, or `safety stop --actor NAME --reason TEXT` also stop all work. `safety status` shows why, and `safety resume` restarts work once you pass it the trigger hash from `safety status`.
+- **Stops.** `lifecycle sync` checks the PRs Autocontribute opened and stops all work after a maintainer requests changes or asks you to stop, CI fails, the PR branch changes, or a PR is closed unmerged or reverted; `publish` syncs first. A maintainer's stop request on a candidate issue, repeated GitHub abuse-limit responses, or `safety stop --actor NAME --reason TEXT` also stop all work. `safety status` shows why; to restart work, pass the "Active trigger-set revision" it prints to `safety resume`.
 
 ## Costs
 
@@ -101,8 +101,6 @@ Each run stops at the first `budget` limit it reaches: 9 model calls, 3,000,000 
 
 cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod 600`), export a `PATH` on which `autocontribute`, `docker`, `git`, and `gh` resolve, and `OPENAI_API_KEY` (plus `AUTOCONTRIBUTE_GITHUB_TOKEN` with `github.auth: token`). With the starter config, this schedule can spend up to $100 a day on models.
 
-A GitHub Actions runner is planned.
-
 ## Command reference
 
 | Command | What it does |
@@ -116,11 +114,11 @@ A GitHub Actions runner is planned.
 | `version` | Print the installed version. |
 | `runs list` | List recent runs and their status. |
 | `runs show RUN_ID` | Show the evidence for one run. |
-| `runs cancel RUN_ID --reason TEXT` | Cancel a run that is ready for approval or approved, and release its issue. |
+| `runs cancel RUN_ID --reason TEXT` | Cancel a run that is ready for approval or approved. |
 | `config validate` | Check the config file and print a summary. |
 | `config show` | Print the config with defaults filled in; it shows secret names, never values. |
 | `lifecycle sync` | Check the PRs Autocontribute opened and stop all work on an adverse signal. |
-| `safety status` | Show whether work is stopped, why, and the trigger hash. |
+| `safety status` | Show whether work is stopped, why, and the trigger-set revision that `safety resume` needs. |
 | `safety stop` | Stop all preparation and publication (`--actor`, `--reason`). |
 | `safety resume` | Resume after you resolve the cause (`--actor`, `--reason`, `--expected-trigger-hash`). |
 | `policy inspect REPO` | Link a repository's policy files and show the CLA or DCO requirements it detects. |
@@ -133,15 +131,6 @@ A GitHub Actions runner is planned.
 - [Sandbox image](docs/sandbox-image.md): build and pin the image your checks run in.
 - [Security policy](SECURITY.md): reporting vulnerabilities and safe use.
 - [Contributing](CONTRIBUTING.md): working on Autocontribute itself.
-
-## Development
-
-Install the dev tools in a clone and run the four checks CI runs. Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request.
-
-```bash
-uv sync --extra dev
-uv run ruff check . && uv run ruff format --check . && uv run mypy src && uv run pytest
-```
 
 ## License
 

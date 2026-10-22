@@ -1326,7 +1326,10 @@ class Orchestrator:
         manifest.model_reservation = None
 
         violations = [usage_error] if usage_error else []
-        if profile.deployment_model is not None and result.model != profile.deployment_model:
+        if (
+            profile.expected_response_model is not None
+            and result.model != profile.expected_response_model
+        ):
             violations.append("provider resolved a model ID other than expected_response_model")
         if usage.input_tokens > input_reservation:
             violations.append("provider input usage exceeded its durable reservation")

@@ -18,8 +18,7 @@ uv sync --extra dev --locked
 - Add or update tests for every behavior change.
 - Use fixtures or mocked APIs in tests; never write to real GitHub.
 - Update the docs when behavior or configuration changes.
-- Run the four checks from CI's `test` job and fix every failure. CI runs on Ubuntu only;
-  macOS is untested.
+- Run the four checks from CI's `test` job and fix every failure.
 
 ```bash
 uv run --no-sync ruff check .
@@ -31,8 +30,12 @@ uv run --no-sync pytest
 ## End-to-end check
 
 `autocontribute.staging.example.yml` configures runs against a public fixture repository you own,
-with issues labeled `autocontribute-e2e`. Copy it, replace `YOUR_ACCOUNT` and the identity, and pass
-the copy with `--config`.
+named `autocontribute-staging-fixture`. The fixture needs a CONTRIBUTING file, issues labeled
+`autocontribute-e2e`, and the files the example's checks run: `tools/lint.py`,
+`tools/typecheck.py`, `tests/unit/`, and `tests/integration/`. These must use only the Python
+standard library, because the example's sandbox image is plain Python. Copy the example, replace
+`YOUR_ACCOUNT` and the identity, export `AUTOCONTRIBUTE_STAGING_GITHUB_TOKEN` and `OPENAI_API_KEY`,
+and pass the copy with `--config`.
 
 ## Safety changes
 

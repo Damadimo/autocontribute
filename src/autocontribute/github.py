@@ -167,7 +167,6 @@ class CheckRunDetails:
     details_url: str
     app_name: str
     started_at: datetime | None
-    completed_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,9 +174,7 @@ class CommitStatusDetails:
     identifier: int
     context: str
     state: str
-    description: str
     target_url: str
-    creator: str
     created_at: datetime
     updated_at: datetime
 
@@ -2182,7 +2179,6 @@ def _parse_check_run(data: dict[str, Any]) -> CheckRunDetails:
         details_url=_optional_string(data.get("details_url"), field="check run details URL"),
         app_name=_nonempty(app_name, field="check run app name"),
         started_at=_parse_datetime(data.get("started_at")),
-        completed_at=completed_at,
     )
 
 
@@ -2194,9 +2190,7 @@ def _parse_commit_status(data: dict[str, Any]) -> CommitStatusDetails:
         identifier=_identifier(data.get("id"), resource="commit status"),
         context=_nonempty(data.get("context"), field="commit status context"),
         state=state,
-        description=_optional_string(data.get("description"), field="commit status description"),
         target_url=_optional_string(data.get("target_url"), field="commit status target URL"),
-        creator=_user_login(data.get("creator"), resource="commit status"),
         created_at=_required_datetime(data.get("created_at"), field="commit status created_at"),
         updated_at=_required_datetime(data.get("updated_at"), field="commit status updated_at"),
     )
