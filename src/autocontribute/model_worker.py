@@ -1,30 +1,39 @@
-"""Single-call model worker for the application's hard process deadline.
+"""Single-request model worker for the application's hard process deadline.
 
 This module is intentionally an internal executable.  It accepts only inherited file
 descriptors, validates one canonical bounded request, and writes one canonical bounded result.
+It serves single structured calls (model-call.v1) and transcript turns (model-turn.v1).
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import math
 import os
 from contextlib import suppress
+from typing import cast
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, JsonValue, ValidationError
 
+from autocontribute import openai_adapter
 from autocontribute.config import ModelProfile
 from autocontribute.exceptions import ModelError, ModelRequestError
 from autocontribute.model_retry import PROVIDER_ERROR_CODES
 from autocontribute.openai_adapter import _create_in_process_provider
+from autocontribute.pricing import MODELS
 from autocontribute.providers import (
     _MAX_MODEL_REQUEST_BYTES,
     _MAX_MODEL_RESULT_BYTES,
+    _MODEL_TURN_PROTOCOL,
     _MODEL_WORKER_PROTOCOL,
+    MAX_TURN_SECONDS,
+    TurnRequest,
     _canonical_json_bytes,
     _output_schema_type,
     _strict_worker_envelope,
 )
+from autocontribute.transcript import TOOL_SETS, TranscriptKind, Turn
 
 
 def _read_bounded(fd: int) -> bytes:
@@ -49,7 +58,7 @@ def _write_all(fd: int, payload: bytes) -> None:
 
 
 def _request(
-    payload: bytes,
+    envelope: dict[str, object],
 ) -> tuple[
     ModelProfile,
     str,
@@ -59,7 +68,6 @@ def _request(
     int,
     float,
 ]:
-    envelope = _strict_worker_envelope(payload)
     expected_keys = {
         "protocol",
         "profile",
@@ -112,6 +120,68 @@ def _request(
     )
 
 
+def _turn_request(envelope: dict[str, object]) -> TurnRequest:
+    expected_keys = {
+        "protocol",
+        "model_id",
+        "effort",
+        "instructions",
+        "transcript",
+        "max_output_tokens",
+        "timeout_seconds",
+    }
+    if set(envelope) != expected_keys:
+        raise ModelError("Model worker received an invalid IPC request")
+    model_id = envelope["model_id"]
+    spec = MODELS.get(model_id) if isinstance(model_id, str) else None
+    if spec is None:
+        raise ModelError("Model worker received a model outside the built-in table")
+    effort = envelope["effort"]
+    if effort not in spec.efforts:
+        raise ModelError("Model worker received an effort the model does not support")
+    instructions = envelope["instructions"]
+    if not isinstance(instructions, str):
+        raise ModelError("Model worker received invalid request text")
+    transcript = envelope["transcript"]
+    if not isinstance(transcript, dict) or set(transcript) != {"kind", "run_id", "items"}:
+        raise ModelError("Model worker received an invalid transcript")
+    kind = transcript["kind"]
+    run_id = transcript["run_id"]
+    items = transcript["items"]
+    if (
+        kind not in TOOL_SETS
+        or not isinstance(run_id, str)
+        or not isinstance(items, list)
+        or not all(isinstance(item, dict) for item in items)
+    ):
+        raise ModelError("Model worker received an invalid transcript")
+    output_limit = envelope["max_output_tokens"]
+    if (
+        isinstance(output_limit, bool)
+        or not isinstance(output_limit, int)
+        or not 1 <= output_limit <= spec.max_output_tokens
+    ):
+        raise ModelError("Model worker received an invalid output-token limit")
+    timeout_seconds = envelope["timeout_seconds"]
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or not 0 < timeout_seconds <= MAX_TURN_SECONDS
+    ):
+        raise ModelError("Model worker received an invalid request timeout")
+    return TurnRequest(
+        spec=spec,
+        effort=effort,
+        instructions=instructions,
+        kind=cast("TranscriptKind", kind),
+        run_id=run_id,
+        items=cast("list[dict[str, JsonValue]]", items),
+        max_output_tokens=output_limit,
+        timeout_seconds=float(timeout_seconds),
+    )
+
+
 def _safe_provider_message(error: ModelError) -> str:
     message = str(error)
     if message and len(message) <= 1_000 and message.isprintable():
@@ -123,12 +193,13 @@ def _error_result(
     error_code: str,
     message: str,
     *,
+    protocol: str,
     http_status: int | None = None,
     provider_code: str | None = None,
     retry_after_seconds: float | None = None,
 ) -> bytes:
     envelope: dict[str, object] = {
-        "protocol": _MODEL_WORKER_PROTOCOL,
+        "protocol": protocol,
         "status": "error",
         "error_code": error_code,
         "message": message,
@@ -142,7 +213,7 @@ def _error_result(
     return _canonical_json_bytes(envelope)
 
 
-def _request_error_result(error: ModelRequestError) -> bytes:
+def _request_error_result(error: ModelRequestError, *, protocol: str) -> bytes:
     """Serialize a request failure, dropping details the parent would reject."""
 
     status_code = error.status_code
@@ -155,13 +226,14 @@ def _request_error_result(error: ModelRequestError) -> bytes:
     return _error_result(
         "provider_request_error",
         _safe_provider_message(error),
+        protocol=protocol,
         http_status=status_code,
         provider_code=provider_code,
         retry_after_seconds=retry_after,
     )
 
 
-def _execute(payload: bytes) -> bytes:
+def _execute(envelope: dict[str, object]) -> bytes:
     (
         profile,
         instructions,
@@ -170,7 +242,7 @@ def _execute(payload: bytes) -> bytes:
         output_type,
         output_limit,
         timeout_seconds,
-    ) = _request(payload)
+    ) = _request(envelope)
     provider = _create_in_process_provider(profile)
     try:
         result = provider.generate(
@@ -194,19 +266,45 @@ def _execute(payload: bytes) -> bytes:
             "output": result.output.model_dump(mode="json"),
             "response_id": result.response_id,
             "model": result.model,
-            "usage": {
-                "input_tokens": result.usage.input_tokens,
-                "cached_input_tokens": result.usage.cached_input_tokens,
-                "cache_write_tokens": result.usage.cache_write_tokens,
-                "output_tokens": result.usage.output_tokens,
-                "reasoning_tokens": result.usage.reasoning_tokens,
-                "total_tokens": result.usage.total_tokens,
-            },
+            "usage": dataclasses.asdict(result.usage),
         }
     )
     if len(response) > _MAX_MODEL_RESULT_BYTES:
-        return _error_result("worker_error", "Model worker result exceeded the bounded IPC limit")
+        return _error_result(
+            "worker_error",
+            "Model worker result exceeded the bounded IPC limit",
+            protocol=_MODEL_WORKER_PROTOCOL,
+        )
     return response
+
+
+def _execute_turn(envelope: dict[str, object]) -> bytes:
+    turn = _step(_turn_request(envelope))
+    response = _canonical_json_bytes(
+        {
+            "protocol": _MODEL_TURN_PROTOCOL,
+            "status": "ok",
+            "stop": turn.stop,
+            "output_items": list(turn.output_items),
+            "tool_calls": [call.model_dump(mode="json") for call in turn.tool_calls],
+            "response_id": turn.response_id,
+            "model": turn.model,
+            "usage": dataclasses.asdict(turn.usage),
+        }
+    )
+    if len(response) > _MAX_MODEL_RESULT_BYTES:
+        return _error_result(
+            "worker_error",
+            "Model worker result exceeded the bounded IPC limit",
+            protocol=_MODEL_TURN_PROTOCOL,
+        )
+    return response
+
+
+def _step(request: TurnRequest) -> Turn:
+    if request.spec.provider == "openai":
+        return openai_adapter.step(request)
+    raise ModelError(f"Unsupported model provider: {request.spec.provider}")
 
 
 def main() -> int:
@@ -215,16 +313,24 @@ def main() -> int:
     parser.add_argument("--result-fd", required=True, type=int)
     arguments = parser.parse_args()
     result_fd = arguments.result_fd
+    # Errors answer in the request's protocol once it is known.
+    protocol = _MODEL_WORKER_PROTOCOL
     try:
         try:
-            payload = _read_bounded(arguments.request_fd)
-            response = _execute(payload)
+            envelope = _strict_worker_envelope(_read_bounded(arguments.request_fd))
+            if envelope.get("protocol") == _MODEL_TURN_PROTOCOL:
+                protocol = _MODEL_TURN_PROTOCOL
+                response = _execute_turn(envelope)
+            else:
+                response = _execute(envelope)
         except ModelRequestError as exc:
-            response = _request_error_result(exc)
+            response = _request_error_result(exc, protocol=protocol)
         except ModelError as exc:
-            response = _error_result("provider_error", _safe_provider_message(exc))
+            response = _error_result(
+                "provider_error", _safe_provider_message(exc), protocol=protocol
+            )
         except Exception:
-            response = _error_result("worker_error", "Model worker failed")
+            response = _error_result("worker_error", "Model worker failed", protocol=protocol)
         _write_all(result_fd, response)
         return 0
     finally:
