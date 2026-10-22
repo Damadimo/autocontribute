@@ -830,6 +830,7 @@ def test_publisher_commits_exact_authorized_dco_trailer(tmp_path: Path, monkeypa
         policy_text=policy,
     )
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    pushed_messages: list[str] = []
 
     def push(
         workspace: Path,
@@ -840,7 +841,8 @@ def test_publisher_commits_exact_authorized_dco_trailer(tmp_path: Path, monkeypa
         before_mutation,  # type: ignore[no-untyped-def]
     ) -> None:
         before_mutation()
-        del workspace, fork, branch
+        del fork, branch
+        pushed_messages.append(_git(workspace, "show", "--no-patch", "--format=%B", commit_sha))
         github.branch_sha = commit_sha
 
     monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
@@ -849,14 +851,7 @@ def test_publisher_commits_exact_authorized_dco_trailer(tmp_path: Path, monkeypa
     published = publisher.publish(run_id)
 
     assert published.commit_sha is not None
-    committed_message = _git(
-        store.workspace_dir(run_id) / "repository",
-        "show",
-        "--no-patch",
-        "--format=%B",
-        published.commit_sha,
-    )
-    assert committed_message == expected_message
+    assert pushed_messages == [expected_message]
 
 
 def test_workspace_reconstruction_rejects_stored_cross_origin_clone_before_git(

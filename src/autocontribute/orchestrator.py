@@ -254,6 +254,7 @@ class Orchestrator:
                     stale_before=utc_now() - _STALE_RUN_AGE,
                     reason="A previous worker stopped before completing this preparation run.",
                 )
+                self.store.remove_finished_workspaces()
                 self._assert_operational()
                 manifest = self.store.create_run(
                     deployment_fingerprint=compute_deployment_fingerprint(self.config)

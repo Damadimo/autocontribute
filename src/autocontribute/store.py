@@ -7,10 +7,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -19,6 +20,7 @@ from typing import Final, cast
 
 from autocontribute.domain import (
     ALLOWED_TRANSITIONS,
+    TERMINAL_STATUSES,
     IssueCandidate,
     RunManifest,
     RunStatus,
@@ -1306,79 +1308,6 @@ class RunStore:
             ).fetchall()
         return [RunManifest.model_validate_json(row["manifest_json"]) for row in rows]
 
-    def oldest_runs(self, *, limit: int = 100) -> builtins.list[RunManifest]:
-        """Return a cohort ordered by validated, hash-chained creation evidence."""
-
-        if isinstance(limit, bool) or not isinstance(limit, int):
-            raise TypeError("oldest run limit must be an integer")
-        if not 1 <= limit <= _MAX_RUN_CORPUS:
-            raise ValueError("oldest run limit must be between 1 and 10000")
-        with self._connection() as connection:
-            connection.execute("BEGIN")
-            _verify_event_anchors(connection)
-            rows = connection.execute(
-                """
-                SELECT runs.run_id, runs.status, runs.created_at, runs.manifest_json,
-                       creation.occurred_at AS creation_occurred_at,
-                       creation.event_type AS creation_event_type,
-                       creation.details_json AS creation_details
-                FROM runs
-                JOIN events AS creation ON creation.id = (
-                    SELECT MIN(first_event.id) FROM events AS first_event
-                    WHERE first_event.run_id = runs.run_id
-                )
-                ORDER BY runs.run_id ASC LIMIT ?
-                """,
-                (_MAX_RUN_CORPUS + 1,),
-            ).fetchall()
-        if len(rows) > _MAX_RUN_CORPUS:
-            raise StateError("Run cohort exceeds the supported integrity bound")
-
-        validated: builtins.list[tuple[datetime, RunManifest]] = []
-        for row in rows:
-            run_id = str(row["run_id"])
-            try:
-                manifest = RunManifest.model_validate_json(row["manifest_json"])
-            except (TypeError, ValueError) as exc:
-                raise StateError(f"Run {run_id} contains an invalid manifest") from exc
-            stored_status = _stored_run_status(row["status"], run_id=run_id)
-            stored_created_at = _stored_datetime(row["created_at"], field="run creation time")
-            creation_occurred_at = _stored_datetime(
-                row["creation_occurred_at"], field="run creation event time"
-            )
-            try:
-                creation_details = json.loads(row["creation_details"])
-            except (TypeError, ValueError) as exc:
-                raise StateError(f"Run {run_id} has invalid creation evidence") from exc
-            if creation_details == {"status": "queued"}:
-                creation_fingerprint = None
-            elif (
-                isinstance(creation_details, dict)
-                and set(creation_details) == {"deployment_fingerprint", "status"}
-                and creation_details.get("status") == "queued"
-                and isinstance(creation_details.get("deployment_fingerprint"), str)
-                and len(creation_details["deployment_fingerprint"]) == 64
-                and not any(
-                    character not in "0123456789abcdef"
-                    for character in creation_details["deployment_fingerprint"]
-                )
-            ):
-                creation_fingerprint = creation_details["deployment_fingerprint"]
-            else:
-                raise StateError(f"Run {run_id} has invalid creation evidence")
-            if (
-                row["creation_event_type"] != "run.created"
-                or manifest.run_id != run_id
-                or manifest.status != stored_status
-                or manifest.created_at.astimezone(UTC) != stored_created_at
-                or manifest.deployment_fingerprint != creation_fingerprint
-                or creation_occurred_at < stored_created_at
-            ):
-                raise StateError(f"Run {run_id} manifest disagrees with its state row")
-            validated.append((creation_occurred_at, manifest))
-        validated.sort(key=lambda item: (item[0], item[1].run_id))
-        return [manifest for _, manifest in validated[:limit]]
-
     def run_deployment_fingerprint(self, run_id: str) -> str | None:
         """Read the deployment identity sealed into a run's first ledger event."""
 
@@ -1433,26 +1362,6 @@ class RunStore:
             limit=limit,
             resource="submitting",
         )
-
-    def has_publication_reconstruction_evidence(self, run_id: str) -> bool:
-        """Return whether the ledger contains state relevant to publication recovery."""
-
-        normalized_run_id = _lease_identity(run_id, field="publication run id")
-        with self._connection() as connection:
-            row = connection.execute(
-                """
-                SELECT 1 FROM events
-                WHERE run_id = ? AND (
-                    event_type GLOB 'publication.*'
-                    OR event_type GLOB 'commit.*'
-                    OR event_type GLOB 'branch.*'
-                    OR event_type GLOB 'pull_request.*'
-                )
-                LIMIT 1
-                """,
-                (normalized_run_id,),
-            ).fetchone()
-        return row is not None
 
     def _list_runs_with_status(
         self,
@@ -1804,6 +1713,8 @@ class RunStore:
             updated_at=manifest.updated_at.isoformat(),
             manifest_sha256=_manifest_json_digest(manifest_json),
         )
+        if manifest.status in TERMINAL_STATUSES:
+            self._remove_workspace(manifest.run_id)
 
     def transition(
         self,
@@ -1937,6 +1848,7 @@ class RunStore:
             updated_at=manifest.updated_at.isoformat(),
             manifest_sha256=_manifest_json_digest(updated_manifest_json),
         )
+        self._remove_workspace(manifest.run_id)
         return manifest
 
     def finalize_publication_compensation(
@@ -2038,6 +1950,7 @@ class RunStore:
             updated_at=manifest.updated_at.isoformat(),
             manifest_sha256=_manifest_json_digest(updated_manifest_json),
         )
+        self._remove_workspace(manifest.run_id)
         return manifest
 
     def candidate_attempt_disposition(
@@ -2490,6 +2403,8 @@ class RunStore:
                 )
                 recovered.append(manifest)
         self.synchronize_manifest_artifacts()
+        for manifest in recovered:
+            self._remove_workspace(manifest.run_id)
         return recovered
 
     def acquire_lease(
@@ -3052,6 +2967,30 @@ class RunStore:
         path = self.workspaces_dir / run_id
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def remove_finished_workspaces(self) -> None:
+        """Delete workspaces left behind by runs that finished before this call."""
+
+        finished = tuple(sorted(status.value for status in TERMINAL_STATUSES))
+        placeholders = ",".join("?" for _ in finished)
+        # Only placeholder tokens are interpolated; all status values remain bound parameters.
+        query = f"SELECT run_id FROM runs WHERE status IN ({placeholders}) ORDER BY run_id"
+        with self._connection() as connection:
+            rows = connection.execute(query, finished).fetchall()
+        for row in rows:
+            self._remove_workspace(str(row["run_id"]))
+
+    def _remove_workspace(self, run_id: str) -> None:
+        """Best-effort deletion of a finished run's clone; its evidence in runs/ stays."""
+
+        path = self.workspaces_dir / run_id
+        if path.parent != self.workspaces_dir or path.name == "..":
+            raise StateError(f"Run identifier cannot name a workspace: {run_id!r}")
+        if path.is_symlink() or not path.is_dir():
+            return
+        # A partial failure keeps the remainder; the next run's cleanup retries it.
+        with suppress(OSError):
+            shutil.rmtree(path)
 
     def write_artifact(self, run_id: str, relative_path: str, content: str) -> Path:
         root = self.artifact_dir(run_id).resolve()

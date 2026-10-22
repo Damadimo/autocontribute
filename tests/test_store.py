@@ -2405,6 +2405,136 @@ def test_recovery_only_fails_safe_in_flight_stages_and_is_idempotent(tmp_path: P
     assert store.recover_stale_runs(stale_before=cutoff, reason="again") == []
 
 
+def _workspace_with_clone(store: RunStore, run: RunManifest) -> Path:
+    clone = store.workspace_dir(run.run_id) / "repository"
+    clone.mkdir()
+    (clone / "README.md").write_text("clone\n", encoding="utf-8")
+    return clone
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        RunStatus.SKIPPED,
+        RunStatus.REJECTED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.PR_OPEN,
+    ],
+)
+def test_finished_run_deletes_its_workspace_but_keeps_its_evidence(
+    tmp_path: Path,
+    status: RunStatus,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    _workspace_with_clone(store, run)
+
+    _set_status(store, run, status)
+
+    assert not (store.workspaces_dir / run.run_id).exists()
+    assert (store.runs_dir / run.run_id / "manifest.json").is_file()
+    assert store.get(run.run_id).status == status
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        RunStatus.IMPLEMENTING,
+        RunStatus.READY_FOR_APPROVAL,
+        RunStatus.APPROVED,
+        RunStatus.SUBMITTING,
+    ],
+)
+def test_unfinished_run_keeps_its_workspace(tmp_path: Path, status: RunStatus) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    clone = _workspace_with_clone(store, run)
+
+    _set_status(store, run, status)
+    store.remove_finished_workspaces()
+
+    assert (clone / "README.md").is_file()
+
+
+def test_stale_run_recovery_deletes_the_recovered_workspace(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    run = store.create_run()
+    _set_status(store, run, RunStatus.PLANNING)
+    _workspace_with_clone(store, run)
+
+    store.recover_stale_runs(
+        stale_before=datetime.now(UTC) + timedelta(minutes=1),
+        reason="worker lease expired",
+    )
+
+    assert store.get(run.run_id).status == RunStatus.FAILED
+    assert not (store.workspaces_dir / run.run_id).exists()
+
+
+def test_compensation_finalizers_delete_the_finished_workspace(tmp_path: Path) -> None:
+    failed_store = RunStore(tmp_path / "failed")
+    failed = _publication_run(failed_store)
+    _begin_publication(failed_store, failed)
+    failed_clone = _workspace_with_clone(failed_store, failed)
+    reason = "verified cleanup"
+    evidence = _record_absent_compensation_evidence(failed_store, failed, reason=reason)
+    assert failed_clone.is_dir()
+
+    failed_store.finalize_publication_compensation(failed, reason=reason, evidence=evidence)
+
+    assert not (failed_store.workspaces_dir / failed.run_id).exists()
+
+    merged_store = RunStore(tmp_path / "merged")
+    merged = _publication_run(merged_store)
+    _begin_publication(merged_store, merged)
+    _workspace_with_clone(merged_store, merged)
+    _record_merged_compensation_evidence(merged_store, merged)
+
+    merged_store.finalize_merged_publication_compensation(
+        merged_store.get(merged.run_id),
+        pull_request_url="https://github.com/example/project/pull/7",
+        reason="exact compensating PR merged and is lifecycle-managed",
+    )
+
+    assert not (merged_store.workspaces_dir / merged.run_id).exists()
+
+
+def test_finished_workspace_sweep_deletes_only_leftovers_of_finished_runs(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    finished = store.create_run()
+    _set_status(store, finished, RunStatus.FAILED)
+    _workspace_with_clone(store, finished)
+    waiting = store.create_run()
+    _set_status(store, waiting, RunStatus.READY_FOR_APPROVAL)
+    waiting_clone = _workspace_with_clone(store, waiting)
+    unknown = store.workspaces_dir / "not-a-run"
+    unknown.mkdir()
+
+    store.remove_finished_workspaces()
+
+    assert not (store.workspaces_dir / finished.run_id).exists()
+    assert (store.runs_dir / finished.run_id / "manifest.json").is_file()
+    assert (waiting_clone / "README.md").is_file()
+    assert unknown.is_dir()
+
+
+def test_workspace_cleanup_never_follows_a_symlinked_workspace(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep\n", encoding="utf-8")
+    run = store.create_run()
+    (store.workspaces_dir / run.run_id).symlink_to(outside, target_is_directory=True)
+
+    _set_status(store, run, RunStatus.FAILED)
+    store.remove_finished_workspaces()
+
+    assert (outside / "keep.txt").read_text(encoding="utf-8") == "keep\n"
+
+
 def test_recovery_rolls_back_all_rows_when_one_manifest_is_invalid(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     first = store.create_run()
