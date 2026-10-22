@@ -22,13 +22,18 @@ from autocontribute.discovery import (
     validate_legal_publication,
 )
 from autocontribute.domain import (
-    EligibilityResult,
     IssueCandidate,
     IssueComment,
     RepositoryInfo,
     RunStatus,
 )
-from autocontribute.exceptions import GitHubError, PolicyError, StateError
+from autocontribute.exceptions import (
+    CircuitBreakerTrigger,
+    GitHubError,
+    GitHubSafetyError,
+    PolicyError,
+    StateError,
+)
 from autocontribute.store import (
     CandidateAttemptDisposition,
     CandidateAttemptState,
@@ -427,48 +432,44 @@ def test_issue_reference_parser_is_unambiguous() -> None:
     assert parse_issue_reference("owner/repo#123") == ("owner/repo", 123)
 
 
-def test_discovery_continues_past_suppressed_revision_without_spending_candidate_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def _discovery_config(*repositories: str, **budget: int) -> AutocontributeConfig:
+    return AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": list(repositories)},
+            "budget": budget,
+            "validation": {
+                "required_commands": {
+                    repository: ["python -m pytest"] for repository in repositories
+                }
+            },
+        }
+    )
+
+
+def test_discovery_continues_past_suppressed_revision_without_spending_candidate_budget() -> None:
     first = _issue(number=41, title="Previously rejected candidate")
     second = _issue(number=42, title="Fresh candidate")
     third = _issue(number=43, title="Candidate beyond the configured evaluation budget")
     github = CandidateDiscoveryGitHub([first, second, third])
     store = DispositionStore({41: CandidateAttemptState.SUPPRESSED})
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "budget": {"max_candidates_per_run": 1},
-            "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-        }
-    )
+    config = _discovery_config("example/project", max_candidates_per_run=1)
     service = DiscoveryService(config, github, store)  # type: ignore[arg-type]
-    evaluated: list[int] = []
-
-    def eligible(
-        issue: IssueCandidate,
-        repository: RepositoryInfo,
-        **_: object,
-    ) -> EligibilityResult:
-        del repository
-        evaluated.append(issue.number)
-        return EligibilityResult(eligible=True, score=90, evidence={}, blockers=[])
-
-    monkeypatch.setattr(service, "evaluate", eligible)
 
     outcome = service.discover()
 
     assert outcome.selection is not None
     assert outcome.selection[0].number == 42
     assert outcome.suppressed_candidates == 1
-    assert evaluated == [42]
+    assert [evaluation.issue.number for evaluation in outcome.evaluations] == [42]
     assert github.fetched == [41, 42]
 
 
-def test_discovery_exhaustion_distinguishes_suppressed_active_and_ineligible_candidates(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    issues = [_issue(number=number) for number in (41, 42, 43)]
+def test_discovery_exhaustion_distinguishes_suppressed_active_and_ineligible_candidates() -> None:
+    issues = [
+        _issue(number=41),
+        _issue(number=42),
+        _issue(number=43, assignees=["someone"]),
+    ]
     github = CandidateDiscoveryGitHub(issues)
     store = DispositionStore(
         {
@@ -476,23 +477,7 @@ def test_discovery_exhaustion_distinguishes_suppressed_active_and_ineligible_can
             42: CandidateAttemptState.ACTIVE,
         }
     )
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-        }
-    )
-    service = DiscoveryService(config, github, store)  # type: ignore[arg-type]
-    monkeypatch.setattr(
-        service,
-        "evaluate",
-        lambda *_args, **_kwargs: EligibilityResult(
-            eligible=False,
-            score=20,
-            evidence={},
-            blockers=["fixture"],
-        ),
-    )
+    service = DiscoveryService(_discovery_config("example/project"), github, store)  # type: ignore[arg-type]
 
     outcome = service.discover()
 
@@ -500,10 +485,11 @@ def test_discovery_exhaustion_distinguishes_suppressed_active_and_ineligible_can
     assert outcome.active_candidates == 1
     assert outcome.suppressed_candidates == 1
     assert outcome.ineligible_candidates == 1
+    assert outcome.blocker_counts == [("assigned", 1)]
     assert outcome.no_candidate_reason == (
         "No candidate is currently available: 1 unchanged issue revision was deferred after a "
         "prior skipped, rejected, or cancelled run; 1 candidate already has an active run; "
-        "1 candidate failed deterministic discovery gates."
+        "1 candidate failed discovery gates (assigned 1)."
     )
 
 
@@ -511,6 +497,186 @@ def test_empty_discovery_preserves_generic_no_candidate_reason() -> None:
     outcome = DiscoveryOutcome(selection=None)
 
     assert outcome.no_candidate_reason == "No candidate passed deterministic discovery gates."
+
+
+class IsolationGitHub(FakeGitHub):
+    """Serves several repositories and fails the reads named in ``failures``."""
+
+    def __init__(
+        self,
+        issues: dict[str, list[IssueCandidate]],
+        failures: dict[str, Exception] | None = None,
+    ) -> None:
+        self.issues = issues
+        self.failures = failures or {}
+
+    def _fail(self, key: str) -> None:
+        if key in self.failures:
+            raise self.failures[key]
+
+    def get_repository(self, full_name: str) -> RepositoryInfo:
+        self._fail(f"repository:{full_name}")
+        return _repository().model_copy(
+            update={
+                "full_name": full_name,
+                "html_url": f"https://github.com/{full_name}",
+                "clone_url": f"https://github.com/{full_name}.git",
+            }
+        )
+
+    def list_owner_repositories(self, owner: str, *, limit: int) -> list[RepositoryInfo]:
+        self._fail(f"owner:{owner}")
+        del limit
+        return [self.get_repository(name) for name in self.issues if name.startswith(f"{owner}/")]
+
+    def search_issues(
+        self,
+        repository: str,
+        *,
+        labels: list[str],
+        limit: int,
+    ) -> list[IssueCandidate]:
+        del labels
+        self._fail(f"search:{repository}")
+        return self.issues[repository][:limit]
+
+    def get_issue(self, repository: str, number: int) -> IssueCandidate:
+        self._fail(f"issue:{repository}#{number}")
+        return next(issue for issue in self.issues[repository] if issue.number == number)
+
+    def get_file(
+        self,
+        repository: str,
+        path: str,
+        *,
+        ref: str,
+        max_bytes: int = 1_000_000,
+    ) -> str | None:
+        self._fail(f"file:{repository}/{path}")
+        return super().get_file(repository, path, ref=ref, max_bytes=max_bytes)
+
+
+def _repository_issue(repository: str, number: int, **updates: object) -> IssueCandidate:
+    return _issue(
+        repository=repository,
+        number=number,
+        html_url=f"https://github.com/{repository}/issues/{number}",
+        **updates,
+    )
+
+
+def test_one_failing_repository_or_issue_cannot_abort_discovery(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = IsolationGitHub(
+        {
+            "broken/search": [_repository_issue("broken/search", 1)],
+            "broken/policy": [
+                _repository_issue("broken/policy", 2),
+                _repository_issue("broken/policy", 3),
+            ],
+            "example/project": [
+                _repository_issue("example/project", 7),
+                _repository_issue("example/project", 8, assignees=["someone"]),
+                _repository_issue("example/project", 9),
+            ],
+        },
+        failures={
+            "repository:missing/repository": GitHubError("GitHub returned 404"),
+            "search:broken/search": GitHubError("Search timed out"),
+            "file:broken/policy/CONTRIBUTING.md": GitHubError(
+                "GitHub policy file could not be decoded safely"
+            ),
+            "issue:example/project#7": GitHubError(
+                "Issue changed while its complete discussion was fetched"
+            ),
+        },
+    )
+    config = _discovery_config(
+        "missing/repository", "broken/search", "broken/policy", "example/project"
+    )
+    service = DiscoveryService(config, github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    outcome = service.discover()
+
+    assert outcome.selection is not None
+    assert outcome.selection[0].reference == "example/project#9"
+    assert outcome.repository_errors == (
+        ("missing/repository", "GitHub returned 404"),
+        ("broken/search", "Search timed out"),
+        ("broken/policy", "GitHub policy file could not be decoded safely"),
+    )
+    assert outcome.issue_errors == (
+        ("example/project#7", "Issue changed while its complete discussion was fetched"),
+    )
+    assert [evaluation.issue.number for evaluation in outcome.evaluations] == [8, 9]
+    assert outcome.blocker_counts == [("assigned", 1)]
+    assert outcome.summary == (
+        "2 issues evaluated, 1 eligible; 1 candidate failed discovery gates (assigned 1); "
+        "3 repositories could not be searched; 1 issue could not be evaluated."
+    )
+
+
+def test_failing_owner_listing_keeps_explicit_repositories(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = IsolationGitHub(
+        {"example/project": [_repository_issue("example/project", 42)]},
+        failures={"owner:gone": GitHubError("GitHub returned 404")},
+    )
+    config = _discovery_config("example/project")
+    config.github.owners = ["gone"]
+    service = DiscoveryService(config, github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    outcome = service.discover()
+
+    assert outcome.selection is not None
+    assert outcome.repository_errors == (("gone", "GitHub returned 404"),)
+
+
+def test_repositories_below_the_baseline_are_reported_as_skipped(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = IsolationGitHub({"example/project": [_repository_issue("example/project", 42)]})
+    config = _discovery_config("example/project")
+    config.github.min_stars = 1_000_000
+    service = DiscoveryService(config, github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    outcome = service.discover()
+
+    assert outcome.selection is None
+    assert outcome.skipped_repositories == (
+        (
+            "example/project",
+            "repository is private, archived, disabled, inactive, or below the star floor",
+        ),
+    )
+    assert outcome.no_candidate_reason == (
+        "No candidate is currently available: 1 repository was skipped."
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        GitHubSafetyError(
+            "GitHub reports this account is suspended",
+            trigger=CircuitBreakerTrigger(
+                source="github_api", reason="suspended", trigger_hash="a"
+            ),
+        ),
+        StateError("Circuit breaker is tripped by operator:me: maintenance"),
+        StateError("Lease autocontribute.run is no longer owned by this worker"),
+    ],
+)
+def test_safety_stops_and_state_errors_still_end_discovery(
+    tmp_path,
+    failure: Exception,
+) -> None:  # type: ignore[no-untyped-def]
+    github = IsolationGitHub(
+        {"example/project": [_repository_issue("example/project", 42)]},
+        failures={"issue:example/project#42": failure},
+    )
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project"), github, RunStore(tmp_path)
+    )
+
+    with pytest.raises(type(failure)):
+        service.discover()
 
 
 def _comment(*, body: str, author: str = "contributor", association: str = "NONE") -> IssueComment:
