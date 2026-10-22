@@ -268,7 +268,7 @@ def _bind_publication_context(
     context: _PublicationContext,
     *,
     allow_new: bool,
-) -> bool:
+) -> None:
     fields = {
         "publishing_login": context.login,
         "publishing_api_origin": context.api_origin,
@@ -285,7 +285,7 @@ def _bind_publication_context(
             raise PolicyError("Submitting run is missing its durable publication context")
         for name, value in fields.items():
             setattr(manifest, name, value)
-        return True
+        return
     missing = [name for name, value in present.items() if value is None]
     if missing:
         raise PolicyError("Run has incomplete durable publication context: " + ", ".join(missing))
@@ -295,7 +295,6 @@ def _bind_publication_context(
             "Current publishing account, API origin, or Git identity differs from durable "
             "publication intent: " + ", ".join(mismatches)
         )
-    return False
 
 
 def _durable_publication_context(
@@ -866,11 +865,7 @@ class Publisher:
                 lease_guard=lease_guard,
             )
         self.store.assert_circuit_breaker_clear()
-        if manifest.status not in {
-            RunStatus.READY_FOR_APPROVAL,
-            RunStatus.APPROVED,
-            RunStatus.SUBMITTING,
-        }:
+        if manifest.status not in {RunStatus.APPROVED, RunStatus.SUBMITTING}:
             raise StateError(f"Run {run_id} cannot be published from {manifest.status.value}")
         recovering = manifest.status == RunStatus.SUBMITTING
         context: _PublicationContext | None = None
@@ -1028,24 +1023,7 @@ class Publisher:
                 login=self.github.authenticated_login(),
                 api_origin=self.github.api_origin,
             )
-            context_bound = _bind_publication_context(
-                manifest,
-                context,
-                allow_new=manifest.status == RunStatus.READY_FOR_APPROVAL,
-            )
-            if context_bound:
-                self.store.assert_circuit_breaker_clear()
-                lease_guard.assert_owned()
-                self.store.save(
-                    manifest,
-                    event="publication.context.bound",
-                    details={
-                        "publishing_login": context.login,
-                        "publishing_api_origin": context.api_origin,
-                        "publication_draft": str(context.draft).lower(),
-                        "publication_ready_for_review": str(context.ready_for_review).lower(),
-                    },
-                )
+            _bind_publication_context(manifest, context, allow_new=False)
         if not recovering and manifest.approval is None:
             raise PolicyError("A human approval is required before publication")
         login = context.login

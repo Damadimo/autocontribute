@@ -1049,7 +1049,7 @@ def test_scheduled_preflight_fails_after_lifecycle_when_breaker_is_active(
         if not already_active:
             observed_store.trip_circuit_breaker(
                 source="lifecycle safety evidence",
-                reason="upstream outcome requires operator review",
+                reason="maintainer asked automation to stop",
                 trigger_hash="b" * 64,
             )
         return LifecycleSyncResult(observations=())

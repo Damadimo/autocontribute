@@ -261,8 +261,8 @@ def _require_deployment_model(profile: ModelProfile, model: str) -> None:
     expected = profile.deployment_model
     if expected is not None and model != expected:
         raise ModelError(
-            "Model provider resolved a different model ID than the calibrated deployment; "
-            "set expected_response_model to the exact provider-returned snapshot and recalibrate"
+            "Model provider resolved a different model ID than expected_response_model; "
+            "set it to the exact provider-returned snapshot"
         )
 
 

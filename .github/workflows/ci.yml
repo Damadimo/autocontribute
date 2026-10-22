@@ -6,7 +6,7 @@ on:
   pull_request:
   workflow_dispatch:
   schedule:
-    # Re-evaluate the locked dependency snapshot and hosted baselines even without a source push.
+    # Re-evaluate the locked dependency snapshot even without a source push.
     - cron: "23 5 * * 1"
 
 permissions:

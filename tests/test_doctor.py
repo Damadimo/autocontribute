@@ -195,7 +195,7 @@ def test_model_capability_probe_fails_closed_without_sending_when_credential_is_
     assert all("probe was not sent" in check.detail for check in checks)
 
 
-def test_model_capability_probe_rejects_a_model_outside_the_attested_deployment(
+def test_model_capability_probe_rejects_a_model_other_than_the_expected_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class WrongModelProvider(_ReadyProvider):
@@ -212,7 +212,7 @@ def test_model_capability_probe_rejects_a_model_outside_the_attested_deployment(
 
     assert len(checks) == 2
     assert all(not check.passed for check in checks)
-    assert all("outside the calibrated deployment" in check.detail for check in checks)
+    assert all("other than expected_response_model" in check.detail for check in checks)
 
 
 def test_model_capability_probe_rejects_an_unbounded_resolved_model_id(

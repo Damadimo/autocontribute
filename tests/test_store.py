@@ -457,6 +457,7 @@ def test_stale_manifest_cannot_overwrite_a_newer_transition_or_pr_evidence(
     published = store.get(run.run_id)
     stale = store.get(run.run_id)
 
+    store.transition(published, RunStatus.APPROVED, reason="operator approval")
     store.transition(published, RunStatus.SUBMITTING, reason="publication reserved")
     published.branch_name = "autocontribute/fix"
     published.commit_sha = "a" * 40
@@ -464,7 +465,7 @@ def test_stale_manifest_cannot_overwrite_a_newer_transition_or_pr_evidence(
     store.transition(published, RunStatus.PR_OPEN, reason="pull request created")
 
     with pytest.raises(StateError, match="changed while this manifest was being saved"):
-        store.transition(stale, RunStatus.APPROVED, reason="stale operator approval")
+        store.transition(stale, RunStatus.CANCELLED, reason="stale operator cancellation")
 
     assert stale.status == RunStatus.READY_FOR_APPROVAL
     persisted = store.get(run.run_id)
@@ -1536,7 +1537,7 @@ def test_begin_publication_and_verified_compensation_are_durable(
     tmp_path: Path,
 ) -> None:
     store = RunStore(tmp_path / "state")
-    run = _publication_run(store, status=RunStatus.READY_FOR_APPROVAL)
+    run = _publication_run(store)
 
     _begin_publication(store, run, publication_draft=False)
 
@@ -1560,6 +1561,16 @@ def test_begin_publication_and_verified_compensation_are_durable(
         "publication.compensation.verified",
         "run.transitioned",
     ]
+
+
+def test_begin_publication_requires_an_approved_run(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    run = _publication_run(store, status=RunStatus.READY_FOR_APPROVAL)
+
+    with pytest.raises(StateError, match="cannot begin publication from ready_for_approval"):
+        _begin_publication(store, run)
+
+    assert store.get(run.run_id).status == RunStatus.READY_FOR_APPROVAL
 
 
 def test_begin_publication_matching_submitting_retry_is_exactly_idempotent(
@@ -1945,7 +1956,7 @@ def test_absence_compensation_accepts_exact_bound_fork_identity(tmp_path: Path) 
 
 def test_absence_compensation_rejects_partial_fork_identity(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
-    holder = _publication_run(store, status=RunStatus.READY_FOR_APPROVAL)
+    holder = _publication_run(store)
     _begin_publication(store, holder)
     holder.upstream_repository_id = 1001
     holder.upstream_repository_node_id = "R_upstream_fixture"

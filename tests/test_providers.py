@@ -222,7 +222,7 @@ def test_responses_provider_omits_reasoning_mode_when_disabled(
     assert client.responses.parse.call_args.kwargs["reasoning"] == {"effort": "high"}
 
 
-def test_provider_rejects_model_snapshot_outside_calibrated_deployment(
+def test_provider_rejects_model_snapshot_other_than_the_expected_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     expected = Verdict(accepted=True, summary="well scoped")
@@ -238,7 +238,7 @@ def test_provider_rejects_model_snapshot_outside_calibrated_deployment(
         )
 
 
-def test_compatible_provider_rejects_model_outside_calibrated_deployment(
+def test_compatible_provider_rejects_model_other_than_the_expected_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     response = _chat_response()
