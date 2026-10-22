@@ -1,10 +1,10 @@
 # Sandbox image
 
 Validation commands run in a Docker container with no network, so the image in `sandbox.image` must
-already contain each configured repository's toolchain and test dependencies. One image
-serves every configured repository; repositories with conflicting toolchains need separate
-deployments, each with its own configuration file. The starter configuration's `example.invalid`
-image is a placeholder: `config validate`, `doctor`, `discover`, and `run` refuse it.
+already contain each configured repository's toolchain and test dependencies. One image serves
+every configured repository; give repositories with conflicting toolchains separate configuration
+files. The starter configuration's `example.invalid` image is a placeholder: `config validate`,
+`doctor`, `discover`, and `run` refuse it.
 
 ## Requirements
 
@@ -51,20 +51,10 @@ docker pull registry.example.com/you/sandbox@sha256:<digest>
 autocontribute doctor
 ```
 
-The hosted workflow pulls the image itself without a registry login, so the image must be public.
-On a [systemd deployment](systemd-deployment.md), pull as the service account; its sandbox refuses
-to start a container when the bounded Docker filesystem has under 1 GiB or 16,384 inodes free.
-
-```bash
-sudo -u autocontribute env HOME=/var/lib/autocontribute XDG_RUNTIME_DIR=/run/autocontribute \
-  DOCKER_HOST=unix:///run/autocontribute/docker.sock \
-  docker pull registry.example.com/you/sandbox@sha256:<digest>
-```
-
 ## Rotate
 
 1. Approve and publish, or cancel (`autocontribute runs cancel RUN_ID --reason "..."`), every run
    waiting for approval or publication: `approve` and `publish` refuse runs prepared with an older
-   `sandbox.image`. Rollout gates for automatic publishing also ignore evidence from the old image.
+   `sandbox.image`.
 2. Build, push, and pre-pull the new image, update `sandbox.image`, and run `autocontribute doctor`.
 3. Remove the old image with `docker image rm`.

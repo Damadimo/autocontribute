@@ -28,10 +28,16 @@ uv run --no-sync mypy src
 uv run --no-sync pytest
 ```
 
+## End-to-end check
+
+`autocontribute.staging.example.yml` configures runs against a public fixture repository you own,
+with issues labeled `autocontribute-e2e`. Copy it, replace `YOUR_ACCOUNT` and the identity, and pass
+the copy with `--config`.
+
 ## Safety changes
 
-- Keep defaults conservative. Do not loosen a default such as `publishing.mode: review_required`,
-  draft pull requests, or the publication limits.
+- Keep defaults conservative. Do not loosen a default such as draft pull requests or the
+  publication limits, and do not add a way to publish without approval.
 - When a safety check cannot reach a decision, the code must stop or refuse.
 - Model output or scores must never override credential isolation, approval binding, secret
   scanning, repository policy, upstream freshness, publication limits, or sandbox restrictions.
