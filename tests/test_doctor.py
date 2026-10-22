@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -459,6 +460,39 @@ def test_doctor_private_bind_probe_verifies_0700_mount_and_host_side_output(
     assert "daemon-selected identity" in check.detail
     assert "cgroup v2 limits" in check.detail
     assert "host-side ownership" in check.detail
+
+
+def test_doctor_private_bind_probe_takes_the_service_account_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other_groups = [group for group in os.getgroups() if group != os.getgid()]
+    if not other_groups:
+        pytest.skip("the test account belongs to no secondary group")
+    parent = tmp_path / "shared"
+    parent.mkdir()
+    os.chown(parent, -1, other_groups[0])
+    # New entries take the parent's group on macOS and under a setgid parent on Linux.
+    parent.chmod(0o2770)
+    observed: dict[str, int] = {}
+
+    class ProbeRunner:
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def run(self, workspace: Path, _command: str) -> SimpleNamespace:
+            observed["gid"] = workspace.stat().st_gid
+            output = workspace / doctor._BIND_PROBE_OUTPUT
+            output.write_text(doctor._BIND_PROBE_OUTPUT_CONTENT, encoding="utf-8")
+            output.chmod(0o600)
+            return SimpleNamespace(passed=True, stderr="")
+
+    monkeypatch.setattr(doctor, "DockerSandbox", ProbeRunner)
+
+    check = doctor._docker_bind_mount_check(_config(), workspace_parent=parent)
+
+    assert check.passed, check.detail
+    assert observed["gid"] == os.getgid()
 
 
 def test_doctor_private_bind_probe_uses_store_workspace_filesystem(

@@ -839,6 +839,9 @@ def _docker_bind_mount_check(
             ignore_cleanup_errors=True,
         ) as temporary:
             workspace = Path(temporary)
+            # A new directory takes its parent's group on macOS (and under a setgid parent on
+            # Linux), so /private/tmp would make the probe group-owned by wheel.
+            os.chown(workspace, -1, expected_gid)
             workspace.chmod(0o700)
             workspace_stat = workspace.stat()
             if (
