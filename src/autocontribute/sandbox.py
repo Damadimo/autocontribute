@@ -21,6 +21,7 @@ from autocontribute.exceptions import SandboxError
 from autocontribute.repository import RepositoryWorkspace
 
 _CONTAINER_WORKSPACE: Final = "/workspace"
+_SHM_SIZE: Final = "256m"
 _MAX_CAPTURE_BYTES: Final = 2_000_000
 _TRUNCATED_MARKER: Final = b"\n[output truncated by autocontribute]\n"
 _SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -65,6 +66,20 @@ _DOCKER_CLIENT_ENV_NAMES: Final = (
     "LC_ALL",
     "XDG_CONFIG_HOME",
     "XDG_RUNTIME_DIR",
+)
+# The Docker CLI copies the `proxies` block of its config.json, credentials included,
+# into every container it starts unless the variable is already set.
+_DOCKER_CLI_PROXY_NAMES: Final = (
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+    "FTP_PROXY",
+    "ftp_proxy",
 )
 
 DockerDaemonMode = Literal["rootful", "rootless"]
@@ -168,63 +183,37 @@ class SandboxRunner:
         root = _workspace_path(workspace)
         _validate_command(command)
         _validate_image(self.config.image)
-        if "," in str(root) or "\n" in str(root):
-            raise SandboxError("Workspace path cannot be represented safely as a Docker mount")
+        mounts = _workspace_mounts(root)
         if cidfile.exists() and cidfile.is_symlink():
             raise SandboxError("Docker cidfile cannot be a symlink")
 
         uid, gid = docker_container_identity(self.docker_daemon_mode)
-        arguments = [
+        return [
             self.docker_binary,
             "run",
             "--rm",
-            "--pull=never",
-            "--log-driver=none",
             f"--cidfile={cidfile}",
-            "--network=none",
-            "--read-only",
-            "--cap-drop=ALL",
-            "--security-opt=no-new-privileges",
-            "--ipc=none",
-            f"--user={uid}:{gid}",
-            f"--memory={self.config.memory}",
-            f"--memory-swap={self.config.memory}",
-            f"--cpus={self.config.cpus}",
-            f"--pids-limit={self.config.pids_limit}",
-            "--ulimit=nofile=1024:1024",
-            "--ulimit=core=0:0",
             "--stop-timeout=2",
-            "--init",
-            "--entrypoint=/usr/bin/env",
+            *docker_isolation_arguments(self.config, user=f"{uid}:{gid}", tmp_size="512m"),
             f"--workdir={_CONTAINER_WORKSPACE}",
-            "--tmpfs=/tmp:rw,nosuid,nodev,size=512m",
-            f"--mount=type=bind,src={root},dst={_CONTAINER_WORKSPACE}",
+            *mounts,
+            self.config.image,
+            # `env -i` clears both the Docker image's ENV values and any
+            # future runtime defaults. Only this explicit non-secret set
+            # reaches repository code.
+            "-i",
+            "HOME=/tmp",
+            "TMPDIR=/tmp",
+            f"PATH={_SAFE_CONTAINER_PATH}",
+            "CI=1",
+            "NO_COLOR=1",
+            "GIT_TERMINAL_PROMPT=0",
+            "AUTOCONTRIBUTE_SANDBOX=1",
+            # A login shell (-l) would source /etc/profile, which resets PATH.
+            "/bin/sh",
+            "-c",
+            command,
         ]
-        git_dir = root / ".git"
-        if git_dir.is_dir() and not git_dir.is_symlink():
-            arguments.append(
-                f"--mount=type=bind,src={git_dir},dst={_CONTAINER_WORKSPACE}/.git,readonly"
-            )
-        arguments.extend(
-            [
-                self.config.image,
-                # `env -i` clears both the Docker image's ENV values and any
-                # future runtime defaults. Only this explicit non-secret set
-                # reaches repository code.
-                "-i",
-                "HOME=/tmp",
-                "TMPDIR=/tmp",
-                f"PATH={_SAFE_CONTAINER_PATH}",
-                "CI=1",
-                "NO_COLOR=1",
-                "GIT_TERMINAL_PROMPT=0",
-                "AUTOCONTRIBUTE_SANDBOX=1",
-                "/bin/sh",
-                "-lc",
-                command,
-            ]
-        )
-        return arguments
 
     def _run_docker(self, workspace: Path, command: str) -> CommandResult:
         with tempfile.TemporaryDirectory(prefix="autocontribute-docker-") as temporary:
@@ -381,6 +370,48 @@ class _BoundedCapture:
         return output.decode("utf-8", errors="replace")
 
 
+def docker_isolation_arguments(config: SandboxConfig, *, user: str, tmp_size: str) -> list[str]:
+    """Return the ``docker run`` flags that every repository container shares."""
+
+    return [
+        "--pull=never",
+        "--log-driver=none",
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        # A private IPC namespace that still has /dev/shm; --ipc=none breaks
+        # multiprocessing locks and process pools.
+        "--ipc=private",
+        f"--shm-size={_SHM_SIZE}",
+        f"--user={user}",
+        f"--memory={config.memory}",
+        f"--memory-swap={config.memory}",
+        f"--cpus={config.cpus}",
+        f"--pids-limit={config.pids_limit}",
+        "--ulimit=nofile=1024:1024",
+        "--ulimit=core=0:0",
+        "--init",
+        "--entrypoint=/usr/bin/env",
+        # Docker mounts a tmpfs noexec unless told otherwise, and Go test binaries
+        # and extracted native libraries run from /tmp.
+        f"--tmpfs=/tmp:rw,exec,nosuid,nodev,size={tmp_size},mode=1777",
+        *(f"--env={name}=" for name in _DOCKER_CLI_PROXY_NAMES),
+    ]
+
+
+def _workspace_mounts(root: Path) -> list[str]:
+    if "," in str(root) or "\n" in str(root):
+        raise SandboxError("Workspace path cannot be represented safely as a Docker mount")
+    mounts = [f"--mount=type=bind,src={root},dst={_CONTAINER_WORKSPACE}"]
+    git_dir = root / ".git"
+    if git_dir.is_dir() and not git_dir.is_symlink():
+        # Host git reads .git/config, so a writable one would let repository code
+        # choose commands that run on the host.
+        mounts.append(f"--mount=type=bind,src={git_dir},dst={_CONTAINER_WORKSPACE}/.git,readonly")
+    return mounts
+
+
 def _workspace_path(workspace: RepositoryWorkspace | Path) -> Path:
     candidate = workspace.path if isinstance(workspace, RepositoryWorkspace) else workspace
     if not isinstance(candidate, Path):
@@ -516,4 +547,5 @@ __all__ = [
     "detect_docker_daemon_mode",
     "docker_client_environment",
     "docker_container_identity",
+    "docker_isolation_arguments",
 ]

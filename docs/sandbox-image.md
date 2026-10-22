@@ -18,8 +18,8 @@ files. The starter configuration's `example.invalid` image is a placeholder: `co
 Commands start in `/workspace`, where the patched checkout is mounted. The image's `ENTRYPOINT`,
 `CMD`, `ENV`, `USER`, and `WORKDIR` are ignored: commands get `HOME=/tmp` and a standard `PATH`, so
 install executables in `/usr/local/bin` or `/usr/bin` (a virtualenv on `ENV PATH` is not used). The
-root filesystem is read-only; only `/workspace` and a 512 MB `/tmp` are writable. Doctor skips
-repository scripts such as `tools/lint.py` and commands the model adds.
+root filesystem is read-only; only `/workspace`, a 512 MB `/tmp`, and a 256 MB `/dev/shm` are
+writable. Doctor skips repository scripts such as `tools/lint.py` and commands the model adds.
 
 ## Test the patched source
 

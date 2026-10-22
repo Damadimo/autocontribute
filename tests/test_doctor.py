@@ -396,8 +396,11 @@ def test_docker_toolchain_probe_matches_sandbox_isolation(
     assert "--read-only" in command
     assert "--cap-drop=ALL" in command
     assert "--security-opt=no-new-privileges" in command
+    assert "--ipc=private" in command
+    assert "--tmpfs=/tmp:rw,exec,nosuid,nodev,size=64m,mode=1777" in command
     assert "--init" in command
-    assert any(argument.startswith("--user=") for argument in command)
+    assert "--user=1000:1000" in command
+    assert command.index("--env=HTTPS_PROXY=") < command.index(config.sandbox.image)
     assert config.sandbox.image in command
     assert "python -m pytest && ruff check ." not in command
     assert command[-4:] == ["python", "ruff", "python", "pytest"]

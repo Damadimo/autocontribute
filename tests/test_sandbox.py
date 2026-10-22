@@ -54,14 +54,18 @@ def test_docker_command_enforces_isolation_and_clears_environment(
     monkeypatch.setattr(sandbox.os, "getuid", lambda: 1000)
     monkeypatch.setattr(sandbox.os, "getgid", lambda: 1000)
     monkeypatch.setenv("VERY_SECRET_TOKEN", "do-not-inherit")
+    monkeypatch.setenv("HTTPS_PROXY", "http://operator:proxy-secret@proxy.example.test:3128")
 
     arguments = runner.docker_command(workspace, "python -m pytest", cidfile)
     rendered = "\n".join(arguments)
+    image_index = arguments.index(config.image)
 
     assert "--network=none" in arguments
     assert "--read-only" in arguments
     assert "--cap-drop=ALL" in arguments
     assert "--security-opt=no-new-privileges" in arguments
+    assert "--ipc=private" in arguments
+    assert "--shm-size=256m" in arguments
     assert "--memory=2g" in arguments
     assert "--memory-swap=2g" in arguments
     assert "--cpus=1.5" in arguments
@@ -69,9 +73,26 @@ def test_docker_command_enforces_isolation_and_clears_environment(
     assert "--pull=never" in arguments
     assert "--log-driver=none" in arguments
     assert "--entrypoint=/usr/bin/env" in arguments
-    assert "-i" in arguments
+    assert "--tmpfs=/tmp:rw,exec,nosuid,nodev,size=512m,mode=1777" in arguments
+    for name in (
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "FTP_PROXY",
+        "ftp_proxy",
+    ):
+        assert arguments.index(f"--env={name}=") < image_index
+    assert arguments[image_index + 1] == "-i"
+    assert arguments[-3:] == ["/bin/sh", "-c", "python -m pytest"]
+    assert "-lc" not in arguments
     assert "VERY_SECRET_TOKEN" not in rendered
     assert "do-not-inherit" not in rendered
+    assert "proxy-secret" not in rendered
     user = next(value for value in arguments if value.startswith("--user="))
     assert not user.startswith("--user=0:")
     assert any(value.endswith("dst=/workspace/.git,readonly") for value in arguments)
