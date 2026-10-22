@@ -96,7 +96,6 @@ There is no network setting: the `docker` backend always runs checks with no net
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `min_candidate_score` | `85` | Lowest issue score, out of 100, that discovery accepts. |
 | `min_readiness_score` | `90` | Lowest weighted critic score, out of 100, that passes. |
 | `min_dimension_score` | `80` | Lowest critic score allowed in any one dimension, out of 100. |
 | `max_files_changed` | `8` | Most files a patch may change (1–100). |

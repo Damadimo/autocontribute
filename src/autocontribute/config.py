@@ -598,7 +598,6 @@ class PolicyConfig(StrictModel):
 
 
 class QualityConfig(StrictModel):
-    min_candidate_score: int = Field(default=85, ge=0, le=100)
     min_readiness_score: int = Field(default=90, ge=0, le=100)
     min_dimension_score: int = Field(default=80, ge=0, le=100)
     max_files_changed: int = Field(default=8, ge=1, le=100)
@@ -859,7 +858,6 @@ policy:
     review is implied.
 
 quality:
-  min_candidate_score: 85
   min_readiness_score: 90
   min_dimension_score: 80
   max_files_changed: 8

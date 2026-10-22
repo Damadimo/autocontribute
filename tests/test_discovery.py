@@ -17,6 +17,7 @@ from autocontribute.discovery import (
     DiscoveryOutcome,
     DiscoveryService,
     PolicySnapshot,
+    TriageVerdict,
     apply_legal_commit_message,
     competing_pull_requests,
     parse_issue_reference,
@@ -243,7 +244,111 @@ def test_clear_maintainer_signaled_issue_passes(tmp_path) -> None:
     result = service.evaluate(_issue(), _repository())
 
     assert result.eligible
-    assert result.score >= config.quality.min_candidate_score
+    assert result.score == 75
+    assert {key: result.evidence[key] for key in SCORE_PARTS} == {
+        "invitation": "25/25: labels=['bug', 'help wanted'], maintainer invitation=no",
+        "specificity": "15/25: expected vs actual, reproduction or error",
+        "smallness": "10/20: under 15 comments, one file or none named",
+        "freshness": "10/15: created within 2 years, updated within 90 days",
+        "testability": "15/15: reproduction, tests named",
+    }
+
+
+SCORE_PARTS = ("invitation", "specificity", "smallness", "freshness", "testability")
+
+
+@pytest.mark.parametrize(
+    ("updates", "score"),
+    [
+        ({"labels": ["bug"]}, 65),
+        (
+            {
+                "title": "Parser crashes on empty input",
+                "labels": ["bug"],
+                "body": (
+                    "Steps to reproduce:\n```python\nimport lib\nlib.parse('')\n```\n"
+                    "Traceback (most recent call last):\n  ValueError: empty\n"
+                    "Expected an empty node, but it raises. See src/lib/parser.py. A regression "
+                    "test would help."
+                ),
+            },
+            75,
+        ),
+        (
+            {
+                "title": "Fix typo in README",
+                "labels": ["help wanted", "documentation"],
+                "body": "The README says 'teh' where it means 'the'.",
+            },
+            80,
+        ),
+        (
+            {
+                "title": "Add a timeout to `fetch()`",
+                "labels": ["help wanted"],
+                "body": "Currently `fetch()` waits forever; it should accept a timeout.",
+            },
+            60,
+        ),
+        (
+            {
+                "created_at": datetime.now(UTC) - timedelta(days=900),
+                "updated_at": datetime.now(UTC) - timedelta(days=200),
+            },
+            65,
+        ),
+    ],
+)
+def test_score_rewards_agent_suitable_issues(
+    tmp_path,
+    updates: dict[str, object],
+    score: int,
+) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+
+    result = service.evaluate(_issue(**updates), _repository())
+
+    assert result.score == score
+    assert result.eligible, result.blockers
+
+
+def test_vague_issue_falls_below_the_score_floor(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+
+    evaluation = service._assess(
+        _issue(title="Improve things", body="It would be nice to improve this."), _repository()
+    )
+
+    assert evaluation.eligibility.score == 45
+    assert evaluation.blocker_kinds == ("low score",)
+    assert evaluation.eligibility.blockers == ["candidate score 45 is below the floor of 60"]
+
+
+def test_recent_maintainer_comment_adds_freshness(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    engaged = _issue(
+        comments=1,
+        discussion=[
+            _comment(body="Confirmed on main.", author="maintainer", association="COLLABORATOR")
+        ],
+    )
+
+    assert service.evaluate(engaged, _repository()).score == 80
+
+
+def test_blockers_do_not_lower_the_score(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): "Ordinary contribution guidance.",
+            ("example/.github", "AI_POLICY.md"): "AI-generated contributions will be closed.",
+        }
+    )
+    service = DiscoveryService(AutocontributeConfig(), github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    blocked = service.evaluate(_issue(assignees=["someone"]), _repository())
+
+    assert not blocked.eligible
+    assert blocked.score == 75
 
 
 def test_assigned_issue_fails_closed(tmp_path) -> None:
@@ -889,6 +994,110 @@ def test_maintainer_comment_inviting_a_pull_request_is_an_invitation(tmp_path) -
 
     assert service.evaluate(invited, _repository()).eligible
     assert not service.evaluate(from_contributor, _repository()).eligible
+
+
+class RecordingTriage:
+    def __init__(self, verdicts: dict[int, TriageVerdict | Exception]) -> None:
+        self.verdicts = verdicts
+        self.triaged: list[int] = []
+
+    def triage(self, issue: IssueCandidate, repository: RepositoryInfo) -> TriageVerdict:
+        del repository
+        self.triaged.append(issue.number)
+        verdict = self.verdicts.get(issue.number, _verdict())
+        if isinstance(verdict, Exception):
+            raise verdict
+        return verdict
+
+
+def _verdict(**updates: object) -> TriageVerdict:
+    values: dict[str, object] = {
+        "suitable": True,
+        "reasons": ["Small, well-specified parser fix."],
+        "already_fixed": False,
+        "needs_design": False,
+        "difficulty": "small",
+    }
+    values.update(updates)
+    return TriageVerdict.model_validate(values)
+
+
+def _ranked_issues() -> list[IssueCandidate]:
+    """Seven equally scored eligible issues; a lower number was updated later and ranks first."""
+
+    issues = []
+    for number in range(1, 8):
+        issues.append(
+            _issue(
+                number=number,
+                updated_at=datetime.now(UTC) - timedelta(hours=number),
+            )
+        )
+    return issues
+
+
+def test_without_triage_the_top_score_wins(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = SearchGitHub(_ranked_issues(), REPOSITORY_LABELS)
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project"), github, RunStore(tmp_path)
+    )
+
+    outcome = service.discover()
+
+    assert outcome.selection is not None
+    assert outcome.selection[0].number == 1
+    assert "triage" not in outcome.selection[2].evidence
+
+
+def test_triage_picks_the_best_ranked_issue_it_accepts(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    triage = RecordingTriage(
+        {
+            1: _verdict(suitable=False, reasons=["Needs a maintainer decision on the API."]),
+            2: _verdict(difficulty="large"),
+            3: GitHubError("triage request failed"),
+            4: _verdict(already_fixed=True, reasons=["Fixed on main by #77."]),
+            5: _verdict(difficulty="medium", reasons=["Two files, clear tests."]),
+        }
+    )
+    github = SearchGitHub(_ranked_issues(), REPOSITORY_LABELS)
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project"), github, RunStore(tmp_path), triage=triage
+    )
+
+    outcome = service.discover()
+
+    assert triage.triaged == [1, 2, 3, 4, 5]
+    assert outcome.selection is not None
+    issue, _, eligibility = outcome.selection
+    assert issue.number == 5
+    assert eligibility.evidence["triage"] == "medium, suitable: Two files, clear tests."
+    assert outcome.issue_errors == (("example/project#3", "triage failed: triage request failed"),)
+    blocked = {evaluation.issue.number: evaluation for evaluation in outcome.evaluations}
+    assert blocked[1].eligibility.blockers == [
+        "triage turned the issue down: small, judged unsuitable: Needs a maintainer decision on "
+        "the API."
+    ]
+    assert blocked[2].blocker_kinds == ("triage",)
+    assert blocked[4].eligibility.blockers == [
+        "triage turned the issue down: small, already fixed: Fixed on main by #77."
+    ]
+    assert outcome.blocker_counts == [("triage", 3)]
+
+
+def test_triage_sees_only_the_top_five_issues(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    triage = RecordingTriage({number: _verdict(needs_design=True) for number in range(1, 8)})
+    github = SearchGitHub(_ranked_issues(), REPOSITORY_LABELS)
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project"), github, RunStore(tmp_path), triage=triage
+    )
+
+    outcome = service.discover()
+
+    assert triage.triaged == [1, 2, 3, 4, 5]
+    assert outcome.selection is None
+    assert outcome.no_candidate_reason == (
+        "No candidate is currently available: 5 candidates failed discovery gates (triage 5)."
+    )
 
 
 class LinkedPullRequestGitHub(FakeGitHub):
