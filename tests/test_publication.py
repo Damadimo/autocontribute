@@ -172,7 +172,7 @@ def _ready_run(
         html_url="https://github.com/example/project/issues/42",
         state="open",
         author="maintainer",
-        labels=["help wanted", "bug", "good first issue"],
+        labels=["help wanted", "bug"],
         assignees=[],
         comments=1,
         created_at=now - timedelta(days=5),

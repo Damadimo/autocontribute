@@ -9,9 +9,12 @@ github:
   repositories:
     - your-org/your-repo
   owners: []
-  include_labels: ["help wanted", "good first issue"]
-  exclude_labels: ["security", "breaking change", "needs design", "blocked", "discussion"]
-  min_stars: 1000
+  include_labels: ["help wanted", "bug", "confirmed", "accepted", "status: help wanted",
+                   "contributions welcome", "pr welcome"]
+  exclude_labels: ["security", "breaking change", "needs design", "discussion", "blocked",
+                   "good first issue", "first-timers-only"]
+  labels: {}  # per repository: {owner/repo: {include: [...], exclude: [...]}}
+  min_stars: 0
   require_unassigned: true
   max_repository_inactivity_days: 180
 

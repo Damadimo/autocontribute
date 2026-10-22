@@ -10,6 +10,7 @@ from autocontribute.config import (
     DCO_ATTESTATION_STATEMENT,
     AutocontributeConfig,
     ModelPricing,
+    RepositoryLabels,
     example_config,
     load_config,
     starter_placeholders,
@@ -146,6 +147,41 @@ def test_defaults_disclose_autonomous_work_without_claiming_human_validation() -
     assert "validated by the contributor" not in disclosure
     assert config.publishing.draft is True
     assert config.github.max_repository_inactivity_days == 180
+
+
+def test_discovery_defaults_search_listed_repositories_and_spare_newcomer_issues() -> None:
+    github = AutocontributeConfig().github
+
+    assert github.min_stars == 0
+    assert github.include_labels == [
+        "help wanted",
+        "bug",
+        "confirmed",
+        "accepted",
+        "status: help wanted",
+        "contributions welcome",
+        "pr welcome",
+    ]
+    assert {"good first issue", "first-timers-only"} <= set(github.exclude_labels)
+    assert github.labels == {}
+
+
+def test_repository_label_overrides_are_canonical_and_searchable() -> None:
+    config = AutocontributeConfig.model_validate(
+        {"github": {"labels": {"Example/Project": {"include": [" E-easy ", "e-easy"]}}}}
+    )
+
+    assert config.github.labels == {"example/project": RepositoryLabels(include=["E-easy"])}
+    for labels, message in (
+        ({"*/*": {}}, "owner/name"),
+        ({"example/project": {}, "Example/Project": {}}, "duplicate github.labels"),
+        ({"example/project": {"include": []}}, "at least one label"),
+        ({"example/project": {"exclude": ['wontfix" repo:other/project']}}, "double quotes"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            AutocontributeConfig.model_validate({"github": {"labels": labels}})
+    with pytest.raises(ValueError, match="double quotes"):
+        AutocontributeConfig.model_validate({"github": {"include_labels": ['help" wanted']}})
 
 
 def test_publishing_mode_is_not_a_setting() -> None:
