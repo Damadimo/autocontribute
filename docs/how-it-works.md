@@ -33,31 +33,34 @@ is skipped.
 
 `autocontribute discover` shows the pick without cloning or changing GitHub; `run` picks the same
 way. Both read `github.repositories` and the `github.repository_limit_per_owner` (8) most recently
-pushed public repositories of each `github.owners` entry, most stars first, taking up to
-`github.issue_limit_per_repository` (10) open issues with an `include_labels` label from each. Of
-the first `budget.max_candidates_per_run` (25) eligible issues, the highest score wins.
-`run --issue owner/repo#N` skips the search, not the rules, which all run before any model call.
-Issues with an active run, or unchanged since a `skipped`, `rejected`, or `cancelled` one, are
-passed over ([Run states](#run-states)).
+pushed public repositories of each `github.owners` entry, most stars first. Each repository gets one
+search for open issues with an invitation label, newest first, and discovery reads up to
+`github.issue_limit_per_repository` (10) of them in full, skipping results that already fail a rule
+needing only the issue. Of the first `budget.max_candidates_per_run` (25) eligible issues, the
+highest score wins. `run --issue owner/repo#N` skips the search, not the rules, which all run before
+any model call. Issues with an active run, or unchanged since a `skipped`, `rejected`, or
+`cancelled` one, are passed over ([Run states](#run-states)). A repository or issue that GitHub
+cannot serve is reported and skipped, and `discover --explain` lists every issue with its score and
+blockers.
 
 | Rule | Key (default) |
 | --- | --- |
-| Repository is public, not archived or disabled, has enough stars, and was pushed to recently | `github.min_stars` (1000), `github.max_repository_inactivity_days` (180) |
+| Repository is public, not archived or disabled, has enough stars, and was pushed to recently | `github.min_stars` (0), `github.max_repository_inactivity_days` (180) |
+| No PR this tool opened in the repository is still open | |
 | Issue is open, updated recently, and unassigned | `github.max_issue_age_days` (365), `github.require_unassigned` (true), `policy.allow_assigned_issues` (false) |
-| Issue has an `include_labels` label and no `exclude_labels` label | `policy.require_maintainer_signal` (true), `github.include_labels` (`help wanted`, `good first issue`), `github.exclude_labels` (`security`, `breaking change`, `needs design`, `discussion`, `blocked`) |
+| Issue has an invitation label, or a maintainer comment inviting a pull request, and no excluded label | `policy.require_maintainer_signal` (true), `github.include_labels`, `github.exclude_labels`, `github.labels` ([Configuration](configuration.md#github)) |
 | Title, body, comments, and labels show no sign of a vulnerability (CVE, injection, XSS, ...) | `policy.allow_security_issues` (false) |
-| The issue does not ask contributors to stay away, no open PR links it, no comment claims the work ("I'm working on this"), and no maintainer comment asks contributors to stop or hold off (that also activates the [safety stop](#lifecycle-sync-and-the-safety-stop)) | |
+| The issue does not ask contributors to stay away; no open PR in the repository links it with a closing keyword or was updated in the last 90 days; no comment from the last 30 days claims the work ("I'm working on this") unless a maintainer has since invited a PR; and no maintainer comment asks contributors to stop or hold off. A maintainer comment that turns away automated or AI contributions skips the whole repository for the run | |
 | The repository or its owner's `.github` repository has contribution guidelines, no policy file bans AI-assisted or automated contributions, and a detected CLA or DCO has a matching attestation ([Legal attestations](configuration.md#legal-attestations)) | `policy.require_contribution_guidelines` (true), `policy.legal_attestations` |
-| Readiness score reaches the threshold; at 85 an `include_labels` label is required in practice | `quality.min_candidate_score` (85) |
+| The score below reaches 60 | |
 
-| Score dimension | Points | Full points when |
+| Score part | Points | Earned by |
 | --- | ---: | --- |
-| Maintainer signal | 25 | the issue has an `include_labels` label (else 0) |
-| Clarity | 20 | the body has 300+ characters and words like "expected", "actual", "steps" (15 with those words, 10 for 100+ characters without) |
-| Reproducibility | 20 | the title or body has words like "error", "traceback", "fails", "bug", "typo", "reproduce" (else 5) |
-| Scope | 15 | a `good first issue`, `small`, `size/s`, `documentation`, or `bug` label (else 7) |
-| Activity | 10 | updated in the last 30 days (7 within 90 days, else 3) |
-| Policy fit | 10 | no excluded label, guidelines present, no AI or automation ban, no unattested CLA/DCO (else 0) |
+| Invitation | 25 | an invitation label or a maintainer comment inviting a PR (15 for a `bug` label alone) |
+| Specificity | 25 | expected versus actual behavior (10), a code block (5), a file or code reference (5), reproduction steps or error output (5); documentation and test issues get the behavior and reproduction points |
+| Smallness | 20 | a small, easy, or typo label, or "typo" in the title (10), fewer than 15 comments (5), at most one source file named (5) |
+| Freshness | 15 | created in the last 2 years (5), updated in the last 90 days (5), a maintainer comment in the last 90 days (5) |
+| Testability | 15 | a code block or reproduction steps (10; documentation and test issues get these), tests named (5) |
 
 ## Validation
 
@@ -171,7 +174,7 @@ The safety stop is one global switch that never clears itself: while it is on, `
 
 - a published PR's head no longer matches the prepared commit, including after your own push;
 - a maintainer (owner, member, or collaborator, not a bot) requests changes in their latest review,
-  asks in a PR review or comment to stop or close, or asks in an issue comment to stop or hold off;
+  or asks in a PR review or comment to stop or close;
 - a check's latest run ends `failure`, `cancelled`, `timed_out`, `action_required`, `stale`, or
   `startup_failure`, a commit status fails, or a PR is closed unmerged or reverted;
 - the secret scanner finds credential-like text in a patch, GitHub reports the account suspended or
