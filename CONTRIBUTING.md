@@ -1,21 +1,38 @@
-# Contributing to Autocontribute
+# Contributing
 
-Thank you for helping make autonomous contribution tooling useful to maintainers rather than noisy.
+Open an issue, or comment on an existing one, before you start work. Report vulnerabilities
+privately as described in [SECURITY.md](SECURITY.md).
 
-Before opening a PR, create or reference an issue, keep the change narrowly scoped, add tests for
-behavioral changes, and run:
+## Set up
 
 ```bash
-uv sync --extra dev
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy src
-uv run pytest
+git clone https://github.com/Damadimo/autocontribute.git
+cd autocontribute
+uv sync --extra dev --locked
 ```
 
-Security boundaries must fail closed. A model score must never override credential isolation,
-approval binding, secret scanning, repository policy, upstream freshness, or sandbox restrictions.
-Tests must use fixtures or mocked APIs and must never create a real contribution on GitHub.
+## Pull requests
 
-By participating, you agree to follow the project's code of conduct once one is adopted. Report
-security issues through the private process described in [SECURITY.md](SECURITY.md).
+- Keep each pull request small and tied to one issue. Leave out unrelated refactors, generated
+  files, and dependency changes the issue does not need.
+- Add or update tests for every behavior change.
+- Use fixtures or mocked APIs in tests; never write to real GitHub.
+- Update the docs when behavior or configuration changes.
+- Run the four checks from CI's `test` job and fix every failure. CI runs on Ubuntu only;
+  macOS is untested.
+
+```bash
+uv run --no-sync ruff check .
+uv run --no-sync ruff format --check .
+uv run --no-sync mypy src
+uv run --no-sync pytest
+```
+
+## Safety changes
+
+- Keep defaults conservative. Do not loosen a default such as `publishing.mode: review_required`,
+  draft pull requests, or the publication limits.
+- When a safety check cannot reach a decision, the code must stop or refuse.
+- Model output or scores must never override credential isolation, approval binding, secret
+  scanning, repository policy, upstream freshness, publication limits, or sandbox restrictions.
+- In the pull request, say what the change refuses and which tests cover it.
