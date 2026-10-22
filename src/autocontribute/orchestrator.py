@@ -1327,7 +1327,7 @@ class Orchestrator:
 
         violations = [usage_error] if usage_error else []
         if profile.deployment_model is not None and result.model != profile.deployment_model:
-            violations.append("provider resolved a model ID outside the calibrated deployment")
+            violations.append("provider resolved a model ID other than expected_response_model")
         if usage.input_tokens > input_reservation:
             violations.append("provider input usage exceeded its durable reservation")
         if usage.output_tokens > output_limit:

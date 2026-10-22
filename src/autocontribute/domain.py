@@ -84,11 +84,7 @@ ALLOWED_TRANSITIONS: dict[RunStatus, set[RunStatus]] = {
         RunStatus.REJECTED,
         RunStatus.FAILED,
     },
-    RunStatus.READY_FOR_APPROVAL: {
-        RunStatus.APPROVED,
-        RunStatus.SUBMITTING,
-        RunStatus.CANCELLED,
-    },
+    RunStatus.READY_FOR_APPROVAL: {RunStatus.APPROVED, RunStatus.CANCELLED},
     RunStatus.APPROVED: {RunStatus.SUBMITTING, RunStatus.CANCELLED},
     RunStatus.SUBMITTING: {
         RunStatus.PR_OPEN,

@@ -1954,11 +1954,7 @@ class RunStore:
     ) -> RunManifest:
         """Atomically persist publication intent, capacity, and SUBMITTING."""
 
-        if manifest.status not in {
-            RunStatus.READY_FOR_APPROVAL,
-            RunStatus.APPROVED,
-            RunStatus.SUBMITTING,
-        }:
+        if manifest.status not in {RunStatus.APPROVED, RunStatus.SUBMITTING}:
             raise StateError(
                 f"Run {manifest.run_id} cannot begin publication from {manifest.status.value}"
             )

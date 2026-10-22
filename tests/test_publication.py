@@ -136,6 +136,7 @@ def _ready_run(
     *,
     ready_for_review: bool = False,
     legal_policy: str | None = None,
+    approved: bool = True,
 ) -> tuple[AutocontributeConfig, RunStore, str, IssueCandidate]:
     config = AutocontributeConfig.model_validate(
         {
@@ -317,15 +318,16 @@ def _ready_run(
     assert store.release_lease("autocontribute.run", lease_owner, lease.generation)
     run.status = RunStatus.READY_FOR_APPROVAL
     store.save(run, event="fixture.ready", details={})
-    approval_review = build_approval_review(config, store, run.run_id, actor="octocat")
-    approve_run(
-        config,
-        store,
-        run.run_id,
-        actor="octocat",
-        attestation="I reviewed the exact contribution.",
-        reviewed_fingerprint=approval_review.fingerprint,
-    )
+    if approved:
+        approval_review = build_approval_review(config, store, run.run_id, actor="octocat")
+        approve_run(
+            config,
+            store,
+            run.run_id,
+            actor="octocat",
+            attestation="I reviewed the exact contribution.",
+            reviewed_fingerprint=approval_review.fingerprint,
+        )
     return config, store, run.run_id, issue
 
 
@@ -915,6 +917,21 @@ def test_publisher_rejects_patch_that_differs_from_preparation_seal(tmp_path: Pa
 
     assert github.calls == []
     assert not github.mutated
+
+
+def test_publisher_refuses_a_run_without_human_approval(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path, approved=False)
+    manifest = store.get(run_id)
+    assert manifest.status == RunStatus.READY_FOR_APPROVAL
+    events_before = store.events(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+
+    with pytest.raises(StateError, match="cannot be published from ready_for_approval"):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert github.calls == []
+    assert not github.mutated
+    assert store.events(run_id) == events_before
 
 
 def test_publisher_rejects_validation_artifact_that_differs_from_manifest(tmp_path: Path) -> None:

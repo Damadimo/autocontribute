@@ -3152,7 +3152,7 @@ def test_review_mode_accepts_observed_provider_model_without_an_attestation(
     assert result.model == "provider-snapshot-2026-07-21"
 
 
-def test_orchestrator_rejects_a_provider_model_outside_the_attested_deployment(
+def test_orchestrator_rejects_a_provider_model_other_than_the_expected_model(
     tmp_path: Path,
 ) -> None:
     config = AutocontributeConfig.model_validate(
@@ -3172,7 +3172,7 @@ def test_orchestrator_rejects_a_provider_model_outside_the_attested_deployment(
     )
     manifest = store.create_run()
 
-    with pytest.raises(PolicyError, match="outside the calibrated deployment"):
+    with pytest.raises(PolicyError, match="other than expected_response_model"):
         orchestrator._call_model(
             manifest,
             role="scout",
