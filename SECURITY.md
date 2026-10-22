@@ -1,34 +1,30 @@
 # Security policy
 
-Autocontribute processes hostile repositories, issue text, model output, package metadata, and test
-output. Do not run it with host execution enabled on code you do not fully trust.
+## Report a vulnerability
 
-## Supported versions
+Do not open a public issue. Use GitHub's private vulnerability reporting for this repository:
+<https://github.com/Damadimo/autocontribute/security/advisories/new>. Include the affected commit,
+steps to reproduce, and the impact, but no live credentials or other people's data. There are no
+releases yet; only the `main` branch is supported.
 
-Only the latest release on the default branch receives security fixes during the alpha.
+## Scope
 
-## Reporting a vulnerability
-
-Do not open a public issue for a suspected vulnerability. Use GitHub's private vulnerability
-reporting for this repository. Include the affected version, reproduction steps, impact, and any
-suggested mitigation. Please do not include live credentials or data belonging to another person.
+In scope: this repository's code, systemd deployment files, and GitHub Actions workflows. Examples:
+escaping the validation sandbox or reaching the network from it; exposing a GitHub token or model
+API key to the sandbox, the model, logs, run evidence, or a pull request; publishing without a valid
+approval, or publishing anything other than the approved diff; bypassing publication limits, policy
+checks, secret scanning, or `safety stop`; and state or backup tampering that `state restore`
+misses. Out of scope: the repositories Autocontribute contributes to; Docker, GitHub, and model
+provider services (report those upstream); and anything that needs the `local` sandbox backend.
 
 ## Deployment expectations
 
-- Keep model and GitHub credentials in a secret manager or environment variables.
-- Before storing credentials in GitHub Actions, protect the default branch that controls the
-  workflows: require pull requests and passing CI, apply the rules to administrators where supported,
-  and block force pushes and deletion. If the repository plan cannot enforce those controls, keep the
-  credentials out of hosted Actions and use a trusted persistent worker instead.
-- Prefer an expiring GitHub App user token with minimum permissions for hosted deployments.
-- Never mount a home directory, Docker socket, SSH agent, cloud credentials, or provider keys into
-  the repository sandbox.
-- Keep every sandbox image pinned to an audited `sha256` digest; mutable tags are rejected.
-- Keep sandbox networking disabled during validation and use a separate, credential-free dependency
-  acquisition stage if a project requires downloads.
-- On a persistent worker, keep both repository workspaces and rootless Docker data on separate,
-  capacity-limited filesystems and require the exact mount checks in the supplied systemd guide.
-- Keep human approval enabled until acceptance, revision, and incident metrics justify a narrower
-  automated policy.
-- Treat a GitHub `403`, `429`, abuse warning, maintainer stop request, or secret-scanner finding as a
-  global circuit breaker.
+- Keep `sandbox.backend: docker`; the `local` backend runs repository code on your host.
+- Keep tokens and API keys in environment variables or a secret manager; the configuration holds
+  only their names. Give the GitHub token the fewest permissions that work, and for hosted runs
+  prefer an expiring GitHub App user token.
+- Before adding credentials to GitHub Actions, protect the default branch as described in the
+  [scheduling guide](docs/scheduling.md), or use a [persistent worker](docs/systemd-deployment.md).
+- Keep `publishing.mode: review_required` until evaluation results justify automatic publication.
+- After a GitHub `403` or `429`, an abuse warning, a maintainer's stop request, or a secret-scanner
+  finding, run `safety stop --actor NAME --reason TEXT` and investigate before resuming.

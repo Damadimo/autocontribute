@@ -1,84 +1,70 @@
-# Sandbox toolchain images
+# Sandbox image
 
-Every validation command runs inside one digest-pinned Docker image with networking disabled
-(`sandbox.network` is always `none`). Nothing can be downloaded or installed at validation time, so
-the image must already contain the complete offline toolchain — interpreters, test runners, linters,
-and every project dependency — for **all** configured repositories. `sandbox.image` is a single
-global setting: if the configured repositories need different ecosystems, the one image must carry
-the union of their toolchains, or the repository list must be split across separate deployments.
-
-A bare interpreter base image such as `python:3.12-bookworm` satisfies only validation recipes that
-use the standard library alone (the staging fixture is deliberately built this way). It cannot run
-`python -m pytest` or install a real project's dependencies, and `doctor` fails such a configuration
-before any contribution work starts: it launches the exact pinned image offline and probes the
-executables and explicit `python -m` modules named by `validation.required_commands`. Treat a doctor
-toolchain failure as a missing image ingredient, never as a reason to weaken the validation recipe
-or to relax the offline boundary. Repository-relative entrypoints (for example `tools/lint.py`) are
-deliberately not probed by doctor; they are exercised by the real isolated validation run.
+Validation commands run in a Docker container with no network, so the image in `sandbox.image` must
+already contain each configured repository's toolchain and test dependencies. One image
+serves every configured repository; repositories with conflicting toolchains need separate
+deployments, each with its own configuration file. The starter configuration's `example.invalid`
+image is a placeholder: `config validate`, `doctor`, `discover`, and `run` refuse it.
 
 ## Requirements
 
-- **Digest-pinned.** Configuration rejects a Docker image without `@sha256:<64 hex digits>`. A tag
-  can be repointed upstream at any time; a digest cannot, so scheduled runs can never silently pick
-  up a different toolchain.
-- **Complete and offline.** Every executable and Python module named by any repository's
-  `validation.required_commands` must already be importable/executable in the image, along with the
-  full dependency closure the target repositories need to build and test.
-- **Pre-pulled.** Pull the digest before running `doctor`. Sandbox and doctor containers launch
-  with `--pull=never`, and the packaged systemd deployment runs Docker on a separately bounded
-  filesystem sized for pre-pulled images.
-- **Boring and reproducible.** Build from a digest-pinned base with pinned (ideally hash-verified)
-  dependency versions so the image can be rebuilt and audited later.
+| The image must | Checked by |
+| --- | --- |
+| Be pinned by digest (`name@sha256:<64 hex digits>`); a tag alone is rejected | Configuration loading |
+| Be pulled before use; containers never pull | `doctor`: `sandbox image` |
+| Provide `/usr/bin/env`, `/bin/sh`, and `cat` (distroless images fail) | `doctor`: `sandbox private bind mount` |
+| Contain every executable and `python -m` module named in `validation.required_commands` | `doctor`: `offline validation toolchain` |
 
-## Build, pin, and verify
+Commands start in `/workspace`, where the patched checkout is mounted. The image's `ENTRYPOINT`,
+`CMD`, `ENV`, `USER`, and `WORKDIR` are ignored: commands get `HOME=/tmp` and a standard `PATH`, so
+install executables in `/usr/local/bin` or `/usr/bin` (a virtualenv on `ENV PATH` is not used). The
+root filesystem is read-only; only `/workspace` and a 512 MB `/tmp` are writable. Doctor skips
+repository scripts such as `tools/lint.py` and commands the model adds.
 
-Build one image per deployment that layers the required toolchain onto a digest-pinned base:
+## Test the patched source
+
+Tests must import the patched source in `/workspace`. If the image holds an installed copy of a
+src-layout package (for example from `pip install .`), tests can import that copy and test unpatched
+code. Install each repository's dependencies, not a regular copy of the repository, and use either:
+
+- `PYTHONPATH=src` in `validation.required_commands`: `PYTHONPATH=src python -m pytest`.
+  `ENV PYTHONPATH` in the Dockerfile has no effect.
+- An editable install made from `/workspace` at build time (copy the repository there, then
+  `pip install --no-deps -e /workspace`). It resolves to the patched checkout mounted over it.
+
+## Build, pin, and pre-pull
 
 ```dockerfile
-# Dockerfile.sandbox — example for Python repositories validated with pytest
+# Dockerfile.sandbox for Python repositories tested with pytest. requirements-sandbox.txt pins
+# pytest and each repository's test dependencies with hashes (uv pip compile --generate-hashes).
 FROM python:3.12-bookworm@sha256:<base-digest>
-COPY requirements-sandbox.txt /tmp/requirements-sandbox.txt
+COPY requirements-sandbox.txt /tmp/
 RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements-sandbox.txt
 ```
 
-`requirements-sandbox.txt` should pin exact versions with hashes and include the test toolchain
-(`pytest` and friends) plus each configured repository's dependency closure. Regenerate it from the
-target repositories' own lock/requirements files when they change.
-
-Push the image to a registry you control, then record the immutable digest reference:
-
 ```bash
-docker build -f Dockerfile.sandbox -t registry.example.com/autocontribute/sandbox:2026-08-14 .
-docker push registry.example.com/autocontribute/sandbox:2026-08-14
-docker inspect --format '{{index .RepoDigests 0}}' \
-  registry.example.com/autocontribute/sandbox:2026-08-14
+docker build -f Dockerfile.sandbox -t registry.example.com/you/sandbox:2026-10-21 .
+docker push registry.example.com/you/sandbox:2026-10-21
+docker inspect --format '{{index .RepoDigests 0}}' registry.example.com/you/sandbox:2026-10-21
+# Set sandbox.image to the printed reference, pull it where validation runs, then check:
+docker pull registry.example.com/you/sandbox@sha256:<digest>
+autocontribute doctor
 ```
 
-Put the printed `repository@sha256:…` reference into `sandbox.image`. Never put the tag form into
-configuration; the digest is what makes the toolchain immutable.
-
-## Pre-pull for the deployment that runs it
-
-For local review use, `docker pull <repository@sha256:…>` as the operating user is enough. For the
-packaged systemd deployment, the sandbox talks only to the dedicated rootless daemon, so pull as the
-`autocontribute` service account through its socket before running doctor:
+The hosted workflow pulls the image itself without a registry login, so the image must be public.
+On a [systemd deployment](systemd-deployment.md), pull as the service account; its sandbox refuses
+to start a container when the bounded Docker filesystem has under 1 GiB or 16,384 inodes free.
 
 ```bash
-sudo -u autocontribute \
+sudo -u autocontribute env HOME=/var/lib/autocontribute XDG_RUNTIME_DIR=/run/autocontribute \
   DOCKER_HOST=unix:///run/autocontribute/docker.sock \
-  docker pull registry.example.com/autocontribute/sandbox@sha256:<digest>
+  docker pull registry.example.com/you/sandbox@sha256:<digest>
 ```
 
-Confirm the bounded Docker filesystem retains comfortable headroom afterward; the deployment guide's
-storage checks treat that filesystem as an aggregate ceiling across images, layers, and container
-writable layers (see [systemd-deployment.md](systemd-deployment.md)).
+## Rotate
 
-## Rotation
-
-To pick up new dependency versions, rebuild, push, record the new digest, pre-pull it, update
-`sandbox.image`, and rerun `autocontribute doctor` before the next scheduled run. The sandbox block
-is part of the preparation configuration fingerprint: changing the image is a material configuration
-change, so a guarded-auto deployment starts a new calibration cohort and re-earns automatic
-publication under the new toolchain. Keep the previous digest available until every in-flight
-prepared contribution has been approved or expired, then prune old images from the bounded
-filesystem deliberately.
+1. Approve and publish, or cancel (`autocontribute runs cancel RUN_ID --reason "..."`), every run
+   waiting for approval or publication: `approve` and `publish` refuse runs prepared with an older
+   `sandbox.image`. Rollout gates for automatic publishing also ignore evidence from the old image.
+2. Build, push, and pre-pull the new image, update `sandbox.image`, and run `autocontribute doctor`.
+3. Remove the old image with `docker image rm`.

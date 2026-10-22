@@ -3623,7 +3623,7 @@ def test_docs_apply_sensitive_dropins_to_both_execution_services() -> None:
     assert auto_doctor in guide
     assert "Put this identical content in each file" in guide
     assert "The doctor makes no repository or GitHub writes and cannot publish" in normalized_guide
-    assert "opening the store can migrate or repair local durable" in normalized_guide
+    assert "opening the store can repair local durable" in normalized_guide
     assert "Environment=AUTOCONTRIBUTE_ALLOW_AUTO_PUBLISH=1" in guide
     assert guide.count("sudo cmp --silent --") == 2
     assert guide.count("sudo systemctl daemon-reload") >= 2
