@@ -33,7 +33,7 @@ This installs the `autocontribute` command. There is no PyPI release yet. To wor
 ## Set up
 
 1. Run `autocontribute init`. It writes `autocontribute.yml`, which commands read from the current directory unless you pass `--config PATH`.
-2. Edit the file. Replace `your-org/your-repo` in `github.repositories` and `validation.required_commands` with a public repository you own or one that welcomes AI-assisted PRs, lower `github.min_stars` (1000) if it has fewer stars, and replace the `example.invalid` image in `sandbox.image`. `config validate`, `doctor`, `discover`, and `run` refuse to start while a placeholder remains.
+2. Edit the file. Replace `your-org/your-repo` in `github.repositories` and `validation.required_commands` with the public repositories you want to contribute to, lower `github.min_stars` (1000) if one has fewer stars, and replace the `example.invalid` image in `sandbox.image`. `config validate`, `doctor`, `discover`, and `run` refuse to start while a placeholder remains.
 3. Build a sandbox image that already contains every tool and dependency your validation commands need, because checks run offline. Pin it by digest and `docker pull` it: see [docs/sandbox-image.md](docs/sandbox-image.md).
 4. Run `gh auth login` (or set `github.auth: token` and export `AUTOCONTRIBUTE_GITHUB_TOKEN`), export `OPENAI_API_KEY`, then run `autocontribute doctor` and fix each failed check. `doctor` sends one small paid model request per distinct model profile (two with the defaults), each capped at 1,024 output tokens.
 
