@@ -333,8 +333,6 @@ def _deletion_blocker(
         return ("run is not terminal", False)
     try:
         store.verify_event_chains(run_id=manifest.run_id)
-        if store.has_active_publication_gate_hold(manifest.run_id):
-            return ("run still owns a durable publication gate hold", True)
         _validate_manifest_artifact(store, manifest)
         _validate_prepared_artifacts(store, manifest)
         has_publication_intent = store.has_publication_reconstruction_evidence(manifest.run_id)

@@ -28,12 +28,10 @@ from autocontribute.backup_replication import (
     verify_latest_state_bundle_replication,
 )
 from autocontribute.config import (
-    AUTO_PUBLISH_ENV,
     CLA_ATTESTATION_STATEMENT,
     DCO_ATTESTATION_STATEMENT,
     AutocontributeConfig,
     LegalAttestation,
-    auto_publish_opt_in_enabled,
     example_config,
     load_config,
     starter_placeholders,
@@ -44,19 +42,11 @@ from autocontribute.coordination import (
     PUBLICATION_LEASE_TTL,
     LeaseHeartbeatGuard,
 )
-from autocontribute.deployment import compute_deployment_fingerprint
 from autocontribute.discovery import DiscoveryService, PolicySnapshot
 from autocontribute.doctor import run_doctor
 from autocontribute.domain import RunManifest, RunStatus
-from autocontribute.evaluation import (
-    EvaluationRevision,
-    EvaluationStore,
-    EvaluationVerdict,
-    evaluation_hash,
-)
 from autocontribute.exceptions import (
     AutocontributeError,
-    AutomaticRolloutBlocked,
     ConfigurationError,
     PublicationResumeRequired,
     StateError,
@@ -67,13 +57,11 @@ from autocontribute.lifecycle import LifecycleSyncResult, sync_open_pull_request
 from autocontribute.orchestrator import Orchestrator, RunInvocationMode
 from autocontribute.publication import Publisher, approve_run, build_approval_review
 from autocontribute.reporting import render_approval_review, render_run_report
-from autocontribute.rollout import RolloutGate, RolloutSummary
 from autocontribute.store import CandidateRetryAuthorization, RunStore
 from autocontribute.systemd_assets import (
     verify_installed_systemd_assets,
     verify_source_systemd_assets,
 )
-from autocontribute.upstream_outcomes import UpstreamPublicationScope
 from autocontribute.workspace_gc import WorkspaceGCReport, collect_terminal_workspaces
 
 app = typer.Typer(
@@ -83,14 +71,6 @@ app = typer.Typer(
 )
 runs_app = typer.Typer(help="List, show, or cancel contribution runs.", no_args_is_help=True)
 config_app = typer.Typer(help="Inspect configuration safely.", no_args_is_help=True)
-evaluation_app = typer.Typer(
-    help="Record expert shadow-run grades and inspect rollout gates.",
-    no_args_is_help=True,
-)
-rollout_app = typer.Typer(
-    help="Inspect the complete evidence-backed autonomous rollout decision.",
-    no_args_is_help=True,
-)
 state_app = typer.Typer(
     help="Manage durable state, verified backups, and bounded workspace cleanup.",
     no_args_is_help=True,
@@ -117,8 +97,6 @@ alert_app = typer.Typer(
 )
 app.add_typer(runs_app, name="runs")
 app.add_typer(config_app, name="config")
-app.add_typer(evaluation_app, name="eval")
-app.add_typer(rollout_app, name="rollout")
 app.add_typer(state_app, name="state")
 app.add_typer(lifecycle_app, name="lifecycle")
 app.add_typer(safety_app, name="safety")
@@ -319,18 +297,8 @@ def run_once(
     try:
         github = _github_client(settings, store)
         if scheduled:
-            _sync_lifecycle(
-                settings,
-                store,
-                github,
-                resume_submitting_publications=(
-                    settings.publishing.mode == "auto" and auto_publish_opt_in_enabled()
-                ),
-                scheduled_preflight=True,
-            )
+            _sync_lifecycle(settings, store, github, scheduled_preflight=True)
             store.assert_circuit_breaker_clear()
-            if not _scheduled_auto_preflight(settings, store, github):
-                return
         with Orchestrator(settings, store=store, github=github) as orchestrator:
             manifest = orchestrator.run(
                 issue_reference=issue,
@@ -339,9 +307,6 @@ def run_once(
                 ),
                 retry_authorization=retry_authorization,
             )
-        if manifest.status == RunStatus.READY_FOR_APPROVAL and settings.publishing.mode == "auto":
-            _sync_lifecycle(settings, store, github)
-            manifest = Publisher(settings, store, github).publish(manifest.run_id)
         if scheduled and manifest.status in _PRODUCTIVE_SCHEDULED_STATUSES:
             _refresh_contribution_stamp()
     except (AutocontributeError, ValueError) as exc:
@@ -398,7 +363,7 @@ def approve(
 
 @app.command()
 def publish(
-    run_id: Annotated[str, typer.Argument(help="Approved or auto-authorized run identifier.")],
+    run_id: Annotated[str, typer.Argument(help="Approved run identifier.")],
     config: ConfigOption = DEFAULT_CONFIG,
     yes: Annotated[
         bool,
@@ -522,7 +487,6 @@ def validate_config(config: ConfigOption = DEFAULT_CONFIG) -> None:
     console.print("[green]Configuration is valid.[/green]")
     console.print(f"Repositories: {len(settings.github.repositories)}")
     console.print(f"Owners: {len(settings.github.owners)}")
-    console.print(f"Publishing mode: {settings.publishing.mode}")
     console.print(
         "Models: "
         + ", ".join(
@@ -687,206 +651,6 @@ def attest_policy(
         markup=False,
     )
     console.print(yaml.safe_dump(snippet, sort_keys=False), markup=False)
-
-
-@evaluation_app.command(name="record")
-def record_evaluation(
-    run_id: Annotated[
-        str,
-        typer.Argument(help="Run identifier whose exact artifact was reviewed."),
-    ],
-    reviewer: Annotated[str, typer.Option(help="Expert reviewer identity for the audit record.")],
-    verdict: Annotated[
-        EvaluationVerdict,
-        typer.Option(help="Independent judgment of the prepared artifact or abstention."),
-    ],
-    config: ConfigOption = DEFAULT_CONFIG,
-    notes: Annotated[str, typer.Option(help="Concise evidence supporting the judgment.")] = "",
-    policy_failure: Annotated[
-        bool,
-        typer.Option(help="Mark any repository-policy or legal-process failure."),
-    ] = False,
-    security_failure: Annotated[
-        bool,
-        typer.Option(help="Mark any credential, isolation, or security failure."),
-    ] = False,
-    etiquette_failure: Annotated[
-        bool,
-        typer.Option(help="Mark spam, claimed-work, disclosure, or maintainer-time harm."),
-    ] = False,
-    yes: Annotated[
-        bool,
-        typer.Option(
-            "--yes",
-            help="Attest to the displayed expert judgment without an interactive prompt.",
-        ),
-    ] = False,
-) -> None:
-    """Review and bind one immutable expert grade to a shadow-run artifact."""
-
-    settings = _config(config)
-    evaluations = EvaluationStore(RunStore(settings.storage.path))
-    try:
-        preview = evaluations.preview_record(
-            run_id,
-            reviewer=reviewer,
-            verdict=verdict,
-            notes=notes,
-            policy_failure=policy_failure,
-            security_failure=security_failure,
-            etiquette_failure=etiquette_failure,
-        )
-    except (AutocontributeError, ValueError) as exc:
-        _fail(str(exc))
-    console.print(_render_evaluation_preview(preview), markup=False)
-    if not yes and not typer.confirm(
-        "I reviewed every field above and attest that this expert judgment is accurate"
-    ):
-        raise typer.Abort()
-    try:
-        evaluation = evaluations.commit_preview(preview)
-    except (AutocontributeError, ValueError) as exc:
-        _fail(str(exc))
-    console.print(
-        f"[green]Recorded[/green] {evaluation.verdict.value} for `{evaluation.run_id}` "
-        f"(subject `{evaluation.subject_hash}`)."
-    )
-
-
-@evaluation_app.command(name="amend")
-def amend_evaluation(
-    run_id: Annotated[
-        str,
-        typer.Argument(help="Run identifier whose latest expert grade needs correction."),
-    ],
-    reviewer: Annotated[str, typer.Option(help="Expert reviewer identity for the audit record.")],
-    verdict: Annotated[
-        EvaluationVerdict,
-        typer.Option(help="Complete replacement judgment for the same reviewed subject."),
-    ],
-    amendment_reason: Annotated[
-        str,
-        typer.Option(
-            "--reason",
-            help="Required explanation of why the previous judgment was incorrect.",
-        ),
-    ],
-    config: ConfigOption = DEFAULT_CONFIG,
-    notes: Annotated[
-        str,
-        typer.Option(help="Complete replacement evidence supporting the corrected judgment."),
-    ] = "",
-    policy_failure: Annotated[
-        bool,
-        typer.Option(help="Corrected repository-policy or legal-process failure value."),
-    ] = False,
-    security_failure: Annotated[
-        bool,
-        typer.Option(help="Corrected credential, isolation, or security failure value."),
-    ] = False,
-    etiquette_failure: Annotated[
-        bool,
-        typer.Option(help="Corrected spam, disclosure, or maintainer-time harm value."),
-    ] = False,
-    yes: Annotated[
-        bool,
-        typer.Option(
-            "--yes",
-            help="Attest to the displayed correction without an interactive prompt.",
-        ),
-    ] = False,
-) -> None:
-    """Append a reviewed correction without mutating or deleting prior grades."""
-
-    settings = _config(config)
-    evaluations = EvaluationStore(RunStore(settings.storage.path))
-    try:
-        preview = evaluations.preview_amendment(
-            run_id,
-            reviewer=reviewer,
-            verdict=verdict,
-            amendment_reason=amendment_reason,
-            notes=notes,
-            policy_failure=policy_failure,
-            security_failure=security_failure,
-            etiquette_failure=etiquette_failure,
-        )
-    except (AutocontributeError, ValueError) as exc:
-        _fail(str(exc))
-    console.print(_render_evaluation_preview(preview), markup=False)
-    if not yes and not typer.confirm(
-        "I reviewed every field above and attest that this correction is accurate"
-    ):
-        raise typer.Abort()
-    try:
-        evaluation = evaluations.commit_preview(preview)
-    except (AutocontributeError, ValueError) as exc:
-        _fail(str(exc))
-    console.print(
-        f"[green]Appended revision {evaluation.revision}[/green] "
-        f"{evaluation.verdict.value} for `{evaluation.run_id}` "
-        f"(record `{evaluation_hash(evaluation)}`)."
-    )
-
-
-@evaluation_app.command(name="report")
-def evaluation_report(
-    config: ConfigOption = DEFAULT_CONFIG,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Emit the machine-readable summary."),
-    ] = False,
-) -> None:
-    """Report whether measured evidence satisfies the conservative shadow gate."""
-
-    settings = _config(config)
-    try:
-        summary = EvaluationStore(RunStore(settings.storage.path)).summary(
-            deployment_fingerprint=compute_deployment_fingerprint(settings)
-        )
-    except AutocontributeError as exc:
-        _fail(str(exc))
-    if json_output:
-        console.print(summary.model_dump_json(indent=2), markup=False, soft_wrap=True)
-        return
-    marker = "PASS" if summary.shadow_gate_passed else "NOT READY"
-    color = "green" if summary.shadow_gate_passed else "yellow"
-    console.print(f"[{color}]Shadow rollout gate: {marker}[/{color}]")
-    for evidence in summary.gate_evidence:
-        console.print(f"- {evidence}")
-
-
-@rollout_app.command(name="report")
-def rollout_report(
-    config: ConfigOption = DEFAULT_CONFIG,
-    json_output: Annotated[
-        bool,
-        typer.Option("--json", help="Emit the complete machine-readable decision."),
-    ] = False,
-) -> None:
-    """Report every gate required before autonomous publication is authorized."""
-
-    settings = _config(config)
-    store = RunStore(settings.storage.path)
-    try:
-        with _github_client(settings, store) as github:
-            summary = _rollout_summary(settings, store, github)
-    except (AutocontributeError, ValueError) as exc:
-        _fail(str(exc))
-    if json_output:
-        console.print(summary.model_dump_json(indent=2), markup=False, soft_wrap=True)
-        return
-    marker = "PASS" if summary.overall_gate_passed else "NOT READY"
-    color = "green" if summary.overall_gate_passed else "yellow"
-    console.print(f"[{color}]Combined autonomous rollout gate: {marker}[/{color}]")
-    console.print(
-        "Scope: "
-        f"{summary.scope.publishing_login} at {summary.scope.publishing_api_origin} "
-        f"(deployment {summary.scope.deployment_fingerprint})",
-        markup=False,
-    )
-    for evidence in summary.gate_evidence:
-        console.print(f"- {evidence}", markup=False)
 
 
 @state_app.command(name="backup")
@@ -1159,7 +923,7 @@ def verify_latest_state_s3(
     settings = _config(config)
     replication = settings.s3_replication
     if replication is None:
-        if if_configured and settings.publishing.mode == "review_required":
+        if if_configured:
             console.print(
                 "[yellow]S3 replication verification skipped: optional review-mode "
                 "replication is not configured.[/yellow]"
@@ -1211,7 +975,7 @@ def gc_state_bundles(
     settings = _config(config)
     replication = settings.s3_replication
     if replication is None:
-        if if_configured and settings.publishing.mode == "review_required":
+        if if_configured:
             console.print(
                 "[yellow]Local bundle pruning skipped: optional review-mode "
                 "replication is not configured.[/yellow]"
@@ -1457,33 +1221,6 @@ def version() -> None:
     console.print(__version__)
 
 
-def _render_evaluation_preview(evaluation: EvaluationRevision) -> str:
-    """Render every persisted field without allowing terminal control sequences."""
-
-    payload = json.dumps(
-        evaluation.model_dump(mode="json"),
-        ensure_ascii=True,
-        indent=2,
-        sort_keys=True,
-    )
-    revision = evaluation.schema_version if evaluation.schema_version == 1 else evaluation.revision
-    return "\n".join(
-        [
-            f"# Exact expert-evaluation preview (revision {revision})",
-            "",
-            "Every stored field is shown below. Terminal-control and non-ASCII characters are ",
-            "JSON escaped. Confirmation binds this exact object and fails if its subject or ",
-            "revision predecessor changes before the append.",
-            "",
-            f"Content SHA-256: {evaluation_hash(evaluation)}",
-            "----- BEGIN COMPLETE EVALUATION JSON -----",
-            payload,
-            "----- END COMPLETE EVALUATION JSON -----",
-            "",
-        ]
-    )
-
-
 def _require_configured_policy_target(
     settings: AutocontributeConfig,
     repository: str,
@@ -1572,78 +1309,12 @@ def _github_client(
     )
 
 
-def _rollout_summary(
-    settings: AutocontributeConfig,
-    store: RunStore,
-    github: GitHubClient,
-) -> RolloutSummary:
-    """Compute one decision for the exact deployed code and publishing identity."""
-
-    scope = UpstreamPublicationScope(
-        deployment_fingerprint=compute_deployment_fingerprint(settings),
-        publishing_login=github.authenticated_login().strip().casefold(),
-        publishing_api_origin=github.api_origin,
-    )
-    return RolloutGate.for_store(store).summary(scope)
-
-
-def _scheduled_auto_preflight(
-    settings: AutocontributeConfig,
-    store: RunStore,
-    github: GitHubClient,
-) -> bool:
-    """Defer scheduled automatic work before a run or model call when authority is absent."""
-
-    if settings.publishing.mode != "auto":
-        return True
-    replication = settings.s3_replication
-    if replication is None:  # Defensive against programmatic nested-model mutation.
-        raise StateError("Automatic scheduled work requires configured S3 replication")
-    verify_latest_state_bundle_replication(
-        bundle_directory=replication.bundle_directory,
-        receipt_directory=replication.receipt_directory,
-        bucket=replication.bucket,
-        expected_bucket_owner=replication.expected_bucket_owner,
-        region=replication.region,
-        prefix=replication.prefix,
-        maximum_age=timedelta(hours=replication.max_age_hours),
-        minimum_retention=timedelta(days=replication.retention_days),
-    )
-    summary = _rollout_summary(settings, store, github)
-    switch_enabled = auto_publish_opt_in_enabled()
-    if switch_enabled and summary.overall_gate_passed:
-        return True
-
-    blockers: list[str] = []
-    if not switch_enabled:
-        blockers.append(
-            f"{AUTO_PUBLISH_ENV} is not enabled as the dedicated automatic-publication switch"
-        )
-    if not summary.evaluation_gate_passed:
-        blockers.append("expert-evaluation shadow cohort")
-    if not summary.manual_cohort_passed:
-        blockers.append("fixed manual upstream-outcome cohort")
-    if not summary.prior_automatic_passed:
-        blockers.append("prior automatic upstream outcomes")
-    if (
-        not summary.upstream_outcome_gate_passed
-        and summary.manual_cohort_passed
-        and summary.prior_automatic_passed
-    ):
-        blockers.append("complete upstream-outcome evidence")
-    console.print(
-        "[yellow]Scheduled automatic run deferred before model use:[/yellow] " + ", ".join(blockers)
-    )
-    return False
-
-
 def _sync_lifecycle(
     settings: AutocontributeConfig,
     store: RunStore,
     github: GitHubClient,
     *,
     publication_retry_run_id: str | None = None,
-    resume_submitting_publications: bool = False,
     scheduled_preflight: bool = False,
 ) -> LifecycleSyncResult:
     publisher = Publisher(settings, store, github)
@@ -1667,30 +1338,14 @@ def _sync_lifecycle(
                 publisher._reconcile_submitting(manifest.run_id, lease_guard=lease_guard)
             except PublicationResumeRequired:
                 lease_guard.assert_owned()
-                retry_this_run = manifest.run_id == publication_retry_run_id
-                scheduled_resume_allowed = (
-                    resume_submitting_publications
-                    and settings.publishing.mode == "auto"
-                    and auto_publish_opt_in_enabled()
-                )
-                if not (scheduled_resume_allowed or retry_this_run):
+                if manifest.run_id != publication_retry_run_id:
                     if scheduled_preflight:
                         continue
-                    if settings.publishing.mode != "auto":
-                        reason = "publishing.mode is review_required"
-                    elif not auto_publish_opt_in_enabled():
-                        reason = (
-                            f"{AUTO_PUBLISH_ENV} is not enabled as the "
-                            "dedicated automatic-publication switch"
-                        )
-                    else:
-                        reason = "this lifecycle sync has no publication-resume authorization"
                     reconciliation_failures.append(
                         (
                             manifest.run_id,
                             PublicationResumeRequired(
-                                f"Run {manifest.run_id} requires publication resumption, but "
-                                f"GitHub writes are disabled because {reason}; use "
+                                f"Run {manifest.run_id} requires publication resumption; use "
                                 f"`autocontribute publish {manifest.run_id}` after review"
                             ),
                         )
@@ -1699,10 +1354,6 @@ def _sync_lifecycle(
                 lease_guard.assert_owned()
                 try:
                     publisher._publish(manifest.run_id, lease_guard=lease_guard)
-                except AutomaticRolloutBlocked as resume_exc:
-                    lease_guard.assert_owned()
-                    if not scheduled_preflight:
-                        reconciliation_failures.append((manifest.run_id, resume_exc))
                 except AutocontributeError as resume_exc:
                     lease_guard.assert_owned()
                     reconciliation_failures.append((manifest.run_id, resume_exc))
@@ -1728,7 +1379,6 @@ def _print_lifecycle_result(result: LifecycleSyncResult) -> None:
     console.print(
         "Lifecycle sync: "
         f"{result.runs_checked} PR(s), "
-        f"{result.snapshots_recorded} new snapshot(s), "
         f"{result.signals_detected} safety signal(s), "
         f"{result.newly_tripped} new trigger(s)."
     )

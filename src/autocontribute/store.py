@@ -27,23 +27,13 @@ from autocontribute.domain import (
     utc_now,
 )
 from autocontribute.exceptions import CircuitBreakerTrigger, StateError
-from autocontribute.github_origin import canonical_api_origin
 from autocontribute.issue_revision import compute_issue_revision
-from autocontribute.lifecycle import (
-    PullRequestLifecycleSnapshot,
-    parse_lifecycle_snapshot_json,
-    parse_pull_request_url,
-)
+from autocontribute.lifecycle import parse_pull_request_url
 
-CURRENT_SCHEMA_VERSION: Final = 8
+CURRENT_SCHEMA_VERSION: Final = 9
 _MAX_GENERATION: Final = 2**63 - 1
 _MAX_ACTIVE_CIRCUIT_BREAKER_TRIGGERS: Final = 10_000
-_MAX_LIFECYCLE_SNAPSHOT_BYTES: Final = 2_000_000
-_MAX_LIFECYCLE_SNAPSHOT_CORPUS: Final = 100_000
 _MAX_RUN_CORPUS: Final = 10_000
-_MAX_EVALUATION_EVENT_CORPUS: Final = 10_000
-_UPSTREAM_OUTCOME_CURSOR_DOMAIN: Final = b"autocontribute.upstream-outcome-corpus.v1\x00"
-_GITHUB_LOGIN: Final = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _CANDIDATE_REPOSITORY: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _REQUIRED_STORAGE_ROOT_ENV: Final = "AUTOCONTRIBUTE_REQUIRED_STORAGE_ROOT"
@@ -84,13 +74,6 @@ _LEASE_GENERATION_COLUMNS: Final = {
     "lease_name",
     "generation",
 }
-_LIFECYCLE_SNAPSHOT_COLUMNS: Final = {
-    "id",
-    "run_id",
-    "fingerprint",
-    "observed_at",
-    "snapshot_json",
-}
 _CIRCUIT_BREAKER_COLUMNS: Final = {
     "singleton",
     "is_tripped",
@@ -114,13 +97,6 @@ _PUBLICATION_RESERVATION_COLUMNS: Final = {
     "repository",
     "reserved_at",
 }
-_PUBLICATION_GATE_HOLD_COLUMNS: Final = {
-    "run_id",
-    "deployment_fingerprint",
-    "corpus_cursor",
-    "held_at",
-    "outcome_corpus_cursor",
-}
 _MANIFEST_ARTIFACT_SYNC_COLUMNS: Final = {
     "run_id",
     "updated_at",
@@ -138,28 +114,19 @@ _CANDIDATE_RETRY_AUTHORIZATION_COLUMNS: Final = {
     "reason",
     "authorized_at",
 }
-_PUBLICATION_EVIDENCE_EVENT_TYPES: Final = (
-    "publication.reserved",
-    "publication.gate.held",
-    "publication.gate.rebound",
-    "publication.gate.released",
-)
-_MAX_PUBLICATION_EVIDENCE_EVENTS: Final = _MAX_RUN_CORPUS * 4
 _REQUIRED_INDEXES: Final = {
     "runs_status_idx",
     "runs_candidate_idx",
     "events_run_idx",
     "leases_expiry_idx",
-    "lifecycle_snapshots_run_idx",
     "circuit_breaker_events_epoch_idx",
     "publication_reservations_reserved_at_idx",
     "publication_reservations_repository_idx",
     "runs_candidate_revision_idx",
     "runs_active_candidate_idx",
 }
-# Development builds created schemas 1-7 and an earlier schema-8 layout that still had this
-# table. That state is not migrated; opening it asks the operator to start a fresh state root.
-_DEVELOPMENT_SCHEMA_8_TABLE: Final = "legacy_candidate_retry_overrides"
+# Development builds created schemas 1-8. That state is not migrated; opening it asks the
+# operator to start a fresh state root.
 
 _CANDIDATE_CLAIM_LEASE_NAME: Final = "autocontribute.run"
 
@@ -199,10 +166,6 @@ RECOVERABLE_IN_FLIGHT_STATUSES: Final = frozenset(
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _validate_evaluation_anchor_details(details: dict[str, str]) -> None:
-    _validate_event_details(details, field="evaluation anchor details")
 
 
 def _validate_event_details(details: dict[str, str], *, field: str) -> None:
@@ -786,20 +749,6 @@ class Lease:
 
 
 @dataclass(frozen=True, slots=True)
-class LifecycleSnapshot:
-    """One verified row; ``observed_at`` is non-authoritative storage metadata.
-
-    Upstream outcome decisions must use timestamps inside ``snapshot_json`` and immutable ledger
-    order. The local polling time neither contributes to the fingerprint nor proves an outcome.
-    """
-
-    run_id: str
-    fingerprint: str
-    observed_at: datetime
-    snapshot_json: str
-
-
-@dataclass(frozen=True, slots=True)
 class CircuitBreakerStatus:
     is_tripped: bool
     epoch: int
@@ -819,14 +768,6 @@ class PublicationReservation:
 
 
 @dataclass(frozen=True, slots=True)
-class PublicationGateHold:
-    run_id: str
-    deployment_fingerprint: str
-    corpus_cursor: str
-    outcome_corpus_cursor: str
-
-
-@dataclass(frozen=True, slots=True)
 class _PublicationReservationRequest:
     run_id: str
     repository: str
@@ -836,18 +777,6 @@ class _PublicationReservationRequest:
     day_end: datetime
     cooldown_start: datetime
     enforce_cooldown: bool
-    evaluation_corpus_cursor: str | None
-    evaluation_deployment_fingerprint: str | None
-    outcome_corpus_cursor: str | None
-    publishing_login: str | None
-    publishing_api_origin: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class _PublicationReservationResult:
-    reservation: PublicationReservation
-    reservation_created: bool
-    hold_created: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -855,15 +784,6 @@ class _PublicationReservationEvidence:
     run_id: str
     repository: str
     reserved_at: str
-
-
-@dataclass(frozen=True, slots=True)
-class _PublicationGateEvidence:
-    run_id: str
-    deployment_fingerprint: str
-    corpus_cursor: str
-    outcome_corpus_cursor: str
-    held_at: str
 
 
 class _ManifestArtifactSyncError(StateError):
@@ -1000,11 +920,7 @@ class RunStore:
             connection.execute("BEGIN IMMEDIATE")
             if self._supported_schema_version(connection) == 0:
                 self._create_schema(connection)
-            _reconcile_publication_state(
-                connection,
-                repair_missing=True,
-                require_current_rollout_cursors=False,
-            )
+            _reconcile_publication_state(connection, repair_missing=True)
             self._validate_current_schema(connection)
             connection.commit()
         except Exception:
@@ -1033,9 +949,7 @@ class RunStore:
     def _is_development_schema(cls, connection: sqlite3.Connection, version: int) -> bool:
         """Whether stored state comes from a development build this release does not migrate."""
 
-        return version not in {0, CURRENT_SCHEMA_VERSION} or (
-            _DEVELOPMENT_SCHEMA_8_TABLE in cls._table_names(connection)
-        )
+        return version not in {0, CURRENT_SCHEMA_VERSION}
 
     @staticmethod
     def _table_names(connection: sqlite3.Connection) -> set[str]:
@@ -1052,11 +966,9 @@ class RunStore:
             "events",
             "leases",
             "lease_generations",
-            "lifecycle_snapshots",
             "circuit_breaker",
             "circuit_breaker_events",
             "publication_reservations",
-            "publication_gate_holds",
             "manifest_artifact_sync",
             "candidate_retry_authorizations",
         }:
@@ -1170,17 +1082,6 @@ class RunStore:
             )
             """,
             """
-            CREATE TABLE lifecycle_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL REFERENCES runs(run_id),
-                fingerprint TEXT NOT NULL,
-                observed_at TEXT NOT NULL,
-                snapshot_json TEXT NOT NULL,
-                UNIQUE(run_id, fingerprint)
-            )
-            """,
-            "CREATE INDEX lifecycle_snapshots_run_idx ON lifecycle_snapshots(run_id, id)",
-            """
             CREATE TABLE circuit_breaker (
                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                 is_tripped INTEGER NOT NULL CHECK(is_tripped IN (0, 1)),
@@ -1225,24 +1126,6 @@ class RunStore:
             """
             CREATE INDEX publication_reservations_repository_idx
             ON publication_reservations(repository, reserved_at)
-            """,
-            """
-            CREATE TABLE publication_gate_holds (
-                run_id TEXT PRIMARY KEY REFERENCES publication_reservations(run_id),
-                deployment_fingerprint TEXT NOT NULL CHECK(
-                    length(deployment_fingerprint) = 64
-                    AND deployment_fingerprint NOT GLOB '*[^0-9a-f]*'
-                ),
-                corpus_cursor TEXT NOT NULL CHECK(
-                    length(corpus_cursor) = 64
-                    AND corpus_cursor NOT GLOB '*[^0-9a-f]*'
-                ),
-                held_at TEXT NOT NULL,
-                outcome_corpus_cursor TEXT NOT NULL CHECK(
-                    length(outcome_corpus_cursor) = 64
-                    AND outcome_corpus_cursor NOT GLOB '*[^0-9a-f]*'
-                )
-            )
             """,
             """
             CREATE TABLE manifest_artifact_sync (
@@ -1344,11 +1227,9 @@ class RunStore:
             "events": _EVENT_COLUMNS,
             "leases": _LEASE_COLUMNS,
             "lease_generations": _LEASE_GENERATION_COLUMNS,
-            "lifecycle_snapshots": _LIFECYCLE_SNAPSHOT_COLUMNS,
             "circuit_breaker": _CIRCUIT_BREAKER_COLUMNS,
             "circuit_breaker_events": _CIRCUIT_BREAKER_EVENT_COLUMNS,
             "publication_reservations": _PUBLICATION_RESERVATION_COLUMNS,
-            "publication_gate_holds": _PUBLICATION_GATE_HOLD_COLUMNS,
             "manifest_artifact_sync": _MANIFEST_ARTIFACT_SYNC_COLUMNS,
             "candidate_retry_authorizations": _CANDIDATE_RETRY_AUTHORIZATION_COLUMNS,
         }
@@ -1371,12 +1252,8 @@ class RunStore:
             raise StateError("State database schema objects do not match the canonical manifest")
         _verify_circuit_breaker_evidence(connection)
         _verify_event_anchors(connection)
-        _verify_lifecycle_snapshot_evidence(connection, collect=False)
         _verify_manifest_artifact_sync(connection)
-        _verify_publication_state(
-            connection,
-            require_current_rollout_cursors=False,
-        )
+        _verify_publication_state(connection)
         _verify_issue_revision_evidence(connection)
 
     @classmethod
@@ -1459,23 +1336,13 @@ class RunStore:
             ).fetchall()
         return [RunManifest.model_validate_json(row["manifest_json"]) for row in rows]
 
-    def oldest_runs(
-        self,
-        *,
-        limit: int = 100,
-        deployment_fingerprint: str | None = None,
-    ) -> builtins.list[RunManifest]:
+    def oldest_runs(self, *, limit: int = 100) -> builtins.list[RunManifest]:
         """Return a cohort ordered by validated, hash-chained creation evidence."""
 
         if isinstance(limit, bool) or not isinstance(limit, int):
             raise TypeError("oldest run limit must be an integer")
         if not 1 <= limit <= _MAX_RUN_CORPUS:
             raise ValueError("oldest run limit must be between 1 and 10000")
-        if deployment_fingerprint is not None and (
-            len(deployment_fingerprint) != 64
-            or any(character not in "0123456789abcdef" for character in deployment_fingerprint)
-        ):
-            raise ValueError("deployment fingerprint must be a lowercase SHA-256 value")
         with self._connection() as connection:
             connection.execute("BEGIN")
             _verify_event_anchors(connection)
@@ -1539,14 +1406,8 @@ class RunStore:
             ):
                 raise StateError(f"Run {run_id} manifest disagrees with its state row")
             validated.append((creation_occurred_at, manifest))
-        matching = [
-            (created_at, manifest)
-            for created_at, manifest in validated
-            if deployment_fingerprint is None
-            or manifest.deployment_fingerprint == deployment_fingerprint
-        ]
-        matching.sort(key=lambda item: (item[0], item[1].run_id))
-        return [manifest for _, manifest in matching[:limit]]
+        validated.sort(key=lambda item: (item[0], item[1].run_id))
+        return [manifest for _, manifest in validated[:limit]]
 
     def run_deployment_fingerprint(self, run_id: str) -> str | None:
         """Read the deployment identity sealed into a run's first ledger event."""
@@ -1585,46 +1446,6 @@ class RunStore:
             raise StateError(f"Run {normalized_run_id} has invalid creation evidence")
         return fingerprint
 
-    def publication_ledger_sequence(self, run_id: str) -> int:
-        """Return the global ledger position of one exact SUBMITTING-to-PR_OPEN transition."""
-
-        normalized_run_id = _lease_identity(run_id, field="publication run id")
-        with self._connection() as connection:
-            connection.execute("BEGIN")
-            _verify_event_anchors(connection, selected_run_id=normalized_run_id)
-            rows = connection.execute(
-                """
-                SELECT id, details_json FROM events
-                WHERE run_id = ? AND event_type = 'run.transitioned'
-                ORDER BY id
-                """,
-                (normalized_run_id,),
-            ).fetchall()
-        matches: builtins.list[int] = []
-        for row in rows:
-            try:
-                details = json.loads(row["details_json"])
-            except (TypeError, ValueError) as exc:
-                raise StateError(
-                    f"Run {normalized_run_id} contains invalid transition evidence"
-                ) from exc
-            if (
-                isinstance(details, dict)
-                and details.get("from") == RunStatus.SUBMITTING.value
-                and details.get("to") == RunStatus.PR_OPEN.value
-                and isinstance(details.get("reason"), str)
-                and bool(details["reason"])
-            ):
-                event_id = row["id"]
-                if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 1:
-                    raise StateError("Publication transition has an invalid ledger position")
-                matches.append(event_id)
-        if len(matches) != 1:
-            raise StateError(
-                f"Run {normalized_run_id} does not have exactly one canonical PR_OPEN transition"
-            )
-        return matches[0]
-
     def list_open_pull_request_runs(self, *, limit: int = 1_000) -> builtins.list[RunManifest]:
         """Return every lifecycle-managed PR, failing instead of truncating the set."""
 
@@ -1642,103 +1463,6 @@ class RunStore:
             limit=limit,
             resource="submitting",
         )
-
-    def has_active_publication_gate_hold(self, run_id: str) -> bool:
-        """Return whether one run still owns crash-persistent publication capacity."""
-
-        return self.publication_gate_hold(run_id) is not None
-
-    def publication_gate_hold(self, run_id: str) -> PublicationGateHold | None:
-        """Return one validated active automatic-publication hold, if present."""
-
-        normalized_run_id = _lease_identity(run_id, field="publication run id")
-        with self._connection() as connection:
-            row = connection.execute(
-                """
-                SELECT run_id, deployment_fingerprint, corpus_cursor,
-                       outcome_corpus_cursor, held_at
-                FROM publication_gate_holds WHERE run_id = ?
-                """,
-                (normalized_run_id,),
-            ).fetchone()
-        return _publication_gate_hold_from_row(row) if row is not None else None
-
-    def assert_publication_gate_hold_current(
-        self,
-        run_id: str,
-        *,
-        deployment_fingerprint: str | None,
-        publishing_login: str,
-        publishing_api_origin: str,
-    ) -> bool:
-        """Fail closed if an automatic publication hold has lost its exact authority.
-
-        A missing hold identifies a manual publication and requires no rollout assertion.  When
-        a hold exists, every check shares one read snapshot: ledger and publication evidence,
-        immutable deployment identity, durable publishing identity, and both rollout cursors.
-        The return value distinguishes a true manual publication from a validated automatic hold.
-        """
-
-        normalized_run_id = _lease_identity(run_id, field="publication run id")
-        with self._connection() as connection:
-            connection.execute("BEGIN")
-            # Read-only reconciliation verifies every event anchor, binds publication rows to
-            # their ledger evidence, and compares this run's active-hold cursors.  In
-            # particular, a deleted automatic hold row cannot masquerade as a manual
-            # publication, while another crashed run's drifted hold cannot block this run's
-            # own validated authority.
-            _verify_publication_state(
-                connection,
-                require_current_rollout_cursors=True,
-                currency_run_id=normalized_run_id,
-            )
-            row = connection.execute(
-                """
-                SELECT run_id, deployment_fingerprint, corpus_cursor,
-                       outcome_corpus_cursor, held_at
-                FROM publication_gate_holds WHERE run_id = ?
-                """,
-                (normalized_run_id,),
-            ).fetchone()
-            if row is None:
-                return False
-
-            hold = _publication_gate_hold_from_row(row)
-            if deployment_fingerprint is None:
-                raise StateError("Automatic publication lacks its deployment fingerprint")
-            deployment, login, origin, _ = _upstream_outcome_cursor_scope(
-                deployment_fingerprint,
-                publishing_login,
-                publishing_api_origin,
-                exclude_run_id=normalized_run_id,
-            )
-            if hold.deployment_fingerprint != deployment:
-                raise StateError("Publication gate hold belongs to a different deployment")
-
-            manifest_row = connection.execute(
-                "SELECT manifest_json FROM runs WHERE run_id = ?",
-                (normalized_run_id,),
-            ).fetchone()
-            if manifest_row is None or not isinstance(manifest_row["manifest_json"], str):
-                raise StateError(
-                    f"Publication gate hold for run {normalized_run_id} lacks its run manifest"
-                )
-            try:
-                manifest = RunManifest.model_validate_json(manifest_row["manifest_json"])
-            except (TypeError, ValueError) as exc:
-                raise StateError(
-                    f"Publication gate hold for run {normalized_run_id} has an invalid run manifest"
-                ) from exc
-            if (
-                manifest.run_id != normalized_run_id
-                or manifest.deployment_fingerprint != deployment
-                or manifest.publishing_login != login
-                or manifest.publishing_api_origin != origin
-            ):
-                raise StateError(
-                    "Publication gate hold belongs to a different publishing identity or scope"
-                )
-            return True
 
     def has_publication_reconstruction_evidence(self, run_id: str) -> bool:
         """Return whether the ledger contains state relevant to publication recovery."""
@@ -2126,110 +1850,17 @@ class RunStore:
         previous = manifest.status
         manifest.status = target
         try:
-            if target == RunStatus.PR_OPEN:
-                self._save_pr_open_transition(manifest, previous=previous, reason=reason)
-            else:
-                self.save(
-                    manifest,
-                    event="run.transitioned",
-                    details={"from": previous.value, "to": target.value, "reason": reason},
-                )
+            self.save(
+                manifest,
+                event="run.transitioned",
+                details={"from": previous.value, "to": target.value, "reason": reason},
+            )
         except _ManifestArtifactSyncError:
             raise
         except Exception:
             manifest.status = previous
             raise
         return manifest
-
-    def _save_pr_open_transition(
-        self,
-        manifest: RunManifest,
-        *,
-        previous: RunStatus,
-        reason: str,
-    ) -> None:
-        """Persist PR_OPEN and release its exact evaluation hold in one transaction."""
-
-        expected_updated_at = manifest.updated_at
-        saved_at = _next_run_update_time(expected_updated_at)
-        candidate = manifest.candidate
-        issue_revision = compute_issue_revision(candidate) if candidate is not None else None
-        manifest.updated_at = saved_at
-        manifest_json = manifest.model_dump_json()
-        try:
-            with self._connection() as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                current = connection.execute(
-                    """
-                    SELECT run_id, status, repository, issue_number, issue_revision,
-                           manifest_json
-                    FROM runs WHERE run_id = ?
-                    """,
-                    (manifest.run_id,),
-                ).fetchone()
-                if current is None:
-                    raise StateError(f"Unknown run: {manifest.run_id}")
-                _, stored_status, stored_revision = _verified_issue_revision_row(current)
-                if stored_status != previous or stored_revision != issue_revision:
-                    raise StateError(
-                        f"Run {manifest.run_id} candidate evidence changed after selection"
-                    )
-                result = connection.execute(
-                    """
-                    UPDATE runs
-                    SET status = ?, repository = ?, issue_number = ?, updated_at = ?,
-                        manifest_json = ?
-                    WHERE run_id = ? AND updated_at = ? AND status = ?
-                        AND issue_revision IS ? AND manifest_json = ?
-                    """,
-                    (
-                        manifest.status.value,
-                        candidate.repository if candidate else None,
-                        candidate.number if candidate else None,
-                        manifest.updated_at.isoformat(),
-                        manifest_json,
-                        manifest.run_id,
-                        expected_updated_at.isoformat(),
-                        previous.value,
-                        issue_revision,
-                        current["manifest_json"],
-                    ),
-                )
-                if result.rowcount != 1:
-                    raise StateError(
-                        f"Run {manifest.run_id} changed while this manifest was being saved"
-                    )
-                self._append_event(
-                    connection,
-                    manifest.run_id,
-                    "run.transitioned",
-                    {
-                        "from": previous.value,
-                        "to": RunStatus.PR_OPEN.value,
-                        "reason": reason,
-                    },
-                )
-                _release_publication_gate_hold(
-                    self,
-                    connection,
-                    manifest.run_id,
-                    outcome="pr_open",
-                    required=False,
-                )
-                _mark_manifest_artifact_sync(
-                    connection,
-                    run_id=manifest.run_id,
-                    updated_at=manifest.updated_at.isoformat(),
-                    manifest_json=manifest_json,
-                )
-        except Exception:
-            manifest.updated_at = expected_updated_at
-            raise
-        self._synchronize_manifest_artifact(
-            manifest.run_id,
-            updated_at=manifest.updated_at.isoformat(),
-            manifest_sha256=_manifest_json_digest(manifest_json),
-        )
 
     def finalize_merged_publication_compensation(
         self,
@@ -2240,10 +1871,8 @@ class RunStore:
     ) -> RunManifest:
         """Adopt one exact already-merged compensating PR into lifecycle management.
 
-        This exposure-reducing recovery is intentionally tolerant of rollout-cursor drift. It is
-        not a general PR_OPEN transition: the durable created-PR compensation marker and exact
-        URL must remain intact in the committing transaction. Automatic runs must retain their
-        same-run hold; a genuine manual run may have no hold.
+        This is not a general PR_OPEN transition: the durable created-PR compensation marker and
+        exact URL must remain intact in the committing transaction.
         """
 
         if manifest.status != RunStatus.SUBMITTING:
@@ -2277,32 +1906,12 @@ class RunStore:
         try:
             with self._connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                _reconcile_publication_state(
-                    connection,
-                    repair_missing=True,
-                    require_current_rollout_cursors=False,
-                )
+                _reconcile_publication_state(connection, repair_missing=True)
                 _assert_merged_publication_compensation_events(
                     connection,
                     manifest,
                     pull_request_url=expected_pull_request_url,
                 )
-                other_hold = connection.execute(
-                    """
-                    SELECT run_id FROM publication_gate_holds
-                    WHERE run_id <> ? ORDER BY run_id LIMIT 1
-                    """,
-                    (manifest.run_id,),
-                ).fetchone()
-                if other_hold is not None:
-                    other_run_id = other_hold["run_id"]
-                    if not isinstance(other_run_id, str) or not other_run_id:
-                        raise StateError("Publication gate hold contains invalid stored values")
-                    raise StateError(f"Publication gate is held by another run: {other_run_id}")
-                hold_row = connection.execute(
-                    "SELECT run_id FROM publication_gate_holds WHERE run_id = ?",
-                    (manifest.run_id,),
-                ).fetchone()
                 result = connection.execute(
                     """
                     UPDATE runs
@@ -2343,14 +1952,6 @@ class RunStore:
                         "reason": normalized_reason,
                     },
                 )
-                if hold_row is not None:
-                    _release_publication_gate_hold(
-                        self,
-                        connection,
-                        manifest.run_id,
-                        outcome="pr_open",
-                        required=True,
-                    )
                 _mark_manifest_artifact_sync(
                     connection,
                     run_id=manifest.run_id,
@@ -2375,7 +1976,7 @@ class RunStore:
         reason: str,
         evidence: dict[str, str],
     ) -> RunManifest:
-        """Finalize verified compensation with an exact same-run hold or no active hold."""
+        """Finalize verified compensation after exact remote cleanup evidence is durable."""
 
         if manifest.status != RunStatus.SUBMITTING:
             raise StateError("Verified publication compensation requires a SUBMITTING manifest")
@@ -2402,33 +2003,13 @@ class RunStore:
         try:
             with self._connection() as connection:
                 connection.execute("BEGIN IMMEDIATE")
-                _reconcile_publication_state(
-                    connection,
-                    repair_missing=True,
-                    require_current_rollout_cursors=False,
-                )
+                _reconcile_publication_state(connection, repair_missing=True)
                 _assert_failed_publication_compensation_events(
                     connection,
                     manifest,
                     reason=normalized_reason,
                     evidence=verified_details,
                 )
-                other_hold = connection.execute(
-                    """
-                    SELECT run_id FROM publication_gate_holds
-                    WHERE run_id <> ? ORDER BY run_id LIMIT 1
-                    """,
-                    (manifest.run_id,),
-                ).fetchone()
-                if other_hold is not None:
-                    other_run_id = other_hold["run_id"]
-                    if not isinstance(other_run_id, str) or not other_run_id:
-                        raise StateError("Publication gate hold contains invalid stored values")
-                    raise StateError(f"Publication gate is held by another run: {other_run_id}")
-                hold_row = connection.execute(
-                    "SELECT run_id FROM publication_gate_holds WHERE run_id = ?",
-                    (manifest.run_id,),
-                ).fetchone()
                 result = connection.execute(
                     """
                     UPDATE runs
@@ -2472,14 +2053,6 @@ class RunStore:
                         "reason": normalized_reason,
                     },
                 )
-                if hold_row is not None:
-                    _release_publication_gate_hold(
-                        self,
-                        connection,
-                        manifest.run_id,
-                        outcome="verified_compensation",
-                        required=True,
-                    )
                 _mark_manifest_artifact_sync(
                     connection,
                     run_id=manifest.run_id,
@@ -2580,11 +2153,8 @@ class RunStore:
         max_per_utc_day: int,
         repository_cooldown: timedelta,
         now: datetime | None = None,
-        evaluation_corpus_cursor: str | None = None,
-        evaluation_deployment_fingerprint: str | None = None,
-        outcome_corpus_cursor: str | None = None,
     ) -> RunManifest:
-        """Atomically persist publication intent, capacity, gate hold, and SUBMITTING."""
+        """Atomically persist publication intent, capacity, and SUBMITTING."""
 
         if manifest.status not in {
             RunStatus.READY_FOR_APPROVAL,
@@ -2600,11 +2170,6 @@ class RunStore:
             max_per_utc_day=max_per_utc_day,
             repository_cooldown=repository_cooldown,
             now=now,
-            evaluation_corpus_cursor=evaluation_corpus_cursor,
-            evaluation_deployment_fingerprint=evaluation_deployment_fingerprint,
-            outcome_corpus_cursor=outcome_corpus_cursor,
-            publishing_login=publishing_login,
-            publishing_api_origin=publishing_api_origin,
         )
         intent = _publication_intent(
             branch_name=branch_name,
@@ -2774,11 +2339,6 @@ class RunStore:
         max_per_utc_day: int,
         repository_cooldown: timedelta,
         now: datetime | None = None,
-        evaluation_corpus_cursor: str | None = None,
-        evaluation_deployment_fingerprint: str | None = None,
-        outcome_corpus_cursor: str | None = None,
-        publishing_login: str | None = None,
-        publishing_api_origin: str | None = None,
     ) -> PublicationReservation:
         """Durably consume local publication capacity before the first remote mutation."""
 
@@ -2788,43 +2348,17 @@ class RunStore:
             max_per_utc_day=max_per_utc_day,
             repository_cooldown=repository_cooldown,
             now=now,
-            evaluation_corpus_cursor=evaluation_corpus_cursor,
-            evaluation_deployment_fingerprint=evaluation_deployment_fingerprint,
-            outcome_corpus_cursor=outcome_corpus_cursor,
-            publishing_login=publishing_login,
-            publishing_api_origin=publishing_api_origin,
         )
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            result = self._reserve_publication_in_transaction(connection, request)
-        return result.reservation
+            return self._reserve_publication_in_transaction(connection, request)
 
     def _reserve_publication_in_transaction(
         self,
         connection: sqlite3.Connection,
         request: _PublicationReservationRequest,
-    ) -> _PublicationReservationResult:
-        # Rows and ledger evidence must agree exactly, but a durable hold whose anchored
-        # cursors drifted while its run awaited crash recovery must stay recoverable here:
-        # the request-cursor branch below re-verifies currency and re-anchors the hold.
-        _reconcile_publication_state(
-            connection,
-            repair_missing=True,
-            require_current_rollout_cursors=False,
-        )
-        other_hold = connection.execute(
-            """
-            SELECT run_id FROM publication_gate_holds
-            WHERE run_id <> ? ORDER BY run_id LIMIT 1
-            """,
-            (request.run_id,),
-        ).fetchone()
-        if other_hold is not None:
-            other_run_id = other_hold["run_id"]
-            if not isinstance(other_run_id, str) or not other_run_id:
-                raise StateError("Publication gate hold contains invalid stored values")
-            raise StateError(f"Publication gate is held by another run: {other_run_id}")
-
+    ) -> PublicationReservation:
+        _reconcile_publication_state(connection, repair_missing=True)
         existing = connection.execute(
             """
             SELECT repository, reserved_at FROM publication_reservations
@@ -2833,7 +2367,7 @@ class RunStore:
             (request.run_id,),
         ).fetchone()
         run = connection.execute(
-            "SELECT repository, manifest_json FROM runs WHERE run_id = ?", (request.run_id,)
+            "SELECT repository FROM runs WHERE run_id = ?", (request.run_id,)
         ).fetchone()
         if run is None:
             raise StateError(f"Unknown run: {request.run_id}")
@@ -2843,26 +2377,7 @@ class RunStore:
                 raise StateError(f"Run {request.run_id} has an invalid repository")
             if _repository_identity(run_repository) != request.repository:
                 raise StateError(f"Run {request.run_id} does not belong to {request.repository}")
-        if request.evaluation_deployment_fingerprint is not None:
-            manifest_json_value = run["manifest_json"]
-            if not isinstance(manifest_json_value, str):
-                raise StateError(f"Run {request.run_id} has an invalid manifest")
-            try:
-                stored_manifest = RunManifest.model_validate_json(manifest_json_value)
-            except (TypeError, ValueError) as exc:
-                raise StateError(f"Run {request.run_id} has an invalid manifest") from exc
-            creation_fingerprint = _run_creation_deployment_fingerprint(
-                connection,
-                request.run_id,
-            )
-            if (
-                stored_manifest.run_id != request.run_id
-                or stored_manifest.deployment_fingerprint != creation_fingerprint
-                or creation_fingerprint != request.evaluation_deployment_fingerprint
-            ):
-                raise StateError("Automatic publication run belongs to a different deployment")
 
-        reservation_created = existing is None
         if existing is not None:
             existing_repository = existing["repository"]
             if not isinstance(existing_repository, str):
@@ -2921,124 +2436,10 @@ class RunStore:
             )
             effective_reserved_at = request.reserved_at
 
-        hold_row = connection.execute(
-            """
-            SELECT run_id, deployment_fingerprint, corpus_cursor,
-                   outcome_corpus_cursor, held_at
-            FROM publication_gate_holds WHERE run_id = ?
-            """,
-            (request.run_id,),
-        ).fetchone()
-        hold_created = False
-        if request.evaluation_corpus_cursor is not None:
-            assert request.evaluation_deployment_fingerprint is not None
-            assert request.outcome_corpus_cursor is not None
-            assert request.publishing_login is not None
-            assert request.publishing_api_origin is not None
-            actual_corpus_cursor = _evaluation_corpus_cursor_from_connection(connection)
-            if actual_corpus_cursor != request.evaluation_corpus_cursor:
-                raise StateError("Evaluation corpus changed before publication could be reserved")
-            actual_outcome_cursor = _upstream_outcome_corpus_cursor_from_connection(
-                connection,
-                request.evaluation_deployment_fingerprint,
-                request.publishing_login,
-                request.publishing_api_origin,
-                request.run_id,
-            )
-            if actual_outcome_cursor != request.outcome_corpus_cursor:
-                raise StateError(
-                    "Upstream-outcome corpus changed before publication could be reserved"
-                )
-            if hold_row is None:
-                connection.execute(
-                    """
-                    INSERT INTO publication_gate_holds(
-                        run_id, deployment_fingerprint, corpus_cursor,
-                        outcome_corpus_cursor, held_at
-                    ) VALUES (?, ?, ?, ?, ?)
-                    """,
-                    (
-                        request.run_id,
-                        request.evaluation_deployment_fingerprint,
-                        request.evaluation_corpus_cursor,
-                        request.outcome_corpus_cursor,
-                        request.reserved_at.isoformat(),
-                    ),
-                )
-                self._append_event(
-                    connection,
-                    request.run_id,
-                    "publication.gate.held",
-                    {
-                        "deployment_fingerprint": request.evaluation_deployment_fingerprint,
-                        "corpus_cursor": request.evaluation_corpus_cursor,
-                        "outcome_corpus_cursor": request.outcome_corpus_cursor,
-                        "held_at": request.reserved_at.isoformat(),
-                    },
-                )
-                hold_created = True
-            else:
-                hold = _publication_gate_hold_from_row(hold_row)
-                if hold.deployment_fingerprint != request.evaluation_deployment_fingerprint:
-                    raise StateError("Publication run already holds different rollout evidence")
-                if (
-                    hold.corpus_cursor != request.evaluation_corpus_cursor
-                    or hold.outcome_corpus_cursor != request.outcome_corpus_cursor
-                ):
-                    # The corpus drifted while this run's crashed publication awaited recovery
-                    # (for example lifecycle outcomes observed for other runs). The request
-                    # cursors were verified against the live corpus above in this same
-                    # transaction, so re-anchor the hold to the current rollout authority
-                    # instead of wedging recovery behind bit-identical history.
-                    rebound = connection.execute(
-                        """
-                        UPDATE publication_gate_holds
-                        SET corpus_cursor = ?, outcome_corpus_cursor = ?, held_at = ?
-                        WHERE run_id = ? AND deployment_fingerprint = ?
-                          AND corpus_cursor = ? AND outcome_corpus_cursor = ? AND held_at = ?
-                        """,
-                        (
-                            request.evaluation_corpus_cursor,
-                            request.outcome_corpus_cursor,
-                            request.reserved_at.isoformat(),
-                            request.run_id,
-                            hold_row["deployment_fingerprint"],
-                            hold_row["corpus_cursor"],
-                            hold_row["outcome_corpus_cursor"],
-                            hold_row["held_at"],
-                        ),
-                    )
-                    if rebound.rowcount != 1:
-                        raise StateError(
-                            "Publication gate hold changed while it was being re-anchored"
-                        )
-                    self._append_event(
-                        connection,
-                        request.run_id,
-                        "publication.gate.rebound",
-                        {
-                            "deployment_fingerprint": request.evaluation_deployment_fingerprint,
-                            "corpus_cursor": request.evaluation_corpus_cursor,
-                            "outcome_corpus_cursor": request.outcome_corpus_cursor,
-                            "held_at": request.reserved_at.isoformat(),
-                        },
-                    )
-        elif hold_row is not None:
-            _publication_gate_hold_from_row(hold_row)
-            # Re-entry without proffered rollout cursors reconciles already-durable state
-            # (for example adopting a pull request that provably exists). Corpus drift since
-            # the hold was anchored must not wedge that bookkeeping; every constructive
-            # remote mutation still revalidates its own hold currency immediately before
-            # acting.
-
-        return _PublicationReservationResult(
-            reservation=PublicationReservation(
-                run_id=request.run_id,
-                repository=request.repository,
-                reserved_at=effective_reserved_at,
-            ),
-            reservation_created=reservation_created,
-            hold_created=hold_created,
+        return PublicationReservation(
+            run_id=request.run_id,
+            repository=request.repository,
+            reserved_at=effective_reserved_at,
         )
 
     def recover_stale_runs(
@@ -3449,76 +2850,6 @@ class RunStore:
         ):
             raise StateError(f"Lease {lease_name} is no longer owned by this worker")
         return lease
-
-    def record_lifecycle_snapshot(self, run_id: str, fingerprint: str, snapshot_json: str) -> bool:
-        """Persist one immutable lifecycle observation, deduplicated by its fingerprint."""
-
-        normalized_run_id = _lease_identity(run_id, field="run id")
-        observed_at = utc_now()
-        normalized_fingerprint = _sha256_identity(fingerprint, field="lifecycle fingerprint")
-        parsed_snapshot = _validated_snapshot_json(snapshot_json, observed_at=observed_at)
-        if parsed_snapshot.fingerprint() != normalized_fingerprint:
-            raise ValueError("lifecycle fingerprint does not match the canonical snapshot")
-        with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            if (
-                connection.execute(
-                    "SELECT 1 FROM runs WHERE run_id = ?", (normalized_run_id,)
-                ).fetchone()
-                is None
-            ):
-                raise StateError(f"Unknown run: {normalized_run_id}")
-            _verify_event_anchors(connection, selected_run_id=normalized_run_id)
-            _verify_lifecycle_snapshot_evidence(
-                connection,
-                selected_run_id=normalized_run_id,
-                collect=False,
-            )
-            existing = connection.execute(
-                """
-                SELECT snapshot_json FROM lifecycle_snapshots
-                WHERE run_id = ? AND fingerprint = ?
-                """,
-                (normalized_run_id, normalized_fingerprint),
-            ).fetchone()
-            if existing is not None:
-                if str(existing["snapshot_json"]) != snapshot_json:
-                    raise StateError(
-                        "Lifecycle fingerprint was reused for different snapshot content"
-                    )
-                return False
-            connection.execute(
-                """
-                INSERT INTO lifecycle_snapshots(
-                    run_id, fingerprint, observed_at, snapshot_json
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (
-                    normalized_run_id,
-                    normalized_fingerprint,
-                    observed_at.isoformat(),
-                    snapshot_json,
-                ),
-            )
-            self._append_event(
-                connection,
-                normalized_run_id,
-                "lifecycle.snapshot.recorded",
-                {"fingerprint": normalized_fingerprint},
-            )
-        return True
-
-    def lifecycle_snapshots(self, run_id: str) -> builtins.list[LifecycleSnapshot]:
-        """Return strictly parsed snapshots in their verified per-run ledger order."""
-
-        normalized_run_id = _lease_identity(run_id, field="run id")
-        with self._connection() as connection:
-            connection.execute("BEGIN")
-            _verify_event_anchors(connection, selected_run_id=normalized_run_id)
-            return _verify_lifecycle_snapshot_evidence(
-                connection,
-                selected_run_id=normalized_run_id,
-            )
 
     def trip_circuit_breaker(self, *, source: str, reason: str, trigger_hash: str) -> bool:
         """Trip persistently and make each new immutable trigger the active revision."""
@@ -3945,181 +3276,6 @@ class RunStore:
         with self._connection() as connection:
             connection.execute("BEGIN")
             _verify_event_anchors(connection, selected_run_id=selected_run_id)
-
-    def evaluation_corpus_cursor(self) -> str:
-        """Hash the complete bounded evaluation-event corpus in ledger order."""
-
-        with self._connection() as connection:
-            connection.execute("BEGIN")
-            return _evaluation_corpus_cursor_from_connection(connection)
-
-    def upstream_outcome_corpus_cursor(
-        self,
-        deployment_fingerprint: str,
-        publishing_login: str,
-        publishing_api_origin: str,
-        *,
-        exclude_run_id: str | None = None,
-    ) -> str:
-        """Hash all deployment evidence that can affect an upstream-outcome decision."""
-
-        scope = _upstream_outcome_cursor_scope(
-            deployment_fingerprint,
-            publishing_login,
-            publishing_api_origin,
-            exclude_run_id=exclude_run_id,
-        )
-        with self._connection() as connection:
-            connection.execute("BEGIN")
-            return _upstream_outcome_corpus_cursor_from_connection(connection, *scope)
-
-    def record_evaluation_anchor(self, run_id: str, details: dict[str, str]) -> None:
-        """Atomically append one evaluation anchor without rewriting the run manifest."""
-
-        normalized_run_id = _lease_identity(run_id, field="evaluation run id")
-        _validate_evaluation_anchor_details(details)
-        with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            _assert_no_publication_gate_hold(connection)
-            if (
-                connection.execute(
-                    "SELECT 1 FROM runs WHERE run_id = ?", (normalized_run_id,)
-                ).fetchone()
-                is None
-            ):
-                raise StateError(f"Unknown run: {normalized_run_id}")
-            if (
-                connection.execute(
-                    """
-                    SELECT 1 FROM events
-                    WHERE run_id = ?
-                      AND event_type IN ('evaluation.recorded', 'evaluation.amended')
-                    LIMIT 1
-                    """,
-                    (normalized_run_id,),
-                ).fetchone()
-                is not None
-            ):
-                raise StateError(f"Run {normalized_run_id} already has an evaluation anchor")
-            self._append_event(
-                connection,
-                normalized_run_id,
-                "evaluation.recorded",
-                details,
-            )
-
-    def record_evaluation_amendment_anchor(
-        self,
-        run_id: str,
-        details: dict[str, str],
-        *,
-        expected_previous_hash: str,
-    ) -> None:
-        """Append an amendment only when it extends the current evaluation revision."""
-
-        normalized_run_id = _lease_identity(run_id, field="evaluation run id")
-        _validate_evaluation_anchor_details(details)
-        previous_hash = _stored_event_hash(
-            expected_previous_hash,
-            field="expected previous evaluation hash",
-        )
-        with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            _assert_no_publication_gate_hold(connection)
-            if (
-                connection.execute(
-                    "SELECT 1 FROM runs WHERE run_id = ?", (normalized_run_id,)
-                ).fetchone()
-                is None
-            ):
-                raise StateError(f"Unknown run: {normalized_run_id}")
-            rows = connection.execute(
-                """
-                SELECT event_type, details_json FROM events
-                WHERE run_id = ?
-                  AND event_type IN ('evaluation.recorded', 'evaluation.amended')
-                ORDER BY id
-                """,
-                (normalized_run_id,),
-            ).fetchall()
-            if not rows or rows[0]["event_type"] != "evaluation.recorded":
-                raise StateError(
-                    f"Run {normalized_run_id} does not have an initial evaluation anchor"
-                )
-            if any(row["event_type"] != "evaluation.amended" for row in rows[1:]):
-                raise StateError(f"Run {normalized_run_id} has an invalid evaluation history")
-            latest_details_value = rows[-1]["details_json"]
-            if not isinstance(latest_details_value, str):
-                raise StateError("Evaluation revision anchor contains invalid stored values")
-            try:
-                latest_details = json.loads(latest_details_value)
-            except json.JSONDecodeError as exc:
-                raise StateError("Evaluation revision anchor contains malformed details") from exc
-            if not isinstance(latest_details, dict):
-                raise StateError("Evaluation revision anchor contains malformed details")
-            latest_hash = latest_details.get("evaluation_hash")
-            if latest_hash != previous_hash:
-                raise StateError(
-                    f"Run {normalized_run_id} evaluation changed before the amendment was recorded"
-                )
-            self._append_event(
-                connection,
-                normalized_run_id,
-                "evaluation.amended",
-                details,
-            )
-
-    def evaluation_revision_anchors(
-        self,
-        *,
-        limit: int = 10_000,
-    ) -> builtins.list[dict[str, str]]:
-        """Return all initial and amendment anchors in immutable ledger order."""
-
-        if isinstance(limit, bool) or not isinstance(limit, int):
-            raise TypeError("evaluation revision anchor limit must be an integer")
-        if not 1 <= limit <= 10_000:
-            raise ValueError("evaluation revision anchor limit must be between 1 and 10000")
-        with self._connection() as connection:
-            rows = connection.execute(
-                """
-                SELECT run_id, event_type, details_json FROM events
-                WHERE event_type IN ('evaluation.recorded', 'evaluation.amended')
-                ORDER BY id LIMIT ?
-                """,
-                (limit + 1,),
-            ).fetchall()
-        if len(rows) > limit:
-            raise StateError("Evaluation revision anchor set exceeds the configured safety bound")
-
-        anchors: builtins.list[dict[str, str]] = []
-        for row in rows:
-            run_id_value = row["run_id"]
-            event_type_value = row["event_type"]
-            details_value = row["details_json"]
-            if (
-                not isinstance(run_id_value, str)
-                or event_type_value not in {"evaluation.recorded", "evaluation.amended"}
-                or not isinstance(details_value, str)
-            ):
-                raise StateError("Evaluation revision anchor contains invalid stored values")
-            try:
-                parsed_details = json.loads(details_value)
-            except json.JSONDecodeError as exc:
-                raise StateError("Evaluation revision anchor contains malformed details") from exc
-            if not isinstance(parsed_details, dict) or not all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in parsed_details.items()
-            ):
-                raise StateError("Evaluation revision anchor contains malformed details")
-            anchors.append(
-                {
-                    "run_id": run_id_value,
-                    "event_type": event_type_value,
-                    "details": details_value,
-                }
-            )
-        return anchors
 
     def _append_event(
         self,
@@ -4793,160 +3949,6 @@ def _verify_circuit_breaker_evidence(connection: sqlite3.Connection) -> None:
             raise StateError("Circuit-breaker state does not identify its latest trigger")
 
 
-def _verify_lifecycle_snapshot_evidence(
-    connection: sqlite3.Connection,
-    *,
-    selected_run_id: str | None = None,
-    collect: bool = True,
-) -> builtins.list[LifecycleSnapshot]:
-    """Strictly parse snapshot rows and reconcile them 1:1 with ledger events."""
-
-    if selected_run_id is None:
-        snapshot_count = connection.execute("SELECT count(*) FROM lifecycle_snapshots").fetchone()
-        event_count = connection.execute(
-            """
-            SELECT count(*) FROM events
-            WHERE event_type = 'lifecycle.snapshot.recorded'
-            """
-        ).fetchone()
-        snapshot_rows = connection.execute(
-            """
-            SELECT id, run_id, fingerprint, observed_at, snapshot_json
-            FROM lifecycle_snapshots ORDER BY id
-            """
-        )
-        event_rows = connection.execute(
-            """
-            SELECT id, run_id, details_json FROM events
-            WHERE event_type = 'lifecycle.snapshot.recorded'
-            ORDER BY id
-            """
-        )
-    else:
-        snapshot_count = connection.execute(
-            "SELECT count(*) FROM lifecycle_snapshots WHERE run_id = ?",
-            (selected_run_id,),
-        ).fetchone()
-        event_count = connection.execute(
-            """
-            SELECT count(*) FROM events
-            WHERE run_id = ? AND event_type = 'lifecycle.snapshot.recorded'
-            """,
-            (selected_run_id,),
-        ).fetchone()
-        snapshot_rows = connection.execute(
-            """
-            SELECT id, run_id, fingerprint, observed_at, snapshot_json
-            FROM lifecycle_snapshots WHERE run_id = ? ORDER BY id
-            """,
-            (selected_run_id,),
-        )
-        event_rows = connection.execute(
-            """
-            SELECT id, run_id, details_json FROM events
-            WHERE run_id = ? AND event_type = 'lifecycle.snapshot.recorded'
-            ORDER BY id
-            """,
-            (selected_run_id,),
-        )
-    if snapshot_count is None or snapshot_count[0] > _MAX_LIFECYCLE_SNAPSHOT_CORPUS:
-        raise StateError("Lifecycle snapshot corpus exceeds the configured safety bound")
-    if event_count is None or event_count[0] > _MAX_LIFECYCLE_SNAPSHOT_CORPUS:
-        raise StateError("Lifecycle snapshot event corpus exceeds the configured safety bound")
-
-    snapshot_values: dict[tuple[str, str], LifecycleSnapshot] = {}
-    snapshot_keys: set[tuple[str, str]] = set()
-    for row in snapshot_rows:
-        run_id_value = row["run_id"]
-        snapshot_json_value = row["snapshot_json"]
-        if not isinstance(run_id_value, str) or not run_id_value:
-            raise StateError("Lifecycle snapshot row contains an invalid run ID")
-        run_id = run_id_value
-        fingerprint = _stored_event_hash(
-            row["fingerprint"],
-            field=f"run {run_id} lifecycle fingerprint",
-        )
-        observed_at = _stored_canonical_utc_datetime(
-            row["observed_at"],
-            field=f"run {run_id} lifecycle observation time",
-        )
-        if not isinstance(snapshot_json_value, str):
-            raise StateError(f"Run {run_id} lifecycle snapshot is not stored as text")
-        try:
-            parsed = _validated_snapshot_json(
-                snapshot_json_value,
-                observed_at=observed_at,
-            )
-        except (TypeError, ValueError) as exc:
-            raise StateError(f"Run {run_id} lifecycle snapshot is invalid: {exc}") from exc
-        if parsed.fingerprint() != fingerprint:
-            raise StateError(f"Run {run_id} lifecycle snapshot fingerprint mismatch")
-        key = (run_id, fingerprint)
-        if key in snapshot_keys:
-            raise StateError(f"Run {run_id} has duplicate lifecycle snapshot rows")
-        snapshot_keys.add(key)
-        if collect:
-            snapshot_values[key] = LifecycleSnapshot(
-                run_id=run_id,
-                fingerprint=fingerprint,
-                observed_at=observed_at,
-                snapshot_json=snapshot_json_value,
-            )
-
-    event_keys: set[tuple[str, str]] = set()
-    event_order: builtins.list[tuple[str, str]] = []
-    for row in event_rows:
-        run_id_value = row["run_id"]
-        details_value = row["details_json"]
-        if not isinstance(run_id_value, str) or not run_id_value:
-            raise StateError("Lifecycle snapshot event contains an invalid run ID")
-        run_id = run_id_value
-        fingerprint = _lifecycle_event_fingerprint(details_value, run_id=run_id)
-        key = (run_id, fingerprint)
-        if key in event_keys:
-            raise StateError(f"Run {run_id} has duplicate lifecycle snapshot ledger events")
-        event_keys.add(key)
-        if collect:
-            event_order.append(key)
-
-    missing_events = snapshot_keys - event_keys
-    if missing_events:
-        run_id, _ = min(missing_events)
-        raise StateError(f"Run {run_id} lifecycle snapshot is missing its ledger event")
-    orphan_events = event_keys - snapshot_keys
-    if orphan_events:
-        run_id, _ = min(orphan_events)
-        raise StateError(f"Run {run_id} has an orphan lifecycle snapshot ledger event")
-    return [snapshot_values[key] for key in event_order] if collect else []
-
-
-def _lifecycle_event_fingerprint(value: object, *, run_id: str) -> str:
-    if not isinstance(value, str):
-        raise StateError(f"Run {run_id} lifecycle snapshot event details are invalid")
-    try:
-        parsed = json.loads(value, object_pairs_hook=_unique_lifecycle_event_object)
-    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
-        raise StateError(f"Run {run_id} lifecycle snapshot event details are invalid") from exc
-    if not isinstance(parsed, dict) or set(parsed) != {"fingerprint"}:
-        raise StateError(f"Run {run_id} lifecycle snapshot event details are invalid")
-    fingerprint = _stored_event_hash(
-        parsed["fingerprint"],
-        field=f"run {run_id} lifecycle event fingerprint",
-    )
-    if value != _canonical_json({"fingerprint": fingerprint}):
-        raise StateError(f"Run {run_id} lifecycle snapshot event details are not canonical")
-    return fingerprint
-
-
-def _unique_lifecycle_event_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate lifecycle event detail: {key}")
-        result[key] = value
-    return result
-
-
 def _verify_event_anchors(
     connection: sqlite3.Connection,
     *,
@@ -5003,290 +4005,30 @@ def _verify_event_anchors(
             raise StateError(f"Event ledger anchor mismatch for run {run_id_value}")
 
 
-def _evaluation_corpus_cursor_from_connection(connection: sqlite3.Connection) -> str:
-    """Return an exact bounded cursor after validating the underlying event ledger."""
-
-    _verify_event_anchors(connection)
+def _publication_evidence_from_connection(
+    connection: sqlite3.Connection,
+) -> dict[str, _PublicationReservationEvidence]:
     rows = connection.execute(
         """
-        SELECT id, run_id, event_type, event_hash FROM events
-        WHERE event_type IN ('evaluation.recorded', 'evaluation.amended')
-        ORDER BY id ASC LIMIT ?
-        """,
-        (_MAX_EVALUATION_EVENT_CORPUS + 1,),
-    ).fetchall()
-    if len(rows) > _MAX_EVALUATION_EVENT_CORPUS:
-        raise StateError("Evaluation event corpus exceeds the configured safety bound")
-    canonical: builtins.list[dict[str, int | str]] = []
-    for row in rows:
-        event_id = row["id"]
-        run_id = row["run_id"]
-        event_type = row["event_type"]
-        if (
-            isinstance(event_id, bool)
-            or not isinstance(event_id, int)
-            or event_id < 1
-            or not isinstance(run_id, str)
-            or not run_id
-            or event_type not in {"evaluation.recorded", "evaluation.amended"}
-        ):
-            raise StateError("Evaluation event cursor contains invalid stored values")
-        event_hash = _stored_event_hash(
-            row["event_hash"], field=f"evaluation event {event_id} hash"
-        )
-        canonical.append(
-            {
-                "id": event_id,
-                "run_id": run_id,
-                "event_type": str(event_type),
-                "event_hash": event_hash,
-            }
-        )
-    return hashlib.sha256(_canonical_json(canonical).encode("utf-8")).hexdigest()
-
-
-def _run_creation_deployment_fingerprint(
-    connection: sqlite3.Connection,
-    run_id: str,
-) -> str | None:
-    row = connection.execute(
-        """
-        SELECT event_type, details_json FROM events
-        WHERE run_id = ? ORDER BY id ASC LIMIT 1
-        """,
-        (run_id,),
-    ).fetchone()
-    if row is None or row["event_type"] != "run.created":
-        raise StateError(f"Run {run_id} is missing valid creation evidence")
-    try:
-        details = json.loads(row["details_json"])
-    except (TypeError, ValueError) as exc:
-        raise StateError(f"Run {run_id} has invalid creation evidence") from exc
-    if details == {"status": "queued"}:
-        return None
-    if (
-        not isinstance(details, dict)
-        or set(details) != {"deployment_fingerprint", "status"}
-        or details.get("status") != "queued"
-    ):
-        raise StateError(f"Run {run_id} has invalid creation evidence")
-    return _stored_event_hash(
-        details.get("deployment_fingerprint"),
-        field=f"run {run_id} creation deployment fingerprint",
-    )
-
-
-def _upstream_outcome_cursor_scope(
-    deployment_fingerprint: str,
-    publishing_login: str,
-    publishing_api_origin: str,
-    *,
-    exclude_run_id: str | None,
-) -> tuple[str, str, str, str | None]:
-    deployment = _sha256_identity(
-        deployment_fingerprint,
-        field="upstream-outcome deployment fingerprint",
-    )
-    if not isinstance(publishing_login, str):
-        raise TypeError("upstream-outcome publishing login must be a string")
-    login = publishing_login.strip().casefold()
-    if publishing_login != login or not _GITHUB_LOGIN.fullmatch(login):
-        raise ValueError("upstream-outcome publishing login must be canonical")
-    if not isinstance(publishing_api_origin, str):
-        raise TypeError("upstream-outcome API origin must be a string")
-    origin = canonical_api_origin(publishing_api_origin)
-    if publishing_api_origin != origin:
-        raise ValueError("upstream-outcome API origin must be canonical")
-    excluded = (
-        _lease_identity(exclude_run_id, field="excluded upstream-outcome run id")
-        if exclude_run_id is not None
-        else None
-    )
-    return deployment, login, origin, excluded
-
-
-def _upstream_outcome_corpus_cursor_from_connection(
-    connection: sqlite3.Connection,
-    deployment_fingerprint: str,
-    publishing_login: str,
-    publishing_api_origin: str,
-    exclude_run_id: str | None,
-) -> str:
-    """Return a bounded cursor over every durable input to outcome classification.
-
-    The polling timestamp on lifecycle rows is intentionally absent: only GitHub timestamps and
-    hash-chained ledger order are authoritative. The exact candidate run is excluded so that the
-    cursor remains the pre-publication corpus after its atomic hold and intent are appended.
-    """
-
-    _verify_event_anchors(connection)
-    rows = connection.execute(
-        """
-        SELECT runs.run_id, runs.status, runs.created_at, runs.manifest_json,
-               runs.event_count, runs.event_head_hash,
-               creation.occurred_at AS creation_occurred_at,
-               creation.event_type AS creation_event_type,
-               creation.details_json AS creation_details
-        FROM runs
-        JOIN events AS creation ON creation.id = (
-            SELECT MIN(first_event.id) FROM events AS first_event
-            WHERE first_event.run_id = runs.run_id
-        )
-        ORDER BY creation.occurred_at ASC, runs.run_id ASC
-        LIMIT ?
+        SELECT run_id, details_json FROM events
+        WHERE event_type = 'publication.reserved' ORDER BY id LIMIT ?
         """,
         (_MAX_RUN_CORPUS + 1,),
     ).fetchall()
     if len(rows) > _MAX_RUN_CORPUS:
-        raise StateError("Upstream-outcome run corpus exceeds the configured safety bound")
-
-    canonical_runs: builtins.list[dict[str, object]] = []
-    lifecycle_count = 0
-    for row in rows:
-        run_id_value = row["run_id"]
-        if not isinstance(run_id_value, str) or not run_id_value:
-            raise StateError("Upstream-outcome corpus contains an invalid run ID")
-        run_id = run_id_value
-        try:
-            manifest_json = row["manifest_json"]
-            if not isinstance(manifest_json, str):
-                raise TypeError("manifest is not text")
-            manifest = RunManifest.model_validate_json(manifest_json)
-            creation_details = json.loads(row["creation_details"])
-        except (TypeError, ValueError) as exc:
-            raise StateError(f"Run {run_id} has invalid upstream-outcome evidence") from exc
-        if creation_details == {"status": "queued"}:
-            creation_fingerprint = None
-        elif (
-            isinstance(creation_details, dict)
-            and set(creation_details) == {"deployment_fingerprint", "status"}
-            and creation_details.get("status") == "queued"
-        ):
-            creation_fingerprint = _stored_event_hash(
-                creation_details.get("deployment_fingerprint"),
-                field=f"run {run_id} creation deployment fingerprint",
-            )
-        else:
-            raise StateError(f"Run {run_id} has invalid creation evidence")
-        stored_created_at = _stored_datetime(row["created_at"], field="run creation time")
-        creation_occurred_at = _stored_datetime(
-            row["creation_occurred_at"],
-            field="run creation event time",
-        )
-        if (
-            row["creation_event_type"] != "run.created"
-            or manifest.run_id != run_id
-            or manifest.status != _stored_run_status(row["status"], run_id=run_id)
-            or manifest.created_at.astimezone(UTC) != stored_created_at
-            or manifest.deployment_fingerprint != creation_fingerprint
-            or creation_occurred_at < stored_created_at
-        ):
-            raise StateError(f"Run {run_id} manifest disagrees with its state row")
-        if creation_fingerprint != deployment_fingerprint or run_id == exclude_run_id:
-            continue
-        if manifest.status not in {RunStatus.SUBMITTING, RunStatus.PR_OPEN}:
-            publication_event = connection.execute(
-                """
-                SELECT 1 FROM events WHERE run_id = ? AND (
-                    event_type GLOB 'approval.*'
-                    OR event_type GLOB 'branch.*'
-                    OR event_type GLOB 'commit.*'
-                    OR event_type GLOB 'publication.*'
-                    OR event_type GLOB 'pull_request.*'
-                )
-                LIMIT 1
-                """,
-                (run_id,),
-            ).fetchone()
-            if publication_event is None:
-                continue
-
-        lifecycle_rows = _verify_lifecycle_snapshot_evidence(
-            connection,
-            selected_run_id=run_id,
-        )
-        lifecycle_count += len(lifecycle_rows)
-        if lifecycle_count > _MAX_LIFECYCLE_SNAPSHOT_CORPUS:
-            raise StateError("Upstream-outcome lifecycle corpus exceeds the safety bound")
-        canonical_runs.append(
-            {
-                "run_id": run_id,
-                "manifest_json": manifest_json,
-                "event_count": _stored_event_count(
-                    row["event_count"],
-                    field=f"run {run_id} event count",
-                ),
-                "event_head_hash": _stored_event_hash(
-                    row["event_head_hash"],
-                    field=f"run {run_id} event head",
-                ),
-                "lifecycle": [
-                    {
-                        "fingerprint": snapshot.fingerprint,
-                        "snapshot_json": snapshot.snapshot_json,
-                    }
-                    for snapshot in lifecycle_rows
-                ],
-            }
-        )
-
-    payload = {
-        "schema_version": 1,
-        "scope": {
-            "deployment_fingerprint": deployment_fingerprint,
-            "publishing_login": publishing_login,
-            "publishing_api_origin": publishing_api_origin,
-            "excluded_run_id": exclude_run_id,
-        },
-        "runs": canonical_runs,
-    }
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(_UPSTREAM_OUTCOME_CURSOR_DOMAIN + encoded).hexdigest()
-
-
-def _publication_evidence_from_connection(
-    connection: sqlite3.Connection,
-) -> tuple[
-    dict[str, _PublicationReservationEvidence],
-    dict[str, _PublicationGateEvidence],
-    dict[str, _PublicationGateEvidence],
-]:
-    placeholders = ",".join("?" for _ in _PUBLICATION_EVIDENCE_EVENT_TYPES)
-    # The event inventory is an internal constant; interpolation only chooses the number of bound
-    # parameter placeholders.
-    evidence_query = (
-        "SELECT id, run_id, event_type, details_json FROM events "
-        f"WHERE event_type IN ({placeholders}) ORDER BY id LIMIT ?"
-    )
-    rows = connection.execute(
-        evidence_query,
-        (*_PUBLICATION_EVIDENCE_EVENT_TYPES, _MAX_PUBLICATION_EVIDENCE_EVENTS + 1),
-    ).fetchall()
-    if len(rows) > _MAX_PUBLICATION_EVIDENCE_EVENTS:
         raise StateError("Publication evidence exceeds the configured safety bound")
 
     reservations: dict[str, _PublicationReservationEvidence] = {}
-    holds: dict[str, _PublicationGateEvidence] = {}
-    releases: dict[str, _PublicationGateEvidence] = {}
     for row in rows:
         run_id_value = row["run_id"]
-        event_type_value = row["event_type"]
         details_value = row["details_json"]
         if (
             not isinstance(run_id_value, str)
             or not run_id_value
-            or event_type_value not in _PUBLICATION_EVIDENCE_EVENT_TYPES
             or not isinstance(details_value, str)
         ):
             raise StateError("Publication evidence contains invalid stored values")
         run_id = run_id_value
-        event_type = str(event_type_value)
         try:
             parsed = json.loads(details_value)
         except json.JSONDecodeError as exc:
@@ -5298,143 +4040,26 @@ def _publication_evidence_from_connection(
         ):
             raise StateError(f"Run {run_id} publication evidence contains malformed details")
         details = cast(dict[str, str], parsed)
-
-        if event_type == "publication.reserved":
-            if set(details) != {"repository", "reserved_at"}:
-                raise StateError(f"Run {run_id} publication reservation evidence is incomplete")
-            try:
-                repository = _repository_identity(details["repository"])
-            except (TypeError, ValueError) as exc:
-                raise StateError(
-                    f"Run {run_id} publication reservation evidence is invalid"
-                ) from exc
-            if repository != details["repository"]:
-                raise StateError(f"Run {run_id} publication reservation evidence is not canonical")
-            _stored_datetime(
-                details["reserved_at"],
-                field=f"run {run_id} publication reservation evidence time",
-            )
-            if run_id in reservations:
-                raise StateError(f"Run {run_id} has duplicate publication reservation evidence")
-            reservations[run_id] = _PublicationReservationEvidence(
-                run_id=run_id,
-                repository=repository,
-                reserved_at=details["reserved_at"],
-            )
-            continue
-
-        if event_type == "publication.gate.held":
-            if set(details) != {
-                "deployment_fingerprint",
-                "corpus_cursor",
-                "outcome_corpus_cursor",
-                "held_at",
-            }:
-                raise StateError(f"Run {run_id} publication gate evidence is incomplete")
-            fingerprint = _stored_event_hash(
-                details["deployment_fingerprint"],
-                field=f"run {run_id} publication gate evidence deployment fingerprint",
-            )
-            outcome_cursor = _stored_event_hash(
-                details["outcome_corpus_cursor"],
-                field=f"run {run_id} publication gate evidence outcome cursor",
-            )
-            cursor = _stored_event_hash(
-                details["corpus_cursor"],
-                field=f"run {run_id} publication gate evidence corpus cursor",
-            )
-            _stored_datetime(
-                details["held_at"],
-                field=f"run {run_id} publication gate evidence time",
-            )
-            if run_id in holds:
-                raise StateError(f"Run {run_id} has duplicate publication gate hold evidence")
-            holds[run_id] = _PublicationGateEvidence(
-                run_id=run_id,
-                deployment_fingerprint=fingerprint,
-                corpus_cursor=cursor,
-                outcome_corpus_cursor=outcome_cursor,
-                held_at=details["held_at"],
-            )
-            continue
-
-        if event_type == "publication.gate.rebound":
-            if set(details) != {
-                "deployment_fingerprint",
-                "corpus_cursor",
-                "outcome_corpus_cursor",
-                "held_at",
-            }:
-                raise StateError(f"Run {run_id} publication gate rebind evidence is incomplete")
-            existing_hold = holds.get(run_id)
-            if existing_hold is None:
-                raise StateError(f"Run {run_id} publication gate rebind lacks hold evidence")
-            if run_id in releases:
-                raise StateError(f"Run {run_id} publication gate rebind follows its release")
-            rebind_fingerprint = _stored_event_hash(
-                details["deployment_fingerprint"],
-                field=f"run {run_id} publication gate rebind deployment fingerprint",
-            )
-            if existing_hold.deployment_fingerprint != rebind_fingerprint:
-                raise StateError(
-                    f"Run {run_id} publication gate rebind changes its deployment identity"
-                )
-            _stored_datetime(
-                details["held_at"],
-                field=f"run {run_id} publication gate rebind time",
-            )
-            # A rebind re-anchors an unreleased hold to rollout cursors that were verified
-            # current in the same transaction; the latest rebind is the effective hold
-            # evidence that durable rows and the eventual release must match exactly.
-            holds[run_id] = _PublicationGateEvidence(
-                run_id=run_id,
-                deployment_fingerprint=rebind_fingerprint,
-                corpus_cursor=_stored_event_hash(
-                    details["corpus_cursor"],
-                    field=f"run {run_id} publication gate rebind corpus cursor",
-                ),
-                outcome_corpus_cursor=_stored_event_hash(
-                    details["outcome_corpus_cursor"],
-                    field=f"run {run_id} publication gate rebind outcome cursor",
-                ),
-                held_at=details["held_at"],
-            )
-            continue
-
-        if set(details) != {
-            "outcome",
-            "deployment_fingerprint",
-            "corpus_cursor",
-            "outcome_corpus_cursor",
-            "held_at",
-        } or details["outcome"] not in {"pr_open", "verified_compensation"}:
-            raise StateError(f"Run {run_id} publication gate release evidence is incomplete")
-        release_fingerprint = _stored_event_hash(
-            details["deployment_fingerprint"],
-            field=f"run {run_id} publication gate release deployment fingerprint",
-        )
-        release_cursor = _stored_event_hash(
-            details["corpus_cursor"],
-            field=f"run {run_id} publication gate release corpus cursor",
-        )
-        release_outcome_cursor = _stored_event_hash(
-            details["outcome_corpus_cursor"],
-            field=f"run {run_id} publication gate release outcome cursor",
-        )
+        if set(details) != {"repository", "reserved_at"}:
+            raise StateError(f"Run {run_id} publication reservation evidence is incomplete")
+        try:
+            repository = _repository_identity(details["repository"])
+        except (TypeError, ValueError) as exc:
+            raise StateError(f"Run {run_id} publication reservation evidence is invalid") from exc
+        if repository != details["repository"]:
+            raise StateError(f"Run {run_id} publication reservation evidence is not canonical")
         _stored_datetime(
-            details["held_at"],
-            field=f"run {run_id} publication gate release time",
+            details["reserved_at"],
+            field=f"run {run_id} publication reservation evidence time",
         )
-        if run_id in releases:
-            raise StateError(f"Run {run_id} has duplicate publication gate release evidence")
-        releases[run_id] = _PublicationGateEvidence(
+        if run_id in reservations:
+            raise StateError(f"Run {run_id} has duplicate publication reservation evidence")
+        reservations[run_id] = _PublicationReservationEvidence(
             run_id=run_id,
-            deployment_fingerprint=release_fingerprint,
-            corpus_cursor=release_cursor,
-            outcome_corpus_cursor=release_outcome_cursor,
-            held_at=details["held_at"],
+            repository=repository,
+            reserved_at=details["reserved_at"],
         )
-    return reservations, holds, releases
+    return reservations
 
 
 def _publication_reservation_evidence_from_row(
@@ -5467,26 +4092,9 @@ def _publication_reservation_evidence_from_row(
     )
 
 
-def _publication_gate_evidence_from_row(row: sqlite3.Row) -> _PublicationGateEvidence:
-    hold = _publication_gate_hold_from_row(row)
-    held_at_value = row["held_at"]
-    if not isinstance(held_at_value, str):
-        raise StateError("Publication gate hold contains invalid stored values")
-    return _PublicationGateEvidence(
-        run_id=hold.run_id,
-        deployment_fingerprint=hold.deployment_fingerprint,
-        corpus_cursor=hold.corpus_cursor,
-        outcome_corpus_cursor=hold.outcome_corpus_cursor,
-        held_at=held_at_value,
-    )
-
-
 def _bounded_publication_rows(
     connection: sqlite3.Connection,
-) -> tuple[
-    dict[str, _PublicationReservationEvidence],
-    dict[str, _PublicationGateEvidence],
-]:
+) -> dict[str, _PublicationReservationEvidence]:
     reservation_rows = connection.execute(
         """
         SELECT run_id, repository, reserved_at FROM publication_reservations
@@ -5494,50 +4102,27 @@ def _bounded_publication_rows(
         """,
         (_MAX_RUN_CORPUS + 1,),
     ).fetchall()
-    hold_rows = connection.execute(
-        """
-        SELECT run_id, deployment_fingerprint, corpus_cursor, outcome_corpus_cursor, held_at
-        FROM publication_gate_holds ORDER BY run_id LIMIT ?
-        """,
-        (_MAX_RUN_CORPUS + 1,),
-    ).fetchall()
     if len(reservation_rows) > _MAX_RUN_CORPUS:
         raise StateError("Publication reservation set exceeds the configured safety bound")
-    if len(hold_rows) > _MAX_RUN_CORPUS:
-        raise StateError("Publication gate hold set exceeds the configured safety bound")
     reservations = {
         evidence.run_id: evidence
         for evidence in map(_publication_reservation_evidence_from_row, reservation_rows)
     }
-    holds = {
-        evidence.run_id: evidence
-        for evidence in map(_publication_gate_evidence_from_row, hold_rows)
-    }
-    if len(reservations) != len(reservation_rows) or len(holds) != len(hold_rows):
+    if len(reservations) != len(reservation_rows):
         raise StateError("Publication state contains duplicate run identities")
-    return reservations, holds
+    return reservations
 
 
 def _reconcile_publication_state(
     connection: sqlite3.Connection,
     *,
     repair_missing: bool,
-    require_current_rollout_cursors: bool = True,
-    currency_run_id: str | None = None,
 ) -> None:
-    """Cross-check publication tables against their verified per-run ledger evidence.
-
-    Recovery-capable schema validation and exact compensation may waive current rollout-cursor
-    equality without granting constructive authority. Ledger anchors, durable rows, hold identity,
-    and every recorded modern deployment scope remain mandatory.
-
-    ``currency_run_id`` scopes the current-cursor requirement to that run's active hold, so one
-    crashed run's drifted hold cannot poison an unrelated caller's own validated authority.
-    """
+    """Cross-check publication reservations against their verified per-run ledger evidence."""
 
     _verify_event_anchors(connection)
-    event_reservations, event_holds, releases = _publication_evidence_from_connection(connection)
-    row_reservations, row_holds = _bounded_publication_rows(connection)
+    event_reservations = _publication_evidence_from_connection(connection)
+    row_reservations = _bounded_publication_rows(connection)
 
     for run_id, reservation in event_reservations.items():
         row_reservation = row_reservations.get(run_id)
@@ -5557,255 +4142,9 @@ def _reconcile_publication_state(
     for run_id in row_reservations.keys() - event_reservations.keys():
         raise StateError(f"Run {run_id} publication reservation lacks ledger evidence")
 
-    for run_id, release in releases.items():
-        hold = event_holds.get(run_id)
-        if hold is None:
-            raise StateError(f"Run {run_id} publication gate release lacks hold evidence")
-        if hold != release:
-            raise StateError(f"Run {run_id} publication gate release disagrees with hold evidence")
-    for run_id in event_holds.keys() | releases.keys():
-        if run_id not in event_reservations:
-            raise StateError(f"Run {run_id} publication gate evidence lacks a reservation")
 
-    for run_id, hold in event_holds.items():
-        row_hold = row_holds.get(run_id)
-        if run_id in releases:
-            if row_hold is not None:
-                raise StateError(f"Run {run_id} has a released publication gate hold row")
-            continue
-        if row_hold is None:
-            if not repair_missing:
-                raise StateError(f"Run {run_id} publication gate hold row is missing")
-            connection.execute(
-                """
-                INSERT INTO publication_gate_holds(
-                    run_id, deployment_fingerprint, corpus_cursor,
-                    outcome_corpus_cursor, held_at
-                ) VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    hold.deployment_fingerprint,
-                    hold.corpus_cursor,
-                    hold.outcome_corpus_cursor,
-                    hold.held_at,
-                ),
-            )
-            row_holds[run_id] = hold
-        elif row_hold != hold:
-            if row_hold.corpus_cursor != hold.corpus_cursor:
-                raise StateError(
-                    "Evaluation corpus differs from the active publication gate hold; "
-                    "stored hold disagrees with the evaluation corpus"
-                )
-            raise StateError(f"Run {run_id} publication gate hold disagrees with ledger evidence")
-    for run_id in row_holds.keys() - event_holds.keys():
-        raise StateError(f"Run {run_id} publication gate hold lacks ledger evidence")
-
-    active_holds = [hold for run_id, hold in row_holds.items() if run_id not in releases]
-    for hold in active_holds:
-        _validated_active_outcome_scope(connection, hold)
-    if active_holds and require_current_rollout_cursors:
-        currency_holds = (
-            active_holds
-            if currency_run_id is None
-            else [hold for hold in active_holds if hold.run_id == currency_run_id]
-        )
-        if currency_holds:
-            current_cursor = _evaluation_corpus_cursor_from_connection(connection)
-            for hold in currency_holds:
-                if hold.corpus_cursor != current_cursor:
-                    raise StateError(
-                        f"Publication gate hold for run {hold.run_id} disagrees with "
-                        "the evaluation corpus"
-                    )
-                _verify_active_outcome_hold(connection, hold)
-
-
-def _verify_publication_state(
-    connection: sqlite3.Connection,
-    *,
-    require_current_rollout_cursors: bool,
-    currency_run_id: str | None = None,
-) -> None:
-    _reconcile_publication_state(
-        connection,
-        repair_missing=False,
-        require_current_rollout_cursors=require_current_rollout_cursors,
-        currency_run_id=currency_run_id,
-    )
-
-
-def _verify_active_outcome_hold(
-    connection: sqlite3.Connection,
-    hold: PublicationGateHold | _PublicationGateEvidence,
-) -> None:
-    """Validate that an active hold's outcome cursor is still current."""
-
-    scope = _validated_active_outcome_scope(connection, hold)
-    actual = _upstream_outcome_corpus_cursor_from_connection(connection, *scope)
-    if actual != hold.outcome_corpus_cursor:
-        raise StateError(
-            f"Publication gate hold for run {hold.run_id} disagrees with the "
-            "upstream-outcome corpus"
-        )
-
-
-def _validated_active_outcome_scope(
-    connection: sqlite3.Connection,
-    hold: PublicationGateHold | _PublicationGateEvidence,
-) -> tuple[str, str, str, str | None]:
-    """Validate hold ownership and return its outcome scope without comparing cursors."""
-
-    row = connection.execute(
-        "SELECT manifest_json FROM runs WHERE run_id = ?",
-        (hold.run_id,),
-    ).fetchone()
-    if row is None or not isinstance(row["manifest_json"], str):
-        raise StateError(f"Publication gate hold for run {hold.run_id} lacks its run manifest")
-    try:
-        manifest = RunManifest.model_validate_json(row["manifest_json"])
-    except (TypeError, ValueError) as exc:
-        raise StateError(
-            f"Publication gate hold for run {hold.run_id} has an invalid run manifest"
-        ) from exc
-    if manifest.run_id != hold.run_id:
-        raise StateError("Publication gate hold manifest identity is inconsistent")
-    creation_fingerprint = _run_creation_deployment_fingerprint(connection, hold.run_id)
-    if (
-        manifest.deployment_fingerprint != creation_fingerprint
-        or creation_fingerprint != hold.deployment_fingerprint
-    ):
-        raise StateError(
-            f"Publication gate hold for run {hold.run_id} belongs to a different deployment"
-        )
-    if manifest.publishing_login is None or manifest.publishing_api_origin is None:
-        raise StateError(
-            f"Publication gate hold for run {hold.run_id} lacks its publishing identity"
-        )
-    try:
-        return _upstream_outcome_cursor_scope(
-            hold.deployment_fingerprint,
-            manifest.publishing_login,
-            manifest.publishing_api_origin,
-            exclude_run_id=hold.run_id,
-        )
-    except (TypeError, ValueError) as exc:
-        raise StateError(
-            f"Publication gate hold for run {hold.run_id} has an invalid publishing scope"
-        ) from exc
-
-
-def _publication_gate_hold_from_row(row: sqlite3.Row) -> PublicationGateHold:
-    run_id_value = row["run_id"]
-    if not isinstance(run_id_value, str) or not run_id_value:
-        raise StateError("Publication gate hold contains an invalid run ID")
-    fingerprint_value = _stored_event_hash(
-        row["deployment_fingerprint"],
-        field=f"publication gate hold {run_id_value} deployment fingerprint",
-    )
-    cursor = _stored_event_hash(
-        row["corpus_cursor"],
-        field=f"publication gate hold {run_id_value} corpus cursor",
-    )
-    _stored_datetime(
-        row["held_at"],
-        field=f"publication gate hold {run_id_value} time",
-    )
-    return PublicationGateHold(
-        run_id=run_id_value,
-        deployment_fingerprint=fingerprint_value,
-        corpus_cursor=cursor,
-        outcome_corpus_cursor=_stored_event_hash(
-            row["outcome_corpus_cursor"],
-            field=f"publication gate hold {run_id_value} outcome corpus cursor",
-        ),
-    )
-
-
-def _release_publication_gate_hold(
-    store: RunStore,
-    connection: sqlite3.Connection,
-    run_id: str,
-    *,
-    outcome: str,
-    required: bool,
-) -> bool:
-    """Release a publication gate hold with exact identity and outcome-scope validation.
-
-    The release copies the hold's anchored cursors into its ledger evidence verbatim. Corpus
-    drift observed after the held mutations completed must not wedge a finished publication:
-    constructive authority was already revalidated immediately before every remote mutation,
-    and releasing a hold grants no new authority.
-    """
-
-    _reconcile_publication_state(
-        connection,
-        repair_missing=True,
-        require_current_rollout_cursors=False,
-    )
-    row = connection.execute(
-        """
-        SELECT run_id, deployment_fingerprint, corpus_cursor,
-               outcome_corpus_cursor, held_at
-        FROM publication_gate_holds WHERE run_id = ?
-        """,
-        (run_id,),
-    ).fetchone()
-    if row is None:
-        if required:
-            raise StateError(f"Run {run_id} does not have an active publication gate hold")
-        return False
-    hold = _publication_gate_hold_from_row(row)
-    if hold.run_id != run_id:
-        raise StateError("Publication gate hold identity changed during release")
-    _validated_active_outcome_scope(connection, hold)
-    release_details = {
-        "outcome": outcome,
-        "deployment_fingerprint": hold.deployment_fingerprint,
-        "corpus_cursor": hold.corpus_cursor,
-        "outcome_corpus_cursor": hold.outcome_corpus_cursor,
-        "held_at": str(row["held_at"]),
-    }
-    store._append_event(
-        connection,
-        run_id,
-        "publication.gate.released",
-        release_details,
-    )
-    deletion = connection.execute(
-        """
-        DELETE FROM publication_gate_holds
-        WHERE run_id = ? AND deployment_fingerprint = ?
-          AND corpus_cursor = ? AND outcome_corpus_cursor = ? AND held_at = ?
-        """,
-        (
-            run_id,
-            row["deployment_fingerprint"],
-            row["corpus_cursor"],
-            row["outcome_corpus_cursor"],
-            row["held_at"],
-        ),
-    )
-    if deletion.rowcount != 1:
-        raise StateError("Publication gate hold changed while it was being released")
-    return True
-
-
-def _assert_no_publication_gate_hold(connection: sqlite3.Connection) -> None:
-    _reconcile_publication_state(
-        connection,
-        repair_missing=True,
-        require_current_rollout_cursors=False,
-    )
-    row = connection.execute(
-        "SELECT run_id FROM publication_gate_holds ORDER BY run_id LIMIT 1"
-    ).fetchone()
-    if row is not None:
-        run_id = row["run_id"]
-        if not isinstance(run_id, str) or not run_id:
-            raise StateError("Publication gate hold contains invalid stored values")
-        raise StateError(f"Evaluation corpus is held by active publication run {run_id}")
+def _verify_publication_state(connection: sqlite3.Connection) -> None:
+    _reconcile_publication_state(connection, repair_missing=False)
 
 
 def _next_run_update_time(expected_updated_at: datetime) -> datetime:
@@ -5957,14 +4296,6 @@ def _assert_candidate_claim_lease(
         raise StateError("Candidate claim lease ownership was lost")
 
 
-def _sha256_identity(value: str, *, field: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{field} must be a string")
-    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
-        raise ValueError(f"{field} must be a lowercase SHA-256 value")
-    return value
-
-
 def _stored_boolean(value: object, *, field: str) -> bool:
     if value not in (0, 1) or isinstance(value, bool):
         raise StateError(f"Stored {field} is invalid")
@@ -5995,11 +4326,6 @@ def _publication_reservation_request(
     max_per_utc_day: int,
     repository_cooldown: timedelta,
     now: datetime | None,
-    evaluation_corpus_cursor: str | None,
-    evaluation_deployment_fingerprint: str | None,
-    outcome_corpus_cursor: str | None,
-    publishing_login: str | None,
-    publishing_api_origin: str | None,
 ) -> _PublicationReservationRequest:
     normalized_run_id = _lease_identity(run_id, field="publication run id")
     normalized_repository = _repository_identity(repository)
@@ -6011,50 +4337,6 @@ def _publication_reservation_request(
         raise TypeError("repository cooldown must be a timedelta")
     if repository_cooldown < timedelta(0):
         raise ValueError("repository cooldown cannot be negative")
-    gate_values = (
-        evaluation_corpus_cursor,
-        evaluation_deployment_fingerprint,
-        outcome_corpus_cursor,
-    )
-    if any(value is not None for value in gate_values) and not all(
-        value is not None for value in gate_values
-    ):
-        raise ValueError(
-            "evaluation cursor, outcome cursor, deployment fingerprint, publishing login, and "
-            "API origin must be provided together"
-        )
-    expected_corpus_cursor: str | None = None
-    expected_deployment_fingerprint: str | None = None
-    expected_outcome_cursor: str | None = None
-    expected_login: str | None = None
-    expected_origin: str | None = None
-    if (publishing_login is None) != (publishing_api_origin is None):
-        raise ValueError("publishing login and API origin must be provided together")
-    if publishing_login is not None and publishing_api_origin is not None:
-        scope_deployment = evaluation_deployment_fingerprint or ("0" * 64)
-        _, expected_login, expected_origin, _ = _upstream_outcome_cursor_scope(
-            scope_deployment,
-            publishing_login,
-            publishing_api_origin,
-            exclude_run_id=normalized_run_id,
-        )
-    if evaluation_corpus_cursor is not None:
-        expected_corpus_cursor = _sha256_identity(
-            evaluation_corpus_cursor,
-            field="evaluation corpus cursor",
-        )
-        assert evaluation_deployment_fingerprint is not None
-        expected_deployment_fingerprint = _sha256_identity(
-            evaluation_deployment_fingerprint,
-            field="evaluation deployment fingerprint",
-        )
-        assert outcome_corpus_cursor is not None
-        expected_outcome_cursor = _sha256_identity(
-            outcome_corpus_cursor,
-            field="upstream-outcome corpus cursor",
-        )
-        if expected_login is None or expected_origin is None:
-            raise ValueError("automatic publication requires a publishing login and API origin")
     reserved_at = _aware_utc(now or utc_now(), field="publication reservation time")
     day_start = reserved_at.replace(hour=0, minute=0, second=0, microsecond=0)
     day_end = day_start + timedelta(days=1)
@@ -6071,11 +4353,6 @@ def _publication_reservation_request(
         day_end=day_end,
         cooldown_start=cooldown_start,
         enforce_cooldown=repository_cooldown > timedelta(0),
-        evaluation_corpus_cursor=expected_corpus_cursor,
-        evaluation_deployment_fingerprint=expected_deployment_fingerprint,
-        outcome_corpus_cursor=expected_outcome_cursor,
-        publishing_login=expected_login,
-        publishing_api_origin=expected_origin,
     )
 
 
@@ -6145,18 +4422,6 @@ def _canonical_publication_intent_text(value: str, *, field: str, maximum: int) 
     return normalized
 
 
-def _validated_snapshot_json(
-    value: str,
-    *,
-    observed_at: datetime,
-) -> PullRequestLifecycleSnapshot:
-    if not isinstance(value, str):
-        raise TypeError("lifecycle snapshot must be a JSON string")
-    if len(value.encode("utf-8")) > _MAX_LIFECYCLE_SNAPSHOT_BYTES:
-        raise ValueError("lifecycle snapshot exceeds the storage limit")
-    return parse_lifecycle_snapshot_json(value, observed_at=observed_at)
-
-
 def _lease_identity(value: str, *, field: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{field} must be a string")
@@ -6224,8 +4489,6 @@ __all__ = [
     "CandidateRetryAuthorization",
     "CircuitBreakerStatus",
     "Lease",
-    "LifecycleSnapshot",
-    "PublicationGateHold",
     "PublicationReservation",
     "RunStore",
 ]

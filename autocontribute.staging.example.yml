@@ -1,4 +1,4 @@
-# Shadow-run configuration for a repository owned by the operator.
+# Local end-to-end test configuration for a fixture repository you own.
 identity:
   name: "Staging Operator"
   email: "your-handle@users.noreply.github.com"
@@ -22,9 +22,8 @@ models:
   scout: &staging_model
     provider: openai
     model: gpt-5.6
-    # Required for `publishing.mode: auto`: copy the exact immutable model ID returned by the API.
+    # Optional: refuse any response whose provider-reported model ID differs from this one.
     # expected_response_model: gpt-5.6-YYYY-MM-DD
-    # immutable_response_model_attested: true  # only after verifying the provider contract
     api_key_env: OPENAI_API_KEY
     reasoning_effort: high
     reasoning_mode: standard
@@ -86,7 +85,6 @@ quality:
   require_regression_evidence_for_bugfix: true
 
 publishing:
-  mode: review_required
   approval_expires_hours: 12
   draft: true
   # These limits use durable SQLite reservations if a reviewed fixture is manually published.
@@ -104,18 +102,3 @@ budget:
 
 storage:
   path: .autocontribute-staging
-
-# Optional while this shadow deployment remains `review_required`. Uncomment every field only when
-# testing the persistent/systemd path; guarded `auto` always requires this non-secret policy block.
-# Keep the AWS credential triplet in the replication service's encrypted credential files, not YAML.
-# s3_replication:
-#   bundle_directory: /var/backups/autocontribute
-#   receipt_directory: /var/backups/autocontribute/receipts
-#   scratch_directory: /var/backups/autocontribute/replication-scratch
-#   bucket: your-staging-object-lock-bucket
-#   expected_bucket_owner: "123456789012"
-#   region: ca-central-1
-#   prefix: staging/worker-1
-#   retention_days: 90       # allowed range: 30..3650
-#   timeout_seconds: 21600   # allowed range: 10..86400
-#   max_age_hours: 48        # allowed range: 1..8760

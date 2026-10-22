@@ -19,9 +19,8 @@ models:
   scout: &builder_model
     provider: openai
     model: gpt-5.6
-    # Required for `publishing.mode: auto`: copy the exact immutable model ID returned by the API.
+    # Optional: refuse any response whose provider-reported model ID differs from this one.
     # expected_response_model: gpt-5.6-YYYY-MM-DD
-    # immutable_response_model_attested: true  # only after verifying the provider contract
     api_key_env: OPENAI_API_KEY
     reasoning_effort: high
     reasoning_mode: standard
@@ -84,7 +83,6 @@ quality:
   require_regression_evidence_for_bugfix: true
 
 publishing:
-  mode: review_required # guarded `auto` is limited to the one configured repository
   approval_expires_hours: 24
   draft: true
   # Daily/cooldown capacity is durably reserved in the SQLite store before GitHub mutation.
@@ -104,8 +102,7 @@ budget:
 storage:
   path: .autocontribute
 
-# Optional for local/manual `review_required` use. Uncomment the complete block for the packaged
-# scheduled systemd worker; `publishing.mode: auto` also rejects configurations without it.
+# Optional. Uncomment the complete block for the packaged scheduled systemd worker.
 # Credentials never belong here: the replication service receives a separate encrypted AWS triplet.
 # s3_replication:
 #   bundle_directory: /var/backups/autocontribute

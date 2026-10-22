@@ -102,7 +102,6 @@ def _profile(monkeypatch: pytest.MonkeyPatch) -> ModelProfile:
         provider="openai",
         model="test-model",
         expected_response_model="test-model-snapshot",
-        immutable_response_model_attested=True,
         api_key_env=_API_KEY_ENV,
         max_output_tokens=2_000,
         timeout_seconds=10,

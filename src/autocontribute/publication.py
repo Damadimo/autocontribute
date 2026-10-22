@@ -15,6 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 from autocontribute.approval import (
     ApprovalReview,
@@ -23,11 +24,7 @@ from autocontribute.approval import (
     manifest_fingerprint,
     validate_approval,
 )
-from autocontribute.config import (
-    AUTO_PUBLISH_ENV,
-    AutocontributeConfig,
-    auto_publish_opt_in_enabled,
-)
+from autocontribute.config import AutocontributeConfig
 from autocontribute.coordination import (
     PUBLICATION_HEARTBEAT_INTERVAL,
     PUBLICATION_LEASE_NAME,
@@ -44,9 +41,14 @@ from autocontribute.discovery import (
     DiscoveryService,
     validate_legal_publication,
 )
-from autocontribute.domain import EligibilityResult, IssueCandidate, RunManifest, RunStatus
+from autocontribute.domain import (
+    Approval,
+    EligibilityResult,
+    IssueCandidate,
+    RunManifest,
+    RunStatus,
+)
 from autocontribute.exceptions import (
-    AutomaticRolloutBlocked,
     GitHubError,
     GitHubRequestNotSentError,
     GitHubSafetyError,
@@ -66,13 +68,7 @@ from autocontribute.preparation import (
 )
 from autocontribute.redaction import contains_credential_material, redact_text
 from autocontribute.repository import RepositoryWorkspace
-from autocontribute.rollout import RolloutGate, RolloutSummary
-from autocontribute.store import PublicationGateHold, RunStore
-from autocontribute.upstream_outcomes import (
-    ExactHumanApproval,
-    UpstreamPublicationScope,
-    classify_exact_human_approval,
-)
+from autocontribute.store import RunStore
 
 _SAFE_SLUG = re.compile(r"[^a-z0-9-]+")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
@@ -81,6 +77,15 @@ _SECRET = re.compile(
     r"sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
 )
 _GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class _ExactHumanApproval:
+    """One ledger-bound approval that authorized an exact publication intent."""
+
+    approval_event_hash: str
+    publication_intent_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -496,66 +501,6 @@ class Publisher:
         self.store = store
         self.github = github
 
-    def _require_automatic_rollout(
-        self,
-        *,
-        run_id: str,
-        deployment_fingerprint: str,
-        context: _PublicationContext,
-        lease_guard: LeaseHeartbeatGuard,
-    ) -> RolloutSummary:
-        """Return exact dual-gate authority or an expected no-publication decision."""
-
-        if not auto_publish_opt_in_enabled():
-            raise AutomaticRolloutBlocked(
-                f"Automatic publication is disabled; set {AUTO_PUBLISH_ENV}=1 deliberately"
-            )
-        scope = UpstreamPublicationScope(
-            deployment_fingerprint=deployment_fingerprint,
-            publishing_login=context.login,
-            publishing_api_origin=context.api_origin,
-        )
-        self.store.assert_circuit_breaker_clear()
-        lease_guard.assert_owned()
-        summary = RolloutGate.for_store(self.store).summary(
-            scope,
-            exclude_run_id=run_id,
-        )
-        if not summary.overall_gate_passed:
-            blockers: list[str] = []
-            if not summary.evaluation_gate_passed:
-                blockers.append("expert-evaluation shadow cohort")
-            if not summary.manual_cohort_passed:
-                blockers.append("fixed manual upstream-outcome cohort")
-            if not summary.prior_automatic_passed:
-                blockers.append("prior automatic upstream outcomes")
-            if not summary.upstream_outcome_gate_passed and not blockers:
-                blockers.append("complete upstream-outcome evidence")
-            raise AutomaticRolloutBlocked(
-                "Automatic publication requires every measured rollout gate to pass; blocked: "
-                + ", ".join(blockers)
-            )
-        return summary
-
-    @staticmethod
-    def _validate_recovery_hold(
-        hold: PublicationGateHold,
-        summary: RolloutSummary,
-    ) -> None:
-        """Require recovery to retain the hold's immutable deployment identity.
-
-        The hold's anchored cursors may lag the live corpus after a crash (for example when
-        lifecycle outcomes were observed for other runs while this publication awaited
-        recovery). Recovery re-proves current authority instead: every measured rollout gate
-        must pass on the fresh summary, whose verified-current cursors re-anchor the durable
-        hold, and each constructive mutation revalidates that hold immediately before acting.
-        """
-
-        if hold.deployment_fingerprint != summary.scope.deployment_fingerprint:
-            raise StateError(
-                "Current semantic rollout authority differs from the durable publication hold"
-            )
-
     def _assert_constructive_mutation_authorized(
         self,
         manifest: RunManifest,
@@ -568,46 +513,30 @@ class Publisher:
             raise StateError("Publication mutation lacks its durable publishing identity")
         lease_guard.assert_owned()
         self.store.assert_circuit_breaker_clear()
-        automatic = self.store.assert_publication_gate_hold_current(
-            manifest.run_id,
-            deployment_fingerprint=manifest.deployment_fingerprint,
-            publishing_login=manifest.publishing_login,
-            publishing_api_origin=manifest.publishing_api_origin,
-        )
         lease_guard.assert_owned()
-        if automatic and not auto_publish_opt_in_enabled():
-            raise AutomaticRolloutBlocked(
-                "Automatic publication was disabled before the next remote mutation"
-            )
-        self.store.assert_circuit_breaker_clear()
-        lease_guard.assert_owned()
-        if automatic and not auto_publish_opt_in_enabled():
-            raise AutomaticRolloutBlocked(
-                "Automatic publication was disabled before the next remote mutation"
-            )
 
     def _require_exact_review_recovery(
         self,
         manifest: RunManifest,
-    ) -> ExactHumanApproval:
+    ) -> _ExactHumanApproval:
         """Prove exact ledger-bound human authority for a review recovery."""
 
         self.store.verify_event_chains(run_id=manifest.run_id)
-        authority = classify_exact_human_approval(
+        authority = _classify_exact_human_approval(
             manifest,
             tuple(self.store.events(manifest.run_id)),
         )
         if authority is None or manifest.approval is None:
             raise StateError(
-                "Submitting recovery without an automatic gate hold requires one exact "
-                "ledger-bound human approval preceding publication intent"
+                "Submitting recovery requires one exact ledger-bound human approval preceding "
+                "publication intent"
             )
         return authority
 
     def _validate_exact_review_recovery_payload(
         self,
         manifest: RunManifest,
-        authority: ExactHumanApproval,
+        authority: _ExactHumanApproval,
     ) -> None:
         """Revalidate the exact approved payload before a constructive recovery write."""
 
@@ -667,7 +596,6 @@ class Publisher:
             self.store,
             assert_owned=lease_guard.assert_owned,
         ).observe(
-            manifest.run_id,
             repository=repository,
             number=number,
             expected_head_sha=manifest.commit_sha,
@@ -950,9 +878,7 @@ class Publisher:
         branch: str | None = None
         head: str | None = None
         recovered_remote_sha: str | None = None
-        review_recovery_authority: ExactHumanApproval | None = None
-        deployment_fingerprint: str | None = None
-        rollout_summary: RolloutSummary | None = None
+        review_recovery_authority: _ExactHumanApproval | None = None
         if recovering:
             if (
                 manifest.candidate is None
@@ -968,31 +894,7 @@ class Publisher:
                 login=self.github.authenticated_login(),
                 api_origin=self.github.api_origin,
             )
-            publication_hold = self.store.publication_gate_hold(run_id)
-            if publication_hold is not None:
-                _validate_current_config(self.config)
-                creation_deployment_fingerprint = self.store.run_deployment_fingerprint(run_id)
-                if (
-                    manifest.deployment_fingerprint != creation_deployment_fingerprint
-                    or publication_hold.deployment_fingerprint != creation_deployment_fingerprint
-                ):
-                    raise PolicyError(
-                        "Automatic publication recovery differs from its immutable deployment "
-                        "evidence"
-                    )
-                deployment_fingerprint = validate_deployment_fingerprint(
-                    creation_deployment_fingerprint,
-                    self.config,
-                )
-                rollout_summary = self._require_automatic_rollout(
-                    run_id=run_id,
-                    deployment_fingerprint=deployment_fingerprint,
-                    context=context,
-                    lease_guard=lease_guard,
-                )
-                self._validate_recovery_hold(publication_hold, rollout_summary)
-            else:
-                review_recovery_authority = self._require_exact_review_recovery(manifest)
+            review_recovery_authority = self._require_exact_review_recovery(manifest)
             branch = manifest.branch_name
             head = f"{context.login}:{branch}"
             self.store.assert_circuit_breaker_clear()
@@ -1011,15 +913,6 @@ class Publisher:
                 publication_ready_for_review=context.ready_for_review,
                 max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
                 repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
-                evaluation_corpus_cursor=(
-                    rollout_summary.evaluation_corpus_cursor if rollout_summary else None
-                ),
-                evaluation_deployment_fingerprint=(
-                    rollout_summary.scope.deployment_fingerprint if rollout_summary else None
-                ),
-                outcome_corpus_cursor=(
-                    rollout_summary.outcome_corpus_cursor if rollout_summary else None
-                ),
             )
             assert manifest.candidate is not None
             assert manifest.repository is not None
@@ -1102,10 +995,7 @@ class Publisher:
                     "Run deployment fingerprint differs from its immutable creation evidence"
                 )
             validate_preparation_config_fingerprint(manifest, self.config)
-            deployment_fingerprint = validate_deployment_fingerprint(
-                creation_deployment_fingerprint,
-                self.config,
-            )
+            validate_deployment_fingerprint(creation_deployment_fingerprint, self.config)
         assert manifest.candidate is not None
         assert manifest.repository is not None
         assert manifest.base_sha is not None
@@ -1163,21 +1053,8 @@ class Publisher:
                         "publication_ready_for_review": str(context.ready_for_review).lower(),
                     },
                 )
-        if not recovering and self.config.publishing.mode == "review_required":
-            if manifest.approval is None:
-                raise PolicyError("A human approval is required before publication")
-        elif not recovering:
-            if manifest.status != RunStatus.READY_FOR_APPROVAL:
-                raise PolicyError(
-                    "Automatic publication requires an unapproved ready-for-approval run"
-                )
-            assert deployment_fingerprint is not None
-            rollout_summary = self._require_automatic_rollout(
-                run_id=run_id,
-                deployment_fingerprint=deployment_fingerprint,
-                context=context,
-                lease_guard=lease_guard,
-            )
+        if not recovering and manifest.approval is None:
+            raise PolicyError("A human approval is required before publication")
         login = context.login
         if manifest.eligibility is None or manifest.proposal is None:
             raise PolicyError("Run is missing durable legal-publication evidence")
@@ -1188,7 +1065,7 @@ class Publisher:
             publishing_login=login,
             commit_message=manifest.proposal.commit_message,
         )
-        if not recovering and self.config.publishing.mode == "review_required":
+        if not recovering:
             assert manifest.approval is not None
             approval_manifest = build_approval_manifest(
                 manifest,
@@ -1224,15 +1101,6 @@ class Publisher:
                 publication_ready_for_review=context.ready_for_review,
                 max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
                 repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
-                evaluation_corpus_cursor=(
-                    rollout_summary.evaluation_corpus_cursor if rollout_summary else None
-                ),
-                evaluation_deployment_fingerprint=(
-                    rollout_summary.scope.deployment_fingerprint if rollout_summary else None
-                ),
-                outcome_corpus_cursor=(
-                    rollout_summary.outcome_corpus_cursor if rollout_summary else None
-                ),
             )
         assert manifest.candidate is not None
         assert manifest.repository is not None
@@ -1933,7 +1801,7 @@ class Publisher:
                     before_observation=assert_ready_observation_authorized,
                     before_mutation=assert_ready_mutation_authorized,
                 )
-            except (AutomaticRolloutBlocked, StateError):
+            except StateError:
                 raise
             except GitHubSafetyError:
                 raise
@@ -2743,7 +2611,7 @@ class Publisher:
         *,
         lease_guard: LeaseHeartbeatGuard,
     ) -> RunManifest:
-        """Idempotently reduce exact marked remote state despite constructive gate drift."""
+        """Idempotently reduce exact marked remote state despite constructive stops."""
 
         reason = manifest.publication_compensation_reason
         if (
@@ -3086,9 +2954,7 @@ class Publisher:
             api_origin=self.github.api_origin,
         )
         login = context.login
-        publication_hold = self.store.publication_gate_hold(run_id)
-        if publication_hold is None:
-            self._require_exact_review_recovery(manifest)
+        self._require_exact_review_recovery(manifest)
         lease_guard.assert_owned()
         manifest = self.store.begin_publication(
             manifest,
@@ -3104,14 +2970,6 @@ class Publisher:
             publication_ready_for_review=context.ready_for_review,
             max_per_utc_day=self.config.publishing.max_new_pull_requests_per_day,
             repository_cooldown=timedelta(days=self.config.publishing.repository_cooldown_days),
-            # Reconciliation adopts already-durable state without constructive mutations, so
-            # it must not proffer the hold's anchored cursors as current rollout authority:
-            # they may legitimately lag the live corpus after a crash. The store validates
-            # the hold's identity instead, and any remote mutation would still revalidate
-            # its own hold currency immediately before acting.
-            evaluation_corpus_cursor=None,
-            evaluation_deployment_fingerprint=None,
-            outcome_corpus_cursor=None,
         )
         assert manifest.candidate is not None
         assert manifest.branch_name is not None
@@ -3194,7 +3052,7 @@ class Publisher:
         allow_remote_mutation: bool,
         allow_new_repository_identity: bool,
         lease_guard: LeaseHeartbeatGuard,
-        review_recovery_authority: ExactHumanApproval | None = None,
+        review_recovery_authority: _ExactHumanApproval | None = None,
     ) -> RunManifest:
         """Bind exact remote PR evidence to one durable intent before lifecycle monitoring."""
 
@@ -4084,6 +3942,120 @@ class Publisher:
         if not prefix:
             prefix = "autocontribute"
         return f"{prefix}/issue-{manifest.candidate.number}-{manifest.run_id[:8]}"
+
+
+def _classify_exact_human_approval(
+    manifest: RunManifest,
+    events: tuple[dict[str, str], ...],
+) -> _ExactHumanApproval | None:
+    """Classify an approval only when the exact ledger intent follows it while live.
+
+    Event-chain integrity remains the caller's responsibility.  Production callers must verify
+    the selected run's hash chain before treating this classification as recovery authority.
+    """
+
+    approval = manifest.approval
+    approval_events = [event for event in events if event["event_type"] == "approval.created"]
+    if approval is None or len(approval_events) != 1:
+        return None
+    event = approval_events[0]
+    try:
+        details = _event_details(event, run_id=manifest.run_id)
+        _validate_approval_values(approval, manifest, event, details)
+        approval_index = next(index for index, item in enumerate(events) if item is event)
+        intent_events = [
+            (index, item)
+            for index, item in enumerate(events)
+            if item["event_type"] == "publication.intent.begun"
+        ]
+        if len(intent_events) != 1:
+            return None
+        intent_index, intent = intent_events[0]
+        approved_at = _aware_utc(approval.approved_at, field="approval time")
+        expires_at = _aware_utc(approval.expires_at, field="approval expiry")
+        intent_at = _event_time(intent["occurred_at"], field="publication intent time")
+        if approval_index >= intent_index or not approved_at <= intent_at < expires_at:
+            return None
+        approval_event_hash = _event_hash(
+            event["event_hash"],
+            field="approval event hash",
+        )
+        _event_hash(intent["event_hash"], field="publication intent event hash")
+    except (StateError, TypeError, ValueError):
+        return None
+    return _ExactHumanApproval(
+        approval_event_hash=approval_event_hash,
+        publication_intent_at=intent_at,
+    )
+
+
+def _validate_approval_values(
+    approval: Approval,
+    manifest: RunManifest,
+    event: dict[str, str],
+    details: dict[str, str],
+) -> None:
+    if set(details) != {"actor", "expires_at", "manifest_hash"}:
+        raise ValueError("approval event has unsupported fields")
+    if (
+        not approval.actor.strip()
+        or not approval.attestation.strip()
+        or manifest.publishing_login is None
+        or approval.actor != manifest.publishing_login
+        or details["actor"] != approval.actor
+        or details["manifest_hash"] != approval.manifest_hash
+        or details["expires_at"] != approval.expires_at.isoformat()
+        or not _SHA256.fullmatch(approval.manifest_hash)
+    ):
+        raise ValueError("approval does not match its durable event")
+    approved_at = _aware_utc(approval.approved_at, field="approval time")
+    expires_at = _aware_utc(approval.expires_at, field="approval expiry")
+    recorded_at = _event_time(event["occurred_at"], field="approval event time")
+    if not approved_at <= recorded_at < expires_at:
+        raise ValueError("approval was not live when it was durably recorded")
+
+
+def _event_details(event: dict[str, str], *, run_id: str) -> dict[str, str]:
+    raw = event.get("details")
+    if not isinstance(raw, str):
+        raise StateError(f"Run {run_id} event details are not text")
+    try:
+        value = json.loads(raw)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise StateError(f"Run {run_id} event details are malformed") from exc
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not isinstance(item, str) for key, item in value.items()
+    ):
+        raise StateError(f"Run {run_id} event details are invalid")
+    details = cast("dict[str, str]", value)
+    if json.dumps(details, sort_keys=True, separators=(",", ":")) != raw:
+        raise StateError(f"Run {run_id} event details are not canonical")
+    return details
+
+
+def _event_hash(value: object, *, field: str) -> str:
+    if not isinstance(value, str) or not _SHA256.fullmatch(value):
+        raise ValueError(f"{field} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _event_time(value: object, *, field: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a canonical UTC timestamp")
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a canonical UTC timestamp") from exc
+    normalized = _aware_utc(parsed, field=field)
+    if parsed.utcoffset() != UTC.utcoffset(parsed) or normalized.isoformat() != value:
+        raise ValueError(f"{field} must be a canonical UTC timestamp")
+    return normalized
+
+
+def _aware_utc(value: datetime, *, field: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field} must be timezone-aware")
+    return value.astimezone(UTC)
 
 
 def _git_apply(workspace: Path, patch: bytes) -> None:

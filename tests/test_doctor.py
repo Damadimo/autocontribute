@@ -36,16 +36,8 @@ def _config(
     )
 
 
-def _auto_config() -> AutocontributeConfig:
-    pricing = {
-        "input_usd_per_million_tokens": "1",
-        "output_usd_per_million_tokens": "1",
-    }
-    profile = {
-        "expected_response_model": "gpt-5.6-2026-07-21",
-        "immutable_response_model_attested": True,
-        "pricing": pricing,
-    }
+def _pinned_config() -> AutocontributeConfig:
+    profile = {"expected_response_model": "gpt-5.6-2026-07-21"}
     return AutocontributeConfig.model_validate(
         {
             "github": {"repositories": ["example/project"]},
@@ -55,15 +47,6 @@ def _auto_config() -> AutocontributeConfig:
                 "critic": {**profile, "reasoning_mode": "pro"},
             },
             "validation": {"required_commands": {"example/project": ["python -m unittest"]}},
-            "publishing": {
-                "mode": "auto",
-                "draft": True,
-                "ready_for_review": True,
-                "max_new_pull_requests_per_day": 1,
-                "max_open_pull_requests": 1,
-                "repository_cooldown_days": 7,
-            },
-            "budget": {"max_model_cost_usd_per_run": "1"},
             "s3_replication": {
                 "bundle_directory": "/var/backups/autocontribute",
                 "receipt_directory": "/var/backups/autocontribute/receipts",
@@ -74,45 +57,6 @@ def _auto_config() -> AutocontributeConfig:
                 "prefix": "production/test",
             },
         }
-    )
-
-
-def _rollout_summary(
-    *,
-    evaluation_passed: bool = True,
-    manual_passed: bool = True,
-    automatic_passed: bool = True,
-    overall_passed: bool = True,
-    ambiguous: int = 0,
-    scope: object | None = None,
-) -> Any:
-    return SimpleNamespace(
-        scope=scope
-        or SimpleNamespace(
-            publishing_login="octocat",
-            publishing_api_origin="https://api.github.com",
-        ),
-        evaluation=SimpleNamespace(
-            total_cases=100,
-            prepared_cases=20,
-            accept_as_is_precision=0.95,
-            safety_failures=0,
-        ),
-        upstream_outcomes=SimpleNamespace(
-            manual_cohort=tuple(
-                SimpleNamespace(manual_member_passed=manual_passed) for _ in range(20)
-            ),
-            required_manual_publications=20,
-            exact_manual_publications=20,
-            prior_automatic=tuple(
-                SimpleNamespace(automatic_member_passed=automatic_passed) for _ in range(2)
-            ),
-            ambiguous=tuple(object() for _ in range(ambiguous)),
-        ),
-        evaluation_gate_passed=evaluation_passed,
-        manual_cohort_passed=manual_passed,
-        prior_automatic_passed=automatic_passed,
-        overall_gate_passed=overall_passed,
     )
 
 
@@ -127,22 +71,6 @@ class _ReadyProvider:
             output=output_type(status="ready"),
             model="gpt-5.6-2026-07-21",
         )
-
-
-class _FakeGitHub:
-    def __init__(self, fork: object) -> None:
-        self.fork = fork
-        self.requests: list[tuple[str, str, bool]] = []
-
-    def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        allow_not_found: bool = False,
-    ) -> object:
-        self.requests.append((method, path, allow_not_found))
-        return self.fork
 
 
 class _RateLimitedDoctorGitHub:
@@ -274,7 +202,7 @@ def test_doctor_reports_optional_review_mode_replication_as_an_explicit_warning(
 def test_doctor_proves_latest_configured_replication_or_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config = _auto_config()
+    config = _pinned_config()
     captured: dict[str, object] = {}
 
     def verify(**kwargs: object) -> SimpleNamespace:
@@ -424,7 +352,7 @@ def test_model_capability_probe_rejects_a_model_outside_the_attested_deployment(
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(doctor, "create_provider", lambda _profile: WrongModelProvider(calls))
 
-    checks = doctor._model_capability_checks(_auto_config())
+    checks = doctor._model_capability_checks(_pinned_config())
 
     assert len(checks) == 2
     assert all(not check.passed for check in checks)
@@ -554,208 +482,8 @@ def test_authentication_captures_classic_scopes_from_the_hardened_get() -> None:
     assert scopes == frozenset({"read:org", "public_repo"})
 
 
-def test_rollout_doctor_uses_the_exact_authenticated_publication_scope(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    deployment = "d" * 64
-    observed: dict[str, object] = {}
-
-    class FakeGate:
-        def summary(self, scope: object) -> Any:
-            observed["scope"] = scope
-            return _rollout_summary(scope=scope)
-
-    store = RunStore(tmp_path / "state")
-    monkeypatch.setattr(doctor, "compute_deployment_fingerprint", lambda _config: deployment)
-    monkeypatch.setattr(
-        doctor.RolloutGate,
-        "for_store",
-        classmethod(
-            lambda _cls, selected_store: (observed.setdefault("store", selected_store), FakeGate())[
-                1
-            ]
-        ),
-    )
-
-    checks = doctor._rollout_readiness_checks(
-        _config(),
-        store,
-        publishing_login="OctoCat",
-        publishing_api_origin="https://api.github.com",
-    )
-
-    scope = observed["scope"]
-    assert scope.deployment_fingerprint == deployment  # type: ignore[attr-defined]
-    assert scope.publishing_login == "octocat"  # type: ignore[attr-defined]
-    assert scope.publishing_api_origin == "https://api.github.com"  # type: ignore[attr-defined]
-    assert observed["store"] is store
-    assert [check.name for check in checks] == [
-        "rollout evaluation gate",
-        "rollout fixed manual cohort",
-        "rollout prior automatic outcomes",
-        "rollout overall readiness",
-    ]
-    assert all(check.passed and not check.warning for check in checks)
-
-
-def test_rollout_doctor_blocks_failed_gates_in_auto_mode() -> None:
-    checks = doctor._rollout_summary_checks(
-        _auto_config(),
-        _rollout_summary(
-            evaluation_passed=False,
-            manual_passed=False,
-            automatic_passed=False,
-            overall_passed=False,
-        ),
-    )
-
-    assert all(not check.passed for check in checks)
-    assert all(not check.warning for check in checks)
-    assert all(check.detail.startswith("blocked;") for check in checks)
-
-
-def test_rollout_doctor_warns_without_failing_review_mode_during_calibration() -> None:
-    checks = doctor._rollout_summary_checks(
-        _config(),
-        _rollout_summary(
-            evaluation_passed=False,
-            manual_passed=False,
-            automatic_passed=True,
-            overall_passed=False,
-        ),
-    )
-
-    assert all(check.passed for check in checks)
-    assert [check.warning for check in checks] == [True, True, False, True]
-    assert "review_required mode remains non-publishing" in checks[0].detail
-    assert checks[2].detail.startswith("ready;")
-
-
-def test_rollout_overall_readiness_catches_ambiguous_upstream_evidence() -> None:
-    checks = doctor._rollout_summary_checks(
-        _auto_config(),
-        _rollout_summary(overall_passed=False, ambiguous=1),
-    )
-
-    assert all(check.passed for check in checks[:3])
-    assert not checks[3].passed
-    assert "1 ambiguous publication(s)" in checks[3].detail
-
-
-def test_rollout_evidence_validation_errors_are_hard_failures_in_review_mode(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FakeGitHub:
-        token = "test-token"
-        api_origin = "https://api.github.com"
-        _client = SimpleNamespace(event_hooks={})
-
-        def __init__(self, *_args: object, **_kwargs: object) -> None:
-            pass
-
-        def __enter__(self) -> FakeGitHub:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-    class InvalidGate:
-        def summary(self, _scope: object) -> Any:
-            raise RuntimeError("corrupt outcome evidence")
-
-    monkeypatch.setattr(doctor, "GitHubClient", FakeGitHub)
-    monkeypatch.setattr(
-        doctor,
-        "_authenticated_login_and_scopes",
-        lambda _github: ("octocat", None),
-    )
-    monkeypatch.setattr(
-        doctor,
-        "_github_target_access_check",
-        lambda *_args, **_kwargs: doctor.DoctorCheck("GitHub target access", True, "ready"),
-    )
-    monkeypatch.setattr(
-        doctor,
-        "_github_permission_check",
-        lambda *_args, **_kwargs: doctor.DoctorCheck("GitHub permission boundary", True, "ready"),
-    )
-    monkeypatch.setattr(doctor, "compute_deployment_fingerprint", lambda _config: "d" * 64)
-    monkeypatch.setattr(
-        doctor.RolloutGate,
-        "for_store",
-        classmethod(lambda _cls, _store: InvalidGate()),
-    )
-
-    checks = doctor._github_checks(_config(), store=RunStore(tmp_path / "state"))
-    rollout_checks = checks[-4:]
-
-    assert all(not check.passed for check in rollout_checks)
-    assert all(not check.warning for check in rollout_checks)
-    assert all("corrupt outcome evidence" in check.detail for check in rollout_checks)
-
-
-def test_auto_github_probe_uses_only_get_and_verifies_existing_fork_push_access() -> None:
-    github = _FakeGitHub(
-        {
-            "fork": True,
-            "parent": {"full_name": "example/project"},
-            "permissions": {"push": True},
-        }
-    )
-
-    check = doctor._github_permission_check(
-        _auto_config(),
-        github,  # type: ignore[arg-type]
-        login="octocat",
-        scopes=None,
-    )
-
-    assert check.passed
-    assert check.warning
-    assert "no write was sent" in check.detail
-    assert github.requests == [("GET", "/repos/octocat/project", True)]
-
-
-def test_auto_github_probe_fails_when_fork_creation_cannot_be_verified() -> None:
-    github = _FakeGitHub(None)
-
-    check = doctor._github_permission_check(
-        _auto_config(),
-        github,  # type: ignore[arg-type]
-        login="octocat",
-        scopes=None,
-    )
-
-    assert not check.passed
-    assert "create the fork manually" in check.detail
-    assert github.requests == [("GET", "/repos/octocat/project", True)]
-
-
-def test_auto_github_probe_reports_inferred_classic_scope_without_creating_fork() -> None:
-    github = _FakeGitHub(None)
-
-    check = doctor._github_permission_check(
-        _auto_config(),
-        github,  # type: ignore[arg-type]
-        login="octocat",
-        scopes=frozenset({"public_repo"}),
-    )
-
-    assert check.passed
-    assert check.warning
-    assert "fork creation was intentionally not attempted" in check.detail
-    assert github.requests == [("GET", "/repos/octocat/project", True)]
-
-
 def test_review_required_warns_when_credential_has_unneeded_write_scope() -> None:
-    check = doctor._github_permission_check(
-        _config(),
-        _FakeGitHub(None),  # type: ignore[arg-type]
-        login="octocat",
-        scopes=frozenset({"repo"}),
-    )
+    check = doctor._github_permission_check(scopes=frozenset({"repo"}))
 
     assert check.passed
     assert check.warning

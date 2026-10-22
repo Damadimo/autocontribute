@@ -89,10 +89,6 @@ class PolicyError(AutocontributeError):
     """A contribution violated a non-negotiable policy."""
 
 
-class AutomaticRolloutBlocked(PolicyError):
-    """Measured rollout evidence does not currently authorize automatic publication."""
-
-
 class SandboxError(AutocontributeError):
     """An isolated validation command could not be executed."""
 

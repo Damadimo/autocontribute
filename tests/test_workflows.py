@@ -5,8 +5,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-from autocontribute.config import load_config
-
 ROOT = Path(__file__).resolve().parents[1]
 HOSTED_SCHEMA_VERSION = 8
 HOSTED_PARENT_SCHEMA_VERSIONS = (HOSTED_SCHEMA_VERSION,)
@@ -104,33 +102,6 @@ def _run_security_classifier(
     )
 
 
-def test_checked_in_staging_config_is_safe_for_the_operator_fixture() -> None:
-    settings = load_config(ROOT / "autocontribute.staging.yml")
-
-    assert settings.github.repositories == ["Damadimo/autocontribute-staging-fixture"]
-    assert settings.github.owners == []
-    assert settings.validation.required_commands == {
-        "damadimo/autocontribute-staging-fixture": [
-            "python tools/lint.py",
-            "python tools/typecheck.py",
-            "python -m unittest discover -s tests/unit -v",
-            "python -m unittest discover -s tests/integration -v",
-        ]
-    }
-    assert settings.publishing.mode == "review_required"
-    assert settings.publishing.draft is True
-    assert settings.sandbox.backend == "docker"
-    assert settings.sandbox.max_commands == 11
-    assert settings.storage.path == ROOT / ".autocontribute-staging"
-    assert settings.models.scout.model == "gpt-5.5"
-    assert settings.models.builder.model == "gpt-5.5"
-    assert settings.models.critic.model == "gpt-5.5"
-    assert settings.models.scout.reasoning_mode is None
-    assert settings.models.builder.reasoning_mode is None
-    assert settings.models.critic.reasoning_mode is None
-    assert settings.models.critic.pricing == settings.models.scout.pricing
-
-
 @pytest.mark.parametrize(
     ("workflow", "run_path", "evaluation_path", "snapshot_path"),
     [
@@ -139,12 +110,6 @@ def test_checked_in_staging_config_is_safe_for_the_operator_fixture() -> None:
             ".autocontribute/runs/",
             ".autocontribute/evaluations/",
             ".autocontribute/snapshots/state.sqlite3",
-        ),
-        (
-            "staging.yml",
-            ".autocontribute-staging/runs/",
-            ".autocontribute-staging/evaluations/",
-            ".autocontribute-staging/snapshots/state.sqlite3",
         ),
     ],
 )
@@ -187,13 +152,6 @@ def test_scheduler_persistence_keeps_evaluations_with_every_state_copy(
             "${{ secrets.AUTOCONTRIBUTE_STATE_TOKEN }}",
             "autocontribute-state-",
             "in-progress:v2:$final_prefix:$RUN_ID:$RUN_ATTEMPT:$PARENT_KEY:$NEW_KEY",
-        ),
-        (
-            "staging.yml",
-            "AUTOCONTRIBUTE_STAGING_STATE_LINEAGE",
-            "${{ secrets.AUTOCONTRIBUTE_STAGING_STATE_TOKEN }}",
-            "autocontribute-staging-state-",
-            "in-progress:v2:committed:$RUN_ID:$RUN_ATTEMPT:$PARENT_KEY:$NEW_KEY",
         ),
     ],
 )
@@ -290,12 +248,6 @@ def test_scheduler_cache_uses_externally_committed_exact_lineage(
             "Validate configuration and isolation",
             "Prepare one contribution attempt",
         ),
-        (
-            "staging.yml",
-            "Sync staging pull-request lifecycle",
-            "Validate live staging dependencies",
-            "Prepare shadow contribution",
-        ),
     ],
 )
 def test_scheduler_claims_before_lifecycle_doctor_and_run_then_always_snapshots(
@@ -379,7 +331,7 @@ def test_production_hosted_run_uses_scheduled_mode_only_without_an_issue(
     assert captured_arguments.read_text(encoding="utf-8").splitlines() == expected_arguments
 
 
-@pytest.mark.parametrize("workflow", ["autocontribute.yml", "staging.yml"])
+@pytest.mark.parametrize("workflow", ["autocontribute.yml"])
 def test_scheduler_commits_only_after_cache_and_evidence_upload(workflow: str) -> None:
     document = yaml.safe_load((ROOT / ".github" / "workflows" / workflow).read_text())
     job = next(iter(document["jobs"].values()))
@@ -402,7 +354,6 @@ def test_scheduler_commits_only_after_cache_and_evidence_upload(workflow: str) -
     ("workflow", "step_name"),
     [
         ("autocontribute.yml", "Enforce production Actions configuration"),
-        ("staging.yml", "Enforce staging-only configuration"),
     ],
 )
 def test_hosted_workflows_require_review_only_docker_isolation(
@@ -478,16 +429,6 @@ def test_production_handoff_locks_hosted_mutation_steps() -> None:
             "autocontribute-state-",
             ".autocontribute",
             "autocontribute",
-        ),
-        (
-            "recover-staging-lineage.yml",
-            "staging.yml",
-            "AUTOCONTRIBUTE_STAGING_ENABLED",
-            "AUTOCONTRIBUTE_STAGING_STATE_LINEAGE",
-            "${{ secrets.AUTOCONTRIBUTE_STAGING_STATE_TOKEN }}",
-            "autocontribute-staging-state-",
-            ".autocontribute-staging",
-            "autocontribute-staging",
         ),
     ],
 )

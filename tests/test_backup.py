@@ -182,17 +182,6 @@ def test_complete_bundle_verifies_staging_with_live_root_bindings(
     assert restored.get(run.run_id) == run
 
 
-def test_complete_bundle_rejects_unanchored_evaluation_file(tmp_path: Path) -> None:
-    store = RunStore(tmp_path / "state")
-    run = store.create_run()
-    evaluations = store.root / "evaluations"
-    evaluations.mkdir()
-    (evaluations / f"{run.run_id}.json").write_text("{}", encoding="utf-8")
-
-    with pytest.raises(StateError, match="Invalid evaluation record"):
-        create_state_bundle(store, tmp_path / "state.zip")
-
-
 def test_complete_bundle_rejects_submitting_run_with_stored_commit(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     run = store.create_run()
