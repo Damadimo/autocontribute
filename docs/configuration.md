@@ -137,7 +137,7 @@ Each limit applies to one run, and the run stops when it reaches a model limit.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `path` | `.autocontribute` | Directory for run state and evidence. A relative path is resolved from the config file's directory. |
+| `path` | `.autocontribute` | Directory for run state and evidence. A relative path is resolved from the config file's directory. With Colima on macOS, keep it under your home directory: Colima shares only `$HOME` with containers. |
 
 [How it works](how-it-works.md#where-evidence-is-written) lists what it holds. Deleting it erases the history that retries, publication limits, and `safety stop` rely on.
 
