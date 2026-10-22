@@ -1799,6 +1799,33 @@ def test_lifecycle_read_api_parses_complete_bounded_evidence() -> None:
     assert len(paths) == 7
 
 
+def test_commit_status_without_a_creator_is_accepted() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/repos/example/project/commits/{'a' * 40}/statuses"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 41,
+                    "context": "buildkite/test",
+                    "state": "failure",
+                    "description": None,
+                    "target_url": None,
+                    "creator": None,
+                    "created_at": "2026-07-21T12:15:00Z",
+                    "updated_at": "2026-07-21T12:20:00Z",
+                }
+            ],
+        )
+
+    with _client(handler) as github:
+        statuses = github.list_commit_statuses("example/project", "a" * 40)
+
+    assert [(status.context, status.state) for status in statuses] == [
+        ("buildkite/test", "failure")
+    ]
+
+
 def test_pull_request_timeline_overflow_fails_closed() -> None:
     pages: list[int] = []
 

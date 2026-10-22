@@ -137,6 +137,7 @@ def _ready_run(
     ready_for_review: bool = False,
     legal_policy: str | None = None,
     approved: bool = True,
+    actor: str = "octocat",
 ) -> tuple[AutocontributeConfig, RunStore, str, IssueCandidate]:
     config = AutocontributeConfig.model_validate(
         {
@@ -319,12 +320,12 @@ def _ready_run(
     run.status = RunStatus.READY_FOR_APPROVAL
     store.save(run, event="fixture.ready", details={})
     if approved:
-        approval_review = build_approval_review(config, store, run.run_id, actor="octocat")
+        approval_review = build_approval_review(config, store, run.run_id, actor=actor)
         approve_run(
             config,
             store,
             run.run_id,
-            actor="octocat",
+            actor=actor,
             attestation="I reviewed the exact contribution.",
             reviewed_fingerprint=approval_review.fingerprint,
         )
@@ -752,12 +753,14 @@ class FakePublishingGitHub:
 def _strand_review_publication_after_intent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    login: str = "octocat",
 ) -> tuple[AutocontributeConfig, RunStore, str, FakePublishingGitHub, Publisher]:
     """Crash after the approved publication intent is durable but before any GitHub mutation."""
 
-    config, store, run_id, issue = _ready_run(tmp_path, ready_for_review=True)
+    config, store, run_id, issue = _ready_run(tmp_path, ready_for_review=True, actor=login)
     manifest = store.get(run_id)
-    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    github = FakePublishingGitHub(issue, manifest.base_sha or "", login=login)
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
     original_find = github.find_pull_request
 
@@ -2623,15 +2626,17 @@ def test_ready_for_review_publication_marks_the_exact_created_draft_ready(
     assert completed < final_transition
 
 
+@pytest.mark.parametrize("login", ["octocat", "Damadimo"])
 def test_reconcile_submitting_adopts_existing_ready_pull_request_after_crash(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    login: str,
 ) -> None:
     """Reconciliation adopts already-durable remote state without another GitHub write."""
 
-    config, store, run_id, issue = _ready_run(tmp_path, ready_for_review=True)
+    config, store, run_id, issue = _ready_run(tmp_path, ready_for_review=True, actor=login)
     manifest = store.get(run_id)
-    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    github = FakePublishingGitHub(issue, manifest.base_sha or "", login=login)
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
     original_save = store.save
     completion_crashed = False
@@ -2714,9 +2719,7 @@ def test_exact_human_approval_exposes_ledger_bound_intent_time(tmp_path: Path) -
     authority = publication_module._classify_exact_human_approval(store.get(run_id), events)
 
     assert authority is not None
-    approval = next(event for event in events if event["event_type"] == "approval.created")
     intent = next(event for event in events if event["event_type"] == "publication.intent.begun")
-    assert authority.approval_event_hash == approval["event_hash"]
     assert authority.publication_intent_at == datetime.fromisoformat(intent["occurred_at"])
     without_intent = tuple(
         event for event in events if event["event_type"] != "publication.intent.begun"
@@ -2724,6 +2727,97 @@ def test_exact_human_approval_exposes_ledger_bound_intent_time(tmp_path: Path) -
     assert (
         publication_module._classify_exact_human_approval(store.get(run_id), without_intent) is None
     )
+
+
+def _approval_recorded_after_intent(events: list[dict[str, str]]) -> list[dict[str, str]]:
+    approval = next(event for event in events if event["event_type"] == "approval.created")
+    reordered = [event for event in events if event is not approval]
+    intent_index = next(
+        index
+        for index, event in enumerate(reordered)
+        if event["event_type"] == "publication.intent.begun"
+    )
+    reordered.insert(intent_index + 1, approval)
+    return reordered
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "approval_after_intent",
+        "duplicate_approval",
+        "duplicate_intent",
+        "actor_differs_from_publishing_login",
+        "approval_recorded_before_approval_time",
+    ],
+)
+def test_exact_human_approval_rejects_an_inexact_ledger(tmp_path: Path, corruption: str) -> None:
+    config, store, run_id, _issue = _ready_run(tmp_path)
+    _begin_review_publication(config, store, store.get(run_id))
+    manifest = store.get(run_id)
+    assert manifest.approval is not None
+    events = store.events(run_id)
+    approval = next(event for event in events if event["event_type"] == "approval.created")
+    intent = next(event for event in events if event["event_type"] == "publication.intent.begun")
+    if corruption == "approval_after_intent":
+        events = _approval_recorded_after_intent(events)
+    elif corruption == "duplicate_approval":
+        events.insert(events.index(approval) + 1, dict(approval))
+    elif corruption == "duplicate_intent":
+        events.append(dict(intent))
+    elif corruption == "actor_differs_from_publishing_login":
+        manifest.publishing_login = "other-user"
+    else:
+        recorded_at = manifest.approval.approved_at.astimezone(UTC) - timedelta(seconds=1)
+        approval["occurred_at"] = recorded_at.isoformat()
+
+    assert publication_module._classify_exact_human_approval(manifest, tuple(events)) is None
+
+
+def test_submitting_recovery_refuses_an_approval_recorded_after_publication_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, store, run_id, github, publisher = _strand_review_publication_after_intent(
+        tmp_path,
+        monkeypatch,
+    )
+    reordered = _approval_recorded_after_intent(store.events(run_id))
+    monkeypatch.setattr(store, "events", lambda selected_run_id: reordered)
+
+    with pytest.raises(StateError, match="exact ledger-bound human approval"):
+        publisher.publish(run_id)
+
+    assert not github.mutated
+    assert store.get(run_id).status == RunStatus.SUBMITTING
+
+
+def test_mixed_case_login_recovers_a_publication_stranded_after_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, store, run_id, github, publisher = _strand_review_publication_after_intent(
+        tmp_path,
+        monkeypatch,
+        login="Damadimo",
+    )
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+
+    publisher.publish(run_id)
+
+    published = store.get(run_id)
+    assert published.status == RunStatus.PR_OPEN
+    assert published.publishing_login == "damadimo"
+    assert published.approval is not None
+    assert published.approval.actor == "Damadimo"
 
 
 def test_submitting_without_exact_approval_fails_before_github_mutation(

@@ -306,7 +306,10 @@ def _model_capability_checks(config: AutocontributeConfig) -> list[DoctorCheck]:
             if result.output.status != "ready":  # defensive against a non-conforming adapter
                 raise ValueError("provider returned the wrong capability sentinel")
             resolved_model = validate_model_identifier(result.model)
-            if profile.deployment_model is not None and resolved_model != profile.deployment_model:
+            if (
+                profile.expected_response_model is not None
+                and resolved_model != profile.expected_response_model
+            ):
                 raise ValueError("provider returned a model ID other than expected_response_model")
         except Exception as exc:
             checks.append(

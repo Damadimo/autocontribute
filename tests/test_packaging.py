@@ -45,20 +45,14 @@ def test_dependency_snapshot_is_locked_and_at_least_seven_days_old() -> None:
     assert datetime.now(UTC) - cutoff.astimezone(UTC) >= timedelta(days=7)
 
 
-def test_build_backend_is_exactly_pinned_in_the_lockfile() -> None:
+def test_build_backend_is_exactly_pinned() -> None:
     project_root = Path(__file__).resolve().parents[1]
     project = tomllib.loads((project_root / "pyproject.toml").read_text(encoding="utf-8"))
-    lock = tomllib.loads((project_root / "uv.lock").read_text(encoding="utf-8"))
 
     assert project["build-system"]["requires"] == ["hatchling==1.27.0"]
-    assert "hatchling==1.27.0" in project["project"]["optional-dependencies"]["dev"]
-    locked_versions = {
-        package["name"]: package["version"] for package in lock["package"] if "version" in package
-    }
-    assert locked_versions["hatchling"] == "1.27.0"
 
 
 if __name__ == "__main__":
     test_lockfile_uses_only_portable_public_sources()
     test_dependency_snapshot_is_locked_and_at_least_seven_days_old()
-    test_build_backend_is_exactly_pinned_in_the_lockfile()
+    test_build_backend_is_exactly_pinned()

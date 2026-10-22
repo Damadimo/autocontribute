@@ -19,20 +19,15 @@ conduct, legal, and PR-template file, plus the root and relevant nested `AGENTS.
 files. It is sent whole: over 30 files or 80,000 characters stops the run. A nested `AGENTS.md` or
 README the scout did not see triggers one replan.
 
-| Limit | Key | Default |
-| --- | --- | --- |
-| Files and characters sent to the builder and critic | `quality.max_context_files`, `quality.max_context_characters` | 20; 160,000 |
-| Per call: request bytes, output tokens, seconds | `models.<role>.max_input_tokens`, `max_output_tokens`, `timeout_seconds` | 500,000; 40,000; 900 |
-| Per run: input tokens, output tokens, model seconds | `budget.max_input_tokens_per_run`, `max_output_tokens_per_run`, `max_model_seconds_per_run` | 3,000,000; 240,000; 3,600 |
-| Model calls per run | `budget.max_model_calls_per_run` | 9 |
-| USD per run (needs `pricing` on every role) | `budget.max_model_cost_usd_per_run` | none; the starter config sets 50 |
-
-A run needs at most six calls (plan, replan, edit, review, one repair and its re-review); the rest
-cover retries after timeouts, connection failures, and HTTP 408, 429, 500, 502, 503, and 504.
-Runs fail on repositories with over 5,000 tracked files, a file over 1,000,000 bytes, over
-32,000,000 bytes in total, or a file list (path, size, and line count per file) over 140,000
-characters, and when a code search for issue or plan terms finds more than 160 matches. Any limit
-fails the run, except that a repair that would not fit is skipped.
+Per-call limits are in [`models`](configuration.md#models), per-run limits in
+[`budget`](configuration.md#budget), and context limits in [`quality`](configuration.md#quality). A
+run needs at most six calls (plan, replan, edit, review, one repair and its re-review); the other
+calls that `budget.max_model_calls_per_run` allows cover retries after timeouts, connection
+failures, and HTTP 408, 429, 500, 502, 503, and 504. Runs fail on repositories with over 5,000
+tracked files, a file over 1,000,000 bytes, over 32,000,000 bytes in total, or a file list (path,
+size, and line count per file) over 140,000 characters, and when a code search for issue or plan
+terms finds more than 160 matches. Any limit fails the run, except that a repair that would not fit
+is skipped.
 
 ## Choosing an issue
 
@@ -52,7 +47,7 @@ passed over ([Run states](#run-states)).
 | Issue has an `include_labels` label and no `exclude_labels` label | `policy.require_maintainer_signal` (true), `github.include_labels` (`help wanted`, `good first issue`), `github.exclude_labels` (`security`, `breaking change`, `needs design`, `discussion`, `blocked`) |
 | Title, body, comments, and labels show no sign of a vulnerability (CVE, injection, XSS, ...) | `policy.allow_security_issues` (false) |
 | The issue does not ask contributors to stay away, no open PR links it, no comment claims the work ("I'm working on this"), and no maintainer comment asks contributors to stop or hold off (that also activates the [safety stop](#lifecycle-sync-and-the-safety-stop)) | |
-| The repository or its owner's `.github` repository has contribution guidelines, no policy file bans AI-assisted or automated contributions, and a detected CLA or DCO has a matching attestation ([below](#approval-and-publication)) | `policy.require_contribution_guidelines` (true), `policy.legal_attestations` |
+| The repository or its owner's `.github` repository has contribution guidelines, no policy file bans AI-assisted or automated contributions, and a detected CLA or DCO has a matching attestation ([Legal attestations](configuration.md#legal-attestations)) | `policy.require_contribution_guidelines` (true), `policy.legal_attestations` |
 | Readiness score reaches the threshold; at 85 an `include_labels` label is required in practice | `quality.min_candidate_score` (85) |
 
 | Score dimension | Points | Full points when |
@@ -128,10 +123,7 @@ the target repository and base commit, the publishing account, and a fingerprint
 - the repository's `validation.required_commands` and the `sandbox`, `policy`, `quality`, and
   `publishing` settings match those the run was prepared with;
 - the PR body still shows the current `policy.ai_disclosure`, which preparation appends;
-- your account, counting every PR it authored, has fewer than `publishing.max_open_pull_requests`
-  (2) open PRs, opened fewer than `publishing.max_new_pull_requests_per_day` (1) today (UTC), and
-  has no open PR in the repository and no closed one there updated in the last
-  `publishing.repository_cooldown_days` (7);
+- your account is within the [publication limits](configuration.md#publishing);
 - the base commit, policy files, CLA/DCO evidence, and issue (state, title, body, labels, comments,
   assignees, update time) are unchanged, and the issue still passes every rule with no linked PR.
 
@@ -145,13 +137,6 @@ starts the cooldown even if a later step fails. `publish` creates or reuses your
 the base, issue, or policy files changed meanwhile, it deletes the branch and the run ends `failed`;
 otherwise it opens a draft PR against the default branch (`publishing.draft`, true), then marks it
 ready for review if `publishing.ready_for_review` is true.
-
-If a repository's policy files mention a CLA or DCO, its issues stay ineligible until you attest:
-review them with `autocontribute policy inspect owner/repo`, run
-`autocontribute policy attest owner/repo` with `--cla-completed` and/or `--authorize-dco-signoff`,
-and paste the printed stanza under `policy.legal_attestations`. A later change to those files voids
-it. A DCO adds your `Signed-off-by` trailer, which needs `identity.name` and `identity.email`; only
-the attesting GitHub account can publish.
 
 ## Run states
 
@@ -214,4 +199,5 @@ autocontribute safety resume --actor NAME --reason "TEXT" --expected-trigger-has
 | `runs/<run-id>/report.md` | a readable summary; approval does not use it |
 | `workspaces/<run-id>/` | the repository checkout, deleted when the run reaches `pr_open`, `skipped`, `rejected`, `failed`, or `cancelled`; the next `run` retries a deletion that failed |
 
-Never delete or roll back `state.sqlite3`; the limits and the safety stop depend on it.
+Never delete or roll back `state.sqlite3`; the limits and the safety stop depend on it. Delete the
+state directory only when a newer version says it cannot migrate it.

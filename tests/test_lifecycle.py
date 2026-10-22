@@ -94,12 +94,7 @@ def _comment(
     )
 
 
-def _check(
-    identifier: int,
-    conclusion: str | None,
-    *,
-    completed_at: datetime | None = NOW,
-) -> CheckRunDetails:
+def _check(identifier: int, conclusion: str | None) -> CheckRunDetails:
     return CheckRunDetails(
         identifier=identifier,
         name="unit",
@@ -108,7 +103,6 @@ def _check(
         details_url=f"https://ci.example.invalid/check/{identifier}",
         app_name="github-actions",
         started_at=NOW - timedelta(minutes=5),
-        completed_at=completed_at,
     )
 
 
@@ -122,9 +116,7 @@ def _status(
         identifier=identifier,
         context="buildkite/test",
         state=state,
-        description=state,
         target_url=f"https://ci.example.invalid/status/{identifier}",
-        creator="ci-bot",
         created_at=updated_at,
         updated_at=updated_at,
     )
@@ -335,8 +327,8 @@ def test_classifier_ignores_untrusted_stop_text_and_superseded_ci_failures() -> 
             _comment(3, "Do not stop work; this is still wanted."),
         ),
         checks=(
-            _check(10, "failure", completed_at=NOW - timedelta(minutes=2)),
-            _check(11, "success", completed_at=NOW),
+            _check(10, "failure"),
+            _check(11, "success"),
         ),
         statuses=(
             _status(20, "failure", updated_at=NOW - timedelta(minutes=2)),

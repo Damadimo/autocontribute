@@ -181,7 +181,7 @@ def run_once(
     scheduled: Annotated[
         bool,
         typer.Option(
-            help="Mark invocation as scheduler-driven; behavior remains policy-controlled."
+            help="Make one unattended attempt: run lifecycle sync, pick the issue, never publish."
         ),
     ] = False,
 ) -> None:
@@ -595,7 +595,7 @@ def safety_status(
         typer.Option("--json", help="Emit the machine-readable breaker status."),
     ] = False,
 ) -> None:
-    """Show whether autonomous preparation and publication are persistently stopped."""
+    """Show whether preparation and publication are stopped, and why."""
 
     settings = _config(config)
     try:

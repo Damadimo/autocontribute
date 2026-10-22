@@ -225,12 +225,6 @@ class ModelProfile(StrictModel):
             )
         return value
 
-    @property
-    def deployment_model(self) -> str | None:
-        """Exact provider-returned model ID this profile accepts, when one is configured."""
-
-        return self.expected_response_model
-
 
 class ModelsConfig(StrictModel):
     scout: ModelProfile = Field(
