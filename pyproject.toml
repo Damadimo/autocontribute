@@ -21,6 +21,7 @@ classifiers = [
   "Topic :: Software Development :: Version Control :: Git",
 ]
 dependencies = [
+  "anthropic>=1.14.0,<2",
   "httpx>=0.28.1,<1",
   "openai>=2.45.0,<3",
   "pydantic>=2.11.0,<3",
@@ -47,7 +48,7 @@ Issues = "https://github.com/Damadimo/autocontribute/issues"
 
 [tool.uv]
 # Dependency-update PRs may advance this snapshot only to a timestamp at least seven days old.
-exclude-newer = "2026-07-15T00:00:00Z"
+exclude-newer = "2026-10-15T00:00:00Z"
 # Security fixes may admit one newer package: certifi 2026.10.19 fixes PYSEC-2026-4320.
 exclude-newer-package = { certifi = "2026-10-21T00:00:00Z" }
 
