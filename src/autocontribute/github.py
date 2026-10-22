@@ -180,6 +180,15 @@ class CommitStatusDetails:
 
 
 @dataclass(frozen=True, slots=True)
+class LinkedPullRequest:
+    """An open pull request in the issue's own repository that references the issue."""
+
+    html_url: str
+    updated_at: datetime
+    closes_issue: bool
+
+
+@dataclass(frozen=True, slots=True)
 class PullRequestReference:
     """One PR-to-PR timeline reference used only as explicit revert evidence."""
 
@@ -760,13 +769,17 @@ class GitHubClient:
         issue_number: int,
         *,
         max_search_results: int = 100,
-    ) -> list[str]:
-        """Find open linked PRs using complete timeline evidence plus bounded search."""
+    ) -> list[LinkedPullRequest]:
+        """Find open PRs that reference the issue, from complete timeline evidence and search.
+
+        Only pull requests in the issue's own repository are returned: a PR elsewhere that
+        mentions the issue does not compete with a fix for it.
+        """
 
         normalized_number = _positive_issue_number(issue_number)
         if not 1 <= max_search_results <= 100:
             raise ValueError("competing pull-request search limit must be between 1 and 100")
-        pull_requests: set[str] = set()
+        pull_requests: dict[str, LinkedPullRequest] = {}
         for page in range(1, 11):
             data = _mapping_list(
                 self._request(
@@ -799,12 +812,16 @@ class GitHubClient:
                     raise GitHubError(
                         "GitHub returned an unsupported cross-referenced pull request state"
                     )
-                if state == "open":
-                    pull_requests.add(
-                        _nonempty(
-                            source_issue.get("html_url"),
-                            field="cross-referenced pull request URL",
-                        )
+                html_url = _nonempty(
+                    source_issue.get("html_url"),
+                    field="cross-referenced pull request URL",
+                )
+                if state == "open" and self._in_repository(html_url, repository):
+                    pull_requests[html_url] = _linked_pull_request(
+                        source_issue,
+                        html_url=html_url,
+                        repository=repository,
+                        issue_number=normalized_number,
                     )
             if len(data) < 100:
                 break
@@ -813,14 +830,23 @@ class GitHubClient:
                 "Issue timeline exceeded 1,000 events; duplicate pull-request status is ambiguous"
             )
 
-        pull_requests.update(
-            self._search_open_pull_requests_referencing_issue(
-                repository,
-                normalized_number,
-                max_results=max_search_results,
-            )
+        for pull_request in self._search_open_pull_requests_referencing_issue(
+            repository,
+            normalized_number,
+            max_results=max_search_results,
+        ):
+            pull_requests.setdefault(pull_request.html_url, pull_request)
+        return [pull_requests[url] for url in sorted(pull_requests)]
+
+    def _in_repository(self, pull_request_url: str, repository: str) -> bool:
+        parsed = urlparse(pull_request_url)
+        origin = urlparse(web_origin_for_api(self.config.api_url))
+        match = re.fullmatch(r"/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/[1-9][0-9]*", parsed.path)
+        return (
+            (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
+            and match is not None
+            and match.group(1).casefold() == repository.casefold()
         )
-        return sorted(pull_requests)
 
     def _search_open_pull_requests_referencing_issue(
         self,
@@ -828,7 +854,7 @@ class GitHubClient:
         issue_number: int,
         *,
         max_results: int,
-    ) -> set[str]:
+    ) -> list[LinkedPullRequest]:
         if not 1 <= max_results <= 100:
             raise ValueError("competing pull-request search limit must be between 1 and 100")
         query = f"repo:{repository} is:pr is:open {issue_number} in:title,body"
@@ -871,7 +897,7 @@ class GitHubClient:
                 "duplicate status is ambiguous"
             )
 
-        matches: set[str] = set()
+        matches: list[LinkedPullRequest] = []
         for item in items:
             if not isinstance(item.get("pull_request"), dict):
                 raise GitHubError("GitHub search returned a non-pull-request result")
@@ -880,8 +906,18 @@ class GitHubClient:
                 raise GitHubError("GitHub search returned a non-open pull request")
             title = _nonempty(item.get("title"), field="searched pull request title")
             body = _optional_string(item.get("body"), field="searched pull request body")
-            if _explicit_issue_reference(f"{title}\n{body}", repository, issue_number):
-                matches.add(_nonempty(item.get("html_url"), field="searched pull request URL"))
+            html_url = _nonempty(item.get("html_url"), field="searched pull request URL")
+            if _explicit_issue_reference(
+                f"{title}\n{body}", repository, issue_number
+            ) and self._in_repository(html_url, repository):
+                matches.append(
+                    _linked_pull_request(
+                        item,
+                        html_url=html_url,
+                        repository=repository,
+                        issue_number=issue_number,
+                    )
+                )
         return matches
 
     def authored_pull_requests(
@@ -1944,22 +1980,46 @@ def _positive_issue_number(value: object) -> int:
     return value
 
 
-def _explicit_issue_reference(text: str, repository: str, issue_number: int) -> bool:
-    """Match GitHub issue references without treating #42 as a prefix of #420."""
-
+def _issue_reference_pattern(repository: str, issue_number: int) -> str:
     reference_end = r"(?![A-Za-z0-9])"
     local = rf"(?<![A-Za-z0-9_./#-])\#{issue_number}{reference_end}"
     qualified = rf"(?<![A-Za-z0-9_./-]){re.escape(repository)}\#{issue_number}{reference_end}"
     canonical_url = (
         rf"https://github\.com/{re.escape(repository)}/issues/{issue_number}{reference_end}"
     )
-    return (
-        re.search(
-            rf"(?:{canonical_url}|{qualified}|{local})",
-            text,
-            re.IGNORECASE,
-        )
-        is not None
+    return rf"(?:{canonical_url}|{qualified}|{local})"
+
+
+def _explicit_issue_reference(text: str, repository: str, issue_number: int) -> bool:
+    """Match GitHub issue references without treating #42 as a prefix of #420."""
+
+    pattern = _issue_reference_pattern(repository, issue_number)
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
+def _closes_issue(text: str, repository: str, issue_number: int) -> bool:
+    """Whether the text links the issue with a GitHub closing keyword, as in "Fixes #42"."""
+
+    keyword = r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+"
+    pattern = keyword + _issue_reference_pattern(repository, issue_number)
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
+def _linked_pull_request(
+    item: dict[str, Any],
+    *,
+    html_url: str,
+    repository: str,
+    issue_number: int,
+) -> LinkedPullRequest:
+    title = _optional_string(item.get("title"), field="linked pull request title")
+    body = _optional_string(item.get("body"), field="linked pull request body")
+    return LinkedPullRequest(
+        html_url=html_url,
+        updated_at=_required_datetime(
+            item.get("updated_at"), field="linked pull request updated_at"
+        ),
+        closes_issue=_closes_issue(f"{title}\n{body}", repository, issue_number),
     )
 
 
@@ -2287,6 +2347,7 @@ __all__ = [
     "ForkIdentity",
     "GitHubClient",
     "GitHubComment",
+    "LinkedPullRequest",
     "PullRequestDetails",
     "PullRequestReference",
     "PullRequestReview",

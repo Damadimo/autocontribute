@@ -802,6 +802,7 @@ def _render_discovery_explanation(outcome: DiscoveryOutcome) -> str:
             f"{evaluation.issue.title}"
         )
         lines.extend(f"    - {blocker}" for blocker in eligibility.blockers)
+        lines.extend(f"    note: {note}" for note in evaluation.notes)
     lines.extend(f"  {reference}: error: {error}" for reference, error in outcome.issue_errors)
     if not outcome.evaluations and not outcome.issue_errors:
         lines.append("  (none evaluated)")

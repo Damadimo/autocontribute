@@ -38,6 +38,7 @@ from autocontribute.discovery import (
     POLICY_ORGANIZATION_REF_EVIDENCE_KEY,
     POLICY_SOURCES_EVIDENCE_KEY,
     DiscoveryService,
+    competing_pull_requests,
     validate_legal_publication,
 )
 from autocontribute.domain import (
@@ -3277,14 +3278,17 @@ class Publisher:
         if manifest.eligibility is None:
             raise PolicyError("Run is missing durable eligibility evidence")
 
-        competing = self.github.search_competing_pull_requests(
-            manifest.candidate.repository,
-            manifest.candidate.number,
+        competing = competing_pull_requests(
+            self.github.search_competing_pull_requests(
+                manifest.candidate.repository,
+                manifest.candidate.number,
+            ),
+            now=datetime.now(UTC),
         )
         if competing:
             raise PolicyError(
                 "A competing pull request appeared at the publication mutation boundary: "
-                + competing[0]
+                + competing[0].html_url
             )
 
         repository = self.github.get_repository(manifest.repository.full_name)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import subprocess
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -310,13 +311,39 @@ def _pull_request_search_item(
     *,
     title: str,
     body: str | None = None,
+    repository: str = "example/project",
+    updated_at: str = "2026-07-20T12:00:00Z",
 ) -> dict[str, object]:
     return {
         "title": title,
         "body": body,
         "state": "open",
-        "html_url": f"https://github.com/example/project/pull/{number}",
+        "updated_at": updated_at,
+        "html_url": f"https://github.com/{repository}/pull/{number}",
         "pull_request": {"url": f"https://api.github.com/pulls/{number}"},
+    }
+
+
+def _cross_reference_event(
+    number: int,
+    *,
+    repository: str = "example/project",
+    state: str = "open",
+    body: str | None = None,
+    updated_at: str = "2026-07-20T12:00:00Z",
+) -> dict[str, object]:
+    return {
+        "event": "cross-referenced",
+        "source": {
+            "issue": {
+                "title": f"Pull request {number}",
+                "body": body,
+                "state": state,
+                "updated_at": updated_at,
+                "html_url": f"https://github.com/{repository}/pull/{number}",
+                "pull_request": {"url": f"https://api.github.com/pulls/{number}"},
+            }
+        },
     }
 
 
@@ -851,15 +878,7 @@ def test_competing_pull_request_search_paginates_issue_timeline() -> None:
                 json={
                     "total_count": 1,
                     "incomplete_results": False,
-                    "items": [
-                        {
-                            "title": "Fixes #42",
-                            "body": None,
-                            "state": "open",
-                            "html_url": "https://github.com/example/project/pull/99",
-                            "pull_request": {"url": "https://api.github.com/pulls/99"},
-                        }
-                    ],
+                    "items": [_pull_request_search_item(99, title="Fixes #42")],
                 },
             )
         page = int(request.url.params["page"])
@@ -867,44 +886,59 @@ def test_competing_pull_request_search_paginates_issue_timeline() -> None:
         if page == 1:
             return httpx.Response(
                 200,
-                json=[
-                    {
-                        "event": "cross-referenced",
-                        "source": {
-                            "issue": {
-                                "state": "open",
-                                "html_url": "https://github.com/example/project/pull/98",
-                                "pull_request": {"url": "https://api.github.com/pulls/98"},
-                            }
-                        },
-                    },
-                    *[{"event": "commented"}] * 99,
-                ],
+                json=[_cross_reference_event(98), *[{"event": "commented"}] * 99],
+            )
+        return httpx.Response(200, json=[_cross_reference_event(99, body="Fixes #42")])
+
+    with _client(handler) as github:
+        matches = github.search_competing_pull_requests("example/project", 42)
+
+    assert [match.html_url for match in matches] == [
+        "https://github.com/example/project/pull/98",
+        "https://github.com/example/project/pull/99",
+    ]
+    assert pages == [1, 2]
+
+
+def test_competing_pull_requests_are_open_same_repository_pull_requests_with_activity() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/search/issues":
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 2,
+                    "incomplete_results": False,
+                    "items": [
+                        _pull_request_search_item(10, title="Parser cleanup", body="Resolves: #42"),
+                        _pull_request_search_item(
+                            11,
+                            title="Fixes #42",
+                            repository="fork-owner/project",
+                        ),
+                    ],
+                },
             )
         return httpx.Response(
             200,
             json=[
-                {
-                    "event": "cross-referenced",
-                    "source": {
-                        "issue": {
-                            "state": "open",
-                            "html_url": "https://github.com/example/project/pull/99",
-                            "pull_request": {"url": "https://api.github.com/pulls/99"},
-                        }
-                    },
-                }
+                _cross_reference_event(
+                    7, body="Related to #42.", updated_at="2024-05-01T08:00:00Z"
+                ),
+                _cross_reference_event(8, state="closed", body="Fixes #42"),
+                _cross_reference_event(1899, repository="joblib/joblib", body="Fixes #42"),
+                _cross_reference_event(9, body="Closes example/project#42"),
             ],
         )
 
     with _client(handler) as github:
         matches = github.search_competing_pull_requests("example/project", 42)
 
-    assert matches == [
-        "https://github.com/example/project/pull/98",
-        "https://github.com/example/project/pull/99",
+    assert [(match.html_url, match.closes_issue) for match in matches] == [
+        ("https://github.com/example/project/pull/10", True),
+        ("https://github.com/example/project/pull/7", False),
+        ("https://github.com/example/project/pull/9", True),
     ]
-    assert pages == [1, 2]
+    assert matches[1].updated_at == datetime(2024, 5, 1, 8, tzinfo=UTC)
 
 
 def test_oversized_issue_timeline_fails_closed() -> None:
@@ -965,7 +999,7 @@ def test_competing_pull_request_search_accepts_only_exact_issue_references() -> 
     with _client(handler) as github:
         matches = github.search_competing_pull_requests("example/project", 42)
 
-    assert matches == [
+    assert [match.html_url for match in matches] == [
         "https://github.com/example/project/pull/1",
         "https://github.com/example/project/pull/2",
         "https://github.com/example/project/pull/3",
