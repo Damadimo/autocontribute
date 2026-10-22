@@ -928,7 +928,7 @@ class DiscoveryService:
             hold = next((comment for comment in stops if _targets_automation(comment.body)), None)
             if hold is not None:
                 repository_hold = (
-                    f"a maintainer comment turns away automated or AI contributions: "
+                    "a maintainer comment turns away automated or AI contributions: "
                     f"{hold.html_url}"
                 )
 

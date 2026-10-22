@@ -180,8 +180,9 @@ def test_repository_label_overrides_are_canonical_and_searchable() -> None:
     ):
         with pytest.raises(ValueError, match=message):
             AutocontributeConfig.model_validate({"github": {"labels": labels}})
-    with pytest.raises(ValueError, match="double quotes"):
-        AutocontributeConfig.model_validate({"github": {"include_labels": ['help" wanted']}})
+    for label in ('help" wanted', " ", "help\twanted"):
+        with pytest.raises(ValueError, match="printable label names without double quotes"):
+            AutocontributeConfig.model_validate({"github": {"include_labels": [label]}})
 
 
 def test_publishing_mode_is_not_a_setting() -> None:
