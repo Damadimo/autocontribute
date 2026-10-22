@@ -16,12 +16,12 @@ from pydantic import BaseModel, ValidationError
 from autocontribute.config import ModelProfile
 from autocontribute.exceptions import ModelError, ModelRequestError
 from autocontribute.model_retry import PROVIDER_ERROR_CODES
+from autocontribute.openai_adapter import _create_in_process_provider
 from autocontribute.providers import (
     _MAX_MODEL_REQUEST_BYTES,
     _MAX_MODEL_RESULT_BYTES,
     _MODEL_WORKER_PROTOCOL,
     _canonical_json_bytes,
-    _create_in_process_provider,
     _output_schema_type,
     _strict_worker_envelope,
 )

@@ -9,10 +9,11 @@ import pytest
 from openai import BadRequestError, RateLimitError
 from pydantic import BaseModel
 
-import autocontribute.providers as providers
+import autocontribute.openai_adapter as openai_adapter
 from autocontribute.config import ModelProfile
 from autocontribute.exceptions import ConfigurationError, ModelError, ModelRequestError
-from autocontribute.providers import ModelUsage, OpenAICompatibleProvider, OpenAIResponsesProvider
+from autocontribute.openai_adapter import OpenAICompatibleProvider, OpenAIResponsesProvider
+from autocontribute.providers import ModelUsage
 from autocontribute.redaction import MODEL_INPUT_REDACTION
 
 _API_KEY_ENV = "AUTOCONTRIBUTE_TEST_MODEL_KEY"
@@ -132,7 +133,7 @@ def _responses_provider(
     client = Mock()
     client.responses.parse.return_value = response
     constructor = Mock(return_value=client)
-    monkeypatch.setattr(providers, "OpenAI", constructor)
+    monkeypatch.setattr(openai_adapter, "OpenAI", constructor)
     return OpenAIResponsesProvider(_profile(monkeypatch, api_key=api_key)), client, constructor
 
 
@@ -174,7 +175,7 @@ def _compatible_provider(
     client = Mock()
     client.chat.completions.create.return_value = response
     constructor = Mock(return_value=client)
-    monkeypatch.setattr(providers, "OpenAI", constructor)
+    monkeypatch.setattr(openai_adapter, "OpenAI", constructor)
     return (
         OpenAICompatibleProvider(_profile(monkeypatch, compatible=True, api_key=api_key)),
         client,
@@ -401,7 +402,7 @@ def test_provider_requires_key_before_constructing_sdk_client(
     profile = _profile(monkeypatch, compatible=compatible)
     monkeypatch.delenv(_API_KEY_ENV)
     constructor = Mock()
-    monkeypatch.setattr(providers, "OpenAI", constructor)
+    monkeypatch.setattr(openai_adapter, "OpenAI", constructor)
     provider_type = OpenAICompatibleProvider if compatible else OpenAIResponsesProvider
 
     with pytest.raises(ConfigurationError, match=_API_KEY_ENV):
