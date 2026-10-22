@@ -81,7 +81,9 @@ def _label_names(values: list[str], *, field: str) -> list[str]:
     for value in values:
         name = value.strip()
         if not name or '"' in name or not name.isprintable():
-            raise ValueError(f"{field} must hold label names without double quotes")
+            raise ValueError(
+                f"{field} must hold non-empty, printable label names without double quotes"
+            )
         if name.casefold() not in {existing.casefold() for existing in names}:
             names.append(name)
     return names
