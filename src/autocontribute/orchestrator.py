@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -79,10 +80,11 @@ from autocontribute.quality import (
     QualityEvaluator,
     actionable_validation_failure_reason,
     infrastructure_failure_reason,
-    secret_findings,
 )
 from autocontribute.redaction import (
     MAX_ARTIFACT_CHARACTERS,
+    contains_host_secret,
+    host_secret_values,
     redact_model_input,
     redact_text,
     truncate_artifact,
@@ -1574,23 +1576,22 @@ class Orchestrator:
         workspace: RepositoryWorkspace,
         diff: str,
     ) -> None:
-        findings = secret_findings(diff)
-        if not findings:
+        # DESIGN §3.6: only an exact secret value of this machine stops every run. Other
+        # credential-like text fails the quality report's secret_scan gate, which rejects it.
+        host_values = host_secret_values(self._secret_env_names(), os.environ)
+        if not contains_host_secret(diff, host_values):
             return
-        safe_evidence = ", ".join(findings)
         manifest.proposal = None
         self.store.record_stop(
             CircuitBreakerTrigger(
                 source=f"secret_scanner:{manifest.run_id}",
                 reason=(
-                    "The deterministic patch secret scanner found credential-like material; "
-                    f"matched values were not retained. Findings: {safe_evidence}"
+                    "The patch contains a secret value of this machine; the value was not retained."
                 ),
                 trigger_hash=hashlib.sha256(
                     json.dumps(
                         {
                             "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
-                            "findings": findings,
                             "run_id": manifest.run_id,
                         },
                         sort_keys=True,
