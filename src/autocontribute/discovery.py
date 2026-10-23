@@ -45,6 +45,7 @@ from autocontribute.exceptions import (
 )
 from autocontribute.github import GitHubClient, LinkedPullRequest
 from autocontribute.github_origin import web_origin_for_api
+from autocontribute.stop_text import AUTOMATION_STOP
 from autocontribute.store import CandidateAttemptState, RunStore
 
 _DANGEROUS_TERMS = re.compile(
@@ -144,10 +145,6 @@ _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+|[;\n]")
 _CLAUSE_BREAK = re.compile(r"[,:()\u2013\u2014]")
 _NEGATED_OR_CONDITIONAL = re.compile(
     r"\b(?:not|no|never|nobody|none|no\s+one|if|unless|whether)\b|n't\b", re.I
-)
-_AUTOMATION_TERMS = re.compile(
-    r"\b(?:ai|llms?|bots?|automated|automation|agentic|machine[- ]generated|copilot|chatgpt)\b",
-    re.I,
 )
 _CLAIM_WINDOW = timedelta(days=30)
 # Repositories name the same invitation in many ways; these are searched whenever a repository
@@ -1822,7 +1819,7 @@ def _automation_stop_hold(
 
 
 def _targets_automation(body: str) -> bool:
-    return any(_AUTOMATION_TERMS.search(sentence) for sentence in _maintainer_stop_sentences(body))
+    return any(AUTOMATION_STOP.search(sentence) for sentence in _maintainer_stop_sentences(body))
 
 
 def _maintainer_stop_sentences(body: str) -> list[str]:
@@ -1843,7 +1840,8 @@ def _maintainer_stop_sentences(body: str) -> list[str]:
             segment = _ALREADY_WORKED_ON.sub("", segment)
         if any(
             not _RETIRED_STOP_PREFIX.search(segment[: match.start()])
-            for match in _MAINTAINER_STOP.finditer(segment)
+            for pattern in (_MAINTAINER_STOP, AUTOMATION_STOP)
+            for match in pattern.finditer(segment)
         ):
             sentences.append(segment)
     return sentences

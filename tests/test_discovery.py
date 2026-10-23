@@ -1506,6 +1506,8 @@ def test_later_maintainer_invitation_reopens_claimed_work(
         "We do not currently accept pull requests.",
         "We are not accepting community contributions.",
         "Please hold off on this issue for now.",
+        "Please hold off on opening a PR until the AI model refactor lands.",
+        "We are no longer accepting contributions from AI agents.",
         "Please hold off on a PR.",
         "Hold off on PRs.",
         "Do not open a PR yet.",
@@ -1551,6 +1553,7 @@ def test_maintainer_stop_request_in_discussion_blocks_only_that_issue(tmp_path, 
             "We will not accept automated submissions.",
             "AI-generated PRs will be closed.",
             "LLM-generated PRs will be closed.",
+            "We are no longer accepting contributions from AI agents.",
         }
     )
     assert not service.store.circuit_breaker_status().is_tripped

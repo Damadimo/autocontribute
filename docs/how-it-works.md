@@ -202,7 +202,7 @@ and PRs, and refuses everything while publication is held.
 | --- | --- |
 | The PR is closed without being merged | repository, 30 days |
 | A maintainer asks to close or stop this PR | the PR, and the repository for 30 days |
-| A maintainer turns away automated, AI, or bot contributions, or says outside contributions are not accepted, on a PR or on a candidate issue | repository, until released |
+| A maintainer turns away automated, AI, or bot contributions ("stop opening AI-generated PRs", "PRs from bots will be closed") on a PR or on a candidate issue, or says on a PR that outside contributions are not accepted | repository, until released |
 | The PR is reverted | repository and all publication, until released |
 | GitHub blocks the account from creating content | all publication, until released |
 

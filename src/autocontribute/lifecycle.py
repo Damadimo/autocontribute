@@ -38,30 +38,17 @@ from autocontribute.github import (
     PullRequestReview,
 )
 from autocontribute.github_origin import canonical_api_origin, web_origin_for_api
+from autocontribute.stop_text import AUTOMATION_STOP
 
 _MAINTAINER_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 # Action-required, cancelled, neutral, skipped and stale runs say nothing about the patch: they
 # wait for a human, were superseded, or did not apply.
 _FAILING_CHECK_CONCLUSIONS = frozenset({"failure", "startup_failure", "timed_out"})
 _FAILING_COMMIT_STATES = frozenset({"error", "failure"})
-_AUTOMATION = (
-    r"(?:ai(?:-generated|-assisted|-written)?|llms?(?:-generated)?|automat(?:ed|ion)|bots?|"
-    r"agents?|agentic|machine-generated)"
-)
-_SUBMISSIONS = r"(?:pull\s+requests?|prs?|contributions?|submissions?|patch(?:es)?)"
-# The directive must govern its object directly: review chatter such as "don't add a dependency
-# in this PR" or "let's stop here and merge this PR" names a PR without asking anyone to stop.
-_PROJECT_STOP = re.compile(
-    r"(?:"
-    rf"\b(?:stop|cease|do\s+not\s+(?:send|open|submit)|don't\s+(?:send|open|submit))\s+"
-    rf"(?:(?:all|any|further|more|these|this|the|your)\s+)*{_AUTOMATION}\b"
-    rf"|\b(?:do\s+not|don't|not|no\s+longer|won't|will\s+not)\s+accept(?:ing)?\s+"
-    rf"(?:any\s+)?{_AUTOMATION}\b"
-    r"|\b(?:not|no\s+longer)\s+accepting\s+(?:any\s+)?(?:new\s+|outside\s+|external\s+)?"
-    r"(?:pull\s+requests|prs|contributions|submissions)\b"
-    rf"|\b{_AUTOMATION}(?:[\s-]+\w+)?[\s-]+{_SUBMISSIONS}\s+(?:are|will\s+be)\s+"
-    r"(?:not\s+(?:accepted|allowed|welcome)|closed|rejected)\b"
-    r")",
+# On this tool's own pull request, a project that stops taking contributions turns it away too.
+_NOT_ACCEPTING = re.compile(
+    r"\b(?:not|no\s+longer)\s+accepting\s+(?:any\s+)?(?:new\s+|outside\s+|external\s+)?"
+    r"(?:pull\s+requests|prs|contributions|submissions)\b",
     re.IGNORECASE,
 )
 _PULL_REQUEST_STOP = re.compile(
@@ -797,7 +784,9 @@ def _stop_kind(text: str) -> LifecycleSignalKind | None:
     # later, independent stop such as "Don't stop CI, but withdraw this contribution."
     unmasked = text.replace("\u2019", "'")
     without_negated_directives = _NEGATED_STOP_DIRECTIVE.sub("", unmasked)
-    if _PROJECT_STOP.search(without_negated_directives):
+    if AUTOMATION_STOP.search(without_negated_directives) or _NOT_ACCEPTING.search(
+        without_negated_directives
+    ):
         return LifecycleSignalKind.AUTOMATION_STOP
     if _PULL_REQUEST_STOP.search(without_negated_directives):
         return LifecycleSignalKind.MAINTAINER_STOP

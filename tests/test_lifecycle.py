@@ -417,6 +417,10 @@ def test_classifier_ignores_negated_stop_directives(body: str) -> None:
         "Thanks! Let's stop here and merge this PR.",
         "Could you rebase? I don't see the fix in the PR yet.",
         "We do not accept PRs without a linked issue.",
+        "Could you stop the bot from reformatting unrelated files?",
+        "This PR should stop agents from retrying forever.",
+        "Don't open the agents module here; keep the change in parser.py.",
+        "Do not send automated PRs more than once a day.",
     ],
 )
 def test_review_chatter_that_names_a_pull_request_is_not_a_stop(body: str) -> None:
@@ -427,13 +431,35 @@ def test_review_chatter_that_names_a_pull_request_is_not_a_stop(body: str) -> No
     ("body", "kind"),
     [
         ("Please close this PR.", LifecycleSignalKind.MAINTAINER_STOP),
-        ("Stop this PR and all automated work.", LifecycleSignalKind.MAINTAINER_STOP),
         ("No PR is needed here.", LifecycleSignalKind.MAINTAINER_STOP),
         ("Stop this automated contribution.", LifecycleSignalKind.AUTOMATION_STOP),
         ("We don\u2019t accept AI-generated changes.", LifecycleSignalKind.AUTOMATION_STOP),
         ("Bot pull requests will be closed.", LifecycleSignalKind.AUTOMATION_STOP),
         ("Please don't open LLM-generated PRs here.", LifecycleSignalKind.AUTOMATION_STOP),
         ("We are not accepting outside contributions.", LifecycleSignalKind.AUTOMATION_STOP),
+        # A comment aimed at both this PR and automation holds the repository.
+        ("Stop this PR and all automated work.", LifecycleSignalKind.AUTOMATION_STOP),
+        ("Do not continue with this automated contribution.", LifecycleSignalKind.AUTOMATION_STOP),
+        ("Please stop submitting automated pull requests.", LifecycleSignalKind.AUTOMATION_STOP),
+        ("We do not accept pull requests from bots.", LifecycleSignalKind.AUTOMATION_STOP),
+        ("We no longer accept contributions from bots.", LifecycleSignalKind.AUTOMATION_STOP),
+        ("Stop opening AI-generated pull requests.", LifecycleSignalKind.AUTOMATION_STOP),
+        (
+            "Closing this PR: we don't take AI-written patches.",
+            LifecycleSignalKind.AUTOMATION_STOP,
+        ),
+        ("Please stop opening AI-generated PRs.", LifecycleSignalKind.AUTOMATION_STOP),
+        (
+            "Please stop submitting AI-generated pull requests to this repo.",
+            LifecycleSignalKind.AUTOMATION_STOP,
+        ),
+        ("Stop sending us LLM-generated PRs.", LifecycleSignalKind.AUTOMATION_STOP),
+        ("We don't want AI-generated PRs here. Closing.", LifecycleSignalKind.AUTOMATION_STOP),
+        (
+            "Please stop using bots to open pull requests here.",
+            LifecycleSignalKind.AUTOMATION_STOP,
+        ),
+        ("Stop opening PRs with an AI agent.", LifecycleSignalKind.AUTOMATION_STOP),
     ],
 )
 def test_stop_text_is_aimed_at_this_pull_request_or_at_automation(

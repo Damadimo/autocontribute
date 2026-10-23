@@ -3058,7 +3058,7 @@ def test_ready_retry_observes_current_run_and_blocks_on_new_adverse_evidence(
             author="maintainer",
             author_association="MEMBER",
             state="CHANGES_REQUESTED",
-            body="We do not accept AI-generated contributions.",
+            body="Do not continue with this automated contribution.",
             html_url="https://github.com/example/project/pull/7#pullrequestreview-2",
             submitted_at=datetime.now(UTC),
         )
