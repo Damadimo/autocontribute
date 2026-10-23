@@ -1383,9 +1383,11 @@ def actions_record(
 ) -> None:
     """Check the prepare job's output, save it as the state, and update the approval issues.
 
-    The output is read as untrusted data and nothing in it runs. Issue bodies are rendered here,
-    from the checked state, so they show exactly what an approval binds. Exit codes: 0 saved and
-    updated, 1 anything else, including a state that changed while the preparation ran.
+    The output is read as untrusted data and nothing in it runs. It is saved only if it extends
+    the saved state: a preparation may add runs and events, start a safety stop, and cancel runs
+    that wait for an approval, and nothing more. Issue bodies are rendered here, from the checked
+    state, so they show exactly what an approval binds. Exit codes: 0 saved and updated, 1
+    anything else, including a state that changed while the preparation ran.
     """
 
     try:
@@ -1394,12 +1396,15 @@ def actions_record(
         settings = load_runner_config(config, owner=context.owner)
         prepared, archive = read_prepared(input_dir)
         branch = StateBranch(state, token=token)
-        if branch.archive_sha256() not in {prepared.base_state_sha256, prepared.state_sha256}:
+        saved_sha256 = branch.archive_sha256()
+        if saved_sha256 not in {prepared.base_state_sha256, prepared.state_sha256}:
             raise StateError(
                 "An approval or setup saved the state while this preparation ran, so its result "
                 "is not saved; the next preparation starts from the new state"
             )
-        import_state(archive, settings.storage.path, release_leases=True)
+        if saved_sha256 is not None:
+            import_state(branch.archive, settings.storage.path, release_leases=True)
+        import_state(archive, settings.storage.path, release_leases=True, append_only=True)
         store = RunStore(settings.storage.path)
         saved = branch.save(
             archive,
