@@ -4,7 +4,7 @@ import copy
 from typing import Any
 
 import pytest
-from pydantic import JsonValue, ValidationError
+from pydantic import BaseModel, JsonValue, ValidationError
 
 from autocontribute.pricing import ModelUsage
 from autocontribute.submissions import AgentSubmission, ReviewSubmission, strict_json_schema
@@ -21,6 +21,8 @@ from autocontribute.transcript import (
     append_user_text,
     canonical_json,
     next_input_reservation,
+    read_submission,
+    start_transcript,
     tool_call_names,
     tool_definitions,
 )
@@ -635,3 +637,85 @@ def test_turn_rejects_inconsistent_shapes(
 def test_tool_call_ids_are_bounded_identifiers(call_id: str) -> None:
     with pytest.raises(ValidationError, match="call_id"):
         ToolCall(call_id=call_id, name="shell", arguments={})
+
+
+def test_start_transcript_binds_the_conversation_and_adds_the_task() -> None:
+    transcript = start_transcript(
+        model="claude-sonnet-5-5",
+        kind="setup",
+        run_id=_RUN_ID,
+        instructions="Set up the test environment.",
+        task="Repository: octo/widgets.",
+    )
+
+    assert (transcript.model, transcript.kind, transcript.run_id) == (
+        "claude-sonnet-5-5",
+        "setup",
+        _RUN_ID,
+    )
+    assert transcript.instructions == "Set up the test environment."
+    assert transcript.items == [
+        {"role": "user", "content": [{"type": "text", "text": "Repository: octo/widgets."}]}
+    ]
+    assert transcript.awaiting_model
+
+
+def test_read_submission_validates_the_arguments_with_the_submission_model() -> None:
+    call = ToolCall(
+        call_id="call_1",
+        name="submit_review",
+        arguments={
+            "verdict": "approve",
+            "blockers": [],
+            "notes": [],
+            "no_test_needed": False,
+            "summary": "The fix is minimal and tested.",
+        },
+    )
+
+    review = read_submission(call, ReviewSubmission)
+
+    assert review == ReviewSubmission.model_validate(call.arguments)
+
+
+@pytest.mark.parametrize(
+    ("call", "submission", "error"),
+    [
+        (
+            ToolCall(
+                call_id="call_1",
+                name="submit",
+                arguments={
+                    "outcome": "skip",
+                    "skip_reason": None,
+                    "summary": "Nothing to change.",
+                    "pr_title": None,
+                    "pr_body": None,
+                    "commit_message": None,
+                    "test_files": [],
+                    "test_command": None,
+                },
+            ),
+            AgentSubmission,
+            "outcome skip needs a skip_reason",
+        ),
+        (
+            ToolCall(call_id="call_1", name="submit_review", arguments={}),
+            AgentSubmission,
+            "not a submit call",
+        ),
+        (
+            ToolCall(call_id="call_1", name="submit", arguments={}),
+            ToolCall,
+            "ToolCall is not a submission model",
+        ),
+    ],
+    ids=["invalid-arguments", "other-tool", "not-a-submission"],
+)
+def test_read_submission_rejects_calls_the_model_must_redo(
+    call: ToolCall,
+    submission: type[BaseModel],
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        read_submission(call, submission)

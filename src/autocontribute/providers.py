@@ -108,7 +108,15 @@ class TurnProvider(Protocol):
         transcript: Transcript,
         max_output_tokens: int,
         timeout_seconds: float,
-    ) -> Turn: ...
+    ) -> Turn:
+        """Send the transcript's next request and return the turn, without appending it.
+
+        Reserve ``next_input_reservation(transcript)`` input tokens and ``max_output_tokens``
+        output tokens first; the turn's usage stays within them, and a failed attempt may still
+        be billed. ``ModelRequestError`` and ``ModelTimeoutError`` are the failures that
+        ``retry_decision`` may retry; any other ``ModelError``, a refusal included, ends the run.
+        """
+        ...
 
 
 @dataclass(frozen=True, slots=True)

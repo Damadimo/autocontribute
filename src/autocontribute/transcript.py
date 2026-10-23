@@ -4,6 +4,17 @@ A transcript is bound to one model, one tool set and one set of instructions, an
 Every request replays all of its items byte for byte: that keeps the provider's prompt cache warm
 and keeps earlier Anthropic thinking blocks valid, and editing an earlier item breaks both.
 Callers truncate and scrub text before they append it; nothing here rewrites it later.
+
+A conversation runs in this order:
+
+1. ``start_transcript`` fixes the model, the kind (and with it the tools) and the instructions,
+   and adds the task.
+2. Reserve ``next_input_reservation(transcript)`` input tokens and the turn's output cap, then
+   call ``TurnProvider.step``. A turn that stopped at ``max_output_tokens`` is not appended:
+   send the same transcript again with a larger cap.
+3. ``append_turn``. If the turn made no tool calls, ``append_user_text`` a nudge and go to 2.
+4. Run the calls in order; ``read_submission`` validates a call of the kind's submit tool.
+   ``append_tool_results`` adds one result per call, and any per-turn reminder. Go to 2.
 """
 
 from __future__ import annotations
@@ -13,7 +24,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Final, Literal
+from typing import Final, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
@@ -28,6 +39,7 @@ from autocontribute.submissions import (
     strict_json_schema,
 )
 
+SubmissionT = TypeVar("SubmissionT", bound=BaseModel)
 TranscriptKind = Literal["setup", "agent", "critic", "triage", "policy"]
 ToolKind = Literal["shell", "edit", "submit"]
 # Why the model stopped: it called tools, it ended its turn without one, or it hit the output
@@ -274,9 +286,29 @@ class Transcript(DomainModel):
         return self.appended_items > 0 and not self.pending_calls
 
 
+def start_transcript(
+    *,
+    model: str,
+    kind: TranscriptKind,
+    run_id: str,
+    instructions: str,
+    task: str,
+) -> Transcript:
+    """Start a conversation of one kind with ``model``, with ``task`` as its first message.
+
+    ``model`` is an id from the built-in table, and ``run_id`` names the run in the provider's
+    prompt cache key. ``instructions`` must stay byte-stable for the whole conversation, so
+    per-run facts belong in ``task``.
+    """
+
+    transcript = Transcript(model=model, kind=kind, run_id=run_id, instructions=instructions)
+    append_user_text(transcript, task)
+    return transcript
+
+
 def append_user_text(transcript: Transcript, text: str) -> None:
-    """Append a user message: the task, a nudge after a turn without tool calls, or the critic's
-    blockers. Per-turn reminders go with the tool results (``append_tool_results``)."""
+    """Append a user message: a nudge after a turn without tool calls, or the critic's blockers.
+    Per-turn reminders go with the tool results (``append_tool_results``)."""
 
     if transcript.pending_calls:
         raise ValueError("tool calls are waiting for their results")
@@ -341,6 +373,22 @@ def append_tool_results(
     transcript.pending_calls = []
     counted_items = len(results) if reminder is None else len(results) + 1
     _append(transcript, items, counted_items=counted_items)
+
+
+def read_submission(call: ToolCall, submission: type[SubmissionT]) -> SubmissionT:
+    """Validate a call of a submit tool with its submission model, such as ``AgentSubmission``.
+
+    Strict tool schemas leave out bounds and rules across fields, so they are checked here.
+    Raises ``ValueError`` (pydantic's ``ValidationError`` for invalid arguments): send its text
+    back as an error result for the call, and the model can submit again.
+    """
+
+    tool = next((tool for tool in SUBMIT_TOOLS.values() if tool.arguments is submission), None)
+    if tool is None:
+        raise ValueError(f"{submission.__name__} is not a submission model")
+    if call.name != tool.name:
+        raise ValueError(f"the call is not a {tool.name} call")
+    return submission.model_validate(call.arguments)
 
 
 def next_input_reservation(transcript: Transcript) -> int:
@@ -444,6 +492,8 @@ __all__ = [
     "append_user_text",
     "canonical_json",
     "next_input_reservation",
+    "read_submission",
+    "start_transcript",
     "tool_call_names",
     "tool_definitions",
 ]
