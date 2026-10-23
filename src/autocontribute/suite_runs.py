@@ -85,8 +85,13 @@ def run_suite(
     run_id: str,
     store_root: Path,
     timeout_seconds: int,
+    test_command: str | None = None,
 ) -> SuiteRun:
-    """Run the recipe's build and test commands offline on a copy of ``source``."""
+    """Run the recipe's build and test commands offline on a copy of ``source``.
+
+    ``test_command`` replaces the recipe's own for a run of related tests only, as
+    :func:`autocontribute.suite_selection.related_test_command` narrows it.
+    """
 
     copy = source.with_name(f"{source.name}.run-{secrets.token_hex(4)}")
     copy_workspace(source, copy)
@@ -122,7 +127,9 @@ def run_suite(
                         output_tail=_tail(built.result.stdout, built.result.stderr),
                     )
             tested = container.exec(
-                recipe.test_command, timeout_seconds=timeout_seconds, environment=environment
+                recipe.test_command if test_command is None else test_command,
+                timeout_seconds=timeout_seconds,
+                environment=environment,
             )
             result = tested.result
             output = _tail(result.stdout, result.stderr)
