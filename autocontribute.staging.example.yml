@@ -19,49 +19,23 @@ github:
   max_repository_inactivity_days: 365
 
 models:
-  scout: &staging_model
-    provider: openai
-    model: gpt-5.6
-    # Optional: refuse any response whose provider-reported model ID differs from this one.
-    # expected_response_model: gpt-5.6-YYYY-MM-DD
-    api_key_env: OPENAI_API_KEY
-    reasoning_effort: high
-    reasoning_mode: standard
-    max_input_tokens: 500000
-    max_output_tokens: 40000
-    timeout_seconds: 900
-    # Conservative price ceilings, not a built-in price table. Verify for the selected model.
-    pricing:
-      input_usd_per_million_tokens: 10
-      cached_input_usd_per_million_tokens: 10
-      cache_write_usd_per_million_tokens: 10
-      output_usd_per_million_tokens: 100
-  builder: *staging_model
-  critic:
-    <<: *staging_model
-    reasoning_mode: pro
+  agent: auto
+  critic: auto
+  setup: auto
+  triage: auto
+
+# The fixture uses only Python's standard library, so it needs no setup.
+environments:
+  YOUR_ACCOUNT/autocontribute-staging-fixture:
+    image: python:3.12-bookworm
+    setup: []
+    test: python -m unittest discover -s tests -v
 
 sandbox:
-  backend: docker
-  # The first fixture intentionally uses only Python's standard library, so a bare interpreter
-  # image is sufficient here. Replace it with a digest-pinned, dependency-complete image before
-  # adding another repository ecosystem: see docs/sandbox-image.md.
-  image: >-
-    python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a
   command_timeout_seconds: 300
   memory: 2g
   cpus: 2
-  pids_limit: 128
-  # One baseline reproduction plus five deduplicated checks before and after one repair pass.
-  max_commands: 11
-
-validation:
-  required_commands:
-    YOUR_ACCOUNT/autocontribute-staging-fixture:
-      - python tools/lint.py
-      - python tools/typecheck.py
-      - python -m unittest discover -s tests/unit -v
-      - python -m unittest discover -s tests/integration -v
+  pids_limit: 256
 
 policy:
   require_maintainer_signal: true
@@ -70,18 +44,12 @@ policy:
   allow_security_issues: false
   allow_dependency_changes: false
   allow_workflow_changes: false
-  ai_disclosure: >-
-    This contribution was prepared autonomously by an AI agent. Its validation evidence comes from
-    Autocontribute's configured automated checks; no human review is implied.
 
 quality:
-  min_readiness_score: 90
-  min_dimension_score: 80
   max_files_changed: 5
   max_changed_lines: 200
-  max_context_files: 20
-  max_context_characters: 120000
-  require_regression_evidence_for_bugfix: true
+  max_source_files: 2
+  max_source_lines: 100
 
 publishing:
   approval_expires_hours: 12
@@ -92,12 +60,11 @@ publishing:
   repository_cooldown_days: 30
 
 budget:
-  max_model_calls_per_run: 6
+  max_cost_usd_per_run: 5
+  max_cost_usd_per_day: 10
+  max_model_calls_per_run: 150
+  max_run_minutes: 45
   max_candidates_per_run: 10
-  max_input_tokens_per_run: 3000000
-  max_output_tokens_per_run: 240000
-  max_model_seconds_per_run: 3600
-  max_model_cost_usd_per_run: 50
 
 storage:
   path: .autocontribute-staging

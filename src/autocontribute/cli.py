@@ -198,9 +198,7 @@ def init(
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(example_config(), encoding="utf-8")
     console.print(f"Created [bold]{target}[/bold]")
-    console.print(
-        "Replace the placeholder repository and sandbox image, then run `autocontribute doctor`."
-    )
+    console.print("Replace the placeholder repository, then run `autocontribute doctor`.")
 
 
 @app.command()
@@ -835,15 +833,10 @@ def validate_config(config: ConfigOption = DEFAULT_CONFIG) -> None:
     console.print("[green]Configuration is valid.[/green]")
     console.print(f"Repositories: {len(settings.github.repositories)}")
     console.print(f"Owners: {len(settings.github.owners)}")
+    models = settings.models
     console.print(
-        "Models: "
-        + ", ".join(
-            [
-                settings.models.scout.model,
-                settings.models.builder.model,
-                settings.models.critic.model,
-            ]
-        )
+        f"Models: agent {models.agent}, critic {models.critic}, setup {models.setup}, "
+        f"triage {models.triage}"
     )
 
 
@@ -1863,7 +1856,7 @@ def _preparation_summary(manifest: RunManifest | None, error: str | None) -> str
         lines.append(
             f"Run {code_span(manifest.run_id)} is **{manifest.status.value}** ({code_span(issue)})."
         )
-        reason = manifest.error or manifest.skip_reason
+        reason = manifest.error or manifest.reject_reason or manifest.skip_reason
         if reason:
             lines += ["", fenced_block(reason, "text")]
     if error is not None:
@@ -1930,13 +1923,15 @@ def _print_outcome(manifest: RunManifest, store: RunStore) -> None:
         console.print(manifest.pull_request_url)
     if manifest.skip_reason:
         console.print(manifest.skip_reason)
+    if manifest.reject_reason:
+        console.print(manifest.reject_reason)
     if manifest.error:
         console.print(f"[red]{manifest.error}[/red]")
 
 
 def _show_report(manifest: RunManifest) -> None:
     console.print(
-        render_run_report(manifest, manifest.patched_validation),
+        render_run_report(manifest),
         markup=False,
     )
 
@@ -1945,7 +1940,7 @@ def _refresh_report(store: RunStore, manifest: RunManifest) -> None:
     store.write_artifact(
         manifest.run_id,
         "report.md",
-        render_run_report(manifest, manifest.patched_validation),
+        render_run_report(manifest),
     )
 
 
@@ -2028,6 +2023,7 @@ def _run_summary(manifest: RunManifest) -> dict[str, object]:
         ),
         "pull_request_url": manifest.pull_request_url,
         "skip_reason": manifest.skip_reason,
+        "reject_reason": manifest.reject_reason,
         "error": manifest.error,
     }
 

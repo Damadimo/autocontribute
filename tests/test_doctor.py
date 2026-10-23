@@ -1,68 +1,65 @@
 from __future__ import annotations
 
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import ClassVar
 
 import httpx
 import pytest
+from pydantic import JsonValue
+from test_agent_loop import Submit, turn
 
 import autocontribute.doctor as doctor
-from autocontribute.config import AutocontributeConfig, SandboxConfig
+from autocontribute.config import AutocontributeConfig
 from autocontribute.domain import RepositoryInfo
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     GitHubSafetyError,
+    ModelRequestError,
+    SandboxError,
 )
 from autocontribute.github import DirectoryEntry, GitHubClient
+from autocontribute.pricing import ModelSpec
 from autocontribute.store import RunStore
+from autocontribute.transcript import Transcript, Turn
+
+_TRIAGE: dict[str, JsonValue] = {
+    "suitable": True,
+    "reasons": ["deployment check"],
+    "already_fixed": False,
+    "needs_design": False,
+    "difficulty": "small",
+}
 
 
-def _config(
-    *,
-    backend: str = "docker",
-    command: str = "python -m unittest discover -v",
-) -> AutocontributeConfig:
-    sandbox: dict[str, object] = (
-        {"backend": "local", "allow_unsafe_local": True} if backend == "local" else {}
-    )
-    return AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "sandbox": sandbox,
-            "validation": {"required_commands": {"example/project": [command]}},
-        }
-    )
+def _config() -> AutocontributeConfig:
+    return AutocontributeConfig.model_validate({"github": {"repositories": ["example/project"]}})
 
 
-def _pinned_config() -> AutocontributeConfig:
-    profile = {"expected_response_model": "gpt-5.6-2026-07-21"}
-    return AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "models": {
-                "scout": profile,
-                "builder": profile,
-                "critic": {**profile, "reasoning_mode": "pro"},
-            },
-            "validation": {"required_commands": {"example/project": ["python -m unittest"]}},
-        }
-    )
+class _ProbeProvider:
+    """Answers each probe with ``answer`` and records what it was asked."""
+
+    requests: ClassVar[list[tuple[str, Transcript, int, float]]] = []
+    answer: ClassVar[Turn | Exception] = turn("openai", Submit(_TRIAGE, name="submit_triage"))
+
+    def __init__(self, spec: ModelSpec, host_values: frozenset[str]) -> None:
+        self.spec = spec
+
+    def step(
+        self, *, transcript: Transcript, max_output_tokens: int, timeout_seconds: float
+    ) -> Turn:
+        self.requests.append((self.spec.id, transcript, max_output_tokens, timeout_seconds))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
 
 
-class _ReadyProvider:
-    def __init__(self, calls: list[dict[str, Any]]) -> None:
-        self.calls = calls
-
-    def generate(self, **kwargs: Any) -> SimpleNamespace:
-        self.calls.append(kwargs)
-        output_type = kwargs["output_type"]
-        return SimpleNamespace(
-            output=output_type(status="ready"),
-            model="gpt-5.6-2026-07-21",
-        )
+@pytest.fixture
+def probe(monkeypatch: pytest.MonkeyPatch) -> type[_ProbeProvider]:
+    monkeypatch.setattr(_ProbeProvider, "requests", [])
+    monkeypatch.setattr(doctor, "SubprocessTurnProvider", _ProbeProvider)
+    return _ProbeProvider
 
 
 class _RateLimitedDoctorGitHub:
@@ -96,6 +93,7 @@ class _RateLimitedDoctorGitHub:
 def test_active_breaker_skips_billed_model_and_github_probes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    probe: type[_ProbeProvider],
 ) -> None:
     store = RunStore(tmp_path / "state")
     store.trip_circuit_breaker(
@@ -109,23 +107,7 @@ def test_active_breaker_skips_billed_model_and_github_probes(
         "_command_check",
         lambda name, *_args, **_kwargs: doctor.DoctorCheck(name, True, "available"),
     )
-    monkeypatch.setattr(
-        doctor,
-        "_offline_toolchain_check",
-        lambda _config: doctor.DoctorCheck("offline validation toolchain", True, "available"),
-    )
-    monkeypatch.setattr(
-        doctor,
-        "_docker_bind_mount_check",
-        lambda _config, **_kwargs: doctor.DoctorCheck(
-            "sandbox private bind mount", True, "available"
-        ),
-    )
-    monkeypatch.setattr(
-        doctor,
-        "create_provider",
-        lambda *_args, **_kwargs: pytest.fail("active breaker must block model probes"),
-    )
+    monkeypatch.setattr(doctor, "_docker_check", lambda: doctor.DoctorCheck("docker", True, "ok"))
     monkeypatch.setattr(
         doctor,
         "GitHubClient",
@@ -137,8 +119,133 @@ def test_active_breaker_skips_billed_model_and_github_probes(
     assert checks[0].name == "operational circuit breaker"
     assert not checks[0].passed
     assert "probes were not sent" in checks[0].detail
-    assert not any(check.name.startswith("model capability") for check in checks)
+    assert probe.requests == []
+    assert [check.name for check in checks if check.name.startswith("model")] == ["models"]
     assert not any(check.name.startswith("GitHub ") for check in checks)
+
+
+def test_model_probe_sends_one_bounded_tool_call_per_distinct_model(
+    monkeypatch: pytest.MonkeyPatch, probe: type[_ProbeProvider]
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-secret")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    checks = doctor._model_checks(_config(), probe=True)
+
+    assert [check.name for check in checks] == [
+        "models",
+        "model gpt-5.6-sol (agent/critic)",
+        "model gpt-5.6-terra (setup)",
+        "model gpt-5.6-luna (triage)",
+    ]
+    assert checks[0].detail == (
+        "agent gpt-5.6-sol, critic gpt-5.6-sol, setup gpt-5.6-terra, triage gpt-5.6-luna"
+    )
+    assert all(check.passed for check in checks)
+    assert [model for model, *_ in probe.requests] == [
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
+    for _model, transcript, max_output_tokens, timeout_seconds in probe.requests:
+        assert (transcript.kind, transcript.effort) == ("triage", "low")
+        assert (max_output_tokens, timeout_seconds) == (4_096, 60.0)
+    assert "made a strict tool call" in checks[1].detail
+    assert all("test-only-secret" not in check.detail for check in checks)
+
+
+def test_model_checks_name_the_missing_key_without_probing(
+    monkeypatch: pytest.MonkeyPatch, probe: type[_ProbeProvider]
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    checks = doctor._model_checks(_config(), probe=True)
+
+    assert len(checks) == 1
+    assert not checks[0].passed
+    assert "ANTHROPIC_API_KEY or OPENAI_API_KEY" in checks[0].detail
+    assert probe.requests == []
+
+
+@pytest.mark.parametrize(
+    ("answer", "detail"),
+    [
+        (turn("openai"), "answered without calling submit_triage"),
+        (turn("openai", Submit({**_TRIAGE, "difficulty": "huge"}, name="submit_triage")), "huge"),
+        (ModelRequestError("OpenAI Responses request failed (HTTP 401)"), "HTTP 401"),
+    ],
+)
+def test_model_probe_fails_on_anything_but_a_valid_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+    probe: type[_ProbeProvider],
+    answer: Turn | Exception,
+    detail: str,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-secret")
+    monkeypatch.setattr(probe, "answer", answer)
+
+    checks = doctor._model_checks(
+        AutocontributeConfig.model_validate(
+            {"models": {"agent": "gpt-5.6-sol", "setup": "gpt-5.6-sol", "triage": "gpt-5.6-sol"}}
+        ),
+        probe=True,
+    )
+
+    assert [check.passed for check in checks] == [True, False]
+    assert "failed the billed probe of at most 4,096 output tokens" in checks[1].detail
+    assert detail in checks[1].detail
+
+
+def test_doctor_redacts_configured_and_recognizable_credentials_from_provider_errors(
+    monkeypatch: pytest.MonkeyPatch, probe: type[_ProbeProvider]
+) -> None:
+    opaque_key = "opaque-provider-key-[should-not-render]-012345"
+    recognizable_token = "ghp_" + "a" * 36
+    monkeypatch.setenv("OPENAI_API_KEY", opaque_key)
+    monkeypatch.setattr(
+        probe,
+        "answer",
+        ModelRequestError(f"upstream echoed {opaque_key} and {recognizable_token}\x1b[31m"),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_command_check",
+        lambda name, *_args, **_kwargs: doctor.DoctorCheck(name, True, "available"),
+    )
+    monkeypatch.setattr(doctor, "_docker_check", lambda: doctor.DoctorCheck("docker", True, "ok"))
+    monkeypatch.setattr(doctor, "_github_checks", lambda *_args, **_kwargs: [])
+
+    checks = doctor.run_doctor(_config())
+    probes = [check for check in checks if check.name.startswith("model ")]
+
+    assert probes
+    assert all(not check.passed for check in probes)
+    assert all(opaque_key not in check.detail for check in probes)
+    assert all(recognizable_token not in check.detail for check in probes)
+    assert all("\x1b" not in check.detail for check in probes)
+    assert all("REDACTED" in check.detail for check in probes)
+
+
+def test_docker_check_needs_a_daemon_with_cgroup_v2_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(doctor, "detect_docker_daemon_mode", lambda: "rootless")
+    ready = doctor._docker_check()
+
+    def refuse() -> str:
+        raise SandboxError("Docker daemon does not enforce required cgroup v2 resource controls")
+
+    monkeypatch.setattr(doctor, "detect_docker_daemon_mode", refuse)
+    refused = doctor._docker_check()
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)
+    missing = doctor._docker_check()
+
+    assert (ready.passed, ready.detail) == (
+        True,
+        "rootless daemon that enforces cgroup v2 memory, CPU and process limits",
+    )
+    assert not refused.passed and "cgroup v2" in refused.detail
+    assert not missing.passed and "not found on PATH" in missing.detail
 
 
 def test_doctor_github_safety_trigger_survives_reopening_state(
@@ -156,131 +263,6 @@ def test_doctor_github_safety_trigger_survives_reopening_state(
     assert reopened.is_tripped
     assert reopened.source == "github_api:rate_or_abuse_limit"
     assert reopened.trigger_hash == "a" * 64
-
-
-def test_model_capability_probe_deduplicates_exact_profiles_and_is_bounded(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config()
-    monkeypatch.setenv("OPENAI_API_KEY", "test-only-secret")
-    calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(doctor, "create_provider", lambda _profile: _ReadyProvider(calls))
-
-    checks = doctor._model_capability_checks(config)
-
-    assert [check.name for check in checks] == [
-        "model capability scout/builder",
-        "model capability critic",
-    ]
-    assert all(check.passed for check in checks)
-    assert len(calls) == 2
-    assert all(call["max_output_tokens"] == 1_024 for call in calls)
-    assert all(call["timeout_seconds"] == 60.0 for call in calls)
-    assert all("bounded billed API probe" in check.detail for check in checks)
-    assert all("resolved to gpt-5.6-2026-07-21" in check.detail for check in checks)
-    assert all("test-only-secret" not in check.detail for check in checks)
-
-
-def test_model_capability_probe_fails_closed_without_sending_when_credential_is_missing(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(
-        doctor,
-        "create_provider",
-        lambda _profile: pytest.fail("provider must not be constructed without a credential"),
-    )
-
-    checks = doctor._model_capability_checks(_config())
-
-    assert len(checks) == 2
-    assert all(not check.passed for check in checks)
-    assert all("probe was not sent" in check.detail for check in checks)
-
-
-def test_model_capability_probe_rejects_a_model_other_than_the_expected_model(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class WrongModelProvider(_ReadyProvider):
-        def generate(self, **kwargs: Any) -> SimpleNamespace:
-            result = super().generate(**kwargs)
-            result.model = "gpt-5.6-2026-07-22"
-            return result
-
-    monkeypatch.setenv("OPENAI_API_KEY", "test-only-secret")
-    calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(doctor, "create_provider", lambda _profile: WrongModelProvider(calls))
-
-    checks = doctor._model_capability_checks(_pinned_config())
-
-    assert len(checks) == 2
-    assert all(not check.passed for check in checks)
-    assert all("other than expected_response_model" in check.detail for check in checks)
-
-
-def test_model_capability_probe_rejects_an_unbounded_resolved_model_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class UnboundedModelProvider(_ReadyProvider):
-        def generate(self, **kwargs: Any) -> SimpleNamespace:
-            result = super().generate(**kwargs)
-            result.model = "m" * 201
-            return result
-
-    monkeypatch.setenv("OPENAI_API_KEY", "test-only-secret")
-    calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(doctor, "create_provider", lambda _profile: UnboundedModelProvider(calls))
-
-    checks = doctor._model_capability_checks(_config())
-
-    assert len(checks) == 2
-    assert all(not check.passed for check in checks)
-    assert all("canonical provider IDs" in check.detail for check in checks)
-
-
-def test_doctor_redacts_configured_and_recognizable_credentials_from_provider_errors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class EchoingProvider:
-        def generate(self, **_kwargs: Any) -> SimpleNamespace:
-            raise RuntimeError(f"upstream echoed {opaque_key} and {recognizable_token}\x1b[31m")
-
-    config = _config()
-    secret_env = "OPAQUE_PROVIDER_AUTH"
-    opaque_key = "opaque-provider-key-[should-not-render]-012345"
-    recognizable_token = "ghp_" + "a" * 36
-    for role in ("scout", "builder", "critic"):
-        config.model_for(role).api_key_env = secret_env
-    monkeypatch.setenv(secret_env, opaque_key)
-    monkeypatch.setattr(doctor, "create_provider", lambda _profile: EchoingProvider())
-    monkeypatch.setattr(
-        doctor,
-        "_command_check",
-        lambda name, *_args, **_kwargs: doctor.DoctorCheck(name, True, "available"),
-    )
-    monkeypatch.setattr(
-        doctor,
-        "_offline_toolchain_check",
-        lambda _config: doctor.DoctorCheck("offline validation toolchain", True, "available"),
-    )
-    monkeypatch.setattr(
-        doctor,
-        "_docker_bind_mount_check",
-        lambda _config, **_kwargs: doctor.DoctorCheck(
-            "sandbox private bind mount", True, "available"
-        ),
-    )
-    monkeypatch.setattr(doctor, "_github_checks", lambda *_args, **_kwargs: [])
-
-    checks = doctor.run_doctor(config)
-    capability_checks = [check for check in checks if check.name.startswith("model capability")]
-
-    assert capability_checks
-    assert all(not check.passed for check in capability_checks)
-    assert all(opaque_key not in check.detail for check in capability_checks)
-    assert all(recognizable_token not in check.detail for check in capability_checks)
-    assert all("\x1b" not in check.detail for check in capability_checks)
-    assert all("REDACTED" in check.detail for check in capability_checks)
 
 
 def test_github_doctor_error_redacts_token_resolved_outside_the_environment(
@@ -349,261 +331,6 @@ def test_review_required_warns_when_credential_has_unneeded_write_scope() -> Non
     assert "not needed for preparation" in check.detail
 
 
-def test_toolchain_parser_finds_pipeline_tools_modules_and_workspace_scripts() -> None:
-    requirements = doctor._toolchain_requirements(
-        [
-            "MODE=test python -m pytest -q && ./scripts/check | ruff check .",
-            "cd package && env CI=1 python -m unittest discover",
-        ]
-    )
-
-    assert requirements.executables == ("python", "ruff")
-    assert requirements.python_modules == (("python", "pytest"), ("python", "unittest"))
-    assert requirements.workspace_entrypoints == ("./scripts/check",)
-    assert requirements.command_count == 2
-
-
-@pytest.mark.parametrize(
-    "command, message",
-    [
-        ("$RUNNER test", "dynamic executable"),
-        ("if pytest; then true; fi", "complex shell keyword"),
-        ("python -m", "missing its module"),
-        ("pytest\nruff check .", "multiline validation commands"),
-    ],
-)
-def test_toolchain_parser_fails_closed_when_requirements_cannot_be_proved(
-    command: str,
-    message: str,
-) -> None:
-    with pytest.raises(ValueError, match=message):
-        doctor._toolchain_requirements([command])
-
-
-def test_docker_toolchain_probe_matches_sandbox_isolation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("autocontribute.sandbox.os.getuid", lambda: 1000)
-    monkeypatch.setattr("autocontribute.sandbox.os.getgid", lambda: 1000)
-    config = _config(command="python -m pytest")
-    requirements = doctor._toolchain_requirements(["python -m pytest && ruff check ."])
-
-    command = doctor._docker_toolchain_probe(config, requirements, daemon_mode="rootful")
-
-    assert command[:3] == ["docker", "run", "--rm"]
-    assert "--pull=never" in command
-    assert "--log-driver=none" in command
-    assert "--network=none" in command
-    assert "--read-only" in command
-    assert "--cap-drop=ALL" in command
-    assert "--security-opt=no-new-privileges" in command
-    assert "--ipc=private" in command
-    assert "--tmpfs=/tmp:rw,exec,nosuid,nodev,size=64m,mode=1777" in command
-    assert "--init" in command
-    assert "--user=1000:1000" in command
-    assert command.index("--env=HTTPS_PROXY=") < command.index(config.sandbox.image)
-    assert config.sandbox.image in command
-    assert "python -m pytest && ruff check ." not in command
-    assert command[-4:] == ["python", "ruff", "python", "pytest"]
-
-
-def test_rootless_toolchain_probe_uses_verified_namespace_root() -> None:
-    config = _config(command="python -m pytest")
-    requirements = doctor._toolchain_requirements(["python -m pytest"])
-
-    command = doctor._docker_toolchain_probe(config, requirements, daemon_mode="rootless")
-
-    assert "--user=0:0" in command
-    assert "--network=none" in command
-    assert "--read-only" in command
-    assert "--cap-drop=ALL" in command
-    assert "--security-opt=no-new-privileges" in command
-
-
-def test_doctor_private_bind_probe_verifies_0700_mount_and_host_side_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    observed: dict[str, object] = {}
-
-    class ProbeRunner:
-        def __init__(self, config: object) -> None:
-            observed["config"] = config
-
-        def run(self, workspace: Path, command: str) -> SimpleNamespace:
-            observed["workspace_mode"] = workspace.stat().st_mode & 0o777
-            observed["command"] = command
-            assert (workspace / doctor._BIND_PROBE_INPUT).read_text(encoding="utf-8") == (
-                doctor._BIND_PROBE_INPUT_CONTENT
-            )
-            output = workspace / doctor._BIND_PROBE_OUTPUT
-            output.write_text(doctor._BIND_PROBE_OUTPUT_CONTENT, encoding="utf-8")
-            output.chmod(0o600)
-            return SimpleNamespace(passed=True, stderr="")
-
-        @property
-        def docker_daemon_mode(self) -> str:
-            return "rootless"
-
-    monkeypatch.setattr(doctor, "DockerSandbox", ProbeRunner)
-
-    check = doctor._docker_bind_mount_check(_config())
-
-    assert check.passed
-    assert observed["workspace_mode"] == 0o700
-    assert "cat .autocontribute-bind-input" in str(observed["command"])
-    assert "cat /sys/fs/cgroup/memory.max" in str(observed["command"])
-    probe_config = observed["config"]
-    assert isinstance(probe_config, SandboxConfig)
-    assert probe_config.memory == "128m"
-    assert probe_config.cpus == 1.0
-    assert probe_config.pids_limit == 32
-    assert "daemon-selected identity" in check.detail
-    assert "cgroup v2 limits" in check.detail
-    assert "host-side ownership" in check.detail
-
-
-def test_doctor_private_bind_probe_takes_the_service_account_group(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    other_groups = [group for group in os.getgroups() if group != os.getgid()]
-    if not other_groups:
-        pytest.skip("the test account belongs to no secondary group")
-    parent = tmp_path / "shared"
-    parent.mkdir()
-    os.chown(parent, -1, other_groups[0])
-    # New entries take the parent's group on macOS and under a setgid parent on Linux.
-    parent.chmod(0o2770)
-    observed: dict[str, int] = {}
-
-    class ProbeRunner:
-        def __init__(self, _config: object) -> None:
-            pass
-
-        def run(self, workspace: Path, _command: str) -> SimpleNamespace:
-            observed["gid"] = workspace.stat().st_gid
-            output = workspace / doctor._BIND_PROBE_OUTPUT
-            output.write_text(doctor._BIND_PROBE_OUTPUT_CONTENT, encoding="utf-8")
-            output.chmod(0o600)
-            return SimpleNamespace(passed=True, stderr="")
-
-    monkeypatch.setattr(doctor, "DockerSandbox", ProbeRunner)
-
-    check = doctor._docker_bind_mount_check(_config(), workspace_parent=parent)
-
-    assert check.passed, check.detail
-    assert observed["gid"] == os.getgid()
-
-
-def test_doctor_private_bind_probe_uses_store_workspace_filesystem(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    store = RunStore(tmp_path / "state")
-    observed: dict[str, Path] = {}
-
-    class FailingProbeRunner:
-        def __init__(self, _config: object) -> None:
-            pass
-
-        def run(self, workspace: Path, _command: str) -> SimpleNamespace:
-            observed["parent"] = workspace.parent
-            return SimpleNamespace(passed=False, stderr="expected test stop")
-
-    monkeypatch.setattr(doctor, "DockerSandbox", FailingProbeRunner)
-
-    check = doctor._docker_bind_mount_check(
-        _config(),
-        workspace_parent=store.workspaces_dir,
-    )
-
-    assert not check.passed
-    assert observed["parent"] == store.workspaces_dir
-
-
-def test_doctor_private_bind_probe_cannot_pass_without_host_side_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class FalsePositiveRunner:
-        def __init__(self, _config: object) -> None:
-            pass
-
-        def run(self, _workspace: Path, _command: str) -> SimpleNamespace:
-            return SimpleNamespace(passed=True, stderr="")
-
-    monkeypatch.setattr(doctor, "DockerSandbox", FalsePositiveRunner)
-
-    check = doctor._docker_bind_mount_check(_config())
-
-    assert not check.passed
-    assert "without a readable host-side output" in check.detail
-
-
-def test_doctor_docker_commands_keep_the_selected_rootless_endpoint_without_secrets(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    observed: dict[str, object] = {}
-    monkeypatch.setenv("DOCKER_HOST", "unix:///run/autocontribute/docker.sock")
-    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/autocontribute")
-    monkeypatch.setenv("OPENAI_API_KEY", "must-not-reach-doctor-subprocess")
-    monkeypatch.setattr(doctor.shutil, "which", lambda _tool: "/usr/bin/docker")
-
-    def fake_run(*_args: object, **kwargs: object) -> SimpleNamespace:
-        observed["environment"] = kwargs["env"]
-        return SimpleNamespace(returncode=0, stdout="27.0.0\n", stderr="")
-
-    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
-
-    check = doctor._command_check("docker", ["docker", "info"])
-
-    assert check.passed
-    environment = observed["environment"]
-    assert isinstance(environment, dict)
-    assert environment["DOCKER_HOST"] == "unix:///run/autocontribute/docker.sock"
-    assert environment["XDG_RUNTIME_DIR"] == "/run/autocontribute"
-    assert "OPENAI_API_KEY" not in environment
-
-
-def test_local_toolchain_check_never_requires_docker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = _config(backend="local")
-    monkeypatch.setattr(doctor.shutil, "which", lambda tool: f"/bin/{tool}")
-    monkeypatch.setattr(doctor.os.path, "isfile", lambda _path: True)
-    monkeypatch.setattr(doctor, "_local_python_module_check", lambda *_args: None)
-    monkeypatch.setattr(
-        doctor,
-        "_command_check",
-        lambda *_args, **_kwargs: pytest.fail("local toolchain must not invoke Docker"),
-    )
-
-    check = doctor._offline_toolchain_check(config)
-
-    assert check.passed
-    assert check.warning
-    assert "unsafe local host" in check.detail
-
-
-def test_offline_toolchain_fails_cleanly_for_rootful_daemon_under_host_root(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(doctor, "detect_docker_daemon_mode", lambda *_args, **_kwargs: "rootful")
-    monkeypatch.setattr("autocontribute.sandbox.os.getuid", lambda: 0)
-    monkeypatch.setattr("autocontribute.sandbox.os.getgid", lambda: 0)
-
-    check = doctor._offline_toolchain_check(_config())
-
-    assert not check.passed
-    assert "host root" in check.detail
-
-
-def test_offline_toolchain_fails_when_no_commands_are_configured() -> None:
-    check = doctor._offline_toolchain_check(AutocontributeConfig())
-
-    assert not check.passed
-    assert "no validation.required_commands" in check.detail
-
-
 class _PolicyDoctorGitHub:
     """Serves one CONTRIBUTING.md per repository at a fixed commit."""
 
@@ -647,12 +374,6 @@ def test_doctor_names_repositories_whose_ai_policy_rules_them_out(tmp_path: Path
     config = AutocontributeConfig.model_validate(
         {
             "github": {"repositories": ["example/project", "banning/project"]},
-            "validation": {
-                "required_commands": {
-                    "example/project": ["python -m pytest"],
-                    "banning/project": ["python -m pytest"],
-                }
-            },
         }
     )
     github = _PolicyDoctorGitHub(

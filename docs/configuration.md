@@ -2,7 +2,7 @@
 
 Autocontribute reads one YAML file: `autocontribute.yml` in the current directory, or the file you pass with `--config`. `autocontribute init` writes a starter file, and the [README](../README.md#minimal-configuration) shows a minimal one. A key you leave out keeps the default listed here; an unknown key is an error. `autocontribute config validate` checks the file, and `autocontribute config show` prints it with every default filled in.
 
-Secrets never go in this file. It holds only the names of the environment variables that contain them: `github.token_env` and each `models.<role>.api_key_env`.
+Secrets never go in this file. Model API keys come from `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`, and the GitHub token from the variable `github.token_env` names, or from `gh`. The file loads without any key; `run` and `doctor` need one.
 
 ## identity
 
@@ -20,8 +20,8 @@ A DCO attestation needs both keys set, because the `Signed-off-by` trailer must 
 | `auth` | `gh` | `gh` uses the token in `token_env` if it is set, otherwise `gh auth token`. `token` requires the token in `token_env`. |
 | `token_env` | `AUTOCONTRIBUTE_GITHUB_TOKEN` | Environment variable that holds a GitHub token. |
 | `api_url` | `https://api.github.com` | GitHub API URL. Must use HTTPS. |
-| `repositories` | `[]` | Repositories to search, as `owner/name`. Each needs a `validation.required_commands` entry. |
-| `owners` | `[]` | Users or organizations whose most recently pushed public repositories are searched too. If the chosen issue's repository has no `validation.required_commands` entry, the run stops before any model call. |
+| `repositories` | `[]` | Repositories to search, as `owner/name`. |
+| `owners` | `[]` | Users or organizations whose most recently pushed public repositories are searched too. |
 | `include_labels` | `help wanted`, `bug`, `confirmed`, `accepted`, `status: help wanted`, `contributions welcome`, `pr welcome` | Discovery searches only open issues that carry one of these labels. Labels match regardless of case, hyphens, underscores, emoji and a category prefix, so `Help-Wanted`, `Help wanted 🙏` and `E-help-wanted` all match `help wanted`, and `kind/bug` matches `bug`. Discovery also searches for `status: help wanted`, `sprintable`, `E-easy`, `contributions welcome`, `PR welcome`, `accepted`, and `confirmed` when a repository defines them, even if you change this list. |
 | `exclude_labels` | `security`, `breaking change`, `needs-*`, `question`, `discussion`, `design`, `rfc`, `proposal`, `wontfix`, `duplicate`, `invalid`, `stale`, `blocked`, `good first issue`, `first-timers-only`, `beginner` | Skip issues that carry any of these labels. A `*` matches any text, so `needs-*` covers `Needs Triage` and `needs-decision`. Maintainers keep `good first issue`, `first-timers-only`, and `beginner` issues for people making their first contribution. |
 | `labels` | `{}` | Labels for one repository, as `owner/name: {include: [...], exclude: [...]}`. A list you set replaces `include_labels` or `exclude_labels` for that repository, and a set `include` list also turns off the extra labels above. |
@@ -36,48 +36,60 @@ Private, archived, and disabled repositories are always skipped.
 
 ## models
 
-The scout reads the issue and the repository, then plans a change or decides to skip; the builder writes the edits and any repair. The critic reviews the finished diff, check output, and PR text in a fresh context and can reject the change.
-
-Each role (`models.scout`, `models.builder`, `models.critic`) takes these keys:
+The agent fixes the issue and writes its test. The critic reviews each fix that passed the checks, in a fresh context, and can send blockers back or reject the change. The setup model writes a recipe for a test environment when detection fails, and the triage model judges candidate issues and reads AI policies.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `provider` | `openai` | `openai` calls the OpenAI Responses API. `openai_compatible` calls a Chat Completions endpoint at `base_url` that supports strict JSON schema output. |
-| `model` | `gpt-5.6` | Model name sent to the provider. |
-| `api_key_env` | `OPENAI_API_KEY` | Environment variable that holds the API key. |
-| `base_url` | none | HTTPS endpoint. Required for `openai_compatible`. |
-| `reasoning_effort` | `high` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
-| `reasoning_mode` | `standard`; critic `pro` | `standard`, `pro`, or `null` to send no mode. `openai_compatible` does not accept `pro`. |
-| `max_input_tokens` | `500000` | Input limit per call (1,000–2,000,000). |
-| `max_output_tokens` | `40000` | Output limit per call (1,000–128,000). |
-| `timeout_seconds` | `900` | Time limit per call (10–3600). |
-| `pricing` | none | Your prices in USD per million tokens, used for the dollar cap. Set it on all three roles or on none. |
-| `expected_response_model` | none | Exact model ID the provider must report; any other ID is refused. |
+| `agent` | `auto` | Model id from the table below, or `auto`: an Anthropic model when `ANTHROPIC_API_KEY` is set, otherwise an OpenAI model when `OPENAI_API_KEY` is set. |
+| `critic` | `auto` | `auto` uses the agent's model, or the other provider's agent model when both keys are set, so the review does not come from the model that wrote the change. |
+| `setup` | `auto` | `auto` uses the provider's middle tier. |
+| `triage` | `auto` | `auto` uses the provider's cheapest tier. |
+| `effort` | `{}` | Reasoning effort per role, such as `{agent: xhigh}`: `low`, `medium`, `high`, `xhigh`, or `max` (not on `gpt-5.5`). Defaults: agent and critic `high`, setup `medium`, triage `low`. |
 
-`pricing` takes `input_usd_per_million_tokens` and `output_usd_per_million_tokens`, both required, plus `cached_input_usd_per_million_tokens` and `cache_write_usd_per_million_tokens`, which default to the input price. There is no built-in price table: use your provider's current prices.
+`auto` resolves when `run` or `doctor` starts, and each run records the models it used. A model you name needs its provider's key.
+
+| Model | Provider | `auto` role | USD per million tokens: input / cached input / cache write / output |
+| --- | --- | --- | --- |
+| `gpt-5.6-sol` | OpenAI | agent, critic | 5.00 / 0.50 / 6.25 / 30.00; above 272,000 input tokens 10.00 / 1.00 / 12.50 / 45.00 |
+| `gpt-5.6-terra` | OpenAI | setup | 2.00 / 0.20 / 2.50 / 12.00; above 272,000 input tokens 4.00 / 0.40 / 5.00 / 18.00 |
+| `gpt-5.6-luna` | OpenAI | triage | 0.20 / 0.02 / 0.25 / 1.20; above 272,000 input tokens 0.40 / 0.04 / 0.50 / 1.80 |
+| `gpt-5.5` | OpenAI | | 5.00 / 0.50 / 5.00 / 30.00; above 272,000 input tokens 10.00 / 1.00 / 10.00 / 45.00 |
+| `claude-opus-5-5` | Anthropic | agent, critic | 4.00 / 0.20 / 5.00 / 20.00 |
+| `claude-sonnet-5-5` | Anthropic | setup | 2.00 / 0.20 / 2.50 / 10.00 |
+| `claude-haiku-5-5` | Anthropic | triage | 0.10 / 0.01 / 0.125 / 0.50; above 100,000 input tokens 0.50 / 0.05 / 0.625 / 2.50 |
+
+Costs use these list prices, so a promotional price lowers what you pay but not what the budget counts.
+
+## environments
+
+Autocontribute detects how to install each repository and run its tests. Where it guesses wrong, set the fields it should use, per repository; detection fills the rest. An entry also lets a repository whose environment failed in the last 7 days be tried again.
+
+```yaml
+environments:
+  owner/repo:
+    image: python:3.12-bookworm        # base image, by tag
+    setup: ["pip install -e .[test]"]  # runs with network, through an allowlisting proxy
+    test: python -m pytest -q          # runs offline
+    allow_hosts: ["files.example.org"] # hosts the proxy allows beyond the package registries
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `image` | detected | Base image. Setup records the digest the tag resolved to. |
+| `setup` | detected | Commands that install the project and its test dependencies. `[]` installs nothing. |
+| `test` | detected | Command that runs the test suite without network. A pytest, unittest, jest, vitest, mocha, `go test` or `cargo test` command gets a report option added, so results count per test. |
+| `allow_hosts` | `[]` | Host names, not URLs or addresses. |
 
 ## sandbox
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `backend` | `docker` | `docker`, or `local` to run repository commands on your machine with no isolation. |
-| `image` | a pinned `python:3.12-bookworm` | Image for every check, pinned as `name@sha256:<64 hex digits>`. The default has no pytest or project dependencies, so build your own ([sandbox-image.md](sandbox-image.md)). |
-| `command_timeout_seconds` | `900` | Time limit per command (10–3600). |
-| `memory` | `4g` | Container memory limit, in Docker syntax. Swap is disabled. |
+| `command_timeout_seconds` | `900` | Time limit per test run and setup step (10–3600). Agent commands get at most 300 seconds. |
+| `memory` | `6g` | Container memory limit, in Docker syntax. Swap is disabled. |
 | `cpus` | `2.0` | CPU limit (above 0, at most 16). |
-| `pids_limit` | `256` | Process limit (32–4096). |
-| `allow_unsafe_local` | `false` | Must be `true` for `backend: local`. Repository code can then read and change your machine. |
-| `max_commands` | `8` | Commands per run, counting model-suggested checks, the bug reproduction, and reruns after a repair (1–30). Each repository's `validation.required_commands` must fit. |
+| `pids_limit` | `1024` | Process limit (32–4096). |
 
-There is no network setting: the `docker` backend always runs checks with no network.
-
-## validation
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `required_commands` | `{}` | Map of `owner/name` to a list of shell commands. They run in the sandbox after every change and must all pass. The model can add checks but cannot remove these. |
-
-[sandbox-image.md](sandbox-image.md) explains how commands run and what the image must contain.
+Repository code runs only in Docker. Tests and the agent's commands run with no network; setup reaches the package registries through a proxy that refuses every other host.
 
 ## policy
 
@@ -89,7 +101,7 @@ There is no network setting: the `docker` backend always runs checks with no net
 | `allow_security_issues` | `false` | `true` allows issues that look security-related. |
 | `allow_dependency_changes` | `false` | `true` allows changes to dependency manifests and lock files, such as `pyproject.toml` or `package-lock.json`. |
 | `allow_workflow_changes` | `false` | `true` allows changes to CI configuration. Also remove those paths from `quality.forbidden_paths`. |
-| `ai_disclosure` | `This contribution was prepared autonomously by an AI agent. Its validation evidence comes from Autocontribute's configured automated checks; no human review is implied.` | Text added to every PR body. It cannot be empty. |
+| `ai_disclosure` | `AI assistance: an AI coding agent (autocontribute {version}, {model}) drafted this change and its test and ran the tests listed above in a sandbox. I reviewed the diff and the test results before opening this PR and will handle the review.` | Text added to every PR body, after a testing note. `{version}` and `{model}` are filled in when the change is prepared, and the approval binds the result. It cannot be empty. |
 | `legal_attestations` | `{}` | See [Legal attestations](#legal-attestations). |
 | `allow_conditional_ai_policy` | `[]` | Repositories, as `owner/name`, to contribute to even though their AI policy asks for pull request text written by a person. Discovery skips such repositories unless they are listed; list one only if you will write that text yourself. |
 
@@ -97,14 +109,13 @@ There is no network setting: the `docker` backend always runs checks with no net
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `min_readiness_score` | `90` | Lowest weighted critic score, out of 100, that passes. |
-| `min_dimension_score` | `80` | Lowest critic score allowed in any one dimension, out of 100. |
-| `max_files_changed` | `8` | Most files a patch may change (1–100). |
+| `max_files_changed` | `8` | Most files a patch may change, tests included (1–100). |
 | `max_changed_lines` | `400` | Most added plus deleted lines in a patch (1–10000). |
-| `max_context_files` | `20` | Most repository files loaded as model context (1–100). |
-| `max_context_characters` | `160000` | Most characters across those files (10,000–2,000,000). |
-| `require_regression_evidence_for_bugfix` | `true` | A bug fix needs a reproduction command that fails before the change and passes after it. |
-| `forbidden_paths` | `.github/**` (with `.github/workflows/**` and `.github/actions/**`), `**/*.pem`, `**/*.key`, `**/generated/**`, `vendor/**`, commit and install hooks (`**/.husky/**`, `**/.githooks/**`, `**/.pre-commit-config.yaml`, `**/lefthook.yml`), build scripts (`**/build.rs`, `**/binding.gyp`, `**/.cargo/config`, `**/.cargo/config.toml`) | Glob patterns. A patch that touches a match is rejected. |
+| `max_source_files` | `3` | Most files other than tests a patch may change (1–100). |
+| `max_source_lines` | `150` | Most added plus deleted lines outside tests (1–10000). |
+| `forbidden_paths` | `.github/**` (with `.github/workflows/**` and `.github/actions/**`), `**/*.pem`, `**/*.key`, `**/generated/**`, `vendor/**`, commit and install hooks (`**/.husky/**`, `**/.githooks/**`, `**/.pre-commit-config.yaml`, `**/lefthook.yml`), build scripts (`**/build.rs`, `**/binding.gyp`, `**/.cargo/config`, `**/.cargo/config.toml`) | Glob patterns. A patch that touches a match goes back to the agent. |
+
+A bug fix needs a test that fails before the change and passes after it; a change to source files with no test passes only when the critic finds no test necessary, as for documentation or typing.
 
 ## publishing
 
@@ -124,16 +135,15 @@ The limits count only PRs Autocontribute opened, recognized by their `<branch_pr
 
 ## budget
 
-Each limit applies to one run, and the run stops when it reaches a model limit.
-
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `max_model_calls_per_run` | `9` | Model calls, retries included (3–30). |
+| `max_cost_usd_per_run` | `10` | Dollar cap for one run's model calls (above 0, at most 1000). Every request reserves its worst case first. |
+| `max_cost_usd_per_day` | `25` | Dollar cap over the last 24 hours (above 0, at most 10000). A run starts only while a quarter of `max_cost_usd_per_run` is left; otherwise it is skipped with reason `daily budget`. |
+| `max_model_calls_per_run` | `200` | Model requests per run, retries included (10–1000). |
+| `max_run_minutes` | `90` | Time for one run, model and tool time together (5–360). |
 | `max_candidates_per_run` | `25` | Discovery stops after this many eligible issues and picks the highest score (1–200). |
-| `max_input_tokens_per_run` | `3000000` | Input tokens (1,000–20,000,000). |
-| `max_output_tokens_per_run` | `240000` | Output tokens (1,000–4,000,000). |
-| `max_model_seconds_per_run` | `3600` | Seconds of model time (10–86,400). |
-| `max_model_cost_usd_per_run` | none | Dollar cap, computed from `pricing`, which every model role then needs. |
+
+The per-run cap is split between phases: setup at most 15%, triage 10% and the agent 55%, which leaves the critic at least 20%.
 
 ## storage
 

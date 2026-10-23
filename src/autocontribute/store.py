@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import sqlite3
 import uuid
 from collections.abc import Collection, Iterator
@@ -35,13 +34,15 @@ from autocontribute.environments import EnvironmentBaseline, EnvironmentRecipe
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     PolicyError,
+    RepositoryError,
     StateError,
     StopScope,
 )
 from autocontribute.issue_revision import compute_issue_revision
 from autocontribute.lifecycle import parse_pull_request_url
+from autocontribute.workspace_copies import remove_workspace_copy
 
-CURRENT_SCHEMA_VERSION: Final = 11
+CURRENT_SCHEMA_VERSION: Final = 12
 # Every table of the current schema; SQL that must name a table checks it against this set.
 STATE_TABLES: Final = frozenset(
     {
@@ -225,7 +226,7 @@ RECOVERABLE_IN_FLIGHT_STATUSES: Final = frozenset(
         RunStatus.DISCOVERING,
         RunStatus.CANDIDATE_SELECTED,
         RunStatus.ELIGIBILITY_CHECKED,
-        RunStatus.PLANNING,
+        RunStatus.SETTING_UP,
         RunStatus.IMPLEMENTING,
         RunStatus.VALIDATING,
         RunStatus.CRITIQUING,
@@ -1933,7 +1934,7 @@ class RunStore:
             manifest_sha256=_manifest_json_digest(manifest_json),
         )
         if manifest.status in TERMINAL_STATUSES:
-            self._remove_workspace(manifest.run_id)
+            self.remove_workspace(manifest.run_id)
 
     def transition(
         self,
@@ -2068,7 +2069,7 @@ class RunStore:
             updated_at=manifest.updated_at.isoformat(),
             manifest_sha256=_manifest_json_digest(updated_manifest_json),
         )
-        self._remove_workspace(manifest.run_id)
+        self.remove_workspace(manifest.run_id)
         return manifest
 
     def finalize_publication_compensation(
@@ -2170,7 +2171,7 @@ class RunStore:
             updated_at=manifest.updated_at.isoformat(),
             manifest_sha256=_manifest_json_digest(updated_manifest_json),
         )
-        self._remove_workspace(manifest.run_id)
+        self.remove_workspace(manifest.run_id)
         return manifest
 
     def candidate_attempt_disposition(
@@ -2669,7 +2670,7 @@ class RunStore:
                 retired.append(manifest)
         self.synchronize_manifest_artifacts()
         for manifest in retired:
-            self._remove_workspace(manifest.run_id)
+            self.remove_workspace(manifest.run_id)
         return retired
 
     def acquire_lease(
@@ -3484,7 +3485,7 @@ class RunStore:
         with self._connection() as connection:
             rows = connection.execute(query, finished).fetchall()
         for row in rows:
-            self._remove_workspace(str(row["run_id"]))
+            self.remove_workspace(str(row["run_id"]))
 
     def unfinished_run_ids(self) -> frozenset[str]:
         """Return every run that has not reached a terminal status."""
@@ -3618,8 +3619,8 @@ class RunStore:
                 ),
             )
 
-    def _remove_workspace(self, run_id: str) -> None:
-        """Best-effort deletion of a finished run's clone; its evidence in runs/ stays."""
+    def remove_workspace(self, run_id: str) -> None:
+        """Best-effort deletion of a run's clone and its copies; its evidence in runs/ stays."""
 
         path = self.workspaces_dir / run_id
         if path.parent != self.workspaces_dir or path.name == "..":
@@ -3627,8 +3628,8 @@ class RunStore:
         if path.is_symlink() or not path.is_dir():
             return
         # A partial failure keeps the remainder; the next run's cleanup retries it.
-        with suppress(OSError):
-            shutil.rmtree(path)
+        with suppress(RepositoryError):
+            remove_workspace_copy(path)
 
     def write_artifact(self, run_id: str, relative_path: str, content: str) -> Path:
         root = self.artifact_dir(run_id).resolve()

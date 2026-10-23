@@ -141,10 +141,6 @@ jobs:
           enable-cache: true
       - name: Install locked dependencies
         run: uv sync --locked --extra dev
-      - name: Preload pinned sandbox image on rootful Docker
-        run: |
-          image="$(uv run python -c 'from autocontribute.config import SandboxConfig; print(SandboxConfig().image)')"
-          docker pull "$image"
       - name: Exercise live rootful Docker isolation
         env:
           AUTOCONTRIBUTE_RUN_DOCKER_TESTS: "1"

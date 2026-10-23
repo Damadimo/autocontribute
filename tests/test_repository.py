@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 import autocontribute.repository as repository_module
-from autocontribute.domain import FileEdit
 from autocontribute.exceptions import RepositoryError
 from autocontribute.repository import RepositoryWorkspace
 
@@ -73,24 +72,6 @@ def _clone(source: Path, sha: str, destination: Path) -> RepositoryWorkspace:
     )
 
 
-def _edit(
-    operation: str,
-    path: str,
-    *,
-    find: str | None = None,
-    replace: str | None = None,
-    content: str | None = None,
-) -> FileEdit:
-    return FileEdit(
-        operation=operation,
-        path=path,
-        find=find,
-        replace=replace,
-        content=content,
-        rationale="fixture",
-    )
-
-
 def test_clone_is_pinned_and_does_not_fetch_later_head(
     tmp_path: Path, source_repository: tuple[Path, str, str]
 ) -> None:
@@ -98,7 +79,7 @@ def test_clone_is_pinned_and_does_not_fetch_later_head(
     workspace = _clone(source, first_sha, tmp_path / "workspace")
 
     assert workspace.base_sha == first_sha
-    assert workspace.read_file("README.md") == "first\n"
+    assert (workspace.path / "README.md").read_text(encoding="utf-8") == "first\n"
     assert _git(workspace.path, "rev-parse", "HEAD") == first_sha
     assert first_sha != second_sha
     assert not (workspace.path / ".git" / "modules").exists()
@@ -287,23 +268,20 @@ def test_clone_rejects_untrusted_sources_and_existing_destination(tmp_path: Path
         )
 
 
-def test_exact_edits_produce_reconstructable_patch(
+def test_workspace_changes_produce_a_reconstructable_patch(
     tmp_path: Path, source_repository: tuple[Path, str, str]
 ) -> None:
     source, first_sha, _ = source_repository
     workspace = _clone(source, first_sha, tmp_path / "workspace")
     pristine = _clone(source, first_sha, tmp_path / "pristine")
 
-    changed = workspace.apply_edits(
-        [
-            _edit("replace", "README.md", find="first\n", replace="improved\n"),
-            _edit("create", "tests/new.txt", content="new coverage\n"),
-            _edit("delete", "delete.txt"),
-        ]
-    )
+    (workspace.path / "README.md").write_text("improved\n", encoding="utf-8")
+    (workspace.path / "tests").mkdir()
+    (workspace.path / "tests" / "new.txt").write_text("new coverage\n", encoding="utf-8")
+    (workspace.path / "delete.txt").unlink()
 
-    assert changed == ["README.md", "delete.txt", "tests/new.txt"]
-    patch = workspace.diff()
+    assert workspace.changed_paths() == ["README.md", "delete.txt", "tests/new.txt"]
+    patch = workspace.diff_bytes().decode("utf-8")
     assert "diff --git a/README.md b/README.md" in patch
     assert "diff --git a/tests/new.txt b/tests/new.txt" in patch
     assert "deleted file mode" in patch
@@ -319,42 +297,6 @@ def test_exact_edits_produce_reconstructable_patch(
     assert (pristine.path / "README.md").read_text(encoding="utf-8") == "improved\n"
     assert (pristine.path / "tests" / "new.txt").read_text(encoding="utf-8") == "new coverage\n"
     assert not (pristine.path / "delete.txt").exists()
-
-
-def test_failed_edit_batch_rolls_back_prior_edits(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-
-    with pytest.raises(RepositoryError, match="found 0"):
-        workspace.apply_edits(
-            [
-                _edit("replace", "README.md", find="first", replace="changed"),
-                _edit("replace", "CONTRIBUTING.md", find="missing", replace="nope"),
-            ]
-        )
-
-    assert workspace.read_file("README.md") == "first\n"
-    assert workspace.changed_paths() == []
-
-
-def test_paths_cannot_escape_or_cross_symlinks(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-    outside = tmp_path / "outside.txt"
-    outside.write_text("secret", encoding="utf-8")
-    (workspace.path / "link").symlink_to(tmp_path)
-
-    with pytest.raises(RepositoryError, match="Unsafe repository path"):
-        workspace.read_file("../outside.txt")
-    with pytest.raises(RepositoryError, match="symlink"):
-        workspace.read_file("link/outside.txt")
-    with pytest.raises(RepositoryError, match="symlink"):
-        workspace.apply_edit(_edit("replace", "link/outside.txt", find="secret", replace="x"))
-    assert outside.read_text(encoding="utf-8") == "secret"
 
 
 @pytest.mark.parametrize(
@@ -375,256 +317,10 @@ def test_repository_paths_reject_control_and_format_characters(
     source, first_sha, _ = source_repository
     workspace = _clone(source, first_sha, tmp_path / "workspace")
 
-    with pytest.raises(RepositoryError, match="Unsafe repository path"):
-        workspace.read_file(unsafe_path)
-    with pytest.raises(RepositoryError, match="Unsafe repository path"):
-        workspace.apply_edit(_edit("create", unsafe_path, content="unsafe\n"))
-
-
-def test_tracked_control_character_path_fails_context_enumeration_closed(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-    unsafe = workspace.path / "quoted\npath.py"
-    unsafe.write_text("unsafe = True\n", encoding="utf-8")
-    _git(workspace.path, "add", "--", unsafe.name)
+    (workspace.path / unsafe_path).write_text("unsafe\n", encoding="utf-8")
 
     with pytest.raises(RepositoryError, match="Unsafe repository path"):
-        workspace.context_index()
-
-
-def test_exact_replace_rejects_ambiguous_matches(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-    workspace.apply_edit(_edit("replace", "README.md", find="first", replace="first first"))
-
-    with pytest.raises(RepositoryError, match="found 2"):
-        workspace.apply_edit(_edit("replace", "README.md", find="first", replace="second"))
-
-
-def test_context_index_and_guidance_are_bounded_and_include_policies(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-
-    index = {entry.path: entry for entry in workspace.context_index()}
-    assert index["README.md"].binary is False
-    assert index["README.md"].lines == 1
-    assert index["binary.bin"].binary is True
-
-    guidance = workspace.guidance()
-    assert "CONTRIBUTING.md" in guidance
-    assert ".github/PULL_REQUEST_TEMPLATE.md" in guidance
-    assert "SECURITY.md" in guidance
-    assert "AI_POLICY.md" in guidance
-    assert sum(map(len, guidance.values())) <= 120_000
-
-
-def test_guidance_never_drops_or_truncates_applicable_files_to_fit_limits(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-    complete = workspace.guidance()
-    exact_characters = sum(len(content) for content in complete.values())
-
-    assert workspace.guidance(max_characters=exact_characters) == complete
-    with pytest.raises(RepositoryError, match=r"refusing to (?:omit|truncate)"):
-        workspace.guidance(max_characters=exact_characters - 1)
-    with pytest.raises(RepositoryError, match="refusing an incomplete guidance set"):
-        workspace.guidance(max_files=len(complete) - 1)
-
-
-def test_guidance_read_failure_is_not_silently_skipped(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-    security = workspace.path / "SECURITY.md"
-    security.unlink()
-    security.symlink_to("README.md")
-
-    with pytest.raises(
-        RepositoryError,
-        match=r"Could not load applicable repository guidance in full: SECURITY[.]md",
-    ):
-        workspace.guidance()
-
-
-def test_guidance_uses_path_scoped_agents_and_readmes_without_loading_unrelated_readmes(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, _, _ = source_repository
-    (source / "AGENTS.md").write_text("Repository rules.\n", encoding="utf-8")
-    package = source / "src" / "package"
-    package.mkdir(parents=True)
-    (source / "src" / "AGENTS.md").write_text("Source rules.\n", encoding="utf-8")
-    (source / "src" / "README.md").write_text("Source conventions.\n", encoding="utf-8")
-    (package / "AGENTS.md").write_text("Package rules.\n", encoding="utf-8")
-    (package / "README.md").write_text("Package conventions.\n", encoding="utf-8")
-    (package / "module.py").write_text("value = 1\n", encoding="utf-8")
-    unrelated = source / "unrelated"
-    unrelated.mkdir()
-    (unrelated / "AGENTS.md").write_text("Unrelated rules.\n", encoding="utf-8")
-    (unrelated / "README.md").write_text("u" * 120_001, encoding="utf-8")
-    nested_policy = unrelated / "CONTRIBUTION_POLICY.md"
-    nested_policy.write_text("Repository-wide contribution policy.\n", encoding="utf-8")
-    alternate_policy = unrelated / "PROJECT-SECURITY-POLICY.adoc"
-    alternate_policy.write_text("Repository-wide security policy.\n", encoding="utf-8")
-    extensionless_policy = unrelated / "AI_POLICY"
-    extensionless_policy.write_text("Repository-wide AI policy.\n", encoding="utf-8")
-    _git(source, "add", ".")
-    _git(source, "commit", "--quiet", "-m", "add scoped guidance")
-    sha = _git(source, "rev-parse", "HEAD")
-    workspace = _clone(source, sha, tmp_path / "workspace")
-
-    global_guidance = workspace.guidance()
-    assert "AGENTS.md" in global_guidance
-    assert "README.md" in global_guidance
-    assert "unrelated/CONTRIBUTION_POLICY.md" in global_guidance
-    assert "unrelated/PROJECT-SECURITY-POLICY.adoc" in global_guidance
-    assert "unrelated/AI_POLICY" in global_guidance
-    assert "src/AGENTS.md" not in global_guidance
-    assert "src/README.md" not in global_guidance
-    assert "unrelated/AGENTS.md" not in global_guidance
-    assert "unrelated/README.md" not in global_guidance
-
-    scoped = workspace.guidance(target_paths=["src/package/module.py"])
-    assert "src/AGENTS.md" in scoped
-    assert "src/README.md" in scoped
-    assert "src/package/AGENTS.md" in scoped
-    assert "src/package/README.md" in scoped
-    assert "unrelated/AGENTS.md" not in scoped
-    assert "unrelated/README.md" not in scoped
-    scoped_paths = list(scoped)
-    assert scoped_paths.index("AGENTS.md") < scoped_paths.index("src/AGENTS.md")
-    assert scoped_paths.index("src/AGENTS.md") < scoped_paths.index("src/package/AGENTS.md")
-
-
-def test_non_utf8_policy_fails_guidance_closed(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, _, _ = source_repository
-    (source / "POLICY.md").write_bytes(b"invalid: \xff\n")
-    _git(source, "add", "POLICY.md")
-    _git(source, "commit", "--quiet", "-m", "add invalid policy")
-    sha = _git(source, "rev-parse", "HEAD")
-    workspace = _clone(source, sha, tmp_path / "workspace")
-
-    with pytest.raises(
-        RepositoryError,
-        match=r"Could not load applicable repository guidance in full: POLICY[.]md",
-    ):
-        workspace.guidance()
-
-
-@pytest.mark.parametrize(
-    ("edit", "path"),
-    [
-        (_edit("create", ".env.production", content="PASSWORD=value\n"), ".env.production"),
-        (_edit("create", "config/private.pem", content="private\n"), "config/private.pem"),
-    ],
-)
-def test_edits_to_sensitive_paths_are_rejected(
-    tmp_path: Path,
-    source_repository: tuple[Path, str, str],
-    edit: FileEdit,
-    path: str,
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-
-    with pytest.raises(RepositoryError, match="sensitive repository path"):
-        workspace.apply_edit(edit)
-
-    assert not (workspace.path / path).exists()
-
-
-def test_sensitive_file_deletion_is_rejected_before_batch_application(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-    sensitive = workspace.path / ".env.production"
-    sensitive.write_text("PASSWORD=live-value-123456\n", encoding="utf-8")
-
-    with pytest.raises(RepositoryError, match="sensitive repository path"):
-        workspace.apply_edits([_edit("delete", ".env.production")])
-
-    assert sensitive.read_text(encoding="utf-8") == "PASSWORD=live-value-123456\n"
-
-
-def test_literal_context_search_finds_symbols_without_executing_repository_code(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-
-    matches = workspace.search_text(["parse_document", "normalize_document"])
-
-    assert [(match.query, match.path, match.line_number) for match in matches] == [
-        ("parse_document", "src/parser.py", 1),
-        ("normalize_document", "src/parser.py", 2),
-        ("normalize_document", "src/parser.py", 4),
-    ]
-
-
-def test_literal_context_search_is_bounded_and_rejects_unsafe_queries(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-
-    matches = workspace.search_text(["document"], max_matches=10, max_line_characters=12)
-
-    assert len(matches) >= 2
-    assert all(len(match.line) <= 25 for match in matches)
-    with pytest.raises(RepositoryError, match="results would be incomplete"):
-        workspace.search_text(["document"], max_matches=2)
-    with pytest.raises(RepositoryError, match="unsafe"):
-        workspace.search_text(["bad\0query"])
-    with pytest.raises(RepositoryError, match="at most 20"):
-        workspace.search_text([f"query-{index}" for index in range(21)])
-
-
-def test_literal_context_search_deduplicates_case_and_enforces_total_byte_budget(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-
-    matches = workspace.search_text(["parse_document", "PARSE_DOCUMENT"])
-
-    assert [(match.query, match.line_number) for match in matches] == [("parse_document", 1)]
-    with pytest.raises(ValueError, match="limits must be positive"):
-        workspace.search_text(["parse_document"], max_total_bytes=0)
-
-
-def test_context_index_signals_byte_exhaustion_and_search_fails_closed(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-
-    entries = workspace.context_index(max_total_bytes=1)
-
-    assert any(not entry.content_inspected for entry in entries)
-    with pytest.raises(RepositoryError, match="before inspecting every tracked file"):
-        workspace.search_text(["parse_document"], max_total_bytes=1)
-
-
-def test_context_index_fails_instead_of_omitting_files_at_file_limit(
-    tmp_path: Path, source_repository: tuple[Path, str, str]
-) -> None:
-    source, first_sha, _ = source_repository
-    workspace = _clone(source, first_sha, tmp_path / "workspace")
-
-    with pytest.raises(RepositoryError, match="file limit"):
-        workspace.context_index(max_files=1)
+        workspace.changed_paths()
 
 
 def _plant_program(tmp_path: Path, name: str) -> tuple[Path, Path]:

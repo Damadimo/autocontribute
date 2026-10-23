@@ -9,9 +9,8 @@ from collections.abc import Sequence
 from pathlib import PurePosixPath
 from typing import Final, Literal
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from autocontribute.config import StrictModel
 from autocontribute.domain import DomainModel
 from autocontribute.egress_proxy import is_host_name
 
@@ -36,11 +35,14 @@ _GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _MAX_COMMAND_CHARACTERS: Final = 20_000
 
 
-class EnvironmentOverride(StrictModel):
+class EnvironmentOverride(BaseModel):
     """Operator-chosen environment fields for one repository; detection fills the rest.
 
     The configuration's ``environments.<owner/repo>`` entries take this shape (DESIGN §2).
+    ``config`` imports this module, so the class repeats ``StrictModel``'s settings.
     """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True, hide_input_in_errors=True)
 
     # Base image for setup, by tag; setup records the digest it resolves to.
     image: str | None = None

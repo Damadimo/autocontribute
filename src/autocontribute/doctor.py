@@ -1,111 +1,51 @@
-"""Non-mutating deployment preflight checks."""
+"""Non-mutating deployment preflight checks.
+
+They cover the configuration, Git, Docker with cgroup v2 limits, a small billed tool-call probe
+of each configured model, and read access to GitHub.
+"""
 
 from __future__ import annotations
 
 import os
 import re
-import shlex
 import shutil
-import stat
 import subprocess
-import tempfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Sequence
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
 from typing import cast
 
 import httpx
+from pydantic import ValidationError
 from rich.markup import escape
 
-from autocontribute.config import (
-    AutocontributeConfig,
-    ModelProfile,
-    validate_model_identifier,
-)
+from autocontribute.config import AutocontributeConfig
 from autocontribute.discovery import DiscoveryService
-from autocontribute.exceptions import AutocontributeError, SandboxError
-from autocontribute.github import GitHubClient
-from autocontribute.providers import ModelCapabilityResponse, create_provider
-from autocontribute.redaction import redact_text
-from autocontribute.sandbox import (
-    DockerDaemonMode,
-    DockerSandbox,
-    detect_docker_daemon_mode,
-    docker_client_environment,
-    docker_container_identity,
-    docker_isolation_arguments,
+from autocontribute.exceptions import (
+    AutocontributeError,
+    ConfigurationError,
+    ModelError,
+    SandboxError,
 )
+from autocontribute.github import GitHubClient
+from autocontribute.pricing import DEFAULT_EFFORTS, ModelSpec, Role
+from autocontribute.providers import SubprocessTurnProvider
+from autocontribute.redaction import host_secret_values, redact_text
+from autocontribute.sandbox import detect_docker_daemon_mode
 from autocontribute.store import RunStore
+from autocontribute.submissions import TriageSubmission
+from autocontribute.transcript import SUBMIT_TOOLS, read_submission, start_transcript
 
 _DETAIL_LIMIT = 500
-_MODEL_PROBE_MAX_OUTPUT_TOKENS = 1_024
+# Enough for a short tool call after adaptive thinking at low effort.
+_MODEL_PROBE_MAX_OUTPUT_TOKENS = 4_096
 _MODEL_PROBE_TIMEOUT_SECONDS = 60.0
-_SAFE_CONTAINER_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-_BIND_PROBE_INPUT = ".autocontribute-bind-input"
-_BIND_PROBE_OUTPUT = ".autocontribute-bind-output"
-_BIND_PROBE_INPUT_CONTENT = "autocontribute-host-bind-probe\n"
-_BIND_PROBE_OUTPUT_CONTENT = "autocontribute-container-bind-probe\n"
+_MODEL_PROBE_INSTRUCTIONS = (
+    "This is a deployment check of tool calling. Call submit_triage once, with suitable true, "
+    'reasons ["deployment check"], already_fixed false, needs_design false and difficulty '
+    "small. Do nothing else."
+)
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
-_SHELL_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_SHELL_SEPARATORS = frozenset({";", ";;", "&", "&&", "|", "||", "(", ")"})
-_SHELL_BUILTINS = frozenset(
-    {
-        ".",
-        ":",
-        "[",
-        "alias",
-        "bg",
-        "break",
-        "cd",
-        "continue",
-        "eval",
-        "exit",
-        "export",
-        "false",
-        "fc",
-        "fg",
-        "getopts",
-        "hash",
-        "jobs",
-        "kill",
-        "pwd",
-        "read",
-        "readonly",
-        "return",
-        "set",
-        "shift",
-        "test",
-        "times",
-        "trap",
-        "true",
-        "type",
-        "ulimit",
-        "umask",
-        "unalias",
-        "unset",
-        "wait",
-    }
-)
-_SHELL_KEYWORDS = frozenset(
-    {
-        "case",
-        "do",
-        "done",
-        "elif",
-        "else",
-        "esac",
-        "fi",
-        "for",
-        "if",
-        "in",
-        "select",
-        "then",
-        "until",
-        "while",
-    }
-)
-_COMMAND_WRAPPERS = frozenset({"command", "exec", "time"})
 _CLASSIC_PUBLIC_WRITE_SCOPES = frozenset({"public_repo", "repo"})
 _DOCTOR_SECRET_ENV_NAMES: ContextVar[tuple[str, ...]] = ContextVar(
     "autocontribute_doctor_secret_env_names", default=()
@@ -123,30 +63,13 @@ class DoctorCheck:
     warning: bool = False
 
 
-@dataclass(frozen=True)
-class _ToolchainRequirements:
-    executables: tuple[str, ...]
-    python_modules: tuple[tuple[str, str], ...]
-    workspace_entrypoints: tuple[str, ...]
-    command_count: int
-
-
 def run_doctor(
     config: AutocontributeConfig,
     *,
     store: RunStore | None = None,
 ) -> list[DoctorCheck]:
     """Run bounded preflight probes without changing a repository or GitHub state."""
-    secret_env_names = tuple(
-        sorted(
-            {
-                config.github.token_env,
-                config.models.scout.api_key_env,
-                config.models.builder.api_key_env,
-                config.models.critic.api_key_env,
-            }
-        )
-    )
+    secret_env_names = tuple(sorted(config.secret_env_names()))
     secret_values = tuple(
         dict.fromkeys(value for name in secret_env_names if (value := os.environ.get(name)))
     )
@@ -192,62 +115,8 @@ def _run_doctor(
             )
 
     checks.append(_command_check("git", ["git", "--version"]))
-    if config.sandbox.backend == "docker":
-        checks.append(
-            _command_check("docker", ["docker", "info", "--format", "{{.ServerVersion}}"])
-        )
-        checks.append(
-            _command_check(
-                "sandbox image",
-                [
-                    "docker",
-                    "image",
-                    "inspect",
-                    "--format",
-                    "{{.Id}}",
-                    config.sandbox.image,
-                ],
-            )
-        )
-        checks.append(
-            _docker_bind_mount_check(
-                config,
-                workspace_parent=store.workspaces_dir if store is not None else None,
-            )
-        )
-    else:
-        checks.append(
-            DoctorCheck(
-                "sandbox",
-                config.sandbox.allow_unsafe_local,
-                "local execution is enabled; repository code can access the host",
-                warning=True,
-            )
-        )
-    checks.append(_offline_toolchain_check(config))
-
-    key_names = {
-        config.models.scout.api_key_env,
-        config.models.builder.api_key_env,
-        config.models.critic.api_key_env,
-    }
-    for name in sorted(key_names):
-        checks.append(
-            DoctorCheck(
-                f"model credential {name}",
-                bool(os.environ.get(name)),
-                "set" if os.environ.get(name) else "missing",
-            )
-        )
-    if not breaker_is_tripped:
-        checks.extend(_model_capability_checks(config))
-    checks.append(
-        DoctorCheck(
-            "model tool boundary",
-            True,
-            "configured providers receive strict schemas but no tools or repository credentials",
-        )
-    )
+    checks.append(_docker_check())
+    checks.extend(_model_checks(config, probe=not breaker_is_tripped))
 
     if not breaker_is_tripped:
         checks.extend(_github_checks(config, store=store))
@@ -270,77 +139,79 @@ def _run_doctor(
     return checks
 
 
-def _model_capability_checks(config: AutocontributeConfig) -> list[DoctorCheck]:
-    grouped: dict[str, tuple[ModelProfile, list[str]]] = {}
-    for role in ("scout", "builder", "critic"):
-        profile = config.model_for(role)
-        fingerprint = profile.model_dump_json()
-        if fingerprint in grouped:
-            grouped[fingerprint][1].append(role)
-        else:
-            grouped[fingerprint] = (profile, [role])
+def _docker_check() -> DoctorCheck:
+    """Repository code runs only in Docker, under memory, CPU and process limits."""
 
-    checks: list[DoctorCheck] = []
-    for profile, roles in grouped.values():
-        label = "/".join(roles)
-        credential = os.environ.get(profile.api_key_env)
-        if not credential:
-            checks.append(
-                DoctorCheck(
-                    f"model capability {label}",
-                    False,
-                    f"{profile.api_key_env} is missing; strict-schema probe was not sent",
-                )
-            )
-            continue
-        try:
-            provider = create_provider(profile)
-            result = provider.generate(
-                instructions=(
-                    "This is a deployment capability probe. Return the requested strict schema "
-                    "with status set to ready. No tools are available."
-                ),
-                prompt="Confirm strict structured-output support.",
-                output_type=ModelCapabilityResponse,
-                max_output_tokens=_MODEL_PROBE_MAX_OUTPUT_TOKENS,
-                timeout_seconds=_MODEL_PROBE_TIMEOUT_SECONDS,
-            )
-            if result.output.status != "ready":  # defensive against a non-conforming adapter
-                raise ValueError("provider returned the wrong capability sentinel")
-            resolved_model = validate_model_identifier(result.model)
-            if (
-                profile.expected_response_model is not None
-                and resolved_model != profile.expected_response_model
-            ):
-                raise ValueError("provider returned a model ID other than expected_response_model")
-        except Exception as exc:
-            checks.append(
-                DoctorCheck(
-                    f"model capability {label}",
-                    False,
-                    _safe_detail(
-                        f"{profile.provider} model {profile.model} failed the bounded billed "
-                        "strict-schema API probe (at most "
-                        f"{_MODEL_PROBE_MAX_OUTPUT_TOKENS} output tokens and "
-                        f"{int(_MODEL_PROBE_TIMEOUT_SECONDS)} seconds): {exc}"
-                    ),
-                )
-            )
-            continue
-        checks.append(
-            DoctorCheck(
-                f"model capability {label}",
-                True,
-                _safe_detail(
-                    f"{profile.provider} model {profile.model} resolved to {resolved_model} and "
-                    "completed a strict-schema response with usage accounting (bounded billed "
-                    "API probe: at most "
-                    f"{_MODEL_PROBE_MAX_OUTPUT_TOKENS} output tokens and "
-                    f"{int(_MODEL_PROBE_TIMEOUT_SECONDS)} seconds)"
-                ),
-            )
+    if shutil.which("docker") is None:
+        return DoctorCheck("docker", False, "docker was not found on PATH")
+    try:
+        mode = detect_docker_daemon_mode()
+    except SandboxError as exc:
+        return DoctorCheck("docker", False, _safe_detail(str(exc)))
+    return DoctorCheck(
+        "docker", True, f"{mode} daemon that enforces cgroup v2 memory, CPU and process limits"
+    )
+
+
+def _model_checks(config: AutocontributeConfig, *, probe: bool) -> list[DoctorCheck]:
+    """Resolve the configured models, then probe each distinct one unless ``probe`` is false."""
+
+    try:
+        models = config.models.resolve(os.environ)
+    except ConfigurationError as exc:
+        return [DoctorCheck("models", False, _safe_detail(str(exc)))]
+    roles: dict[str, list[Role]] = {}
+    specs: dict[str, ModelSpec] = {}
+    for role in DEFAULT_EFFORTS:
+        spec = models.spec(role)
+        roles.setdefault(spec.id, []).append(role)
+        specs[spec.id] = spec
+    checks = [
+        DoctorCheck(
+            "models",
+            True,
+            ", ".join(f"{role} {models.spec(role).id}" for role in DEFAULT_EFFORTS),
         )
+    ]
+    if probe:
+        checks.extend(_model_probe(specs[model], roles[model]) for model in specs)
     return checks
+
+
+def _model_probe(spec: ModelSpec, roles: Sequence[Role]) -> DoctorCheck:
+    """Ask the model for one strict tool call, the way every transcript ends."""
+
+    name = f"model {spec.id} ({'/'.join(roles)})"
+    limits = (
+        f"billed probe of at most {_MODEL_PROBE_MAX_OUTPUT_TOKENS:,} output tokens and "
+        f"{int(_MODEL_PROBE_TIMEOUT_SECONDS)} seconds"
+    )
+    host_values = host_secret_values(_DOCTOR_SECRET_ENV_NAMES.get(), os.environ)
+    try:
+        transcript = start_transcript(
+            model=spec.id,
+            effort="low",
+            kind="triage",
+            run_id="doctor",
+            instructions=_MODEL_PROBE_INSTRUCTIONS,
+            task="Run the deployment check.",
+            host_values=host_values,
+        )
+        turn = SubprocessTurnProvider(spec, host_values).step(
+            transcript=transcript,
+            max_output_tokens=_MODEL_PROBE_MAX_OUTPUT_TOKENS,
+            timeout_seconds=_MODEL_PROBE_TIMEOUT_SECONDS,
+        )
+        submit = SUBMIT_TOOLS["triage"].name
+        call = next((call for call in turn.tool_calls if call.name == submit), None)
+        if call is None:
+            raise ModelError(f"the model answered without calling {submit}")
+        read_submission(call, TriageSubmission)
+    except (AutocontributeError, ValidationError) as exc:
+        return DoctorCheck(name, False, _safe_detail(f"failed the {limits}: {exc}"))
+    return DoctorCheck(
+        name, True, _safe_detail(f"{turn.model} made a strict tool call with usage ({limits})")
+    )
 
 
 def _github_checks(
@@ -516,278 +387,7 @@ def _github_permission_check(*, scopes: frozenset[str] | None) -> DoctorCheck:
     )
 
 
-def _offline_toolchain_check(config: AutocontributeConfig) -> DoctorCheck:
-    commands = [
-        command
-        for repository_commands in config.validation.required_commands.values()
-        for command in repository_commands
-    ]
-    if not commands:
-        return DoctorCheck(
-            "offline validation toolchain",
-            False,
-            "no validation.required_commands are configured",
-        )
-    try:
-        requirements = _toolchain_requirements(commands)
-    except ValueError as exc:
-        return DoctorCheck("offline validation toolchain", False, _safe_detail(str(exc)))
-
-    if config.sandbox.backend == "local":
-        missing = [tool for tool in requirements.executables if shutil.which(tool) is None]
-        if not os.path.isfile("/bin/sh"):
-            missing.insert(0, "/bin/sh")
-        if missing:
-            return DoctorCheck(
-                "offline validation toolchain",
-                False,
-                _safe_detail("missing local executable(s): " + ", ".join(missing)),
-            )
-        for interpreter, module in requirements.python_modules:
-            module_check = _local_python_module_check(interpreter, module)
-            if module_check is not None:
-                return DoctorCheck("offline validation toolchain", False, module_check)
-        return DoctorCheck(
-            "offline validation toolchain",
-            True,
-            _toolchain_success_detail(requirements, backend="unsafe local host"),
-            warning=True,
-        )
-
-    docker_environment = docker_client_environment()
-    try:
-        daemon_mode = detect_docker_daemon_mode(
-            "docker",
-            environment=docker_environment,
-        )
-        command = _docker_toolchain_probe(config, requirements, daemon_mode=daemon_mode)
-    except SandboxError as exc:
-        return DoctorCheck("offline validation toolchain", False, _safe_detail(str(exc)))
-    result = _command_check(
-        "offline validation toolchain",
-        command,
-        timeout_seconds=30,
-        environment=docker_environment,
-    )
-    if not result.passed:
-        return result
-    return DoctorCheck(
-        "offline validation toolchain",
-        True,
-        _toolchain_success_detail(requirements, backend="network-disabled sandbox image"),
-    )
-
-
-def _toolchain_requirements(commands: Iterable[str]) -> _ToolchainRequirements:
-    executables: set[str] = set()
-    python_modules: set[tuple[str, str]] = set()
-    workspace_entrypoints: set[str] = set()
-    command_count = 0
-    for command in commands:
-        command_count += 1
-        if "\n" in command or "\r" in command:
-            raise ValueError(
-                "multiline validation commands cannot be probed reliably; split them into "
-                "separate configured commands"
-            )
-        try:
-            lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>")
-            lexer.whitespace_split = True
-            lexer.commenters = ""
-            tokens = list(lexer)
-        except ValueError as exc:
-            raise ValueError(f"validation command cannot be parsed safely: {exc}") from exc
-        for segment in _shell_segments(tokens):
-            requirement = _segment_requirement(segment)
-            if requirement is None:
-                continue
-            executable, arguments = requirement
-            if "$" in executable or "`" in executable or executable.startswith("-"):
-                raise ValueError(
-                    f"validation command has a dynamic executable that cannot be probed: "
-                    f"{executable}"
-                )
-            if "/" in executable and not PurePosixPath(executable).is_absolute():
-                workspace_entrypoints.add(executable)
-                continue
-            executables.add(executable)
-            if PurePosixPath(executable).name.startswith("python") and "-m" in arguments:
-                module_index = arguments.index("-m") + 1
-                if module_index >= len(arguments) or arguments[module_index].startswith("-"):
-                    raise ValueError("python -m validation command is missing its module name")
-                module = arguments[module_index].split(".", 1)[0]
-                if not module or not module.replace("_", "a").isalnum():
-                    raise ValueError("python -m validation module cannot be probed safely")
-                python_modules.add((executable, module))
-    return _ToolchainRequirements(
-        executables=tuple(sorted(executables)),
-        python_modules=tuple(sorted(python_modules)),
-        workspace_entrypoints=tuple(sorted(workspace_entrypoints)),
-        command_count=command_count,
-    )
-
-
-def _shell_segments(tokens: list[str]) -> list[list[str]]:
-    segments: list[list[str]] = []
-    current: list[str] = []
-    for token in tokens:
-        if token in _SHELL_SEPARATORS:
-            if current:
-                segments.append(current)
-                current = []
-            continue
-        current.append(token)
-    if current:
-        segments.append(current)
-    return segments
-
-
-def _segment_requirement(segment: list[str]) -> tuple[str, list[str]] | None:
-    index = 0
-    while index < len(segment) and (
-        segment[index] == "!" or _SHELL_ASSIGNMENT.match(segment[index])
-    ):
-        index += 1
-    if index >= len(segment):
-        return None
-    executable = segment[index]
-    if executable in _SHELL_KEYWORDS:
-        raise ValueError(
-            f"complex shell keyword {executable!r} prevents a reliable toolchain probe"
-        )
-    if executable in _SHELL_BUILTINS:
-        return None
-    if executable == "env":
-        index += 1
-        while index < len(segment):
-            token = segment[index]
-            if token in {"-u", "--unset"}:
-                index += 2
-                continue
-            if token.startswith("-") or _SHELL_ASSIGNMENT.match(token):
-                index += 1
-                continue
-            break
-        if index >= len(segment):
-            return "env", []
-        executable = segment[index]
-    elif executable in _COMMAND_WRAPPERS:
-        index += 1
-        while index < len(segment) and segment[index].startswith("-"):
-            index += 1
-        if index >= len(segment):
-            return None
-        executable = segment[index]
-    return executable, segment[index + 1 :]
-
-
-def _docker_toolchain_probe(
-    config: AutocontributeConfig,
-    requirements: _ToolchainRequirements,
-    *,
-    daemon_mode: DockerDaemonMode,
-) -> list[str]:
-    script = (
-        'tool_count="$1"; shift; '
-        'while [ "$tool_count" -gt 0 ]; do tool="$1"; shift; '
-        'command -v "$tool" >/dev/null 2>&1 || '
-        '{ printf "missing executable: %s\\n" "$tool"; exit 1; }; '
-        "tool_count=$((tool_count - 1)); done; "
-        'while [ "$#" -gt 0 ]; do interpreter="$1"; module="$2"; shift 2; '
-        '"$interpreter" -I -c '
-        "'import importlib.util,sys; sys.exit(importlib.util.find_spec(sys.argv[1]) is None)' "
-        '"$module" >/dev/null 2>&1 || '
-        '{ printf "missing Python module: %s (%s)\\n" "$module" "$interpreter"; '
-        'exit 1; }; done; printf "toolchain probe passed\\n"'
-    )
-    module_arguments = [
-        value
-        for interpreter, module in requirements.python_modules
-        for value in (interpreter, module)
-    ]
-    uid, gid = docker_container_identity(daemon_mode)
-    return [
-        "docker",
-        "run",
-        "--rm",
-        "--stop-timeout=2",
-        *docker_isolation_arguments(config.sandbox, user=f"{uid}:{gid}", tmp_size="64m"),
-        config.sandbox.image,
-        "-i",
-        f"PATH={_SAFE_CONTAINER_PATH}",
-        "HOME=/tmp",
-        "TMPDIR=/tmp",
-        "PYTHONDONTWRITEBYTECODE=1",
-        "/bin/sh",
-        "-c",
-        script,
-        "autocontribute-doctor",
-        str(len(requirements.executables)),
-        *requirements.executables,
-        *module_arguments,
-    ]
-
-
-def _local_python_module_check(interpreter: str, module: str) -> str | None:
-    executable = shutil.which(interpreter)
-    if executable is None:
-        return _safe_detail(f"missing local executable: {interpreter}")
-    try:
-        result = subprocess.run(
-            [
-                executable,
-                "-I",
-                "-c",
-                (
-                    "import importlib.util,sys; "
-                    "sys.exit(importlib.util.find_spec(sys.argv[1]) is None)"
-                ),
-                module,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            env={
-                "PATH": os.environ.get("PATH", ""),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            },
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return _safe_detail(f"could not probe Python module {module}: {exc}")
-    if result.returncode != 0:
-        return _safe_detail(f"missing Python module: {module} ({interpreter})")
-    return None
-
-
-def _toolchain_success_detail(
-    requirements: _ToolchainRequirements,
-    *,
-    backend: str,
-) -> str:
-    details = [
-        f"{requirements.command_count} configured command(s) have available entrypoints in the "
-        f"{backend}"
-    ]
-    if requirements.python_modules:
-        details.append(
-            "Python modules: " + ", ".join(module for _, module in requirements.python_modules)
-        )
-    if requirements.workspace_entrypoints:
-        details.append(
-            "repository-local scripts deferred to run validation: "
-            + ", ".join(requirements.workspace_entrypoints)
-        )
-    return _safe_detail("; ".join(details))
-
-
-def _command_check(
-    name: str,
-    command: list[str],
-    *,
-    timeout_seconds: float = 15,
-    environment: dict[str, str] | None = None,
-) -> DoctorCheck:
+def _command_check(name: str, command: list[str]) -> DoctorCheck:
     if shutil.which(command[0]) is None:
         return DoctorCheck(name, False, f"{command[0]} was not found on PATH")
     try:
@@ -796,138 +396,14 @@ def _command_check(
             check=False,
             capture_output=True,
             text=True,
-            timeout=timeout_seconds,
-            env=environment or _command_environment(command[0]),
+            timeout=15,
+            env={"PATH": os.environ.get("PATH", "")},
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return DoctorCheck(name, False, _safe_detail(str(exc)))
     output = (result.stdout or result.stderr).strip().splitlines()
     detail = output[0] if output else "no output"
     return DoctorCheck(name, result.returncode == 0, _safe_detail(detail))
-
-
-def _docker_bind_mount_check(
-    config: AutocontributeConfig,
-    *,
-    workspace_parent: Path | None = None,
-) -> DoctorCheck:
-    """Prove the configured sandbox can use a private service-owned bind mount."""
-
-    getuid = getattr(os, "getuid", None)
-    getgid = getattr(os, "getgid", None)
-    if getuid is None or getgid is None:
-        return DoctorCheck(
-            "sandbox private bind mount",
-            False,
-            "host UID/GID inspection is unavailable",
-        )
-    expected_uid = getuid()
-    expected_gid = getgid()
-    probe_config = config.sandbox.model_copy(
-        update={
-            "command_timeout_seconds": 30,
-            "cpus": 1.0,
-            "max_commands": 1,
-            "memory": "128m",
-            "pids_limit": 32,
-        }
-    )
-    try:
-        with tempfile.TemporaryDirectory(
-            prefix="autocontribute-bind-probe-",
-            dir=workspace_parent,
-            ignore_cleanup_errors=True,
-        ) as temporary:
-            workspace = Path(temporary)
-            # A new directory takes its parent's group on macOS (and under a setgid parent on
-            # Linux), so /private/tmp would make the probe group-owned by wheel.
-            os.chown(workspace, -1, expected_gid)
-            workspace.chmod(0o700)
-            workspace_stat = workspace.stat()
-            if (
-                stat.S_IMODE(workspace_stat.st_mode) != 0o700
-                or workspace_stat.st_uid != expected_uid
-                or workspace_stat.st_gid != expected_gid
-            ):
-                return DoctorCheck(
-                    "sandbox private bind mount",
-                    False,
-                    "could not create an exact 0700 probe owned by the service account",
-                )
-            input_path = workspace / _BIND_PROBE_INPUT
-            input_path.write_text(_BIND_PROBE_INPUT_CONTENT, encoding="utf-8")
-            input_path.chmod(0o600)
-            runner = DockerSandbox(probe_config)
-            result = runner.run(
-                workspace,
-                (
-                    "set -eu; "
-                    f'test "$(cat {_BIND_PROBE_INPUT})" = '
-                    f'"{_BIND_PROBE_INPUT_CONTENT.rstrip()}"; '
-                    'test "$(cat /sys/fs/cgroup/memory.max)" = 134217728; '
-                    'test "$(cat /sys/fs/cgroup/memory.swap.max)" = 0; '
-                    'test "$(cat /sys/fs/cgroup/pids.max)" = 32; '
-                    "read -r cpu_quota cpu_period < /sys/fs/cgroup/cpu.max; "
-                    'test "$cpu_quota" != max; '
-                    'test "$cpu_quota" -eq "$cpu_period"; '
-                    f"umask 077; printf '%s\\n' "
-                    f"'{_BIND_PROBE_OUTPUT_CONTENT.rstrip()}' > {_BIND_PROBE_OUTPUT}"
-                ),
-            )
-            if not result.passed:
-                detail = result.stderr.strip() or "container could not read and write the bind"
-                return DoctorCheck("sandbox private bind mount", False, _safe_detail(detail))
-            output_path = workspace / _BIND_PROBE_OUTPUT
-            try:
-                output_stat = output_path.lstat()
-            except OSError:
-                return DoctorCheck(
-                    "sandbox private bind mount",
-                    False,
-                    "container reported success without a readable host-side output",
-                )
-            if (
-                not stat.S_ISREG(output_stat.st_mode)
-                or stat.S_IMODE(output_stat.st_mode) != 0o600
-                or output_stat.st_uid != expected_uid
-                or output_stat.st_gid != expected_gid
-                or output_stat.st_size != len(_BIND_PROBE_OUTPUT_CONTENT.encode("utf-8"))
-            ):
-                return DoctorCheck(
-                    "sandbox private bind mount",
-                    False,
-                    "container output failed host-side type, size, mode, or ownership checks",
-                )
-            try:
-                output_content = output_path.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
-                return DoctorCheck(
-                    "sandbox private bind mount",
-                    False,
-                    "container output was not readable as bounded probe text",
-                )
-            if output_content != _BIND_PROBE_OUTPUT_CONTENT:
-                return DoctorCheck(
-                    "sandbox private bind mount",
-                    False,
-                    "container output failed its host-side content check",
-                )
-    except (OSError, SandboxError) as exc:
-        return DoctorCheck("sandbox private bind mount", False, _safe_detail(str(exc)))
-    return DoctorCheck(
-        "sandbox private bind mount",
-        True,
-        (
-            "verified daemon-selected identity, enforced cgroup v2 limits, and service-owned "
-            "0700 bind read/write with host-side ownership"
-        ),
-    )
-
-
-def _command_environment(executable: str) -> dict[str, str]:
-    if PurePosixPath(executable).name == "docker":
-        return docker_client_environment()
-    return {"PATH": os.environ.get("PATH", "")}
 
 
 def _safe_detail(value: object) -> str:

@@ -421,3 +421,46 @@ def test_missing_key_fails_before_the_client_is_built(monkeypatch: pytest.Monkey
         openai_adapter.step(_request())
 
     constructor.assert_not_called()
+
+
+def test_request_errors_name_no_provider_body_or_error_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failure = _status_error(InternalServerError, 500, code="server_error", headers={})
+    failure.request_id = "req_safe_to_log"  # type: ignore[attr-defined]
+    failure.message = f"request body contained {_API_KEY} and confidentialmergercodename"
+    failure.param = "input.confidentialmergercodename"  # type: ignore[attr-defined]
+    _client(monkeypatch, error=failure)
+
+    with pytest.raises(ModelRequestError) as raised:
+        openai_adapter.step(_request())
+
+    assert str(raised.value) == (
+        "OpenAI Responses request failed (HTTP 500; request ID: req_safe_to_log)"
+    )
+    assert raised.value.__cause__ is None
+    assert raised.value.__suppress_context__ is True
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        _API_KEY,
+        # Assembled at runtime so the repository secret scan does not report this file.
+        "ghp_" + "abcdefghijklmnopqrstuvwxyzABCDEFGHIJ",
+        "req_safe\ncredential-like-diagnostic",
+        "r" * 129,
+    ],
+    ids=["exact-api-key", "recognizable-credential", "control-character", "unbounded"],
+)
+def test_request_errors_leave_out_an_unsafe_request_id(
+    monkeypatch: pytest.MonkeyPatch, request_id: str
+) -> None:
+    failure = RuntimeError("provider request failed")
+    failure.request_id = request_id  # type: ignore[attr-defined]
+    _client(monkeypatch, error=failure)
+
+    with pytest.raises(ModelRequestError) as raised:
+        openai_adapter.step(_request())
+
+    assert str(raised.value) == "OpenAI Responses request failed"

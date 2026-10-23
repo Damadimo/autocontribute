@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import ClassVar
 
 import pytest
+from test_evidence import MODELS, proposal, seal_evidence
 from typer.testing import CliRunner, Result
 
 import autocontribute.cli as cli
@@ -20,17 +21,10 @@ from autocontribute.discovery import (
     IssueEvaluation,
 )
 from autocontribute.domain import (
-    CommandResult,
-    CriticReview,
     EligibilityResult,
-    FileEdit,
-    GateResult,
     IssueCandidate,
     IssueComment,
-    PatchProposal,
-    QualityReport,
     RepositoryInfo,
-    ReviewScores,
     RunManifest,
     RunStatus,
 )
@@ -56,7 +50,6 @@ from autocontribute.orchestrator import RunInvocationMode
 from autocontribute.preparation import (
     compute_preparation_config_fingerprint,
     compute_preparation_fingerprint,
-    render_validation_artifact,
 )
 from autocontribute.publication import PublicationCheck
 from autocontribute.store import CandidateAttemptState, CandidateRetryAuthorization, RunStore
@@ -162,9 +155,6 @@ def _ready_review_run(
         "github:\n"
         f"  auth: {'gh' if runner_owner is None else 'token'}\n"
         "  repositories: [example/project]\n"
-        "validation:\n"
-        "  required_commands:\n"
-        "    example/project: [python -m pytest]\n"
         f"storage:\n  path: {state}\n" + runner_settings,
         encoding="utf-8",
     )
@@ -216,67 +206,17 @@ def _ready_review_run(
         blockers=[],
     )
     manifest.base_sha = "a" * 40
-    edit = FileEdit(
-        operation="replace",
-        path="src/widget.py",
-        find="review_patch_old_marker = 1\n",
-        replace="review_patch_new_marker = 2\n",
-        content=None,
-        rationale="Exercise exact immutable-review evidence.",
-    )
-    manifest.proposal = PatchProposal(
-        summary="Apply the exact review fixture change.",
-        edits=[edit],
-        validation_commands=["python -m pytest"],
+    manifest.proposal = proposal(
+        settings,
+        summary="AGENT_SUMMARY_EXACT_MARKER",
         commit_message="COMMIT_MESSAGE_EXACT_MARKER",
         pull_request_title="PR_TITLE_EXACT_MARKER",
-        pull_request_body=("PR_BODY_EXACT_MARKER\n\n---\n\n" + settings.policy.ai_disclosure),
-        limitations=[],
-    )
-    review = CriticReview(
-        verdict="approve",
-        summary="The focused fixture change is ready.",
-        scores=ReviewScores(
-            correctness=95,
-            issue_alignment=95,
-            tests=95,
-            repository_conventions=95,
-            diff_hygiene=95,
-            maintainer_clarity=95,
-        ),
-        blocking_findings=[],
-        non_blocking_findings=[],
-        issue_requirements_met=["The exact marker is updated."],
-        issue_requirements_missing=[],
-        test_evidence_assessment="The configured command passed.",
-        maintainer_perspective="Small and reviewable.",
-    )
-    manifest.patched_validation = [
-        CommandResult(
-            command="python -m pytest",
-            exit_code=0,
-            duration_seconds=1.25,
-            stdout="VALIDATION_STDOUT_EXACT_MARKER",
-            stderr="VALIDATION_STDERR_EXACT_MARKER",
-        )
-    ]
-    manifest.quality = QualityReport(
-        ready=True,
-        readiness_score=95,
-        gates=[GateResult(gate="fixture", passed=True, evidence="passed")],
-        review=review,
-        changed_files=1,
-        changed_lines=2,
+        pull_request_body=("PR_BODY_EXACT_MARKER\n\n---\n\n" + proposal(settings).disclosure),
     )
     store.write_artifact(manifest.run_id, "contribution.patch", _REVIEW_PATCH)
-    store.write_artifact(
-        manifest.run_id,
-        "validation.json",
-        render_validation_artifact(manifest),
-    )
+    seal_evidence(store, manifest)
     manifest.preparation_config_fingerprint = compute_preparation_config_fingerprint(
-        settings,
-        repository="example/project",
+        settings, repository="example/project", models=MODELS
     )
     manifest.preparation_fingerprint = compute_preparation_fingerprint(
         manifest,
@@ -343,8 +283,8 @@ def test_approval_review_ignores_tampered_report_and_approves_displayed_fingerpr
         "diff --git a/src/widget.py b/src/widget.py",
         "-review_patch_old_marker = 1",
         "+review_patch_new_marker = 2",
-        "VALIDATION_STDOUT_EXACT_MARKER",
-        "VALIDATION_STDERR_EXACT_MARKER",
+        "AGENT_SUMMARY_EXACT_MARKER",
+        "The fix adds the arguments, and its test fails before it.",
         "PR_TITLE_EXACT_MARKER",
         "PR_BODY_EXACT_MARKER",
         "COMMIT_MESSAGE_EXACT_MARKER",
@@ -655,14 +595,11 @@ def test_init_and_config_validation_are_offline(tmp_path: Path) -> None:
     refusal = " ".join(refused.output.split())
     assert "still contains starter placeholders" in refusal
     assert "github.repositories lists your-org/your-repo" in refusal
-    assert "sandbox.image comes from the example.invalid placeholder registry" in refusal
     assert "identity" not in refusal
     assert "Configuration is valid" not in refusal
 
     config.write_text(
-        config.read_text(encoding="utf-8")
-        .replace("your-org/your-repo", "example/project")
-        .replace("example.invalid/sandbox@sha256:", "ghcr.io/example/sandbox@sha256:"),
+        config.read_text(encoding="utf-8").replace("your-org/your-repo", "example/project"),
         encoding="utf-8",
     )
     validated = runner.invoke(
@@ -672,7 +609,7 @@ def test_init_and_config_validation_are_offline(tmp_path: Path) -> None:
 
     assert validated.exit_code == 0, validated.output
     assert "Configuration is valid" in validated.output
-    assert "gpt-5.6" in validated.output
+    assert "Models: agent auto, critic auto, setup auto, triage auto" in validated.output
 
 
 @pytest.mark.parametrize("command", (["doctor"], ["discover"], ["run"], ["run", "--scheduled"]))
@@ -688,11 +625,6 @@ def test_commands_refuse_starter_placeholders_before_external_work(
         '  email: "your-handle@users.noreply.github.com"\n'
         "github:\n"
         "  repositories: [your-org/your-repo]\n"
-        "validation:\n"
-        "  required_commands:\n"
-        "    your-org/your-repo: [python -m pytest]\n"
-        "sandbox:\n"
-        f"  image: example.invalid/sandbox@sha256:{'0' * 64}\n"
         f"storage:\n  path: {tmp_path / 'state'}\n",
         encoding="utf-8",
     )
@@ -711,7 +643,6 @@ def test_commands_refuse_starter_placeholders_before_external_work(
     assert "still contains starter placeholders" in output
     for placeholder in (
         "github.repositories lists your-org/your-repo",
-        "sandbox.image comes from the example.invalid placeholder registry",
         'identity.name is "Your Name"',
         'identity.email is "your-handle@users.noreply.github.com"',
     ):
@@ -897,12 +828,7 @@ def test_discover_explain_lists_every_issue_skip_and_error(
 ) -> None:
     config = tmp_path / "autocontribute.yml"
     config.write_text(
-        "github:\n"
-        "  repositories: [example/project]\n"
-        "validation:\n"
-        "  required_commands:\n"
-        "    example/project: [python -m pytest]\n"
-        f"storage:\n  path: {tmp_path / 'state'}\n",
+        f"github:\n  repositories: [example/project]\nstorage:\n  path: {tmp_path / 'state'}\n",
         encoding="utf-8",
     )
     outcome = _discovery_outcome(selected=selected)
@@ -972,6 +898,7 @@ _RUN_SUMMARY_KEYS = {
     "approval_expires_at",
     "pull_request_url",
     "skip_reason",
+    "reject_reason",
     "error",
 }
 
@@ -1058,12 +985,7 @@ def test_policy_inspection_and_explicit_cla_attestation_preview(
 ) -> None:
     config = tmp_path / "autocontribute.yml"
     config.write_text(
-        "github:\n"
-        "  repositories: [example/project]\n"
-        "validation:\n"
-        "  required_commands:\n"
-        "    example/project: [python -m pytest]\n"
-        f"storage:\n  path: {tmp_path / 'state'}\n",
+        f"github:\n  repositories: [example/project]\nstorage:\n  path: {tmp_path / 'state'}\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(cli, "_github_client", lambda *_: _PolicyGitHub())
@@ -1129,12 +1051,7 @@ def test_policy_attestation_refuses_policy_files_that_could_not_be_read(
 
     config = tmp_path / "autocontribute.yml"
     config.write_text(
-        "github:\n"
-        "  repositories: [example/project]\n"
-        "validation:\n"
-        "  required_commands:\n"
-        "    example/project: [python -m pytest]\n"
-        f"storage:\n  path: {tmp_path / 'state'}\n",
+        f"github:\n  repositories: [example/project]\nstorage:\n  path: {tmp_path / 'state'}\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(cli, "_github_client", lambda *_: _UnreadablePolicyGitHub())
@@ -1165,12 +1082,7 @@ def test_policy_attestation_requires_interactive_personal_confirmation(
 ) -> None:
     config = tmp_path / "autocontribute.yml"
     config.write_text(
-        "github:\n"
-        "  repositories: [example/project]\n"
-        "validation:\n"
-        "  required_commands:\n"
-        "    example/project: [python -m pytest]\n"
-        f"storage:\n  path: {tmp_path / 'state'}\n",
+        f"github:\n  repositories: [example/project]\nstorage:\n  path: {tmp_path / 'state'}\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(cli, "_github_client", lambda *_: _PolicyGitHub())

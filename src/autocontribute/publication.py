@@ -141,8 +141,15 @@ def has_visible_disclosure(body: str, disclosure: str) -> bool:
 def validate_publication_text(
     manifest: RunManifest,
     *,
-    required_disclosure: str | None = None,
+    check_disclosure: bool = False,
 ) -> None:
+    """Check the commit message and pull request text a run would publish.
+
+    ``check_disclosure`` also requires the body to show the run's filled AI disclosure outside
+    comments and code blocks; the configuration fingerprint shows it comes from the current
+    ``policy.ai_disclosure``.
+    """
+
     proposal = manifest.proposal
     if proposal is None:
         raise PolicyError("Run has no publication proposal")
@@ -175,13 +182,12 @@ def validate_publication_text(
             )
     elif len(proposal.commit_message) > 200:
         raise PolicyError("commit message subject exceeds the 200-character limit")
-    if required_disclosure is not None:
-        if not required_disclosure.strip():
-            raise PolicyError("policy.ai_disclosure cannot be blank")
-        if not has_visible_disclosure(proposal.pull_request_body, required_disclosure):
+    if check_disclosure:
+        if not proposal.disclosure.strip():
+            raise PolicyError("The run's AI disclosure cannot be blank")
+        if not has_visible_disclosure(proposal.pull_request_body, proposal.disclosure):
             raise PolicyError(
-                "Pull request body does not visibly contain the exact current configured AI "
-                "disclosure"
+                "Pull request body does not visibly contain the run's exact AI disclosure"
             )
 
 
@@ -251,14 +257,9 @@ def _validate_git_identity_credentials(
     config: AutocontributeConfig,
     *values: str,
 ) -> None:
-    secret_env_names = {
-        config.github.token_env,
-        config.models.scout.api_key_env,
-        config.models.builder.api_key_env,
-        config.models.critic.api_key_env,
-    }
     if any(
-        contains_credential_material(value, secret_env_names=secret_env_names) for value in values
+        contains_credential_material(value, secret_env_names=config.secret_env_names())
+        for value in values
     ):
         raise PolicyError("Git author or committer identity appears to contain a credential")
 
@@ -555,10 +556,7 @@ def _build_approval_review(
     _validate_current_config(config)
     if manifest.quality is None or not manifest.quality.ready:
         raise PolicyError("Run has not passed every quality gate")
-    validate_publication_text(
-        manifest,
-        required_disclosure=config.policy.ai_disclosure,
-    )
+    validate_publication_text(manifest, check_disclosure=True)
     patch = _read_approval_artifact(
         store,
         run_id,
@@ -599,7 +597,6 @@ def _build_approval_review(
     approval_manifest = build_approval_manifest(
         manifest,
         diff=patch,
-        disclosure=config.policy.ai_disclosure,
         draft=context.draft,
         ready_for_review=context.ready_for_review,
     )
@@ -729,7 +726,6 @@ class Publisher:
         approval_manifest = build_approval_manifest(
             manifest,
             diff=patch,
-            disclosure=self.config.policy.ai_disclosure,
             draft=_required_publication_draft(manifest),
             ready_for_review=_required_publication_ready_for_review(manifest),
         )
@@ -1496,10 +1492,7 @@ class Publisher:
         assert manifest.candidate is not None
         assert manifest.repository is not None
         assert manifest.base_sha is not None
-        validate_publication_text(
-            manifest,
-            required_disclosure=(None if recovering else self.config.policy.ai_disclosure),
-        )
+        validate_publication_text(manifest, check_disclosure=not recovering)
         try:
             patch_path = self.store.artifact_dir(run_id) / "contribution.patch"
             if not patch_path.is_file() or patch_path.is_symlink():
@@ -1547,7 +1540,6 @@ class Publisher:
             approval_manifest = build_approval_manifest(
                 manifest,
                 diff=patch,
-                disclosure=self.config.policy.ai_disclosure,
                 draft=context.draft,
                 ready_for_review=context.ready_for_review,
             )

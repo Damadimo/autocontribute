@@ -5,16 +5,16 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from typing import NoReturn, Protocol
+from typing import Protocol
 
 from autocontribute.config import AutocontributeConfig
-from autocontribute.domain import RunManifest
+from autocontribute.domain import RunManifest, RunModels
 from autocontribute.exceptions import PolicyError
 
-_FINGERPRINT_DOMAIN = b"autocontribute.preparation.v2\x00"
-_FINGERPRINT_SCHEMA_VERSION = 2
-_CONFIG_FINGERPRINT_DOMAIN = b"autocontribute.preparation-config.v2\x00"
-_CONFIG_FINGERPRINT_SCHEMA_VERSION = 2
+_FINGERPRINT_DOMAIN = b"autocontribute.preparation.v3\x00"
+_FINGERPRINT_SCHEMA_VERSION = 3
+_CONFIG_FINGERPRINT_DOMAIN = b"autocontribute.preparation-config.v3\x00"
+_CONFIG_FINGERPRINT_SCHEMA_VERSION = 3
 
 
 class _Digest(Protocol):
@@ -29,7 +29,8 @@ def compute_preparation_fingerprint(
     """Hash the exact patch bytes and stable evidence that authorized readiness.
 
     Mutable lifecycle fields are deliberately excluded. The length-prefixed
-    framing keeps the patch and canonical evidence payload unambiguous.
+    framing keeps the patch and canonical evidence payload unambiguous. The evidence covers
+    ``validation.json`` through its SHA-256.
     """
 
     if manifest.candidate is None:
@@ -40,10 +41,10 @@ def compute_preparation_fingerprint(
         raise PolicyError("Cannot fingerprint a preparation without a pinned base SHA")
     if manifest.proposal is None:
         raise PolicyError("Cannot fingerprint a preparation without a patch proposal")
-    if not manifest.patched_validation:
-        raise PolicyError("Cannot fingerprint a preparation without patched validation evidence")
-    if not all(result.passed for result in manifest.patched_validation):
-        raise PolicyError("Cannot fingerprint a preparation with failed patched validation")
+    if manifest.models is None or manifest.environment is None:
+        raise PolicyError("Cannot fingerprint a preparation without its models and environment")
+    if manifest.validation_sha256 is None:
+        raise PolicyError("Cannot fingerprint a preparation without its validation evidence")
     if manifest.quality is None or not manifest.quality.ready:
         raise PolicyError("Cannot fingerprint a preparation that has not passed quality gates")
 
@@ -56,16 +57,10 @@ def compute_preparation_fingerprint(
         ),
         "repository": manifest.repository.model_dump(mode="json"),
         "base_sha": manifest.base_sha,
-        "plan": manifest.plan.model_dump(mode="json") if manifest.plan else None,
+        "models": manifest.models.model_dump(mode="json"),
+        "environment": manifest.environment.model_dump(mode="json"),
         "proposal": manifest.proposal.model_dump(mode="json"),
-        "baseline_validation": (
-            manifest.baseline_validation.model_dump(mode="json")
-            if manifest.baseline_validation
-            else None
-        ),
-        "patched_validation": [
-            result.model_dump(mode="json") for result in manifest.patched_validation
-        ],
+        "validation_sha256": manifest.validation_sha256,
         "quality": manifest.quality.model_dump(mode="json"),
         "preparation_config_fingerprint": manifest.preparation_config_fingerprint,
     }
@@ -102,18 +97,20 @@ def compute_preparation_config_fingerprint(
     config: AutocontributeConfig,
     *,
     repository: str,
+    models: RunModels,
 ) -> str:
-    """Seal the operator-owned gates that made one repository preparation acceptable."""
+    """Seal the operator settings that made one repository preparation acceptable.
 
-    commands = config.validation.commands_for(repository)
-    if not commands:
-        raise PolicyError(
-            f"Repository has no operator-owned validation.required_commands entry: {repository}"
-        )
+    ``models`` are the run's models after ``auto`` was resolved: the jobs that approve and
+    publish have no model key to resolve them again.
+    """
+
+    override = config.environment_for(repository)
     payload = {
         "schema_version": _CONFIG_FINGERPRINT_SCHEMA_VERSION,
         "repository": repository.casefold(),
-        "required_commands": commands,
+        "environment": None if override is None else override.model_dump(mode="json"),
+        "models": models.model_dump(mode="json"),
         "sandbox": config.sandbox.model_dump(mode="json"),
         "quality": config.quality.model_dump(mode="json"),
         "policy": config.policy.model_dump(mode="json"),
@@ -149,81 +146,32 @@ def validate_preparation_config_fingerprint(
             f"Repository {candidate_repository} is no longer in the configured allowlist"
         )
     recorded = manifest.preparation_config_fingerprint
-    if recorded is None:
+    if recorded is None or manifest.models is None:
         raise PolicyError("Run is missing its preparation configuration fingerprint")
     expected = compute_preparation_config_fingerprint(
         config,
         repository=candidate_repository,
+        models=manifest.models,
     )
     if not hmac.compare_digest(recorded, expected):
         raise PolicyError(
-            "Validation, quality, policy, sandbox, or publishing configuration changed "
-            "after preparation"
+            "Environment, sandbox, quality, policy, or publishing configuration changed after "
+            "preparation"
         )
-
-
-def render_validation_artifact(manifest: RunManifest) -> str:
-    """Render the review sidecar from the validation evidence anchored in run state."""
-
-    return json.dumps(_validation_evidence(manifest), indent=2, sort_keys=True) + "\n"
 
 
 def validate_validation_artifact(
     manifest: RunManifest,
     *,
-    artifact: str | bytes,
+    artifact: bytes,
 ) -> None:
-    """Require the validation sidecar to exactly represent durable run evidence."""
+    """Require ``validation.json`` to be the evidence the run recorded when it became ready."""
 
-    try:
-        encoded = artifact.encode("utf-8") if isinstance(artifact, str) else artifact
-        parsed: object = json.loads(
-            encoded.decode("utf-8"),
-            object_pairs_hook=_unique_object,
-            parse_constant=_reject_json_constant,
-        )
-        actual = json.dumps(
-            parsed,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        ).encode("utf-8")
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise PolicyError("Validation artifact is not strict UTF-8 JSON") from exc
-    expected = json.dumps(
-        _validation_evidence(manifest),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    if not hmac.compare_digest(actual, expected):
-        raise PolicyError("Validation artifact does not match durable command evidence")
-
-
-def _validation_evidence(manifest: RunManifest) -> dict[str, object]:
-    return {
-        "baseline": (
-            manifest.baseline_validation.model_dump(mode="json")
-            if manifest.baseline_validation
-            else None
-        ),
-        "patched": [result.model_dump(mode="json") for result in manifest.patched_validation],
-    }
-
-
-def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
-
-
-def _reject_json_constant(value: str) -> NoReturn:
-    raise ValueError(f"invalid JSON constant: {value}")
+    recorded = manifest.validation_sha256
+    if recorded is None:
+        raise PolicyError("Run is missing the digest of its validation evidence")
+    if not hmac.compare_digest(recorded, hashlib.sha256(artifact).hexdigest()):
+        raise PolicyError("Validation artifact does not match the run's validation evidence")
 
 
 def _add_frame(digest: _Digest, label: bytes, payload: bytes) -> None:
@@ -236,7 +184,6 @@ def _add_frame(digest: _Digest, label: bytes, payload: bytes) -> None:
 __all__ = [
     "compute_preparation_config_fingerprint",
     "compute_preparation_fingerprint",
-    "render_validation_artifact",
     "validate_preparation_config_fingerprint",
     "validate_preparation_fingerprint",
     "validate_validation_artifact",

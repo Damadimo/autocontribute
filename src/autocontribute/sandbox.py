@@ -8,10 +8,8 @@ import json
 import os
 import re
 import secrets
-import shutil
 import signal
 import subprocess
-import tempfile
 import threading
 import time
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -129,200 +127,6 @@ _DOCKER_CLI_PROXY_NAMES: Final = (
 )
 
 DockerDaemonMode = Literal["rootful", "rootless"]
-
-
-class SandboxRunner:
-    """Run validation commands in Docker, or explicitly opt into unsafe local use."""
-
-    def __init__(self, config: SandboxConfig, *, docker_binary: str = "docker") -> None:
-        self.config = config
-        self.docker_binary = docker_binary
-        self._commands_run = 0
-        # Keep daemon discovery, container launch, and timeout cleanup on the same
-        # Docker endpoint even if the parent process mutates its environment later.
-        self._docker_environment = docker_client_environment()
-        if config.backend == "local" and not config.allow_unsafe_local:
-            raise SandboxError("Local execution requires allow_unsafe_local=true")
-        if not docker_binary or "\0" in docker_binary:
-            raise SandboxError("Docker binary is invalid")
-
-    def run(
-        self,
-        workspace: RepositoryWorkspace | Path,
-        command: str,
-    ) -> CommandResult:
-        """Run one bounded shell command and capture a size-limited result."""
-
-        root = _workspace_path(workspace)
-        _validate_command(command)
-        if self._commands_run >= self.config.max_commands:
-            raise SandboxError(
-                f"Sandbox command budget exhausted ({self.config.max_commands} commands)"
-            )
-        self._commands_run += 1
-
-        if self.config.backend == "local":
-            return self._run_local(root, command)
-        if self.config.backend != "docker":  # defensive against non-Pydantic construction
-            raise SandboxError(f"Unsupported sandbox backend: {self.config.backend}")
-        return self._run_docker(root, command)
-
-    @property
-    def remaining_commands(self) -> int:
-        """Return the unused per-run command budget."""
-
-        return max(0, self.config.max_commands - self._commands_run)
-
-    @property
-    def docker_daemon_mode(self) -> DockerDaemonMode:
-        """Return the verified Docker daemon mode used by this runner."""
-
-        if self.config.backend != "docker":
-            raise SandboxError("Docker daemon mode is unavailable for the local backend")
-        # Re-probe immediately before every launch. A long validation run must
-        # never retain rootless UID 0 if its endpoint is replaced by a rootful daemon.
-        return detect_docker_daemon_mode(
-            self.docker_binary,
-            environment=self._docker_environment,
-        )
-
-    def run_isolated(
-        self,
-        workspace: RepositoryWorkspace | Path,
-        command: str,
-    ) -> CommandResult:
-        """Run one command against a disposable copy of the exact working tree."""
-
-        root = _workspace_path(workspace)
-        with tempfile.TemporaryDirectory(
-            prefix=".autocontribute-validation-", dir=root.parent
-        ) as temporary:
-            isolated = Path(temporary) / "workspace"
-            try:
-                shutil.copytree(root, isolated, symlinks=True)
-            except (OSError, shutil.Error) as exc:
-                raise SandboxError("Could not create an isolated validation workspace") from exc
-            return self.run(isolated, command)
-
-    def run_all_isolated(
-        self,
-        workspace: RepositoryWorkspace | Path,
-        commands: Sequence[str],
-    ) -> list[CommandResult]:
-        """Run each command on a fresh copy, stopping at the first failure."""
-
-        if len(commands) > self.config.max_commands - self._commands_run:
-            raise SandboxError(
-                f"Validation requested more than the {self.config.max_commands}-command budget"
-            )
-        results: list[CommandResult] = []
-        for command in commands:
-            result = self.run_isolated(workspace, command)
-            results.append(result)
-            if not result.passed:
-                break
-        return results
-
-    def docker_command(self, workspace: Path, command: str, cidfile: Path) -> list[str]:
-        """Build the auditable ``docker run`` invocation used by :meth:`run`."""
-
-        root = _workspace_path(workspace)
-        _validate_command(command)
-        _validate_image(self.config.image)
-        mounts = _workspace_mounts(root)
-        if cidfile.exists() and cidfile.is_symlink():
-            raise SandboxError("Docker cidfile cannot be a symlink")
-
-        uid, gid = docker_container_identity(self.docker_daemon_mode)
-        return [
-            self.docker_binary,
-            "run",
-            "--rm",
-            f"--cidfile={cidfile}",
-            "--stop-timeout=2",
-            *docker_isolation_arguments(self.config, user=f"{uid}:{gid}", tmp_size="512m"),
-            f"--workdir={_CONTAINER_WORKSPACE}",
-            *mounts,
-            self.config.image,
-            # `env -i` clears both the Docker image's ENV values and any
-            # future runtime defaults. Only this explicit non-secret set
-            # reaches repository code.
-            "-i",
-            "HOME=/tmp",
-            "TMPDIR=/tmp",
-            f"PATH={SAFE_CONTAINER_PATH}",
-            "CI=1",
-            "GIT_TERMINAL_PROMPT=0",
-            "AUTOCONTRIBUTE_SANDBOX=1",
-            # A login shell (-l) would source /etc/profile, which resets PATH.
-            "/bin/sh",
-            "-c",
-            command,
-        ]
-
-    def _run_docker(self, workspace: Path, command: str) -> CommandResult:
-        with tempfile.TemporaryDirectory(prefix="autocontribute-docker-") as temporary:
-            cidfile = Path(temporary) / "container.cid"
-            arguments = self.docker_command(workspace, command, cidfile)
-
-            def cleanup() -> None:
-                container_id = _read_container_id(cidfile)
-                if container_id is None:
-                    return
-                with suppress(OSError, subprocess.TimeoutExpired):
-                    subprocess.run(
-                        [self.docker_binary, "rm", "--force", container_id],
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        check=False,
-                        timeout=10,
-                        env=self._docker_environment,
-                    )
-                # The original timeout/result remains the useful failure;
-                # Docker's --rm and daemon cleanup are the final fallback.
-
-            return _execute(
-                arguments,
-                command=command,
-                cwd=workspace,
-                timeout_seconds=self.config.command_timeout_seconds,
-                environment=self._docker_environment,
-                cleanup=cleanup,
-            )
-
-    def _run_local(self, workspace: Path, command: str) -> CommandResult:
-        if not self.config.allow_unsafe_local:
-            raise SandboxError("Local execution requires explicit unsafe opt-in")
-        shell = "/bin/sh"
-        if not Path(shell).is_file():
-            raise SandboxError("Local sandbox requires /bin/sh")
-        environment = {
-            "PATH": os.environ.get("PATH", SAFE_CONTAINER_PATH),
-            "HOME": str(workspace),
-            "TMPDIR": tempfile.gettempdir(),
-            "CI": "1",
-            "NO_COLOR": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-            "AUTOCONTRIBUTE_SANDBOX": "unsafe-local",
-        }
-        return _execute(
-            [shell, "-lc", command],
-            command=command,
-            cwd=workspace,
-            timeout_seconds=self.config.command_timeout_seconds,
-            environment=environment,
-            cleanup=None,
-        )
-
-
-class DockerSandbox(SandboxRunner):
-    """Compatibility wrapper that refuses non-Docker configuration."""
-
-    def __init__(self, config: SandboxConfig, *, docker_binary: str = "docker") -> None:
-        if config.backend != "docker":
-            raise SandboxError("DockerSandbox requires backend=docker")
-        super().__init__(config, docker_binary=docker_binary)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1328,16 +1132,6 @@ def docker_client_environment() -> dict[str, str]:
     return environment
 
 
-def _read_container_id(cidfile: Path) -> str | None:
-    try:
-        value = cidfile.read_text(encoding="ascii").strip()
-    except (FileNotFoundError, OSError, UnicodeError):
-        return None
-    if value and all(character in "0123456789abcdefABCDEF" for character in value):
-        return value
-    return None
-
-
 def _abandon(process: subprocess.Popen[bytes], cleanup: Callable[[], None] | None) -> None:
     # Killing the Docker client alone leaves the command running in the container.
     try:
@@ -1365,10 +1159,8 @@ __all__ = [
     "SAFE_CONTAINER_PATH",
     "SETUP_CAPABILITIES",
     "DockerDaemonMode",
-    "DockerSandbox",
     "EgressNetwork",
     "ImageIdentity",
-    "SandboxRunner",
     "SessionCommandResult",
     "SessionContainer",
     "detect_docker_daemon_mode",

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-from autocontribute.providers import _assert_secret_free_model_output
 from autocontribute.redaction import (
     HIGH_CONFIDENCE_TOKEN_PATTERNS,
     MAX_ARTIFACT_CHARACTERS,
@@ -176,7 +175,6 @@ def test_a_private_key_header_without_key_material_is_left_alone(line: str) -> N
     assert scrub_for_model(line, frozenset()) == line
     assert redact_model_input(line) == line
     assert redact_text(line) == line
-    _assert_secret_free_model_output("OPENAI_API_KEY", "openai-key-placeholder", line)
     # Publication text has no reason to quote a header, so the check still flags it.
     assert contains_high_confidence_token(line)
 

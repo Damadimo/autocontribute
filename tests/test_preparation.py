@@ -1,28 +1,23 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from test_evidence import ENVIRONMENT, MODELS, proposal, ready_quality
 
 from autocontribute.config import AutocontributeConfig
 from autocontribute.domain import (
-    CommandResult,
-    CriticReview,
-    FileEdit,
-    GateResult,
     IssueCandidate,
-    PatchProposal,
-    QualityReport,
     RepositoryInfo,
-    ReviewScores,
     RunManifest,
     RunStatus,
 )
+from autocontribute.environments import EnvironmentOverride
 from autocontribute.exceptions import PolicyError
 from autocontribute.preparation import (
     compute_preparation_config_fingerprint,
     compute_preparation_fingerprint,
-    render_validation_artifact,
     validate_preparation_config_fingerprint,
     validate_preparation_fingerprint,
     validate_validation_artifact,
@@ -33,25 +28,10 @@ NOW = datetime(2026, 7, 21, 12, tzinfo=UTC)
 PATCH = b"diff --git a/app.py b/app.py\n-old\n+new\n"
 
 
+VALIDATION = b'{"recipe": {}}\n'
+
+
 def _ready_manifest(*, run_id: str = "a" * 32) -> RunManifest:
-    review = CriticReview(
-        verdict="approve",
-        summary="The focused change is ready.",
-        scores=ReviewScores(
-            correctness=96,
-            issue_alignment=97,
-            tests=95,
-            repository_conventions=95,
-            diff_hygiene=98,
-            maintainer_clarity=96,
-        ),
-        blocking_findings=[],
-        non_blocking_findings=[],
-        issue_requirements_met=["The boundary is corrected"],
-        issue_requirements_missing=[],
-        test_evidence_assessment="The regression command passed.",
-        maintainer_perspective="Small and reviewable.",
-    )
     manifest = RunManifest(
         run_id=run_id,
         status=RunStatus.READY_FOR_APPROVAL,
@@ -84,56 +64,20 @@ def _ready_manifest(*, run_id: str = "a" * 32) -> RunManifest:
             license_spdx="MIT",
         ),
         base_sha="b" * 40,
-        proposal=PatchProposal(
-            summary="Correct the boundary result.",
-            edits=[
-                FileEdit(
-                    operation="replace",
-                    path="app.py",
-                    find="old",
-                    replace="new",
-                    content=None,
-                    rationale="Match the documented behavior.",
-                )
-            ],
-            validation_commands=["python -m pytest"],
-            commit_message="Correct the boundary result",
-            pull_request_title="Correct the boundary result",
-            pull_request_body="Fixes #42.",
-            limitations=[],
-        ),
-        patched_validation=[
-            CommandResult(
-                command="python -m pytest",
-                exit_code=0,
-                duration_seconds=1.25,
-                stdout="1 passed",
-                stderr="",
-            )
-        ],
-        quality=QualityReport(
-            ready=True,
-            readiness_score=96,
-            gates=[GateResult(gate="validation", passed=True, evidence="1/1 passed")],
-            review=review,
-            changed_files=1,
-            changed_lines=2,
-        ),
+        models=MODELS,
+        environment=ENVIRONMENT,
+        proposal=proposal(_config()),
+        quality=ready_quality(),
+        validation_sha256=hashlib.sha256(VALIDATION).hexdigest(),
     )
     manifest.preparation_config_fingerprint = compute_preparation_config_fingerprint(
-        _config(),
-        repository="example/project",
+        _config(), repository="example/project", models=MODELS
     )
     return manifest
 
 
 def _config() -> AutocontributeConfig:
-    return AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-        }
-    )
+    return AutocontributeConfig.model_validate({"github": {"repositories": ["example/project"]}})
 
 
 def _sealed_manifest() -> RunManifest:
@@ -204,10 +148,22 @@ def test_preparation_config_fingerprint_rejects_gate_and_allowlist_drift() -> No
     with pytest.raises(PolicyError, match="configuration changed"):
         validate_preparation_config_fingerprint(manifest, changed_quality)
 
-    changed_commands = config.model_copy(deep=True)
-    changed_commands.validation.required_commands["example/project"] = ["python -m pytest -q"]
+    changed_environment = config.model_copy(deep=True)
+    changed_environment.environments = {
+        "example/project": EnvironmentOverride(test="python -m pytest -q")
+    }
     with pytest.raises(PolicyError, match="configuration changed"):
-        validate_preparation_config_fingerprint(manifest, changed_commands)
+        validate_preparation_config_fingerprint(manifest, changed_environment)
+
+    # An environment for another repository is no part of this one's preparation.
+    other_environment = config.model_copy(deep=True)
+    other_environment.environments = {"example/other": EnvironmentOverride(test="make test")}
+    validate_preparation_config_fingerprint(manifest, other_environment)
+
+    other_models = manifest.model_copy(deep=True)
+    other_models.models = MODELS.model_copy(update={"critic": "claude-opus-5-5"})
+    with pytest.raises(PolicyError, match="configuration changed"):
+        validate_preparation_config_fingerprint(other_models, config)
 
     removed_target = config.model_copy(deep=True)
     removed_target.github.repositories = []
@@ -219,7 +175,7 @@ def test_preparation_config_fingerprint_rejects_gate_and_allowlist_drift() -> No
     ("section", "field", "replacement"),
     [
         ("sandbox", "command_timeout_seconds", 901),
-        ("sandbox", "max_commands", 9),
+        ("sandbox", "memory", "8g"),
         ("publishing", "branch_prefix", "different-prefix"),
         ("publishing", "draft", True),
     ],
@@ -245,51 +201,37 @@ def test_preparation_fingerprint_binds_preparation_config_fingerprint() -> None:
         validate_preparation_fingerprint(manifest, diff=PATCH)
 
 
-def test_preparation_fingerprint_rejects_patched_validation_tampering() -> None:
+def test_preparation_fingerprint_binds_the_validation_evidence_and_models() -> None:
     manifest = _sealed_manifest()
-    manifest.patched_validation[0].stdout = "different command output"
+    manifest.validation_sha256 = "0" * 64
 
     with pytest.raises(PolicyError, match="does not match"):
         validate_preparation_fingerprint(manifest, diff=PATCH)
 
+    other_environment = _sealed_manifest()
+    other_environment.environment = ENVIRONMENT.model_copy(update={"recipe_source": "agent"})
+    with pytest.raises(PolicyError, match="does not match"):
+        validate_preparation_fingerprint(other_environment, diff=PATCH)
 
-def test_preparation_fingerprint_requires_patched_validation_evidence() -> None:
+
+@pytest.mark.parametrize("missing", ["models", "environment", "validation_sha256"])
+def test_preparation_fingerprint_requires_the_runs_evidence(missing: str) -> None:
     manifest = _ready_manifest()
-    manifest.patched_validation = []
+    setattr(manifest, missing, None)
 
-    with pytest.raises(PolicyError, match="without patched validation evidence"):
+    with pytest.raises(PolicyError, match="Cannot fingerprint a preparation without"):
         compute_preparation_fingerprint(manifest, diff=PATCH)
 
 
-def test_validation_artifact_must_match_durable_command_evidence() -> None:
+def test_validation_artifact_must_be_the_recorded_evidence() -> None:
     manifest = _ready_manifest()
-    manifest.patched_validation[0].stdout = "1 résultat réussi"
-    artifact = render_validation_artifact(manifest)
 
-    validate_validation_artifact(manifest, artifact=artifact)
-    with pytest.raises(PolicyError, match="does not match durable command evidence"):
-        validate_validation_artifact(
-            manifest,
-            artifact=artifact.replace(
-                '"stdout": "1 r\\u00e9sultat r\\u00e9ussi"',
-                '"stdout": "2 r\\u00e9sultats r\\u00e9ussis"',
-            ),
-        )
-
-
-def test_validation_artifact_rejects_extra_or_duplicate_evidence() -> None:
-    manifest = _ready_manifest()
-    artifact = render_validation_artifact(manifest)
-    with pytest.raises(PolicyError, match="does not match durable command evidence"):
-        validate_validation_artifact(
-            manifest,
-            artifact=artifact.replace('"baseline": null,', '"baseline": null, "extra": true,'),
-        )
-    with pytest.raises(PolicyError, match="strict UTF-8 JSON"):
-        validate_validation_artifact(
-            manifest,
-            artifact=artifact.replace('"baseline": null,', '"baseline": null, "baseline": null,'),
-        )
+    validate_validation_artifact(manifest, artifact=VALIDATION)
+    with pytest.raises(PolicyError, match="does not match the run's validation evidence"):
+        validate_validation_artifact(manifest, artifact=VALIDATION.replace(b"{}", b"[]"))
+    manifest.validation_sha256 = None
+    with pytest.raises(PolicyError, match="missing the digest of its validation evidence"):
+        validate_validation_artifact(manifest, artifact=VALIDATION)
 
 
 def test_preparation_fingerprint_is_optional_only_for_legacy_loading() -> None:

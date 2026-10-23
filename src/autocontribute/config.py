@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -20,7 +21,19 @@ from pydantic import (
     model_validator,
 )
 
+from autocontribute.environments import EnvironmentOverride
 from autocontribute.exceptions import ConfigurationError
+from autocontribute.pricing import (
+    API_KEY_ENVS,
+    AUTO_MODEL,
+    DEFAULT_EFFORTS,
+    MODELS,
+    Effort,
+    ModelSpec,
+    Role,
+    resolve_critic,
+    resolve_model,
+)
 
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -31,13 +44,8 @@ _CANONICAL_UTC_TIMESTAMP = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z$"
 )
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
-_IMAGE_DIGEST = re.compile(r"@sha256:[0-9a-fA-F]{64}$")
-_DEFAULT_SANDBOX_IMAGE = (
-    "python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a"
-)
 # Values the starter templates ship with; they parse, but no command may act on them.
 _STARTER_REPOSITORY = "your-org/your-repo"
-_STARTER_REGISTRY_HOST = "example.invalid"
 _STARTER_IDENTITY_NAME = "Your Name"
 _STARTER_IDENTITY_EMAIL = "your-handle@users.noreply.github.com"
 
@@ -64,9 +72,13 @@ def validate_model_identifier(value: object) -> str:
 
 
 class StrictModel(BaseModel):
-    """Configuration base model that rejects silent misspellings."""
+    """Configuration base model that rejects silent misspellings.
 
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+    Errors leave out the rejected value: a key or token pasted into the wrong field must not
+    reach a log.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True, hide_input_in_errors=True)
 
 
 class IdentityConfig(StrictModel):
@@ -204,210 +216,81 @@ class GitHubConfig(StrictModel):
         return list(dict.fromkeys(values))
 
 
-class ModelPricing(StrictModel):
-    """Operator-supplied token prices used for a conservative per-run spend ceiling."""
-
-    input_usd_per_million_tokens: Decimal = Field(gt=0, max_digits=12, decimal_places=6)
-    cached_input_usd_per_million_tokens: Decimal | None = Field(
-        default=None, gt=0, max_digits=12, decimal_places=6
-    )
-    cache_write_usd_per_million_tokens: Decimal | None = Field(
-        default=None, gt=0, max_digits=12, decimal_places=6
-    )
-    output_usd_per_million_tokens: Decimal = Field(gt=0, max_digits=12, decimal_places=6)
-
-    @property
-    def cached_input_rate(self) -> Decimal:
-        return self.cached_input_usd_per_million_tokens or self.input_usd_per_million_tokens
-
-    @property
-    def cache_write_rate(self) -> Decimal:
-        return self.cache_write_usd_per_million_tokens or self.input_usd_per_million_tokens
-
-    def upper_bound_cost(self, *, input_tokens: int, output_tokens: int) -> Decimal:
-        """Price a reservation without assuming a discounted cache hit."""
-
-        input_rate = max(
-            self.input_usd_per_million_tokens,
-            self.cached_input_rate,
-            self.cache_write_rate,
-        )
-        return (
-            Decimal(input_tokens) * input_rate
-            + Decimal(output_tokens) * self.output_usd_per_million_tokens
-        ) / Decimal(1_000_000)
-
-    def cost(
-        self,
-        *,
-        input_tokens: int,
-        cached_input_tokens: int,
-        cache_write_tokens: int,
-        output_tokens: int,
-    ) -> Decimal:
-        regular_input_tokens = input_tokens - cached_input_tokens - cache_write_tokens
-        if regular_input_tokens < 0:
-            raise ValueError("cached and cache-write tokens cannot exceed input tokens")
-        return (
-            Decimal(regular_input_tokens) * self.input_usd_per_million_tokens
-            + Decimal(cached_input_tokens) * self.cached_input_rate
-            + Decimal(cache_write_tokens) * self.cache_write_rate
-            + Decimal(output_tokens) * self.output_usd_per_million_tokens
-        ) / Decimal(1_000_000)
-
-
-class ModelProfile(StrictModel):
-    provider: Literal["openai", "openai_compatible"] = "openai"
-    model: str = "gpt-5.6"
-    expected_response_model: str | None = None
-    api_key_env: str = "OPENAI_API_KEY"
-    base_url: HttpUrl | None = None
-    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"] = "high"
-    reasoning_mode: Literal["standard", "pro"] | None = "standard"
-    max_input_tokens: int = Field(default=500_000, ge=1_000, le=2_000_000)
-    max_output_tokens: int = Field(default=40_000, ge=1_000, le=128_000)
-    timeout_seconds: float = Field(default=900, ge=10, le=3_600)
-    pricing: ModelPricing | None = None
-
-    @field_validator("model", "expected_response_model")
-    @classmethod
-    def model_ids_are_canonical(cls, value: str | None) -> str | None:
-        return None if value is None else validate_model_identifier(value)
-
-    @field_validator("api_key_env")
-    @classmethod
-    def api_key_env_is_a_name(cls, value: str) -> str:
-        if not _ENV_NAME.fullmatch(value):
-            raise ValueError("api_key_env must be an environment variable name, not a key")
-        return value
-
-    @field_validator("base_url")
-    @classmethod
-    def base_url_is_secure(cls, value: HttpUrl | None) -> HttpUrl | None:
-        if value is None:
-            return None
-        if value.scheme != "https":
-            raise ValueError("base_url must use HTTPS")
-        if value.username is not None or value.password is not None:
-            raise ValueError("base_url cannot contain credentials")
-        if value.query is not None or value.fragment is not None:
-            raise ValueError("base_url cannot contain a query string or fragment")
-        return value
-
-    @model_validator(mode="after")
-    def compatible_provider_has_url(self) -> ModelProfile:
-        if self.provider == "openai_compatible" and self.base_url is None:
-            raise ValueError("openai_compatible profiles require base_url")
-        if self.provider == "openai_compatible" and self.reasoning_mode == "pro":
-            raise ValueError(
-                "openai_compatible profiles cannot portably enforce pro reasoning mode; "
-                "use standard or null"
-            )
-        return self
-
-    def require_api_key(self) -> str:
-        value = os.environ.get(self.api_key_env)
-        if not value:
-            raise ConfigurationError(
-                f"Model credential is missing; set environment variable {self.api_key_env}"
-            )
-        return value
-
-
 class ModelsConfig(StrictModel):
-    scout: ModelProfile = Field(
-        default_factory=lambda: ModelProfile(reasoning_mode="standard", reasoning_effort="high")
-    )
-    builder: ModelProfile = Field(
-        default_factory=lambda: ModelProfile(reasoning_mode="standard", reasoning_effort="high")
-    )
-    critic: ModelProfile = Field(
-        default_factory=lambda: ModelProfile(reasoning_mode="pro", reasoning_effort="high")
-    )
+    """The model of each role: ``auto``, or an id from the built-in table in ``pricing``."""
 
-    @model_validator(mode="before")
+    agent: str = AUTO_MODEL
+    # auto: the agent's model, or the other provider's when both providers' keys are set.
+    critic: str = AUTO_MODEL
+    setup: str = AUTO_MODEL
+    triage: str = AUTO_MODEL
+    # Reasoning effort per role, where the default does not suit; pricing.DEFAULT_EFFORTS.
+    effort: dict[Role, Effort] = Field(default_factory=dict)
+
+    @field_validator("agent", "critic", "setup", "triage")
     @classmethod
-    def apply_role_reasoning_defaults(cls, value: object) -> object:
-        if not isinstance(value, dict):
-            return value
-        result = dict(value)
-        for role, mode in (("scout", "standard"), ("builder", "standard"), ("critic", "pro")):
-            profile = result.get(role)
-            if isinstance(profile, dict) and "reasoning_mode" not in profile:
-                normalized = dict(profile)
-                normalized["reasoning_mode"] = mode
-                result[role] = normalized
-        return result
+    def model_is_known(cls, value: str, info: ValidationInfo) -> str:
+        if value != AUTO_MODEL and value not in MODELS:
+            raise ValueError(
+                f"models.{info.field_name} must be auto or one of: {', '.join(MODELS)}"
+            )
+        return value
+
+    def resolve(self, environ: Mapping[str, str]) -> ResolvedModels:
+        """Resolve ``auto`` from the API keys in ``environ`` and check each role's key is set.
+
+        Raises :class:`ConfigurationError` when a key is missing or a role's model does not
+        support its effort. An empty variable counts as unset.
+        """
+
+        agent = resolve_model(self.agent, "agent", environ)
+        resolved = ResolvedModels(
+            agent=agent,
+            critic=resolve_critic(self.critic, agent, environ),
+            setup=resolve_model(self.setup, "setup", environ),
+            triage=resolve_model(self.triage, "triage", environ),
+            efforts={
+                role: self.effort.get(role, default) for role, default in DEFAULT_EFFORTS.items()
+            },
+        )
+        for role in DEFAULT_EFFORTS:
+            spec = resolved.spec(role)
+            key = API_KEY_ENVS[spec.provider]
+            if not environ.get(key):
+                raise ConfigurationError(f"models.{role} is {spec.id}; set {key} to use it")
+            if resolved.efforts[role] not in spec.efforts:
+                raise ConfigurationError(
+                    f"models.effort.{role} is {resolved.efforts[role]}, which {spec.id} does "
+                    "not support"
+                )
+        return resolved
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedModels:
+    """The model and reasoning effort of each role, with ``auto`` resolved."""
+
+    agent: ModelSpec
+    critic: ModelSpec
+    setup: ModelSpec
+    triage: ModelSpec
+    efforts: Mapping[Role, Effort]
+
+    def spec(self, role: Role) -> ModelSpec:
+        return {
+            "agent": self.agent,
+            "critic": self.critic,
+            "setup": self.setup,
+            "triage": self.triage,
+        }[role]
 
 
 class SandboxConfig(StrictModel):
-    backend: Literal["docker", "local"] = "docker"
-    image: str = _DEFAULT_SANDBOX_IMAGE
+    # Each tool command, test run and setup step; agent commands get at most 300 seconds.
     command_timeout_seconds: int = Field(default=900, ge=10, le=3_600)
-    memory: str = "4g"
+    memory: str = "6g"
     cpus: float = Field(default=2.0, gt=0, le=16)
-    pids_limit: int = Field(default=256, ge=32, le=4_096)
-    allow_unsafe_local: bool = False
-    max_commands: int = Field(default=8, ge=1, le=30)
-
-    @field_validator("image")
-    @classmethod
-    def image_is_a_single_reference(cls, value: str) -> str:
-        if (
-            not value
-            or value.startswith("-")
-            or "\0" in value
-            or any(character.isspace() for character in value)
-        ):
-            raise ValueError("image must be one Docker image reference")
-        return value
-
-    @model_validator(mode="after")
-    def backend_safety_requirements(self) -> SandboxConfig:
-        if self.backend == "local" and not self.allow_unsafe_local:
-            raise ValueError("local sandbox requires allow_unsafe_local: true")
-        if self.backend == "docker" and not _IMAGE_DIGEST.search(self.image):
-            raise ValueError("docker sandbox image must be pinned with @sha256:<64 hex digits>")
-        return self
-
-
-class ValidationConfig(StrictModel):
-    """Operator-owned validation commands keyed by canonical repository name."""
-
-    required_commands: dict[str, list[str]] = Field(default_factory=dict)
-
-    @field_validator("required_commands")
-    @classmethod
-    def required_commands_are_safe(cls, values: dict[str, list[str]]) -> dict[str, list[str]]:
-        normalized: dict[str, list[str]] = {}
-        for repository, commands in values.items():
-            if not _REPOSITORY.fullmatch(repository):
-                raise ValueError("validation.required_commands keys must use owner/name syntax")
-            cleaned: list[str] = []
-            for command in commands:
-                value = command.strip()
-                if not value or "\0" in value:
-                    raise ValueError("trusted validation commands must be non-empty and NUL-free")
-                if len(value) > 20_000:
-                    raise ValueError("trusted validation command exceeds 20,000 characters")
-                if value not in cleaned:
-                    cleaned.append(value)
-            if not cleaned:
-                raise ValueError(
-                    f"validation.required_commands[{repository!r}] must contain a command"
-                )
-            key = repository.casefold()
-            if key in normalized:
-                raise ValueError(
-                    f"duplicate validation repository after case-folding: {repository}"
-                )
-            normalized[key] = cleaned
-        return normalized
-
-    def commands_for(self, repository: str) -> list[str]:
-        """Return a copy of the operator-owned commands for one repository."""
-
-        return list(self.required_commands.get(repository.casefold(), []))
+    pids_limit: int = Field(default=1024, ge=32, le=4_096)
 
 
 class CLAAuthorization(StrictModel):
@@ -582,9 +465,11 @@ class PolicyConfig(StrictModel):
     # Repositories whose AI policy asks for human-written PR text, where the user still wants
     # to contribute and will write that text.
     allow_conditional_ai_policy: list[str] = Field(default_factory=list)
+    # {version} and {model} are filled when the run is prepared; the approval binds the result.
     ai_disclosure: str = (
-        "This contribution was prepared autonomously by an AI agent. Its validation evidence "
-        "comes from Autocontribute's configured automated checks; no human review is implied."
+        "AI assistance: an AI coding agent (autocontribute {version}, {model}) drafted this "
+        "change and its test and ran the tests listed above in a sandbox. I reviewed the diff "
+        "and the test results before opening this PR and will handle the review."
     )
 
     @field_validator("legal_attestations")
@@ -626,13 +511,12 @@ class PolicyConfig(StrictModel):
 
 
 class QualityConfig(StrictModel):
-    min_readiness_score: int = Field(default=90, ge=0, le=100)
-    min_dimension_score: int = Field(default=80, ge=0, le=100)
+    # Every changed file counts here, tests included.
     max_files_changed: int = Field(default=8, ge=1, le=100)
     max_changed_lines: int = Field(default=400, ge=1, le=10_000)
-    max_context_files: int = Field(default=20, ge=1, le=100)
-    max_context_characters: int = Field(default=160_000, ge=10_000, le=2_000_000)
-    require_regression_evidence_for_bugfix: bool = True
+    # Files that are not tests, and their changed lines.
+    max_source_files: int = Field(default=3, ge=1, le=100)
+    max_source_lines: int = Field(default=150, ge=1, le=10_000)
     forbidden_paths: list[str] = Field(
         default_factory=lambda: [
             ".github/workflows/**",
@@ -680,18 +564,19 @@ class PublishingConfig(StrictModel):
 
 
 class BudgetConfig(StrictModel):
-    # A maximum-length run makes 6 distinct calls (plan, replan, propose, critique,
-    # repair, re-critique); the remainder is headroom for transient-failure retries,
-    # each of which consumes a call so retried requests stay visible in the billable
-    # accounting.
-    max_model_calls_per_run: int = Field(default=9, ge=3, le=30)
-    max_candidates_per_run: int = Field(default=25, ge=1, le=200)
-    max_input_tokens_per_run: int = Field(default=3_000_000, ge=1_000, le=20_000_000)
-    max_output_tokens_per_run: int = Field(default=240_000, ge=1_000, le=4_000_000)
-    max_model_seconds_per_run: float = Field(default=3_600, ge=10, le=86_400)
-    max_model_cost_usd_per_run: Decimal | None = Field(
-        default=None, gt=0, max_digits=10, decimal_places=4
+    # Prices come from the built-in model table; every request reserves its worst case first.
+    max_cost_usd_per_run: Decimal = Field(
+        default=Decimal(10), gt=0, le=1_000, max_digits=10, decimal_places=4
     )
+    # Over the last 24 hours; a run starts only while a quarter of the per-run cap is left.
+    max_cost_usd_per_day: Decimal = Field(
+        default=Decimal(25), gt=0, le=10_000, max_digits=10, decimal_places=4
+    )
+    # Every request counts, retries included; the turn caps per phase are in ``budget.py``.
+    max_model_calls_per_run: int = Field(default=200, ge=10, le=1_000)
+    # Covers model and tool time alike.
+    max_run_minutes: int = Field(default=90, ge=5, le=360)
+    max_candidates_per_run: int = Field(default=25, ge=1, le=200)
 
 
 class StorageConfig(StrictModel):
@@ -702,36 +587,34 @@ class AutocontributeConfig(StrictModel):
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     github: GitHubConfig = Field(default_factory=GitHubConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    # Per repository, keyed by owner/name: what detection gets wrong about its environment.
+    environments: dict[str, EnvironmentOverride] = Field(default_factory=dict)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
-    validation: ValidationConfig = Field(default_factory=ValidationConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     quality: QualityConfig = Field(default_factory=QualityConfig)
     publishing: PublishingConfig = Field(default_factory=PublishingConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
 
+    @field_validator("environments")
+    @classmethod
+    def environments_are_repository_scoped(
+        cls, values: dict[str, EnvironmentOverride]
+    ) -> dict[str, EnvironmentOverride]:
+        normalized: dict[str, EnvironmentOverride] = {}
+        for repository, override in values.items():
+            if not _REPOSITORY.fullmatch(repository):
+                raise ValueError("environments keys must use owner/name syntax")
+            key = repository.casefold()
+            if key in normalized:
+                raise ValueError(
+                    f"duplicate environments repository after case-folding: {repository}"
+                )
+            normalized[key] = override
+        return normalized
+
     @model_validator(mode="after")
-    def trusted_validation_is_complete(self) -> AutocontributeConfig:
-        missing = [
-            repository
-            for repository in self.github.repositories
-            if not self.validation.commands_for(repository)
-        ]
-        if missing:
-            raise ValueError(
-                "explicit repositories require validation.required_commands entries: "
-                + ", ".join(missing)
-            )
-        oversized = [
-            repository
-            for repository, commands in self.validation.required_commands.items()
-            if len(commands) > self.sandbox.max_commands
-        ]
-        if oversized:
-            raise ValueError(
-                "trusted validation commands exceed sandbox.max_commands for: "
-                + ", ".join(oversized)
-            )
+    def dco_signatory_is_the_identity(self) -> AutocontributeConfig:
         for repository, attestation in self.policy.legal_attestations.items():
             if attestation.dco is None:
                 continue
@@ -743,31 +626,15 @@ class AutocontributeConfig(StrictModel):
                     "DCO signatory must exactly match identity.name and identity.email for "
                     + repository
                 )
-        profiles = (
-            ("scout", self.models.scout),
-            ("builder", self.models.builder),
-            ("critic", self.models.critic),
-        )
-        missing_pricing = [role for role, profile in profiles if profile.pricing is None]
-        configured_pricing = [role for role, profile in profiles if profile.pricing is not None]
-        if configured_pricing and missing_pricing:
-            raise ValueError(
-                "model token pricing must be configured for every role; missing: "
-                + ", ".join(missing_pricing)
-            )
-        if self.budget.max_model_cost_usd_per_run is not None and missing_pricing:
-            raise ValueError(
-                "budget.max_model_cost_usd_per_run requires token pricing for model roles: "
-                + ", ".join(missing_pricing)
-            )
         return self
 
-    def model_for(self, role: Literal["scout", "builder", "critic"]) -> ModelProfile:
-        if role == "scout":
-            return self.models.scout
-        if role == "builder":
-            return self.models.builder
-        return self.models.critic
+    def environment_for(self, repository: str) -> EnvironmentOverride | None:
+        return self.environments.get(repository.casefold())
+
+    def secret_env_names(self) -> frozenset[str]:
+        """Name the variables that hold this machine's secrets: the GitHub token, the model keys."""
+
+        return frozenset({self.github.token_env, *API_KEY_ENVS.values()})
 
 
 def load_config(path: Path) -> AutocontributeConfig:
@@ -802,18 +669,7 @@ def starter_placeholders(config: AutocontributeConfig) -> list[str]:
     ):
         placeholders.append(
             f"github.repositories lists {_STARTER_REPOSITORY}: replace it with the repositories "
-            "you want to contribute to, and give each one a validation.required_commands entry"
-        )
-    # The local backend never pulls or runs the image, so a leftover starter image is harmless.
-    image_registry, separator, _ = config.sandbox.image.partition("/")
-    if (
-        config.sandbox.backend == "docker"
-        and separator
-        and image_registry.partition(":")[0].casefold() == _STARTER_REGISTRY_HOST
-    ):
-        placeholders.append(
-            f"sandbox.image comes from the {_STARTER_REGISTRY_HOST} placeholder registry: build, "
-            "digest-pin, and pre-pull your own validation image (see docs/sandbox-image.md)"
+            "you want to contribute to"
         )
     if config.identity.name.strip() == _STARTER_IDENTITY_NAME:
         placeholders.append(
@@ -829,106 +685,24 @@ def starter_placeholders(config: AutocontributeConfig) -> list[str]:
 
 
 def example_config() -> str:
-    """Return a documented starter configuration with no embedded credentials."""
+    """Return a short starter configuration with no embedded credentials."""
 
-    return """# Credentials are read only from the named environment variables.
-identity:                          # empty = your GitHub login and its noreply email address
-  name: ""
-  email: ""
-
+    return """# Every key and its default: docs/configuration.md.
+# API keys and tokens never go in this file. Set OPENAI_API_KEY or ANTHROPIC_API_KEY, and sign
+# in with `gh auth login` or set AUTOCONTRIBUTE_GITHUB_TOKEN.
 github:
-  auth: gh                         # use `gh auth login`, or change to `token`
-  token_env: AUTOCONTRIBUTE_GITHUB_TOKEN
-  repositories:                   # explicit repositories are safest
+  repositories:      # the public repositories to contribute to, as owner/name
     - your-org/your-repo
-  owners: []                       # optional discovery across selected owners
-  include_labels: ["help wanted", "bug", "confirmed", "accepted", "status: help wanted",
-                   "contributions welcome", "pr welcome"]
-  exclude_labels: ["security", "breaking change", "needs-*", "question", "discussion", "design",
-                   "rfc", "proposal", "wontfix", "duplicate", "invalid", "stale", "blocked",
-                   "good first issue", "first-timers-only", "beginner"]  # * matches any text
-  labels: {}                       # per repository: {owner/repo: {include: [...], exclude: [...]}}
-  min_stars: 0
-  require_unassigned: true
-  max_repository_inactivity_days: 180
 
-models:
-  scout: &builder_model
-    provider: openai
-    model: gpt-5.6
-    # Optional: refuse any response whose provider-reported model ID differs from this one.
-    # expected_response_model: gpt-5.6-YYYY-MM-DD
-    api_key_env: OPENAI_API_KEY
-    reasoning_effort: high
-    reasoning_mode: standard
-    max_input_tokens: 500000
-    max_output_tokens: 40000
-    timeout_seconds: 900
-    pricing:                         # conservative ceilings; verify for the selected model
-      input_usd_per_million_tokens: 10
-      cached_input_usd_per_million_tokens: 10
-      cache_write_usd_per_million_tokens: 10
-      output_usd_per_million_tokens: 100
-  builder: *builder_model
-  critic:
-    <<: *builder_model
-    reasoning_mode: pro
+models:              # auto picks each model from the API key that is set
+  agent: auto
+  critic: auto
+  setup: auto
+  triage: auto
 
-sandbox:
-  backend: docker
-  # Validation always runs offline, so this one global image must already contain the complete
-  # toolchain (pytest, project dependencies) for every configured repository; a bare interpreter
-  # image fails doctor. Build, digest-pin, and pre-pull your own: see docs/sandbox-image.md.
-  image: >-
-    example.invalid/sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000
-  command_timeout_seconds: 900
-  memory: 4g
-  cpus: 2
-
-validation:
-  required_commands:               # operator-owned; model commands are supplementary only
-    your-org/your-repo:
-      - python -m pytest
-
-policy:
-  require_maintainer_signal: true
-  require_contribution_guidelines: true
-  allow_security_issues: false
-  allow_dependency_changes: false
-  allow_workflow_changes: false
-  legal_attestations: {}            # generate only with `autocontribute policy attest`
-  ai_disclosure: >-
-    This contribution was prepared autonomously by an AI agent. Its validation
-    evidence comes from Autocontribute's configured automated checks; no human
-    review is implied.
-
-quality:
-  min_readiness_score: 90
-  min_dimension_score: 80
-  max_files_changed: 8
-  max_changed_lines: 400
-  require_regression_evidence_for_bugfix: true
-
-publishing:
-  login: ""                        # empty = the GitHub token's account
-  head_strategy: auto              # auto | fork
-  approval_expires_hours: 72
-  draft: false
-  ready_for_review: true           # applies only when draft is true
-  max_new_pull_requests_per_day: 1
-  max_open_pull_requests: 3
-  repository_cooldown_days: 7
-
-budget:
-  max_model_calls_per_run: 9
-  max_candidates_per_run: 25
-  max_input_tokens_per_run: 3000000
-  max_output_tokens_per_run: 240000
-  max_model_seconds_per_run: 3600
-  max_model_cost_usd_per_run: 50
-
-storage:
-  path: .autocontribute
+budget:              # in US dollars
+  max_cost_usd_per_run: 10
+  max_cost_usd_per_day: 25
 """
 
 
@@ -936,14 +710,17 @@ __all__ = [
     "CLA_ATTESTATION_STATEMENT",
     "DCO_ATTESTATION_STATEMENT",
     "AutocontributeConfig",
+    "BudgetConfig",
     "CLAAuthorization",
     "DCOAuthorization",
     "GitHubConfig",
     "LegalAttestation",
-    "ModelPricing",
-    "ModelProfile",
+    "ModelsConfig",
+    "PolicyConfig",
+    "QualityConfig",
     "RepositoryLabels",
-    "ValidationConfig",
+    "ResolvedModels",
+    "SandboxConfig",
     "example_config",
     "load_config",
     "starter_placeholders",

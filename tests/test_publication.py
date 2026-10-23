@@ -11,6 +11,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from test_evidence import MODELS, seal_evidence
+from test_evidence import proposal as ready_proposal
 
 import autocontribute.publication as publication_module
 from autocontribute.config import (
@@ -22,19 +24,13 @@ from autocontribute.config import (
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.discovery import DiscoveryService, apply_legal_commit_message
 from autocontribute.domain import (
-    CommandResult,
-    CriticReview,
-    FileEdit,
-    GateResult,
     IssueCandidate,
     IssueComment,
-    PatchProposal,
-    QualityReport,
     RepositoryInfo,
-    ReviewScores,
     RunManifest,
     RunStatus,
 )
+from autocontribute.environments import EnvironmentOverride
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     GitHubError,
@@ -65,7 +61,6 @@ from autocontribute.github import (
 from autocontribute.preparation import (
     compute_preparation_config_fingerprint,
     compute_preparation_fingerprint,
-    render_validation_artifact,
 )
 from autocontribute.publication import (
     PublicationCheck,
@@ -199,7 +194,6 @@ def _ready_run(
     config = AutocontributeConfig.model_validate(
         {
             "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
             "publishing": {"draft": draft, "ready_for_review": ready_for_review},
             "storage": {"path": tmp_path / "state"},
         }
@@ -285,44 +279,10 @@ def _ready_run(
         store.workspace_dir(run.run_id) / "repository",
         allow_local_source=True,
     )
-    edit = FileEdit(
-        operation="replace",
-        path="fix.py",
-        find="answer = 1\n",
-        replace="answer = 2\n",
-        content=None,
-        rationale="Resolve the issue.",
-    )
-    workspace.apply_edit(edit)
-    patch = workspace.diff()
+    (workspace.path / "fix.py").write_text("answer = 2\n", encoding="utf-8")
+    patch = workspace.diff_bytes().decode("utf-8")
     store.write_artifact(run.run_id, "contribution.patch", patch)
-    proposal = PatchProposal(
-        summary="Correct the answer.",
-        edits=[edit],
-        validation_commands=["python -m pytest"],
-        commit_message="Correct documented answer",
-        pull_request_title="Correct documented answer",
-        pull_request_body=f"Fixes #42.\n\n---\n\n{config.policy.ai_disclosure}",
-        limitations=[],
-    )
-    review = CriticReview(
-        verdict="approve",
-        summary="Ready.",
-        scores=ReviewScores(
-            correctness=95,
-            issue_alignment=95,
-            tests=95,
-            repository_conventions=95,
-            diff_hygiene=95,
-            maintainer_clarity=95,
-        ),
-        blocking_findings=[],
-        non_blocking_findings=[],
-        issue_requirements_met=["answer is 2"],
-        issue_requirements_missing=[],
-        test_evidence_assessment="Passed.",
-        maintainer_perspective="Ready.",
-    )
+    proposal = ready_proposal(config)
     run.candidate = issue
     run.repository = repository
     run.eligibility = DiscoveryService(
@@ -341,27 +301,9 @@ def _ready_run(
         proposal.commit_message,
     )
     run.proposal = proposal
-    run.quality = QualityReport(
-        ready=True,
-        readiness_score=95,
-        gates=[GateResult(gate="fixture", passed=True, evidence="passed")],
-        review=review,
-        changed_files=1,
-        changed_lines=2,
-    )
-    run.patched_validation = [
-        CommandResult(
-            command="python -m pytest",
-            exit_code=0,
-            duration_seconds=1.0,
-            stdout="1 passed",
-            stderr="",
-        )
-    ]
-    store.write_artifact(run.run_id, "validation.json", render_validation_artifact(run))
+    seal_evidence(store, run)
     run.preparation_config_fingerprint = compute_preparation_config_fingerprint(
-        config,
-        repository=issue.repository,
+        config, repository=issue.repository, models=MODELS
     )
     run.preparation_fingerprint = compute_preparation_fingerprint(run, diff=patch)
     lease_owner = f"publication-fixture-{run.run_id}"
@@ -480,11 +422,7 @@ class FakePublishingGitHub:
         self.calls: list[str] = []
         self.last_head = f"{login}:autocontribute/issue-42-fixture"
         self.pull_request_title = "Correct documented answer"
-        self.pull_request_body = (
-            "Fixes #42.\n\n---\n\nThis contribution was prepared autonomously by an AI "
-            "agent. Its validation evidence comes from Autocontribute's configured "
-            "automated checks; no human review is implied."
-        )
+        self.pull_request_body = ready_proposal(AutocontributeConfig()).pull_request_body
         self.pull_request_draft = True
         self.pull_request_state = "open"
         self.pull_request_merged = False
@@ -1232,13 +1170,14 @@ def test_publisher_rejects_validation_artifact_that_differs_from_manifest(tmp_pa
     config, store, run_id, issue = _ready_run(tmp_path)
     manifest = store.get(run_id)
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    path = store.artifact_dir(run_id) / "validation.json"
     store.write_artifact(
         run_id,
         "validation.json",
-        render_validation_artifact(manifest).replace("1 passed", "untrusted replacement"),
+        path.read_text(encoding="utf-8").replace("approve", "untrusted replacement"),
     )
 
-    with pytest.raises(PolicyError, match="durable command evidence"):
+    with pytest.raises(PolicyError, match="run's validation evidence"):
         Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
 
     assert github.calls == []
@@ -1260,7 +1199,7 @@ def test_publisher_requires_exact_current_ai_disclosure(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "drift",
-    ["commands", "quality", "policy", "allowlist", "sandbox", "publishing"],
+    ["environment", "quality", "policy", "allowlist", "sandbox", "publishing"],
 )
 def test_preparation_configuration_drift_stops_before_github_work(
     tmp_path: Path,
@@ -1269,8 +1208,8 @@ def test_preparation_configuration_drift_stops_before_github_work(
     config, store, run_id, issue = _ready_run(tmp_path)
     manifest = store.get(run_id)
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
-    if drift == "commands":
-        config.validation.required_commands["example/project"] = ["python -m pytest -q"]
+    if drift == "environment":
+        config.environments = {"example/project": EnvironmentOverride(test="python -m pytest -q")}
     elif drift == "quality":
         config.quality.max_changed_lines += 1
     elif drift == "policy":
@@ -1290,32 +1229,26 @@ def test_preparation_configuration_drift_stops_before_github_work(
 
 
 def test_ai_disclosure_hidden_in_html_comment_is_rejected(tmp_path: Path) -> None:
-    config, store, run_id, _ = _ready_run(tmp_path)
+    _config, store, run_id, _ = _ready_run(tmp_path)
     manifest = store.get(run_id)
     assert manifest.proposal is not None
-    manifest.proposal.pull_request_body = f"Fixes #42.\n\n<!-- {config.policy.ai_disclosure} -->"
+    manifest.proposal.pull_request_body = f"Fixes #42.\n\n<!-- {manifest.proposal.disclosure} -->"
 
     with pytest.raises(PolicyError, match="visibly contain"):
-        validate_publication_text(
-            manifest,
-            required_disclosure=config.policy.ai_disclosure,
-        )
+        validate_publication_text(manifest, check_disclosure=True)
 
 
 @pytest.mark.parametrize("fence", ["```", "~~~~"])
 def test_ai_disclosure_inside_fenced_code_is_rejected(tmp_path: Path, fence: str) -> None:
-    config, store, run_id, _ = _ready_run(tmp_path)
+    _config, store, run_id, _ = _ready_run(tmp_path)
     manifest = store.get(run_id)
     assert manifest.proposal is not None
     manifest.proposal.pull_request_body = (
-        f"Fixes #42.\n\n{fence}text\n{config.policy.ai_disclosure}\n{fence}\n"
+        f"Fixes #42.\n\n{fence}text\n{manifest.proposal.disclosure}\n{fence}\n"
     )
 
     with pytest.raises(PolicyError, match="visibly contain"):
-        validate_publication_text(
-            manifest,
-            required_disclosure=config.policy.ai_disclosure,
-        )
+        validate_publication_text(manifest, check_disclosure=True)
 
 
 def test_publication_text_rejects_tokens_from_the_shared_credential_patterns(
@@ -3047,8 +2980,7 @@ def _unapproved_run_with_login(
     config.publishing.login = login
     manifest = store.get(run_id)
     manifest.preparation_config_fingerprint = compute_preparation_config_fingerprint(
-        config,
-        repository=issue.repository,
+        config, repository=issue.repository, models=MODELS
     )
     patch = (store.artifact_dir(run_id) / "contribution.patch").read_bytes()
     manifest.preparation_fingerprint = compute_preparation_fingerprint(manifest, diff=patch)

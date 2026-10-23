@@ -1,20 +1,12 @@
-"""Deterministic quality gates for a proposed git diff.
-
-The model's review is one input to this module, not an authority.  Every gate
-here is local, reproducible, and represented in the returned ``QualityReport``.
-"""
+"""Signatures of a broken test environment, and the paths a git diff touches."""
 
 from __future__ import annotations
 
 import re
 import shlex
-from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-from autocontribute.config import AutocontributeConfig
-from autocontribute.diff_gates import is_dependency_path, is_workflow_path, path_matches
-from autocontribute.domain import CommandResult, CriticReview, GateResult, QualityReport
-from autocontribute.redaction import high_confidence_token_labels
+from autocontribute.diff_gates import is_workflow_path
 
 # Tests run offline by design, so these alone do not mean the environment is broken.
 _NETWORK_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -139,343 +131,12 @@ _INFRASTRUCTURE_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
 )
-_ACTIONABLE_VALIDATION_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "an assertion failed",
-        re.compile(r"\b(?:AssertionError|AssertionFailedError|assertion failed)\b", re.I),
-    ),
-    (
-        "a test runner reported a failing test",
-        re.compile(
-            r"(?m)^(?:FAILED(?:\s|$)|FAIL:\s|--- FAIL:)|"
-            r"\b[1-9][0-9]* failed(?:[,\s]|$)|"
-            r"\btest result:\s*FAILED\b|"
-            r"\bFailures:\s*[1-9][0-9]*\b|"
-            r"\bFAILED \(failures=[1-9][0-9]*",
-            re.I,
-        ),
-    ),
-    (
-        "the changed source has a syntax error",
-        re.compile(r"\b(?:SyntaxError|IndentationError|TabError)\b"),
-    ),
-    (
-        "a compiler or type checker reported a source error",
-        re.compile(
-            r"(?m)^[^:\r\n]{1,500}:\d+(?::\d+)?:\s+(?:fatal\s+)?error:|"
-            r"^[^:\r\n]{1,500}(?::\d+:\d+|\(\d+,\d+\)):\s*"
-            r"error\s+(?:TS|CS)\d+\b|"
-            r"^\[ERROR\]\s+[^:\r\n]{1,500}:\[\d+,\d+\]\s+|"
-            r"^\.?(?:/[^:\r\n]+|[^:\r\n]+):\d+:\d+:\s+"
-            r"(?:undefined|syntax error|cannot use|too many arguments|not enough arguments)\b",
-            re.I,
-        ),
-    ),
-    (
-        "a linter reported a source diagnostic",
-        re.compile(r"(?m)^[^:\r\n]{1,500}:\d+:\d+:\s+[A-Z]{1,5}\d{3,4}\b"),
-    ),
-)
-_RUST_ERROR_LINE = re.compile(r"^\s*error\[E\d+\]:", re.I)
-_RUST_SOURCE_LOCATION_LINE = re.compile(
-    r"^\s*-->\s+[^:\r\n]{1,500}:\d+:\d+\s*$",
-    re.I,
-)
 
 
 @dataclass
 class _DiffFile:
     old_path: str
     new_path: str
-    additions: int = 0
-    deletions: int = 0
-    binary: bool = False
-    symlink: bool = False
-    submodule: bool = False
-    mode_changed: bool = False
-    added_lines: list[str] = field(default_factory=list)
-
-    @property
-    def path(self) -> str:
-        return self.new_path if self.new_path != "/dev/null" else self.old_path
-
-    @property
-    def changed_lines(self) -> int:
-        return self.additions + self.deletions
-
-
-class QualityEvaluator:
-    """Evaluate non-negotiable local gates for one candidate patch."""
-
-    def __init__(self, config: AutocontributeConfig) -> None:
-        self.config = config
-
-    def evaluate(
-        self,
-        *,
-        diff: str,
-        command_results: Sequence[CommandResult],
-        required_commands: Sequence[str],
-        review: CriticReview,
-        baseline_result: CommandResult | None = None,
-        contribution_kind: str | None = None,
-    ) -> QualityReport:
-        files = _parse_git_diff(diff)
-        paths = [item.path for item in files]
-        changed_lines = sum(item.changed_lines for item in files)
-        gates: list[GateResult] = []
-
-        def gate(name: str, passed: bool, evidence: str) -> None:
-            gates.append(GateResult(gate=name, passed=passed, evidence=evidence))
-
-        gate(
-            "diff_present",
-            bool(files),
-            f"parsed {len(files)} changed file(s) from the git diff",
-        )
-        file_limit = self.config.quality.max_files_changed
-        gate(
-            "file_count",
-            0 < len(files) <= file_limit,
-            f"{len(files)} changed file(s); maximum is {file_limit}",
-        )
-        line_limit = self.config.quality.max_changed_lines
-        gate(
-            "changed_lines",
-            0 < changed_lines <= line_limit,
-            f"{changed_lines} added/deleted line(s); maximum is {line_limit}",
-        )
-
-        binary_paths = [item.path for item in files if item.binary]
-        gate(
-            "no_binary_files",
-            not binary_paths,
-            _path_evidence("binary file", binary_paths),
-        )
-        symlink_paths = [item.path for item in files if item.symlink]
-        gate(
-            "no_symlinks",
-            not symlink_paths,
-            _path_evidence("symlink", symlink_paths),
-        )
-        submodule_paths = [item.path for item in files if item.submodule]
-        gate(
-            "no_submodules",
-            not submodule_paths,
-            _path_evidence("submodule", submodule_paths),
-        )
-        mode_paths = [item.path for item in files if item.mode_changed]
-        gate(
-            "no_mode_changes",
-            not mode_paths,
-            _path_evidence("mode change", mode_paths),
-        )
-
-        unsafe_paths = [path for path in paths if not _safe_repository_path(path)]
-        gate(
-            "safe_paths",
-            not unsafe_paths,
-            _path_evidence("unsafe path", unsafe_paths),
-        )
-        forbidden_paths = [
-            path
-            for path in paths
-            if any(path_matches(path, pattern) for pattern in self.config.quality.forbidden_paths)
-        ]
-        gate(
-            "forbidden_paths",
-            not forbidden_paths,
-            _path_evidence("configured forbidden path", forbidden_paths),
-        )
-
-        dependency_paths = [path for path in paths if is_dependency_path(path)]
-        dependency_allowed = self.config.policy.allow_dependency_changes
-        gate(
-            "dependency_policy",
-            dependency_allowed or not dependency_paths,
-            (
-                "dependency changes are allowed by policy"
-                if dependency_allowed
-                else _path_evidence("dependency or lock file", dependency_paths)
-            ),
-        )
-        workflow_paths = [path for path in paths if is_workflow_path(path)]
-        workflow_allowed = self.config.policy.allow_workflow_changes
-        gate(
-            "workflow_policy",
-            workflow_allowed or not workflow_paths,
-            (
-                "workflow changes are allowed by policy"
-                if workflow_allowed
-                else _path_evidence("workflow file", workflow_paths)
-            ),
-        )
-
-        secret_findings = _secret_findings(files)
-        gate(
-            "secret_scan",
-            not secret_findings,
-            (
-                "no secret patterns detected in added lines"
-                if not secret_findings
-                else "secret pattern(s) detected (values redacted): " + ", ".join(secret_findings)
-            ),
-        )
-
-        required = list(dict.fromkeys(required_commands))
-        missing_required: list[str] = []
-        failed_required: list[str] = []
-        for command in required:
-            matching_results = [result for result in command_results if result.command == command]
-            if not matching_results:
-                missing_required.append(command)
-            elif not any(result.passed for result in matching_results):
-                failed_required.append(command)
-        passed_required = len(required) - len(missing_required) - len(failed_required)
-        required_evidence = (
-            f"{passed_required}/{len(required)} operator-required validation command(s) passed"
-        )
-        if missing_required:
-            required_evidence += "; not executed: " + ", ".join(
-                repr(command) for command in missing_required
-            )
-        if failed_required:
-            required_evidence += "; failed: " + ", ".join(
-                repr(command) for command in failed_required
-            )
-        if not required:
-            required_evidence += "; no operator-required commands were supplied"
-        gate(
-            "required_validation",
-            bool(required) and not missing_required and not failed_required,
-            required_evidence,
-        )
-
-        passed_commands = sum(result.passed for result in command_results)
-        failed_indexes = [
-            str(index) for index, result in enumerate(command_results, start=1) if not result.passed
-        ]
-        validation_ok = bool(command_results) and passed_commands == len(command_results)
-        validation_evidence = (
-            f"{passed_commands}/{len(command_results)} validation command(s) passed"
-        )
-        if failed_indexes:
-            validation_evidence += f"; failed command index(es): {', '.join(failed_indexes)}"
-        elif not command_results:
-            validation_evidence += "; at least one command is required"
-        gate("validation", validation_ok, validation_evidence)
-
-        if (
-            self.config.quality.require_regression_evidence_for_bugfix
-            and contribution_kind == "bugfix"
-        ):
-            patched_reproduction = next(
-                (
-                    result
-                    for result in command_results
-                    if baseline_result is not None and result.command == baseline_result.command
-                ),
-                None,
-            )
-            regression_ok = False
-            if baseline_result is None:
-                regression_evidence = "no pristine-upstream reproduction result was recorded"
-            elif baseline_result.passed:
-                regression_evidence = "the reproduction unexpectedly passed on pristine upstream"
-            elif rejection := _baseline_failure_rejection(baseline_result):
-                regression_evidence = f"baseline failure rejected: {rejection}"
-            elif patched_reproduction is None:
-                regression_evidence = "the same reproduction command was not run with the patch"
-            elif not patched_reproduction.passed:
-                regression_evidence = "the reproduction still failed with the patch"
-            else:
-                regression_ok = True
-                regression_evidence = (
-                    "same reproduction failed on pristine upstream and passed with the patch"
-                )
-            gate(
-                "regression_evidence",
-                regression_ok,
-                regression_evidence,
-            )
-
-        gate(
-            "critic_verdict",
-            review.verdict == "approve",
-            f"critic verdict: {review.verdict}",
-        )
-        gate(
-            "critic_blockers",
-            not review.blocking_findings,
-            (
-                "critic reported no blocking findings"
-                if not review.blocking_findings
-                else f"critic reported {len(review.blocking_findings)} blocking finding(s)"
-            ),
-        )
-        gate(
-            "issue_requirements",
-            not review.issue_requirements_missing,
-            (
-                "critic reported no missing issue requirements"
-                if not review.issue_requirements_missing
-                else (
-                    f"critic reported {len(review.issue_requirements_missing)} "
-                    "missing requirement(s)"
-                )
-            ),
-        )
-        minimum_dimension = review.scores.minimum()
-        required_dimension = self.config.quality.min_dimension_score
-        gate(
-            "minimum_review_dimension",
-            minimum_dimension >= required_dimension,
-            f"minimum critic dimension is {minimum_dimension}; required {required_dimension}",
-        )
-        readiness_score = review.scores.weighted_score()
-        required_readiness = self.config.quality.min_readiness_score
-        gate(
-            "readiness_score",
-            readiness_score >= required_readiness,
-            f"weighted readiness is {readiness_score}; required {required_readiness}",
-        )
-
-        return QualityReport(
-            ready=all(item.passed for item in gates),
-            readiness_score=readiness_score,
-            gates=gates,
-            review=review,
-            changed_files=len(files),
-            changed_lines=changed_lines,
-        )
-
-
-def infrastructure_failure_reason(result: CommandResult) -> str | None:
-    """Explain why a failed command is not actionable repository-code evidence."""
-
-    if result.passed:
-        return None
-    if result.timed_out:
-        return "the validation command timed out"
-    if result.exit_code < 0:
-        return "the validation process was terminated by a host signal"
-    if result.exit_code == 125:
-        return "the Docker validation process could not be started"
-    if result.exit_code in {126, 127}:
-        return (
-            f"exit code {result.exit_code} indicates an unavailable command or permission failure"
-        )
-    if result.exit_code in {130, 137, 143}:
-        return f"exit code {result.exit_code} indicates external or resource-limit termination"
-    output = f"{result.stdout}\n{result.stderr}"
-    if "[output truncated by autocontribute]" in output:
-        return "the validation command output was truncated before it could be classified safely"
-    if _installed_python_package_syntax_failure(output):
-        return "an installed Python package was incompatible with the interpreter"
-    for reason, pattern in _INFRASTRUCTURE_FAILURE_PATTERNS:
-        if pattern.search(output):
-            return reason
-    return None
 
 
 def environment_failure_signature(output: str) -> str | None:
@@ -491,72 +152,9 @@ def environment_failure_signature(output: str) -> str | None:
     return None
 
 
-def actionable_validation_failure_reason(result: CommandResult) -> str | None:
-    """Return a bounded positive reason for offering one repository-code repair."""
-
-    if result.passed or infrastructure_failure_reason(result) is not None:
-        return None
-    output = f"{result.stdout}\n{result.stderr}"
-    for reason, pattern in _ACTIONABLE_VALIDATION_FAILURE_PATTERNS:
-        if pattern.search(output):
-            return reason
-    if _rust_source_diagnostic(output):
-        return "a compiler or type checker reported a source error"
-    return None
-
-
-def _installed_python_package_syntax_failure(output: str) -> bool:
-    """Recognize an adjacent package traceback frame and syntax error in linear time."""
-
-    package_frame_line: int | None = None
-    for line_number, line in enumerate(output.splitlines()):
-        folded = line.casefold()
-        normalized = folded.replace("\\", "/")
-        if (
-            line.lstrip().startswith("File ")
-            and ("site-packages/" in normalized or "dist-packages/" in normalized)
-            and ", line " in folded
-        ):
-            package_frame_line = line_number
-        if (
-            package_frame_line is not None
-            and line_number - package_frame_line <= 4
-            and line.lstrip().startswith(("SyntaxError", "IndentationError", "TabError"))
-        ):
-            return True
-        if package_frame_line is not None and line_number - package_frame_line > 4:
-            package_frame_line = None
-    return False
-
-
-def _rust_source_diagnostic(output: str) -> bool:
-    """Require a nearby rustc source location without overlapping cross-output scans."""
-
-    error_line: int | None = None
-    for line_number, line in enumerate(output.splitlines()):
-        if _RUST_ERROR_LINE.match(line):
-            error_line = line_number
-        if (
-            error_line is not None
-            and line_number - error_line <= 8
-            and _RUST_SOURCE_LOCATION_LINE.match(line)
-        ):
-            return True
-        if error_line is not None and line_number - error_line > 8:
-            error_line = None
-    return False
-
-
-def _baseline_failure_rejection(result: CommandResult) -> str | None:
-    if result.timed_out:
-        return "the baseline command timed out"
-    return infrastructure_failure_reason(result)
-
-
 def _parse_git_diff(diff: str) -> list[_DiffFile]:
     files: list[_DiffFile] = []
     current: _DiffFile | None = None
-    in_hunk = False
 
     for line in diff.splitlines():
         if line.startswith("diff --git "):
@@ -567,33 +165,10 @@ def _parse_git_diff(diff: str) -> list[_DiffFile]:
                 current = _DiffFile(old_path="<unparseable>", new_path="<unparseable>")
             else:
                 current = _DiffFile(old_path=paths[0], new_path=paths[1])
-            in_hunk = False
-            continue
-        if current is None:
-            continue
-        if line.startswith("@@"):
-            in_hunk = True
-        elif line.startswith("rename from "):
+        elif current is not None and line.startswith("rename from "):
             current.old_path = _unquote_path(line.removeprefix("rename from "))
-        elif line.startswith("rename to "):
+        elif current is not None and line.startswith("rename to "):
             current.new_path = _unquote_path(line.removeprefix("rename to "))
-        elif line.startswith("Binary files ") or line == "GIT binary patch":
-            current.binary = True
-        elif re.match(r"(?:old|new|new file|deleted file) mode 120000$", line):
-            current.symlink = True
-        elif re.match(r"(?:old|new|new file|deleted file) mode 160000$", line):
-            current.submodule = True
-        elif line.startswith("index ") and line.endswith(" 120000"):
-            current.symlink = True
-        elif line.startswith("index ") and line.endswith(" 160000"):
-            current.submodule = True
-        elif line.startswith("old mode ") or line.startswith("new mode "):
-            current.mode_changed = True
-        elif in_hunk and line.startswith("+"):
-            current.additions += 1
-            current.added_lines.append(line[1:])
-        elif in_hunk and line.startswith("-"):
-            current.deletions += 1
 
     if current is not None:
         files.append(current)
@@ -620,28 +195,6 @@ def _unquote_path(path: str) -> str:
     except ValueError:
         return "<unparseable>"
     return parts[0] if len(parts) == 1 else path
-
-
-def _safe_repository_path(path: str) -> bool:
-    if not path or path in {"/dev/null", ".", "..", "<unparseable>"}:
-        return False
-    normalized = path.replace("\\", "/")
-    if normalized.startswith("/") or "\x00" in normalized:
-        return False
-    return ".." not in normalized.split("/") and not any(ord(char) < 32 for char in normalized)
-
-
-def _secret_findings(files: Sequence[_DiffFile]) -> list[str]:
-    # The high-confidence token patterns only: password-style assignments are mostly test
-    # fixtures, and a hit here stops every run (G6).
-    return sorted(
-        {
-            f"{label} in {item.path}"
-            for item in files
-            for added_line in item.added_lines
-            for label in high_confidence_token_labels(added_line)
-        }
-    )
 
 
 def patch_paths(diff: str) -> list[str]:
@@ -671,26 +224,4 @@ def workflow_paths(diff: str) -> list[str]:
     )
 
 
-def secret_findings(diff: str) -> list[str]:
-    """Return credential-like findings without retaining or returning matched values."""
-
-    return _secret_findings(_parse_git_diff(diff))
-
-
-def _path_evidence(kind: str, paths: Sequence[str]) -> str:
-    if not paths:
-        return f"no {kind}s detected"
-    rendered = ", ".join(sorted(dict.fromkeys(paths))[:5])
-    suffix = "" if len(set(paths)) <= 5 else f" (+{len(set(paths)) - 5} more)"
-    return f"{kind}(s) detected: {rendered}{suffix}"
-
-
-__all__ = [
-    "QualityEvaluator",
-    "actionable_validation_failure_reason",
-    "environment_failure_signature",
-    "infrastructure_failure_reason",
-    "patch_paths",
-    "secret_findings",
-    "workflow_paths",
-]
+__all__ = ["environment_failure_signature", "patch_paths", "workflow_paths"]

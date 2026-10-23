@@ -23,9 +23,6 @@ from autocontribute.redaction import high_confidence_token_labels, is_sensitive_
 from autocontribute.repository import RepositoryWorkspace
 from autocontribute.workspace_files import WorkspaceFiles
 
-# DESIGN §2: the new quality keys for non-test files.
-DEFAULT_MAX_SOURCE_FILES: Final = 3
-DEFAULT_MAX_SOURCE_LINES: Final = 150
 _LISTED_PATHS: Final = 5
 
 _DEPENDENCY_FILES: Final = frozenset(
@@ -159,8 +156,6 @@ def diff_gates(
     quality: QualityConfig,
     policy: PolicyConfig,
     host_values: frozenset[str],
-    max_source_files: int = DEFAULT_MAX_SOURCE_FILES,
-    max_source_lines: int = DEFAULT_MAX_SOURCE_LINES,
 ) -> DiffGateOutcome:
     """Run every diff gate on ``patch``, extracted from ``workspace``, and its test split.
 
@@ -194,13 +189,14 @@ def diff_gates(
     sources = len(split.sources.files)
     gate(
         "source_file_count",
-        sources <= max_source_files,
-        f"{sources} changed non-test file(s); the limit is {max_source_files}",
+        sources <= quality.max_source_files,
+        f"{sources} changed non-test file(s); the limit is {quality.max_source_files}",
     )
     gate(
         "source_changed_lines",
-        split.sources.changed_lines <= max_source_lines,
-        f"{split.sources.changed_lines} changed non-test line(s); the limit is {max_source_lines}",
+        split.sources.changed_lines <= quality.max_source_lines,
+        f"{split.sources.changed_lines} changed non-test line(s); the limit is "
+        f"{quality.max_source_lines}",
     )
     for name, kind, flagged in (
         ("no_binary_files", "binary file", _binary),
@@ -519,8 +515,6 @@ def _evidence(kind: str, paths: Sequence[str]) -> str:
 
 
 __all__ = [
-    "DEFAULT_MAX_SOURCE_FILES",
-    "DEFAULT_MAX_SOURCE_LINES",
     "ChangedTests",
     "DiffGateOutcome",
     "changed_tests",
