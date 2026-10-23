@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from autocontribute.config import SandboxConfig
+from autocontribute.edit_tools import apply_patch_operation, run_text_editor, syntax_check
 from autocontribute.sandbox import (
     DockerSandbox,
     SessionContainer,
@@ -29,6 +30,7 @@ from autocontribute.sandbox import (
     docker_container_identity,
     remove_leftover_containers,
 )
+from autocontribute.workspace_files import WorkspaceFiles
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("AUTOCONTRIBUTE_RUN_DOCKER_TESTS") != "1",
@@ -37,6 +39,8 @@ pytestmark = pytest.mark.skipif(
 
 # Busybox provides sh, setsid and `sleep infinity`, which is all the session tests need.
 _ALPINE = "alpine@sha256:d406446bc05b82480756ce8f1287964d28768c23955fa9480d2a74a2eae7a654"
+# The smallest official Python image, for the syntax check.
+_PYTHON = "python@sha256:e32be0e55814a08977501ca863271d9bd02443710db8f2afaf8372e2c4508530"
 _SESSION_CONFIG = SandboxConfig(memory="512m", cpus=1.0, pids_limit=64)
 _MAIN_UID = "65534"
 _PROXY_NAMES = (
@@ -65,19 +69,28 @@ def _docker(*arguments: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-@pytest.fixture(scope="module")
-def alpine_image() -> Iterator[str]:
+def _pinned_image(image: str) -> Iterator[str]:
     if shutil.which("docker") is None:
         pytest.fail("live Docker isolation was requested but Docker is not installed")
-    present = _docker("image", "inspect", _ALPINE).returncode == 0
+    present = _docker("image", "inspect", image).returncode == 0
     if not present:
-        pulled = _docker("pull", "--quiet", _ALPINE)
+        pulled = _docker("pull", "--quiet", image)
         assert pulled.returncode == 0, pulled.stderr
     try:
-        yield _ALPINE
+        yield image
     finally:
         if not present:
-            _docker("image", "rm", _ALPINE)
+            _docker("image", "rm", image)
+
+
+@pytest.fixture(scope="module")
+def alpine_image() -> Iterator[str]:
+    yield from _pinned_image(_ALPINE)
+
+
+@pytest.fixture(scope="module")
+def python_image() -> Iterator[str]:
+    yield from _pinned_image(_PYTHON)
 
 
 @pytest.fixture
@@ -502,3 +515,69 @@ def test_live_leftover_sweep_removes_only_finished_or_unknown_runs(
         active.remove()
         abandoned.remove()
         _docker("network", "rm", network)
+
+
+def test_live_session_saves_full_output_the_agent_can_search(session: SessionContainer) -> None:
+    output = "".join(f"line {number}\n" for number in range(20_000))
+
+    path = session.save_output(1, output)
+
+    assert path == "/tmp/ac-out/1.log"
+    assert _passed(session, f"grep -c '^line' {path}") == "20000\n"
+    assert _passed(session, f"tail -n 1 {path}") == "line 19999\n"
+
+
+def test_live_host_file_tools_refuse_symlinks_a_command_planted(
+    live_root: Path, session: SessionContainer
+) -> None:
+    outside = live_root / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("host secret\n", encoding="utf-8")
+    # Targets are host paths: inside the container they dangle, on the host they resolve.
+    _passed(
+        session,
+        f"ln -s {outside} /workspace/escape && ln -s {outside}/secret.txt /workspace/secret.py",
+    )
+    files = WorkspaceFiles(session.workspace)
+
+    results = [
+        run_text_editor(files, {"command": "view", "path": "/workspace/escape/secret.txt"}),
+        run_text_editor(
+            files, {"command": "create", "path": "escape/planted.txt", "file_text": "x\n"}
+        ),
+        run_text_editor(
+            files,
+            {"command": "str_replace", "path": "secret.py", "old_str": "host", "new_str": "x"},
+        ),
+        apply_patch_operation(
+            files, {"type": "update_file", "path": "secret.py", "diff": "-host secret\n+owned\n"}
+        ),
+        apply_patch_operation(files, {"type": "delete_file", "path": "secret.py"}),
+    ]
+
+    assert [result.status for result in results] == ["failed"] * len(results)
+    assert all("symlink" in result.output for result in results)
+    assert sorted(path.name for path in outside.iterdir()) == ["secret.txt"]
+    assert (outside / "secret.txt").read_text(encoding="utf-8") == "host secret\n"
+
+
+def test_live_syntax_check_reports_errors_and_writes_no_bytecode(
+    live_root: Path, python_image: str, session: SessionContainer
+) -> None:
+    (session.workspace / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+    # Alpine has no Python, so the check has nothing to say.
+    assert syntax_check(session, "broken.py") is None
+
+    with _session(live_root / "python", python_image) as python_session:
+        workspace = python_session.workspace
+        (workspace / "good.py").write_text("value = 1\n", encoding="utf-8")
+        (workspace / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+
+        assert syntax_check(python_session, "good.py") is None
+        message = syntax_check(python_session, "broken.py")
+        assert syntax_check(python_session, "deleted.py") is None
+
+    assert message is not None
+    assert 'File "/workspace/broken.py", line 1' in message
+    assert "SyntaxError" in message
+    assert not list(workspace.rglob("__pycache__"))

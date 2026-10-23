@@ -483,6 +483,7 @@ class _ScriptedDocker:
 
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
+        self.inputs: list[str | None] = []
         self.commands: list[list[str]] = []
         # Queued answers; once a queue is empty the container is healthy and clean.
         self.states: list[str] = []
@@ -496,9 +497,12 @@ class _ScriptedDocker:
         _docker_binary: str,
         arguments: Sequence[str],
         _environment: dict[str, str],
+        *,
+        input_text: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         call = list(arguments)
         self.calls.append(call)
+        self.inputs.append(input_text)
         if call[0] == "run" and self.run_failure is not None:
             return subprocess.CompletedProcess(call, 125, "", self.run_failure)
         if call[0] == "inspect":
@@ -661,6 +665,41 @@ def test_session_command_gets_only_the_allowlisted_environment_and_a_plain_shell
     assert outcome.result.command == "python -m pytest -q"
     assert outcome.infrastructure_failure is None
     assert not outcome.restarted
+
+
+def test_session_saves_full_output_where_the_agent_can_search_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = _ScriptedDocker()
+    session = _session(tmp_path, monkeypatch, docker)
+    session.start()
+
+    path = session.save_output(3, "line\n" * 5_000)
+
+    assert path == "/tmp/ac-out/3.log"
+    assert docker.calls[-1] == [
+        "exec",
+        "--interactive",
+        "--user=1000:1000",
+        session.name,
+        "/usr/bin/env",
+        "-i",
+        "PATH=/usr/bin:/bin",
+        "/bin/sh",
+        "-c",
+        "mkdir -p /tmp/ac-out && cat > /tmp/ac-out/3.log",
+    ]
+    assert docker.inputs[-1] == "line\n" * 5_000
+    with pytest.raises(SandboxError, match="start at 1"):
+        session.save_output(0, "output")
+
+    monkeypatch.setattr(
+        sandbox,
+        "_docker_control",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 1, "", "no space left"),
+    )
+    assert session.save_output(4, "output") is None
 
 
 def test_session_kills_leftover_processes_after_every_command(
