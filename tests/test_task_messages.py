@@ -25,8 +25,6 @@ from autocontribute.repository import RepositoryWorkspace
 from autocontribute.submissions import AgentSubmission, ReviewBlocker
 from autocontribute.task_messages import (
     FILE_CHARACTERS,
-    UNTRUSTED_CLOSE,
-    UNTRUSTED_OPEN,
     RunFacts,
     agent_task,
     baseline_summary,
@@ -36,8 +34,8 @@ from autocontribute.task_messages import (
     read_guidance,
     setup_task,
     triage_task,
-    untrusted_block,
 )
+from autocontribute.untrusted import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, untrusted_block
 
 _HOST_SECRET = "host-secret-value-0123456789"
 _NOW = datetime(2026, 10, 1, tzinfo=UTC)
@@ -81,6 +79,11 @@ def _workspace(
 def _blocks(text: str) -> list[dict[str, Any]]:
     pattern = re.escape(UNTRUSTED_OPEN) + r"\n(.*?)\n" + re.escape(UNTRUSTED_CLOSE)
     return [json.loads(match) for match in re.findall(pattern, text, re.DOTALL)]
+
+
+def _outside_blocks(text: str) -> str:
+    pattern = re.escape(UNTRUSTED_OPEN) + r".*?" + re.escape(UNTRUSTED_CLOSE)
+    return re.sub(pattern, "", text, flags=re.DOTALL)
 
 
 def _issue(**changes: Any) -> IssueCandidate:
@@ -288,14 +291,16 @@ def test_the_agent_task_carries_issue_titles_guidance_policy_and_environment(
         "The repository's AI policy",
         "Environment",
     ]
-    issue, titles, contributing, policy = _blocks(text)
+    issue, titles, contributing, policy, failing = _blocks(text)
     assert issue["data"]["comments"][0]["author_association"] == "MEMBER"
     assert titles["data"] == ["Fix parser crash (#12)", "docs: explain options"]
     assert contributing["label"] == "Contributing guide: CONTRIBUTING.md"
     assert policy["data"]["quotes"] == [{"file": "acme/calc/AI.md", "text": "Disclose AI use."}]
     assert "- Run the tests with: `python -m pytest`" in text
     assert "4 tests: 2 passed in every run, 1 failed in every run" in text
-    assert "they are not yours to fix: t::net" in text
+    assert "These tests already failed before any change; they are not yours to fix:" in text
+    assert failing["label"] == "tests failing before any change"
+    assert failing["data"] == ["t::net"] and "t::net" not in _outside_blocks(text)
 
 
 def test_the_agent_task_says_what_is_missing(tmp_path: Path) -> None:
@@ -405,10 +410,20 @@ def test_the_critic_task_carries_the_design_inputs_and_earlier_blockers() -> Non
     ]
     assert "Contribution guidance, to read in /workspace: CONTRIBUTING.md." in text
     assert "These are the author's claims, not evidence." in text
-    assert "- pass file_count: 2 changed file(s)" in text
-    assert "Red/green: passed: 1 test(s) fail without the fix" in text
-    assert "Failing without the fix: t::adds" in text
+    assert (
+        "Gates: all passed.\nRed/green: passed.\nPatched suite against the baseline: passed."
+        in text
+    )
     blocks = {block["label"]: block["data"] for block in _blocks(text)}
+    assert "t::adds" not in _outside_blocks(text)
+    results = blocks["controller results"]
+    assert results["gates"] == [
+        {"gate": "file_count", "passed": True, "evidence": "2 changed file(s)"}
+    ]
+    assert results["red_green"]["reproduced"] == ["t::adds"]
+    assert results["red_green"]["runs"][0]["command"] == "python -m pytest tests/test_calc.py"
+    assert "output_tail" not in results["red_green"]["runs"][0]
+    assert results["regression"]["detail"] == "the full suite shows no new failure"
     assert blocks["patch"] == "diff --git a/calc.py b/calc.py\n"
     assert blocks["pull request text"]["commit_message"] == "Fix add"
     assert blocks["previous blockers"][0]["category"] == "weak_test"

@@ -62,6 +62,7 @@ from autocontribute.transcript import (
     next_input_reservation,
     read_submission,
 )
+from autocontribute.untrusted import untrusted_block
 
 SubmissionT = TypeVar("SubmissionT", bound=BaseModel)
 SubmissionT_contra = TypeVar("SubmissionT_contra", bound=BaseModel, contravariant=True)
@@ -584,6 +585,7 @@ class Solver:
         if transcript.kind != "agent":
             raise ValueError("the solver drives an agent transcript")
         self._checker = checker
+        self._host_values = host_values
         self._submits = 0
         self._passed: CheckReport | None = None
         self._accepted: CheckReport | None = None
@@ -617,7 +619,7 @@ class Solver:
         self._submits = 0
         self._passed = None
         self._accepted = None
-        return self._outcome(self.loop.resume(_blocker_message(blockers)))
+        return self._outcome(self.loop.resume(_blocker_message(blockers, self._host_values)))
 
     def _outcome(self, outcome: LoopOutcome[AgentSubmission]) -> SolverOutcome:
         if not isinstance(outcome, Finished):
@@ -683,14 +685,17 @@ class Solver:
         )
 
 
-def _blocker_message(blockers: Sequence[ReviewBlocker]) -> str:
-    listed = json.dumps(
-        [blocker.model_dump(mode="json") for blocker in blockers], ensure_ascii=False, indent=2
+def _blocker_message(blockers: Sequence[ReviewBlocker], host_values: frozenset[str]) -> str:
+    # A reviewing model wrote them, quoting the repository: data, like the issue.
+    listed = untrusted_block(
+        "reviewer's blockers",
+        [blocker.model_dump(mode="json") for blocker in blockers],
+        host_values=host_values,
     )
     return (
         "A reviewer checked the change you submitted and found problems that block it. Fix "
         "them, run the tests again, and call submit again; the checks and the confirming submit "
-        f"work as before. The blockers, as JSON:\n{listed}"
+        f"work as before. The blockers:\n{listed}"
     )
 
 
