@@ -17,6 +17,8 @@ from autocontribute.exceptions import ConfigurationError
 
 Provider = Literal["openai", "anthropic"]
 Role = Literal["agent", "critic", "setup", "triage"]
+# The roles whose auto model is a tier of the auto provider; the critic follows the agent.
+TierRole = Literal["agent", "setup", "triage"]
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
 MODEL_TABLE_DATE: Final = date(2026, 10, 22)
@@ -158,20 +160,14 @@ MODELS: Final[Mapping[str, ModelSpec]] = MappingProxyType({spec.id: spec for spe
 API_KEY_ENVS: Final[Mapping[Provider, str]] = MappingProxyType(
     {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
 )
-ROLE_MODELS: Final[Mapping[Provider, Mapping[Role, str]]] = MappingProxyType(
+ROLE_MODELS: Final[Mapping[Provider, Mapping[TierRole, str]]] = MappingProxyType(
     {
         "openai": MappingProxyType(
-            {
-                "agent": "gpt-5.6-sol",
-                "critic": "gpt-5.6-sol",
-                "setup": "gpt-5.6-terra",
-                "triage": "gpt-5.6-luna",
-            }
+            {"agent": "gpt-5.6-sol", "setup": "gpt-5.6-terra", "triage": "gpt-5.6-luna"}
         ),
         "anthropic": MappingProxyType(
             {
                 "agent": "claude-opus-5-5",
-                "critic": "claude-opus-5-5",
                 "setup": "claude-sonnet-5-5",
                 "triage": "claude-haiku-5-5",
             }
@@ -195,8 +191,8 @@ TURN_OUTPUT_CAPS: Final[Mapping[Provider, Mapping[Role, int]]] = MappingProxyTyp
 )
 
 
-def resolve_model(name: str, role: Role, environ: Mapping[str, str]) -> ModelSpec:
-    """Return the table entry for a configured model name.
+def resolve_model(name: str, role: TierRole, environ: Mapping[str, str]) -> ModelSpec:
+    """Return the table entry for a configured model name; the critic uses ``resolve_critic``.
 
     ``auto`` picks Anthropic when its API key is set, else OpenAI when its key is set, and then
     that provider's default model for the role.
@@ -210,6 +206,25 @@ def resolve_model(name: str, role: Role, environ: Mapping[str, str]) -> ModelSpe
             f"models.{role} is auto, but no model API key is set; set "
             f"{API_KEY_ENVS['anthropic']} or {API_KEY_ENVS['openai']}"
         )
+    return _table_model(name, role)
+
+
+def resolve_critic(name: str, agent: ModelSpec, environ: Mapping[str, str]) -> ModelSpec:
+    """Return the table entry for the configured critic model, given the resolved agent model.
+
+    ``auto`` is the agent's model, unless both providers' API keys are set: then it is the other
+    provider's agent model, so the review does not come from the model that wrote the change.
+    """
+
+    if name != AUTO_MODEL:
+        return _table_model(name, "critic")
+    other: Provider = "openai" if agent.provider == "anthropic" else "anthropic"
+    if environ.get(API_KEY_ENVS[agent.provider]) and environ.get(API_KEY_ENVS[other]):
+        return MODELS[ROLE_MODELS[other]["agent"]]
+    return agent
+
+
+def _table_model(name: str, role: Role) -> ModelSpec:
     spec = MODELS.get(name)
     if spec is None:
         # The value is not echoed: a key pasted into the wrong field must not reach the logs.
@@ -266,7 +281,9 @@ __all__ = [
     "Provider",
     "Rates",
     "Role",
+    "TierRole",
     "cost",
+    "resolve_critic",
     "resolve_model",
     "upper_bound_cost",
 ]
