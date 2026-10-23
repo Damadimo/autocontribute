@@ -648,8 +648,14 @@ class RepositoryWorkspace:
                     if parent == PurePosixPath(".")
                     else self._resolve_path(str(parent), must_exist=True)
                 )
+                target = directory / PurePosixPath(relative_path).name
                 try:
-                    (directory / PurePosixPath(relative_path).name).unlink()
+                    if stat.S_ISDIR(os.lstat(target).st_mode):
+                        # A new nested repository is one added path; rmtree never follows
+                        # a symlink inside it.
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
                 except OSError as exc:
                     raise RepositoryError(f"Could not delete {relative_path}: {exc}") from exc
         restored = [path for status, path in changes if status != "A"]
@@ -708,6 +714,18 @@ class RepositoryWorkspace:
         if len(data) > max_bytes:
             raise RepositoryError(f"Blob {object_id} exceeds the {max_bytes}-byte limit")
         return data
+
+    def _submodule_paths(self) -> list[str]:
+        """Every submodule path of the base commit, non-UTF-8 ones included."""
+
+        output = self._git_bytes(["ls-tree", "-r", "-z", "--full-tree", self.base_sha])
+        paths: list[str] = []
+        for record in output.split(b"\0"):
+            metadata, separator, raw_path = record.partition(b"\t")
+            if separator and metadata.startswith(b"160000 "):
+                # Round-trips through the file-system encoding back to the same bytes.
+                paths.append(os.fsdecode(raw_path))
+        return paths
 
     def _tracked_paths(self) -> list[str]:
         output = self._git_bytes(["ls-files", "-z", "--cached"])
@@ -954,8 +972,15 @@ class _TemporaryIndex:
         shutil.copy2(real_index, index)
         environment = _git_environment()
         environment["GIT_INDEX_FILE"] = str(index)
+        # `git add` runs `git status` inside a submodule's directory to see whether it is
+        # dirty, and that child git reads the configuration and attributes of whatever
+        # repository a container put there. Submodule paths are therefore left out, so their
+        # changes never reach a patch.
+        excluded = [f":(exclude,literal){path}" for path in self.workspace._submodule_paths()]
         try:
-            self.workspace._git_bytes(["add", "--all", "--", "."], environment=environment)
+            self.workspace._git_bytes(
+                ["add", "--all", "--", ".", *excluded], environment=environment
+            )
         except Exception:
             self._directory.cleanup()
             raise
