@@ -289,7 +289,11 @@ def test_next_request_replays_the_turn_unchanged_and_answers_it_in_one_user_mess
         _message(_TEXT, stop_reason="end_turn"),
     )
     transcript = Transcript(
-        model="claude-opus-5-5", kind="agent", run_id=_RUN_ID, instructions=_INSTRUCTIONS
+        model="claude-opus-5-5",
+        effort="high",
+        kind="agent",
+        run_id=_RUN_ID,
+        instructions=_INSTRUCTIONS,
     )
     append_user_text(transcript, "Fix issue 12 in /workspace.")
 
