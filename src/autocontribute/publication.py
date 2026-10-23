@@ -3347,6 +3347,10 @@ class Publisher:
 
     def _check_freshness(self, manifest: RunManifest) -> None:
         assert manifest.candidate and manifest.repository and manifest.base_sha
+        self.store.assert_publication_not_held(
+            manifest.repository.full_name,
+            pull_request_url=manifest.pull_request_url,
+        )
         issue = self.github.get_issue(manifest.candidate.repository, manifest.candidate.number)
         repository = self.github.get_repository(manifest.repository.full_name)
         if repository.full_name.casefold() != manifest.repository.full_name.casefold():

@@ -350,9 +350,7 @@ def _github_checks(
     try:
         with GitHubClient(
             config.github,
-            safety_trigger_handler=(
-                store.trip_circuit_breaker_trigger if store is not None else None
-            ),
+            safety_trigger_handler=(store.record_stop if store is not None else None),
         ) as github:
             github_token = _DOCTOR_SECRET_VALUES.set(
                 tuple(dict.fromkeys((*_DOCTOR_SECRET_VALUES.get(), github.token)))

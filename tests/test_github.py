@@ -602,7 +602,7 @@ def test_exhausted_rate_limit_retries_then_fails_without_tripping_breaker(
         )
 
     with (
-        _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github,
+        _client(handler, safety_trigger_handler=store.record_stop) as github,
         pytest.raises(GitHubError, match="rate limited") as raised,
     ):
         github.authenticated_login()
@@ -631,7 +631,7 @@ def test_rate_limit_retry_honors_wait_and_recovers(tmp_path, monkeypatch) -> Non
     def handler(request: httpx.Request) -> httpx.Response:
         return next(responses)
 
-    with _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github:
+    with _client(handler, safety_trigger_handler=store.record_stop) as github:
         assert github.authenticated_login() == "octocat"
 
     assert waits == [3.0]
@@ -654,7 +654,7 @@ def test_excessive_rate_limit_wait_fails_fast_without_sleeping(tmp_path, monkeyp
         )
 
     with (
-        _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github,
+        _client(handler, safety_trigger_handler=store.record_stop) as github,
         pytest.raises(GitHubError, match="rate limited"),
     ):
         github.authenticated_login()
@@ -678,7 +678,7 @@ def test_permission_403_fails_without_retry_or_breaker(tmp_path, monkeypatch) ->
         return httpx.Response(403, json={"message": "Resource not accessible by this token"})
 
     with (
-        _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github,
+        _client(handler, safety_trigger_handler=store.record_stop) as github,
         pytest.raises(GitHubError, match="returned 403") as raised,
     ):
         github.authenticated_login()
@@ -705,7 +705,7 @@ def test_persistent_abuse_signal_is_persisted_after_honored_wait(tmp_path, monke
 
     with _client(
         handler,
-        safety_trigger_handler=store.trip_circuit_breaker_trigger,
+        safety_trigger_handler=store.record_stop,
     ) as github:
         with pytest.raises(GitHubSafetyError, match="global safety stop") as raised:
             github.authenticated_login()
@@ -738,7 +738,7 @@ def test_transient_abuse_signal_recovers_without_tripping_breaker(tmp_path, monk
     def handler(request: httpx.Request) -> httpx.Response:
         return next(responses)
 
-    with _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github:
+    with _client(handler, safety_trigger_handler=store.record_stop) as github:
         assert github.authenticated_login() == "octocat"
 
     assert waits == [30.0]
@@ -763,7 +763,7 @@ def test_account_suspension_trips_breaker_immediately(tmp_path, monkeypatch) -> 
         )
 
     with (
-        _client(handler, safety_trigger_handler=store.trip_circuit_breaker_trigger) as github,
+        _client(handler, safety_trigger_handler=store.record_stop) as github,
         pytest.raises(GitHubSafetyError, match="suspended"),
     ):
         github.authenticated_login()

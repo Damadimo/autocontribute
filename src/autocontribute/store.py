@@ -27,7 +27,12 @@ from autocontribute.domain import (
     RunStatus,
     utc_now,
 )
-from autocontribute.exceptions import CircuitBreakerTrigger, StateError
+from autocontribute.exceptions import (
+    CircuitBreakerTrigger,
+    PolicyError,
+    StateError,
+    StopScope,
+)
 from autocontribute.issue_revision import compute_issue_revision
 from autocontribute.lifecycle import parse_pull_request_url
 
@@ -38,6 +43,11 @@ _MAX_RUN_CORPUS: Final = 10_000
 _CANDIDATE_REPOSITORY: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SHA256: Final = re.compile(r"^[0-9a-f]{64}$")
+_ISSUE_KEY: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$")
+_HTTPS_KEY: Final = re.compile(r"^https://[^\s/]+(?:/\S*)?$")
+# Holds from maintainer stop text in this many repositories within the window stop everything.
+_MAINTAINER_STOP_ESCALATION_REPOSITORIES: Final = 2
+_MAINTAINER_STOP_ESCALATION_WINDOW: Final = timedelta(days=30)
 _INITIAL_EVENT_HASH: Final = "0" * 64
 _METADATA_COLUMNS: Final = {"singleton", "schema_version", "migrated_at"}
 _RUN_COLUMNS: Final = {
@@ -119,6 +129,20 @@ _REPOSITORY_POLICY_COLUMNS: Final = {
     "policy_json",
     "recorded_at",
 }
+_HOLD_COLUMNS: Final = {
+    "id",
+    "scope",
+    "scope_key",
+    "source",
+    "reason",
+    "trigger_hash",
+    "maintainer_stop",
+    "created_at",
+    "expires_at",
+    "released_at",
+    "released_by",
+    "release_reason",
+}
 _REQUIRED_INDEXES: Final = {
     "runs_status_idx",
     "runs_candidate_idx",
@@ -129,6 +153,7 @@ _REQUIRED_INDEXES: Final = {
     "publication_reservations_repository_idx",
     "runs_candidate_revision_idx",
     "runs_active_candidate_idx",
+    "holds_active_idx",
 }
 # Development builds created schemas 1-8. That state is not migrated; opening it asks the
 # operator to start a fresh state root.
@@ -766,6 +791,20 @@ class CircuitBreakerStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class Hold:
+    """A scoped stop that blocks only the work its scope names."""
+
+    hold_id: int
+    scope: StopScope
+    scope_key: str
+    source: str
+    reason: str
+    trigger_hash: str
+    created_at: datetime
+    expires_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class PublicationReservation:
     run_id: str
     repository: str
@@ -926,6 +965,7 @@ class RunStore:
             "manifest_artifact_sync",
             "candidate_retry_authorizations",
             "repository_policies",
+            "holds",
         }:
             raise StateError(f"Refusing to inspect unexpected state table: {table}")
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -1126,6 +1166,33 @@ class RunStore:
                 recorded_at TEXT NOT NULL
             )
             """,
+            """
+            CREATE TABLE holds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope TEXT NOT NULL CHECK(
+                    scope IN ('publication', 'repository', 'pull_request', 'issue', 'run')
+                ),
+                scope_key TEXT NOT NULL COLLATE NOCASE,
+                source TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                trigger_hash TEXT NOT NULL UNIQUE,
+                maintainer_stop INTEGER NOT NULL CHECK(maintainer_stop IN (0, 1)),
+                created_at TEXT NOT NULL,
+                expires_at TEXT,
+                released_at TEXT,
+                released_by TEXT,
+                release_reason TEXT,
+                CHECK(
+                    (released_at IS NULL AND released_by IS NULL AND release_reason IS NULL)
+                    OR (released_at IS NOT NULL AND released_by IS NOT NULL
+                        AND release_reason IS NOT NULL)
+                )
+            )
+            """,
+            """
+            CREATE INDEX holds_active_idx ON holds(scope, scope_key)
+            WHERE released_at IS NULL
+            """,
         )
         for statement in statements:
             connection.execute(statement)
@@ -1199,6 +1266,7 @@ class RunStore:
             "manifest_artifact_sync": _MANIFEST_ARTIFACT_SYNC_COLUMNS,
             "candidate_retry_authorizations": _CANDIDATE_RETRY_AUTHORIZATION_COLUMNS,
             "repository_policies": _REPOSITORY_POLICY_COLUMNS,
+            "holds": _HOLD_COLUMNS,
         }
         tables = cls._table_names(connection)
         if tables != set(expected):
@@ -2714,73 +2782,251 @@ class RunStore:
     def trip_circuit_breaker(self, *, source: str, reason: str, trigger_hash: str) -> bool:
         """Trip persistently and make each new immutable trigger the active revision."""
 
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return self._trip_circuit_breaker(
+                connection,
+                source=source,
+                reason=reason,
+                trigger_hash=trigger_hash,
+            )
+
+    def _trip_circuit_breaker(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source: str,
+        reason: str,
+        trigger_hash: str,
+    ) -> bool:
         normalized_source = _bounded_text(source, field="circuit-breaker source", maximum=255)
         normalized_reason = _bounded_text(reason, field="circuit-breaker reason", maximum=2_000)
         normalized_hash = _lease_identity(trigger_hash, field="circuit-breaker trigger hash")
         occurred_at = utc_now()
-        with self._connection() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = self._circuit_breaker_row(connection)
-            epoch = _stored_generation(row["epoch"], field="circuit-breaker epoch")
-            result = connection.execute(
+        row = self._circuit_breaker_row(connection)
+        epoch = _stored_generation(row["epoch"], field="circuit-breaker epoch")
+        result = connection.execute(
+            """
+            INSERT INTO circuit_breaker_events(
+                epoch, occurred_at, event_type, source, reason, trigger_hash
+            ) VALUES (?, ?, 'trip', ?, ?, ?)
+            ON CONFLICT(event_type, trigger_hash) DO NOTHING
+            """,
+            (
+                epoch,
+                occurred_at.isoformat(),
+                normalized_source,
+                normalized_reason,
+                normalized_hash,
+            ),
+        )
+        if result.rowcount != 1:
+            existing = connection.execute(
                 """
-                INSERT INTO circuit_breaker_events(
-                    epoch, occurred_at, event_type, source, reason, trigger_hash
-                ) VALUES (?, ?, 'trip', ?, ?, ?)
-                ON CONFLICT(event_type, trigger_hash) DO NOTHING
+                SELECT source, reason FROM circuit_breaker_events
+                WHERE event_type = 'trip' AND trigger_hash = ?
                 """,
-                (
-                    epoch,
-                    occurred_at.isoformat(),
-                    normalized_source,
-                    normalized_reason,
-                    normalized_hash,
-                ),
-            )
-            if result.rowcount != 1:
-                existing = connection.execute(
-                    """
-                    SELECT source, reason FROM circuit_breaker_events
-                    WHERE event_type = 'trip' AND trigger_hash = ?
-                    """,
-                    (normalized_hash,),
-                ).fetchone()
-                if existing is None:
-                    raise StateError("Circuit-breaker trigger could not be recorded")
-                if (
-                    str(existing["source"]) != normalized_source
-                    or str(existing["reason"]) != normalized_reason
-                ):
-                    raise StateError(
-                        "Circuit-breaker trigger hash was reused for different evidence"
-                    )
-                return False
-            update = connection.execute(
-                """
-                UPDATE circuit_breaker
-                SET is_tripped = 1, changed_at = ?, source = ?, reason = ?, trigger_hash = ?
-                WHERE singleton = 1 AND epoch = ?
-                """,
-                (
-                    occurred_at.isoformat(),
-                    normalized_source,
-                    normalized_reason,
-                    normalized_hash,
-                    epoch,
-                ),
-            )
-            if update.rowcount != 1:
-                raise StateError("Circuit-breaker state changed while tripping")
+                (normalized_hash,),
+            ).fetchone()
+            if existing is None:
+                raise StateError("Circuit-breaker trigger could not be recorded")
+            if (
+                str(existing["source"]) != normalized_source
+                or str(existing["reason"]) != normalized_reason
+            ):
+                raise StateError("Circuit-breaker trigger hash was reused for different evidence")
+            return False
+        update = connection.execute(
+            """
+            UPDATE circuit_breaker
+            SET is_tripped = 1, changed_at = ?, source = ?, reason = ?, trigger_hash = ?
+            WHERE singleton = 1 AND epoch = ?
+            """,
+            (
+                occurred_at.isoformat(),
+                normalized_source,
+                normalized_reason,
+                normalized_hash,
+                epoch,
+            ),
+        )
+        if update.rowcount != 1:
+            raise StateError("Circuit-breaker state changed while tripping")
         return True
 
-    def trip_circuit_breaker_trigger(self, trigger: CircuitBreakerTrigger) -> bool:
-        """Persist a typed trigger emitted by an external safety boundary."""
+    def record_stop(self, trigger: CircuitBreakerTrigger) -> bool:
+        """Persist a safety event at its scope and return whether its evidence is new.
 
-        return self.trip_circuit_breaker(
-            source=trigger.source,
-            reason=trigger.reason,
-            trigger_hash=trigger.trigger_hash,
+        A global event trips the circuit breaker; every other scope becomes a hold. As with the
+        breaker, evidence recorded once never stops work again after it was released, so only new
+        or edited evidence does.
+        """
+
+        if trigger.scope is StopScope.GLOBAL:
+            if trigger.scope_key or trigger.expires_at is not None or trigger.maintainer_stop:
+                raise ValueError("a global stop has no scope key, expiry, or escalation")
+            return self.trip_circuit_breaker(
+                source=trigger.source,
+                reason=trigger.reason,
+                trigger_hash=trigger.trigger_hash,
+            )
+        if trigger.maintainer_stop and trigger.scope is not StopScope.REPOSITORY:
+            raise ValueError("only repository holds count toward escalation")
+        scope_key = _hold_key(trigger.scope, trigger.scope_key)
+        source = _bounded_text(trigger.source, field="hold source", maximum=255)
+        reason = _bounded_text(trigger.reason, field="hold reason", maximum=2_000)
+        trigger_hash = _lease_identity(trigger.trigger_hash, field="hold trigger hash")
+        expires_at = (
+            None
+            if trigger.expires_at is None
+            else _aware_utc(trigger.expires_at, field="hold expiry").isoformat()
         )
+        created_at = utc_now()
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            inserted = connection.execute(
+                """
+                INSERT INTO holds(
+                    scope, scope_key, source, reason, trigger_hash, maintainer_stop,
+                    created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trigger_hash) DO NOTHING
+                """,
+                (
+                    trigger.scope.value,
+                    scope_key,
+                    source,
+                    reason,
+                    trigger_hash,
+                    int(trigger.maintainer_stop),
+                    created_at.isoformat(),
+                    expires_at,
+                ),
+            )
+            if inserted.rowcount != 1:
+                existing = connection.execute(
+                    "SELECT scope, scope_key, source, reason FROM holds WHERE trigger_hash = ?",
+                    (trigger_hash,),
+                ).fetchone()
+                if existing is None or (
+                    str(existing["scope"]),
+                    str(existing["scope_key"]).casefold(),
+                    str(existing["source"]),
+                    str(existing["reason"]),
+                ) != (trigger.scope.value, scope_key.casefold(), source, reason):
+                    raise StateError("Hold trigger hash was reused for different evidence")
+                return False
+            if trigger.maintainer_stop:
+                held = connection.execute(
+                    """
+                    SELECT DISTINCT scope_key FROM holds
+                    WHERE scope = 'repository' AND maintainer_stop = 1
+                        AND released_at IS NULL AND created_at >= ?
+                    """,
+                    ((created_at - _MAINTAINER_STOP_ESCALATION_WINDOW).isoformat(),),
+                ).fetchall()
+                if len(held) >= _MAINTAINER_STOP_ESCALATION_REPOSITORIES:
+                    self._trip_circuit_breaker(
+                        connection,
+                        source="escalation:maintainer_stops",
+                        reason=(
+                            f"Maintainers of {len(held)} repositories turned away automated "
+                            f"contributions within 30 days, most recently {scope_key}"
+                        ),
+                        trigger_hash=hashlib.sha256(
+                            f"maintainer-stop-escalation:{trigger_hash}".encode()
+                        ).hexdigest(),
+                    )
+        return True
+
+    def active_holds(
+        self,
+        scope: StopScope | None = None,
+        scope_key: str | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> builtins.list[Hold]:
+        """Return holds that are neither released nor expired, oldest first."""
+
+        current = _aware_utc(now or utc_now(), field="hold time")
+        conditions = ["released_at IS NULL", "(expires_at IS NULL OR expires_at > ?)"]
+        parameters: builtins.list[str] = [current.isoformat()]
+        if scope is not None:
+            conditions.append("scope = ?")
+            parameters.append(scope.value)
+        if scope_key is not None:
+            conditions.append("scope_key = ?")
+            parameters.append(scope_key)
+        # Only fixed condition strings are interpolated; every value stays a bound parameter.
+        query = (
+            "SELECT id, scope, scope_key, source, reason, trigger_hash, created_at, expires_at "
+            f"FROM holds WHERE {' AND '.join(conditions)} ORDER BY id"
+        )
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [
+            Hold(
+                hold_id=int(row["id"]),
+                scope=StopScope(str(row["scope"])),
+                scope_key=str(row["scope_key"]),
+                source=str(row["source"]),
+                reason=str(row["reason"]),
+                trigger_hash=str(row["trigger_hash"]),
+                created_at=_stored_datetime(row["created_at"], field="hold creation time"),
+                expires_at=(
+                    None
+                    if row["expires_at"] is None
+                    else _stored_datetime(row["expires_at"], field="hold expiry")
+                ),
+            )
+            for row in rows
+        ]
+
+    def release_hold(self, hold_id: int, *, actor: str, reason: str) -> bool:
+        """Release one hold after an operator review; return False if it was already released."""
+
+        if isinstance(hold_id, bool) or not isinstance(hold_id, int) or hold_id < 1:
+            raise ValueError("hold ID must be a positive integer")
+        released_by = _bounded_text(actor, field="release actor", maximum=255)
+        release_reason = _bounded_text(reason, field="release reason", maximum=2_000)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            known = connection.execute("SELECT 1 FROM holds WHERE id = ?", (hold_id,)).fetchone()
+            if known is None:
+                raise StateError(f"Unknown hold: {hold_id}")
+            result = connection.execute(
+                """
+                UPDATE holds SET released_at = ?, released_by = ?, release_reason = ?
+                WHERE id = ? AND released_at IS NULL
+                """,
+                (utc_now().isoformat(), released_by, release_reason, hold_id),
+            )
+        return result.rowcount == 1
+
+    def assert_publication_not_held(
+        self,
+        repository: str,
+        pull_request_url: str | None = None,
+    ) -> None:
+        """Refuse publication while a publication, repository, or pull-request hold applies."""
+
+        for hold in self.active_holds():
+            if (
+                hold.scope is StopScope.PUBLICATION
+                or (
+                    hold.scope is StopScope.REPOSITORY
+                    and hold.scope_key.casefold() == repository.casefold()
+                )
+                or (
+                    hold.scope is StopScope.PULL_REQUEST
+                    and pull_request_url is not None
+                    and hold.scope_key.casefold() == pull_request_url.casefold()
+                )
+            ):
+                raise PolicyError(
+                    f"Publication is held by {hold.source}: {hold.reason} (release it with "
+                    f"`autocontribute safety release {hold.hold_id}` after review)"
+                )
 
     def circuit_breaker_status(self) -> CircuitBreakerStatus:
         with self._connection() as connection:
@@ -4186,6 +4432,19 @@ def _candidate_identity(repository: str, issue_number: int) -> tuple[str, int]:
     if isinstance(issue_number, bool) or not isinstance(issue_number, int) or issue_number < 1:
         raise ValueError("candidate issue number must be a positive integer")
     return normalized_repository, issue_number
+
+
+def _hold_key(scope: StopScope, value: str) -> str:
+    key = _lease_identity(value, field=f"{scope.value} hold key")
+    pattern = {
+        StopScope.REPOSITORY: _CANDIDATE_REPOSITORY,
+        StopScope.ISSUE: _ISSUE_KEY,
+        StopScope.PULL_REQUEST: _HTTPS_KEY,
+        StopScope.PUBLICATION: _HTTPS_KEY,
+    }.get(scope)
+    if key != value or (pattern is not None and pattern.fullmatch(key) is None):
+        raise ValueError(f"{scope.value} hold key is not canonical: {value!r}")
+    return key
 
 
 def _lease_expiry(now: datetime, ttl: timedelta) -> datetime:

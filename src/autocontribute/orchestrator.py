@@ -175,10 +175,10 @@ class Orchestrator:
         self.store = store or RunStore(config.storage.path)
         self.github = github or GitHubClient(
             config.github,
-            safety_trigger_handler=self.store.trip_circuit_breaker_trigger,
+            safety_trigger_handler=self.store.record_stop,
         )
         if isinstance(self.github, GitHubClient):
-            self.github.bind_safety_trigger_handler(self.store.trip_circuit_breaker_trigger)
+            self.github.bind_safety_trigger_handler(self.store.record_stop)
         self._owns_github = github is None
         self._providers = dict(providers or {})
         self._owned_provider_roles: set[str] = set()
@@ -1579,7 +1579,7 @@ class Orchestrator:
             return
         safe_evidence = ", ".join(findings)
         manifest.proposal = None
-        self.store.trip_circuit_breaker_trigger(
+        self.store.record_stop(
             CircuitBreakerTrigger(
                 source=f"secret_scanner:{manifest.run_id}",
                 reason=(

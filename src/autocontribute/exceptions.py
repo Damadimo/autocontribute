@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+from enum import StrEnum
 
 
 class AutocontributeError(Exception):
@@ -17,17 +19,40 @@ class GitHubError(AutocontributeError):
     """A GitHub request or authentication operation failed."""
 
 
+class StopScope(StrEnum):
+    """How much work one safety event stops."""
+
+    GLOBAL = "global"
+    # Every publication, while preparation goes on.
+    PUBLICATION = "publication"
+    REPOSITORY = "repository"
+    PULL_REQUEST = "pull_request"
+    ISSUE = "issue"
+    RUN = "run"
+
+
 @dataclass(frozen=True, slots=True)
 class CircuitBreakerTrigger:
-    """Credential-free evidence identifying one immutable global safety event."""
+    """Credential-free evidence identifying one immutable safety event.
+
+    A global trigger trips the circuit breaker. Any other scope holds only ``scope_key`` (an
+    owner/name, pull-request URL, owner/name#number, run ID, or API origin) until it expires or an
+    operator releases it.
+    """
 
     source: str
     reason: str
     trigger_hash: str
+    scope: StopScope = StopScope.GLOBAL
+    scope_key: str = ""
+    expires_at: datetime | None = None
+    # Maintainer text turning away automated work; holds from it in two repositories within 30
+    # days escalate to a global stop.
+    maintainer_stop: bool = False
 
 
 class GitHubSafetyError(GitHubError):
-    """A GitHub response that must be persisted as a global safety stop."""
+    """A GitHub response that must be persisted as a safety stop at the trigger's scope."""
 
     def __init__(self, message: str, *, trigger: CircuitBreakerTrigger) -> None:
         super().__init__(message)
