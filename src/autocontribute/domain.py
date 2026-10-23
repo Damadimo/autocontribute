@@ -205,10 +205,6 @@ class QualityReport(DomainModel):
     review_summary: str
     review_notes: list[str]
 
-    @property
-    def failed_gates(self) -> list[GateResult]:
-        return [gate for gate in self.gates if not gate.passed]
-
 
 PullRequestAttentionKind = Literal[
     "changes_requested", "ci_failed", "maintainer_push", "observation_failed"

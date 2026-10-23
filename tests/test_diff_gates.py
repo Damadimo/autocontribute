@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -40,8 +40,6 @@ _BASE = {
 # Assembled at runtime so the repository's own secret scan does not report this file.
 _TOKEN = "ghp_" + "Z9" * 18
 _HOST_SECRET = "host-secret-value-0123456789"
-
-Edit = Callable[[Path], None]
 
 
 def _git(repository: Path, *arguments: str) -> str:

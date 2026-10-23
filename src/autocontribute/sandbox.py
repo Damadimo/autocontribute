@@ -23,7 +23,6 @@ from autocontribute.domain import CommandResult
 from autocontribute.egress_proxy import LISTEN_PORT, READY_MESSAGE, is_host_name
 from autocontribute.exceptions import SandboxError
 from autocontribute.host_environment import proxy_environment
-from autocontribute.repository import RepositoryWorkspace
 
 _CONTAINER_WORKSPACE: Final = "/workspace"
 _SHM_SIZE: Final = "256m"
@@ -192,7 +191,7 @@ class SessionContainer:
         self.capabilities = tuple(sorted(capabilities))
         self.volumes = tuple(_container_directory(path) for path in volumes)
         self._store_label = _store_label(store_root)
-        # One Docker endpoint for the whole session, as in SandboxRunner.
+        # One Docker endpoint for the whole session.
         self._docker_environment = docker_client_environment()
         self._command_user = ""
         self._name: str | None = None
@@ -1020,13 +1019,10 @@ def _first_line(text: str) -> str:
     return next((line.strip()[:300] for line in text.splitlines() if line.strip()), "")
 
 
-def _workspace_path(workspace: RepositoryWorkspace | Path) -> Path:
-    candidate = workspace.path if isinstance(workspace, RepositoryWorkspace) else workspace
-    if not isinstance(candidate, Path):
-        raise SandboxError("Sandbox workspace must be a Path or RepositoryWorkspace")
-    if candidate.is_symlink():
+def _workspace_path(workspace: Path) -> Path:
+    if workspace.is_symlink():
         raise SandboxError("Sandbox workspace cannot be a symlink")
-    root = candidate.expanduser().resolve()
+    root = workspace.expanduser().resolve()
     if not root.is_dir():
         raise SandboxError(f"Sandbox workspace is not a directory: {root}")
     return root

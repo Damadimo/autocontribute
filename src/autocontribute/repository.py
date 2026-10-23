@@ -225,11 +225,6 @@ class RepositoryWorkspace:
                 raise RepositoryError(f"Patch contains a symlink: {relative_path}")
         return sorted(paths)
 
-    def diff(self) -> str:
-        """Return a full-index binary-safe patch, including untracked files."""
-
-        return self.diff_bytes().decode("utf-8", errors="surrogateescape")
-
     def diff_bytes(self) -> bytes:
         """Return the lossless byte representation used by ``git apply``."""
 
