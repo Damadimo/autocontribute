@@ -126,6 +126,15 @@ class PolicyError(AutocontributeError):
     """A contribution violated a non-negotiable policy."""
 
 
+class PatchEncodingError(PolicyError):
+    """A patch is not UTF-8 text, so it fails a gate instead of crashing the run (G7)."""
+
+    def __init__(self, paths: tuple[str, ...]) -> None:
+        listed = ", ".join(paths) if paths else "unknown files"
+        super().__init__(f"The patch is not UTF-8 text; non-UTF-8 content in: {listed}")
+        self.paths = paths
+
+
 class SandboxError(AutocontributeError):
     """An isolated validation command could not be executed."""
 
