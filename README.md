@@ -107,11 +107,11 @@ cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod
 | `init` | Write a starter `autocontribute.yml` (`--path`, `--force`). |
 | `doctor` | Check config, credentials, GitHub access, Git, Docker, and the sandbox image, and warn about configured repositories whose AI policy rules this tool out; sends small paid model probes. |
 | `discover` | Show the best current candidate issue without cloning, model calls, or GitHub writes. |
-| `run` | Prepare one contribution or skip; `--issue owner/repo#N` pins an issue, `--scheduled` makes an [unattended attempt](#scheduling). |
+| `run` | Prepare one contribution or skip; `--issue owner/repo#N` pins an issue, `--scheduled` makes an [unattended attempt](#scheduling), `--json` prints the outcome. |
 | `approve RUN_ID` | Show the exact diff, check output, and PR text, then record your approval; `--yes --fingerprint HEX` approves the fingerprint you read without a prompt. |
 | `publish RUN_ID` | Push one branch to your fork (or to the repository itself if you own it) and open one pull request. |
 | `version` | Print the installed version. |
-| `runs list` | List recent runs and their status. |
+| `runs list` | List recent runs and their status; `--status S[,S] --json` lists every run in those statuses, oldest first. |
 | `runs show RUN_ID` | Show the evidence for one run. |
 | `runs review RUN_ID --format github --output-dir DIR` | Write the approval review as a GitHub issue body, plus comment parts for a long patch. |
 | `runs check RUN_ID` | Check, without writing anything, whether a ready or approved run could publish now. |
