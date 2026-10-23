@@ -156,6 +156,29 @@ def test_suite_runs_build_then_tests_offline_on_a_removed_copy(
     }
 
 
+def test_a_run_of_related_tests_replaces_only_the_test_command(
+    tmp_path: Path, fake_container: type[_FakeContainer]
+) -> None:
+    related = "python -m pytest --junitxml=/tmp/ac-report.xml tests/test_a.py"
+
+    run = run_suite(
+        SandboxConfig(),
+        image_id=_IMAGE,
+        recipe=_recipe(),
+        source=_snapshot(tmp_path),
+        run_id="run1",
+        store_root=tmp_path / "state",
+        timeout_seconds=600,
+        test_command=related,
+    )
+
+    assert [command for command, _ in fake_container.instances[0].commands] == [
+        "make generated",
+        related,
+    ]
+    assert run.failure is None and len(run.results) == 2
+
+
 def test_suite_run_reports_build_failures_missing_reports_and_container_failures(
     tmp_path: Path, fake_container: type[_FakeContainer]
 ) -> None:
