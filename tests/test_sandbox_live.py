@@ -22,6 +22,8 @@ import pytest
 
 from autocontribute.config import SandboxConfig
 from autocontribute.edit_tools import apply_patch_operation, run_text_editor, syntax_check
+from autocontribute.patches import extract_patch
+from autocontribute.repository import RepositoryWorkspace
 from autocontribute.sandbox import (
     DockerSandbox,
     SessionContainer,
@@ -30,6 +32,7 @@ from autocontribute.sandbox import (
     docker_container_identity,
     remove_leftover_containers,
 )
+from autocontribute.workspace_copies import copy_workspace
 from autocontribute.workspace_files import WorkspaceFiles
 
 pytestmark = pytest.mark.skipif(
@@ -581,3 +584,59 @@ def test_live_syntax_check_reports_errors_and_writes_no_bytecode(
     assert 'File "/workspace/broken.py", line 1' in message
     assert "SyntaxError" in message
     assert not list(workspace.rglob("__pycache__"))
+
+
+def test_live_session_edits_reach_the_validation_copy_only_through_the_patch(
+    live_root: Path, alpine_image: str
+) -> None:
+    source = live_root / "source"
+    source.mkdir()
+    git_environment = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    (source / ".gitignore").write_text("build/\n", encoding="utf-8")
+    (source / "README.md").write_text("broken\n", encoding="utf-8")
+    for arguments in (
+        ["init", "--quiet"],
+        ["add", "."],
+        ["-c", "user.name=F", "-c", "user.email=f@example.invalid", "commit", "-qm", "base"],
+    ):
+        subprocess.run(["git", *arguments], cwd=source, env=git_environment, check=True)
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source,
+        env=git_environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    work = RepositoryWorkspace.clone(str(source), base, live_root / "w", allow_local_source=True)
+    copy_workspace(work.path, live_root / "s")
+    marker = live_root / "host-command-ran"
+
+    with SessionContainer(
+        _SESSION_CONFIG,
+        image=alpine_image,
+        workspace=work.path,
+        run_id=f"live-{secrets.token_hex(4)}",
+        store_root=live_root / "state",
+    ) as session:
+        _passed(
+            session,
+            "printf 'fixed\\n' > README.md && echo new > added.txt"
+            " && mkdir build && echo stray > build/output.o",
+        )
+        tamper = session.exec(
+            f"printf '[filter \"x\"]\\n\\tclean = touch {marker}\\n' >> .git/config"
+            " && echo '* filter=x' > .gitattributes",
+            timeout_seconds=30,
+        )
+    patch = extract_patch(work)
+    copy_workspace(live_root / "s", live_root / "v")
+    validation = RepositoryWorkspace(live_root / "v", base)
+    validation.apply_patch(patch.text)
+
+    assert not tamper.result.passed, ".git/config was writable inside the session"
+    assert sorted(patch.paths) == ["README.md", "added.txt"]
+    assert (validation.path / "README.md").read_text(encoding="utf-8") == "fixed\n"
+    assert (validation.path / "added.txt").read_text(encoding="utf-8") == "new\n"
+    assert not (validation.path / "build").exists()
+    assert not marker.exists()
