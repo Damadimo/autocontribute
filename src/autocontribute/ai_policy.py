@@ -202,8 +202,10 @@ def checked_ai_policy(
 ) -> RepositoryAiPolicy:
     """Keep a model's reading only when every quote appears verbatim in the file it names.
 
-    A ban or unclear reading that fails the check becomes unclear, so the repository is skipped
-    rather than trusted; any other failing reading gives way to ``fallback``.
+    Only a reading of no policy at all may come without quotes, and it cannot lift a ban that
+    ``fallback`` quotes: one unsupported answer must not reopen a repository that turns agents
+    away. A ban or unclear reading that fails the check becomes unclear, so the repository is
+    skipped rather than trusted; any other failing reading gives way to ``fallback``.
     """
 
     texts = {(file.repository.casefold(), file.path): _collapsed(file.text) for file in files}
@@ -213,7 +215,7 @@ def checked_ai_policy(
         if _collapsed(quote.text)
         and _collapsed(quote.text) in texts.get((quote.repository.casefold(), quote.path), "")
     ]
-    evidenced = bool(verified) or claimed.stance in {"permissive", "none"}
+    evidenced = bool(verified) or (claimed.stance == "none" and fallback.stance != "ban")
     if len(verified) == len(claimed.quotes) and evidenced:
         return claimed
     if claimed.stance in {"ban", "unclear"}:
