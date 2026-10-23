@@ -1,4 +1,5 @@
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -296,9 +297,19 @@ def test_approval_review_ignores_tampered_report_and_approves_displayed_fingerpr
         app,
         ["runs", "show", run_id, "--config", str(config_path)],
     )
+    displayed = re.search(r"Resulting approval fingerprint\s+([0-9a-f]{64})", shown.output)
+    assert displayed is not None, shown.output
     approved = runner.invoke(
         app,
-        ["approve", run_id, "--yes", "--config", str(config_path)],
+        [
+            "approve",
+            run_id,
+            "--yes",
+            "--fingerprint",
+            displayed.group(1)[:12],
+            "--config",
+            str(config_path),
+        ],
     )
 
     assert shown.exit_code == 0, shown.output
@@ -365,7 +376,7 @@ def test_approval_rejects_evidence_race_after_interactive_review(
         ["approve", run_id, "--config", str(config_path)],
     )
 
-    assert result.exit_code == 1, result.output
+    assert result.exit_code == 3, result.output
     assert len(confirmations) == 1
     assert "PR_TITLE_EXACT_MARKER" in result.output
     assert "PR_TITLE_RACED_AFTER_REVIEW" not in result.output
@@ -375,6 +386,161 @@ def test_approval_rejects_evidence_race_after_interactive_review(
     assert durable.status == RunStatus.READY_FOR_APPROVAL
     assert durable.approval is None
     assert "approval.created" not in {event["event_type"] for event in store.events(run_id)}
+
+
+def _review_fingerprint(config_path: Path, store: RunStore, run_id: str) -> str:
+    review = cli.build_approval_review(
+        load_config(config_path),
+        store,
+        run_id,
+        github=_ReviewGitHub(),  # type: ignore[arg-type]
+    )
+    return review.fingerprint
+
+
+def _forbid_github(*_: object) -> None:
+    pytest.fail("this approval must be decided without GitHub")
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--yes"], "--yes needs --fingerprint"),
+        (["--json", "--fingerprint", "a" * 12], "--json cannot prompt"),
+        (["--yes", "--fingerprint", "a" * 11], "12 to 64 lowercase hex characters"),
+        (["--yes", "--fingerprint", "A" * 12], "12 to 64 lowercase hex characters"),
+    ],
+)
+def test_approve_refuses_blind_or_malformed_fingerprints_before_github(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: list[str],
+    message: str,
+) -> None:
+    config_path, store, run_id = _ready_review_run(tmp_path)
+    events = store.events(run_id)
+    monkeypatch.setattr(cli, "_github_client", _forbid_github)
+
+    result = runner.invoke(app, ["approve", run_id, *arguments, "--config", str(config_path)])
+
+    assert result.exit_code == 1, result.output
+    assert message in result.output
+    assert store.get(run_id).status is RunStatus.READY_FOR_APPROVAL
+    assert store.events(run_id) == events
+
+
+def test_approve_binds_a_fingerprint_prefix_and_records_its_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, store, run_id = _ready_review_run(tmp_path)
+    fingerprint = _review_fingerprint(config_path, store, run_id)
+    source = "https://github.com/octocat/runner/issues/3#issuecomment-99"
+    monkeypatch.setattr(cli, "_github_client", lambda *_: _ReviewGitHub())
+    command = [
+        "approve",
+        run_id,
+        "--fingerprint",
+        fingerprint[:12],
+        "--source",
+        source,
+        "--yes",
+        "--json",
+        "--config",
+        str(config_path),
+    ]
+
+    approved = runner.invoke(app, command)
+    events_after_approval = store.events(run_id)
+    monkeypatch.setattr(cli, "_github_client", _forbid_github)
+    repeated = runner.invoke(app, command)
+
+    assert approved.exit_code == 0, approved.output
+    first = json.loads(approved.output)
+    durable = store.get(run_id)
+    assert durable.status is RunStatus.APPROVED
+    assert durable.approval is not None
+    assert first == {
+        "run_id": run_id,
+        "outcome": "approved",
+        "status": "approved",
+        "fingerprint": fingerprint,
+        "actor": "octocat",
+        "approved_at": durable.approval.approved_at.isoformat(),
+        "expires_at": durable.approval.expires_at.isoformat(),
+    }
+    assert durable.approval.attestation.endswith(f"Source: {source}")
+    assert [event["event_type"] for event in events_after_approval[-3:]] == [
+        "approval.created",
+        "approval.source",
+        "run.transitioned",
+    ]
+    assert json.loads(events_after_approval[-2]["details"]) == {"url": source}
+    assert repeated.exit_code == 0, repeated.output
+    assert json.loads(repeated.output) == {**first, "outcome": "already_approved"}
+    assert store.events(run_id) == events_after_approval
+
+
+def test_approve_reports_a_stale_fingerprint_with_its_own_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, store, run_id = _ready_review_run(tmp_path)
+    fingerprint = _review_fingerprint(config_path, store, run_id)
+    stale = ("0" if fingerprint[0] != "0" else "1") + fingerprint[1:12]
+    monkeypatch.setattr(cli, "_github_client", lambda *_: _ReviewGitHub())
+
+    result = runner.invoke(
+        app,
+        [
+            "approve",
+            run_id,
+            "--fingerprint",
+            stale,
+            "--yes",
+            "--json",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 3, result.output
+    assert json.loads(result.output) == {
+        "run_id": run_id,
+        "outcome": "fingerprint_mismatch",
+        "message": "Approval evidence changed after review; inspect the run again before approving",
+    }
+    assert store.get(run_id).approval is None
+
+
+def test_approve_refuses_a_bad_source_and_an_expired_repeat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, store, run_id = _ready_review_run(tmp_path)
+    fingerprint = _review_fingerprint(config_path, store, run_id)
+    monkeypatch.setattr(cli, "_github_client", lambda *_: _ReviewGitHub())
+    command = ["approve", run_id, "--fingerprint", fingerprint, "--yes", "--json"]
+
+    insecure = runner.invoke(
+        app,
+        [*command, "--source", "http://example.invalid/comment", "--config", str(config_path)],
+    )
+    assert insecure.exit_code == 1, insecure.output
+    assert "https URL" in json.loads(insecure.output)["message"]
+    assert store.get(run_id).approval is None
+
+    approved = runner.invoke(app, [*command, "--config", str(config_path)])
+    assert approved.exit_code == 0, approved.output
+    expired = store.get(run_id)
+    assert expired.approval is not None
+    expired.approval.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    store.save(expired, event="fixture.approval_expired", details={})
+
+    repeated = runner.invoke(app, [*command, "--config", str(config_path)])
+
+    assert repeated.exit_code == 1, repeated.output
+    assert "the approval expired" in json.loads(repeated.output)["message"]
 
 
 def test_init_and_config_validation_are_offline(tmp_path: Path) -> None:
@@ -465,7 +631,11 @@ def test_runs_cancel_releases_a_prepared_run_and_records_the_reason(
     config_path, store, run_id = _ready_review_run(tmp_path)
     if approved:
         monkeypatch.setattr(cli, "_github_client", lambda *_: _ReviewGitHub())
-        approval = runner.invoke(app, ["approve", run_id, "--yes", "--config", str(config_path)])
+        approval = runner.invoke(
+            app,
+            ["approve", run_id, "--config", str(config_path)],
+            input="y\n",
+        )
         assert approval.exit_code == 0, approval.output
     prepared = store.get(run_id)
     assert prepared.status is (RunStatus.APPROVED if approved else RunStatus.READY_FOR_APPROVAL)

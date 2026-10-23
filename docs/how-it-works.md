@@ -133,7 +133,12 @@ prints it again and asks you to confirm, and `publish RUN_ID` opens the PR. The 
 from `state.sqlite3`, `contribution.patch`, and `validation.json`, not `report.md`: the issue and
 comments, the full patch, all command output, the commit message and author, the PR title and body,
 the target repository and base commit, the publishing account, and a fingerprint over all of it.
-`approve` refuses if any of it changed. Only the approving GitHub account can publish, within
+`approve` refuses if any of it changed. `approve RUN_ID --yes --fingerprint HEX` approves without a
+prompt, and only when HEX is the fingerprint or at least its first 12 characters, so a script can
+approve only a review you read; it exits 3 when the fingerprint no longer matches. `--source URL`
+records where you approved, such as an issue comment, in the run's ledger and the approval, and
+repeating an approval that is already recorded succeeds without writing anything. `--json` prints
+the outcome instead of the review. Only the approving GitHub account can publish, within
 `publishing.approval_expires_hours` (72, at most 168). `publish` refuses unless:
 
 - the approval is current and matches the stored patch and command results;

@@ -18,6 +18,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from autocontribute import __version__
+from autocontribute.approval import FINGERPRINT_PREFIX, fingerprint_matches
 from autocontribute.config import (
     CLA_ATTESTATION_STATEMENT,
     DCO_ATTESTATION_STATEMENT,
@@ -37,8 +38,10 @@ from autocontribute.discovery import DiscoveryOutcome, DiscoveryService, PolicyS
 from autocontribute.doctor import run_doctor
 from autocontribute.domain import RunManifest, RunStatus
 from autocontribute.exceptions import (
+    ApprovalMismatchError,
     AutocontributeError,
     ConfigurationError,
+    PolicyError,
     PublicationResumeRequired,
     StateError,
 )
@@ -87,6 +90,12 @@ _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _CANCELLABLE_STATUSES = frozenset({RunStatus.READY_FOR_APPROVAL, RunStatus.APPROVED})
 # How long a prepared run may wait for approval beyond the approval lifetime itself.
 _UNAPPROVED_RUN_GRACE = timedelta(days=7)
+
+
+# Statuses whose approval is already on record, so a repeated approval of it is a no-op.
+_APPROVAL_RECORDED_STATUSES = frozenset(
+    {RunStatus.APPROVED, RunStatus.SUBMITTING, RunStatus.PR_OPEN}
+)
 
 
 @app.command()
@@ -281,39 +290,112 @@ def run_once(
 def approve(
     run_id: Annotated[str, typer.Argument(help="Run identifier to approve.")],
     config: ConfigOption = DEFAULT_CONFIG,
+    fingerprint: Annotated[
+        str | None,
+        typer.Option(
+            "--fingerprint",
+            help="Fingerprint of the review you read, or its first 12 or more characters.",
+        ),
+    ] = None,
+    source: Annotated[
+        str | None,
+        typer.Option(
+            "--source",
+            help="https URL where you gave the approval, such as an issue comment.",
+        ),
+    ] = None,
     yes: Annotated[
         bool,
-        typer.Option("--yes", help="Confirm the review attestation non-interactively."),
+        typer.Option("--yes", help="Approve without a prompt; requires --fingerprint."),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the outcome as JSON instead of the review."),
     ] = False,
 ) -> None:
-    """Attest that you reviewed the exact diff, checks, and proposed PR."""
+    """Attest that you reviewed the exact diff, checks, and proposed PR.
 
-    settings = _config(config)
+    Exit codes: 0 approved (or already approved with this fingerprint), 3 the fingerprint no
+    longer matches the run, 1 anything else.
+    """
+
+    context: dict[str, object] = {"run_id": run_id}
+    if yes and fingerprint is None:
+        _fail(
+            "--yes needs --fingerprint, so the approval binds the review you actually read",
+            json_output=json_output,
+            context=context,
+        )
+    if json_output and not yes:
+        _fail(
+            "--json cannot prompt; pass --yes and --fingerprint", json_output=True, context=context
+        )
+    if fingerprint is not None and not FINGERPRINT_PREFIX.fullmatch(fingerprint):
+        _fail(
+            "--fingerprint must be 12 to 64 lowercase hex characters",
+            json_output=json_output,
+            context=context,
+        )
+    settings = _config(config, json_output=json_output)
     store = RunStore(settings.storage.path)
+    outcome = "already_approved"
     try:
-        with _github_client(settings, store) as github:
-            review = build_approval_review(settings, store, run_id, github=github)
-            console.print(render_approval_review(review), markup=False)
-            if not yes and not typer.confirm(
-                "I reviewed the exact diff, validation evidence, and PR text and authorize "
-                "publication"
-            ):
-                raise typer.Abort()
-            manifest = approve_run(
-                settings,
-                store,
-                run_id,
-                github=github,
-                attestation="Reviewed exact diff, validation evidence, and pull-request text.",
-                reviewed_fingerprint=review.fingerprint,
-            )
+        manifest = store.get(run_id)
+        if fingerprint is None or not _already_approved(manifest, fingerprint):
+            with _github_client(settings, store) as github:
+                if fingerprint is None or not json_output:
+                    review = build_approval_review(settings, store, run_id, github=github)
+                    console.print(render_approval_review(review), markup=False)
+                    if not yes and not typer.confirm(
+                        "I reviewed the exact diff, validation evidence, and PR text and "
+                        "authorize publication"
+                    ):
+                        raise typer.Abort()
+                    reviewed = fingerprint or review.fingerprint
+                else:
+                    reviewed = fingerprint
+                manifest = approve_run(
+                    settings,
+                    store,
+                    run_id,
+                    github=github,
+                    attestation="Reviewed exact diff, validation evidence, and pull-request text.",
+                    reviewed_fingerprint=reviewed,
+                    source=source,
+                )
+            outcome = "approved"
+            _refresh_report(store, manifest)
+    except ApprovalMismatchError as exc:
+        _fail(
+            str(exc),
+            exit_code=3,
+            json_output=json_output,
+            outcome="fingerprint_mismatch",
+            context=context,
+        )
     except AutocontributeError as exc:
-        _fail(str(exc))
-    _refresh_report(store, manifest)
-    assert manifest.approval is not None
-    console.print(
-        f"[green]Approved[/green] `{run_id}` until {manifest.approval.expires_at.isoformat()}"
-    )
+        _fail(str(exc), json_output=json_output, context=context)
+    approval = manifest.approval
+    assert approval is not None
+    if json_output:
+        _emit_json(
+            {
+                "run_id": run_id,
+                "outcome": outcome,
+                "status": manifest.status.value,
+                "fingerprint": approval.manifest_hash,
+                "actor": approval.actor,
+                "approved_at": approval.approved_at.isoformat(),
+                "expires_at": approval.expires_at.isoformat(),
+            }
+        )
+    elif outcome == "approved":
+        console.print(f"[green]Approved[/green] `{run_id}` until {approval.expires_at.isoformat()}")
+    else:
+        console.print(
+            f"Run `{run_id}` was already approved with this fingerprint until "
+            f"{approval.expires_at.isoformat()}."
+        )
 
 
 @app.command()
@@ -1100,6 +1182,24 @@ def _refresh_report(store: RunStore, manifest: RunManifest) -> None:
         "report.md",
         render_run_report(manifest, manifest.patched_validation),
     )
+
+
+def _already_approved(manifest: RunManifest, fingerprint: str) -> bool:
+    """Whether a repeated approval names the approval this run already recorded."""
+
+    approval = manifest.approval
+    if (
+        approval is None
+        or manifest.status not in _APPROVAL_RECORDED_STATUSES
+        or not fingerprint_matches(fingerprint, approval.manifest_hash)
+    ):
+        return False
+    if manifest.status == RunStatus.APPROVED and approval.expires_at <= datetime.now(UTC):
+        raise PolicyError(
+            f"Run {manifest.run_id} was approved with this fingerprint, but the approval expired "
+            f"at {approval.expires_at.isoformat()}; cancel the run and prepare it again"
+        )
+    return True
 
 
 def _parse_statuses(value: str, *, json_output: bool) -> frozenset[RunStatus]:

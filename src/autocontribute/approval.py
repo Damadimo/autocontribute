@@ -20,6 +20,9 @@ from autocontribute.exceptions import PolicyError
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+# Twelve hex characters are what a person types into an approval comment; anything shorter
+# would let unrelated reviews collide.
+FINGERPRINT_PREFIX = re.compile(r"^[0-9a-f]{12,64}$")
 # v5 adds the head repository. A run approved before it was bound keeps its v4 bytes and
 # domain, so its approval still authorizes recovery of the fork publication it began.
 _FINGERPRINT_DOMAINS = {
@@ -284,6 +287,14 @@ def manifest_fingerprint(manifest: ApprovalManifest) -> str:
     return hashlib.sha256(_FINGERPRINT_DOMAINS[manifest.schema_version] + canonical).hexdigest()
 
 
+def fingerprint_matches(shown: str, fingerprint: str) -> bool:
+    """Whether ``shown`` is ``fingerprint`` or a prefix of it at least twelve characters long."""
+
+    return bool(FINGERPRINT_PREFIX.fullmatch(shown)) and hmac.compare_digest(
+        shown, fingerprint[: len(shown)]
+    )
+
+
 def create_approval(
     manifest: ApprovalManifest,
     *,
@@ -341,10 +352,12 @@ def _aware_utc(value: datetime, *, field: str) -> datetime:
 
 
 __all__ = [
+    "FINGERPRINT_PREFIX",
     "ApprovalManifest",
     "ApprovalReview",
     "build_approval_manifest",
     "create_approval",
+    "fingerprint_matches",
     "hash_diff",
     "manifest_fingerprint",
     "validate_approval",
