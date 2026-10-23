@@ -53,7 +53,7 @@ blockers.
 | The issue does not ask contributors to stay away; no open PR in the repository links it with a closing keyword or was updated in the last 90 days; no comment from the last 30 days claims the work ("I'm working on this") unless a maintainer has since invited a PR; and no maintainer comment asks contributors to stop or hold off. A maintainer comment that turns away automated or AI contributions [holds](#lifecycle-sync-holds-and-the-safety-stop) the whole repository | |
 | The repository takes pull requests from people who are not collaborators and has no `.github/VOUCHED.td` vouch list | |
 | Every policy file could be read; the repository or its owner's `.github` repository has contribution guidelines; the AI policy does not ban agent-made contributions and, unless you opt in, does not ask for human-written PR text; and a detected CLA or DCO has a matching attestation ([Legal attestations](configuration.md#legal-attestations)) | `policy.require_contribution_guidelines` (true), `policy.allow_conditional_ai_policy`, `policy.legal_attestations` |
-| The score below reaches 60 | |
+| The score below reaches 60 (search only: `run --issue` and `publish` do not apply it, so a prepared run does not go stale as the issue ages) | |
 
 Policy files are read at the pinned commit from the root, `.github/`, and `docs/` of the
 repository and of its owner's `.github` repository: contribution guides, AI policies, `AGENTS.md`,

@@ -366,6 +366,29 @@ def test_vague_issue_falls_below_the_score_floor(tmp_path) -> None:  # type: ign
     assert evaluation.eligibility.blockers == ["candidate score 45 is below the floor of 60"]
 
 
+def test_rank_floor_chooses_among_searched_issues_but_never_blocks_a_chosen_one(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    # The freshness part of the score falls with time alone; a run prepared at the floor must
+    # stay publishable while it waits for approval.
+    issue = _repository_issue(
+        "example/project", 42, title="Improve things", body="It would be nice to improve this."
+    )
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project"),
+        IsolationGitHub({"example/project": [issue]}),
+        RunStore(tmp_path),
+    )
+
+    outcome = service.discover()
+    evaluated = service.evaluate(issue, _repository())
+
+    assert outcome.selection is None
+    assert outcome.blocker_counts == [("low score", 1)]
+    assert evaluated.score == 45
+    assert evaluated.eligible, evaluated.blockers
+
+
 def test_recent_maintainer_comment_adds_freshness(tmp_path) -> None:  # type: ignore[no-untyped-def]
     service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
     engaged = _issue(
