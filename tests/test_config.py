@@ -9,6 +9,7 @@ from autocontribute.config import (
     CLA_ATTESTATION_STATEMENT,
     DCO_ATTESTATION_STATEMENT,
     AutocontributeConfig,
+    GitHubConfig,
     ModelPricing,
     RepositoryLabels,
     example_config,
@@ -68,6 +69,10 @@ def test_starter_configs_name_only_placeholders_that_commands_refuse() -> None:
         assert config.identity.email == ""
         assert config.github.repositories == ["your-org/your-repo"]
         assert config.validation.commands_for("your-org/your-repo") == ["python -m pytest"]
+        # A label list in the file replaces the default, so a shorter starter list would drop
+        # deny labels for everyone who starts from it.
+        assert config.github.include_labels == GitHubConfig().include_labels
+        assert config.github.exclude_labels == GitHubConfig().exclude_labels
 
         placeholders = starter_placeholders(config)
 
