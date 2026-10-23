@@ -4,6 +4,7 @@ import httpx
 import pytest
 
 from autocontribute.model_retry import (
+    MAX_ATTEMPTS,
     MAX_RETRY_WAIT_SECONDS,
     PROVIDER_ERROR_CODES,
     RetryDecision,
@@ -92,15 +93,20 @@ def test_timeouts_and_connection_errors_are_retried() -> None:
     assert _decide(None) == RetryDecision(retry=True, wait_seconds=10.0, reason="connection error")
 
 
-@pytest.mark.parametrize(
-    ("attempt", "wait_seconds"),
-    [(1, 10.0), (2, 30.0), (3, 90.0), (4, MAX_RETRY_WAIT_SECONDS)],
-)
-def test_backoff_grows_without_retry_after_and_stops_at_the_limit(
-    attempt: int,
-    wait_seconds: float,
-) -> None:
+@pytest.mark.parametrize(("attempt", "wait_seconds"), [(1, 10.0), (2, 30.0)])
+def test_backoff_grows_without_retry_after(attempt: int, wait_seconds: float) -> None:
     assert _decide(503, attempt=attempt).wait_seconds == wait_seconds
+
+
+@pytest.mark.parametrize("attempt", [MAX_ATTEMPTS, MAX_ATTEMPTS + 1, 10])
+def test_a_turn_gets_at_most_three_attempts(attempt: int) -> None:
+    assert MAX_ATTEMPTS == 3
+    assert _decide(503, attempt=attempt, retry_after=1.0) == RetryDecision(
+        retry=False, wait_seconds=0.0, reason="HTTP 503 after 3 attempts"
+    )
+    assert _decide(None, attempt=attempt, timed_out=True) == RetryDecision(
+        retry=False, wait_seconds=0.0, reason="timeout after 3 attempts"
+    )
 
 
 @pytest.mark.parametrize(
@@ -118,7 +124,7 @@ def test_retry_after_is_honoured_with_jitter_below_the_limit(
     jitter: float,
     wait_seconds: float,
 ) -> None:
-    decision = _decide(429, retry_after=retry_after, attempt=3, jitter=jitter)
+    decision = _decide(429, retry_after=retry_after, attempt=2, jitter=jitter)
 
     assert decision == RetryDecision(retry=True, wait_seconds=wait_seconds, reason="HTTP 429")
     assert decision.wait_seconds >= retry_after
