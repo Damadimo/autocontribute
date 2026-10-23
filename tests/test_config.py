@@ -400,6 +400,48 @@ def test_load_config_resolves_storage_relative_to_config(tmp_path: Path) -> None
     assert config.storage.path == tmp_path / "state"
 
 
+def test_environment_overrides_are_keyed_by_repository_and_validated() -> None:
+    config = AutocontributeConfig.model_validate(
+        {
+            "environments": {
+                "Pallets/Click": {
+                    "image": "python:3.12-bookworm",
+                    "setup": ["  pip install -e .[test]  "],
+                    "test": "python -m pytest -q",
+                    "allow_hosts": ["Files.Example.org", "files.example.org"],
+                }
+            }
+        }
+    )
+
+    override = config.environment_for("pallets/click")
+    assert override is not None
+    assert override.setup == ["pip install -e .[test]"]
+    assert override.allow_hosts == ["files.example.org"]
+    assert config.environment_for("psf/requests") is None
+    assert AutocontributeConfig().environments == {}
+
+
+@pytest.mark.parametrize(
+    ("environments", "message"),
+    [
+        ({"*/*": {}}, "owner/name"),
+        ({"a/b": {}, "A/B": {}}, "duplicate environments repository"),
+        ({"a/b": {"image": "--privileged"}}, "one Docker image reference"),
+        ({"a/b": {"setup": [" "]}}, "non-empty"),
+        ({"a/b": {"test": "x" * 20_001}}, "exceeds 20,000"),
+        ({"a/b": {"allow_hosts": ["https://example.org"]}}, "DNS host names"),
+        ({"a/b": {"allow_hosts": ["10.0.0.1"]}}, "DNS host names"),
+        ({"a/b": {"network": True}}, "Extra inputs"),
+    ],
+)
+def test_environment_overrides_reject_unsafe_values(
+    environments: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        AutocontributeConfig.model_validate({"environments": environments})
+
+
 def test_secret_value_cannot_be_mistaken_for_environment_name() -> None:
     with pytest.raises(ValueError, match="environment variable name"):
         AutocontributeConfig.model_validate(
