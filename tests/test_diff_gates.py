@@ -29,6 +29,12 @@ _BASE = {
     ),
     "web/sum.test.js": "test('sums', () => {\n  expect(1 + 1).toBe(2);\n});\n",
     "pkg/sum_test.go": "package pkg\n\nfunc TestSum(t *testing.T) {\n\tt.Log(1)\n}\n",
+    "web/parse.test.js": (
+        "describe('parser', () => {\n"
+        "  it('parses numbers', () => {\n    expect(parse('1')).toBe(1);\n  });\n"
+        "  test.each([1, 2])('parses %i', (n) => {\n    expect(parse(String(n))).toBe(n);\n  });\n"
+        "});\n"
+    ),
 }
 # Assembled at runtime so the repository's own secret scan does not report this file.
 _TOKEN = "ghp_" + "Z9" * 18
@@ -270,6 +276,71 @@ def test_removed_and_skipped_existing_tests_fail(
 
     assert _failed(gates) == {"existing_tests"}
     assert expected in gates["existing_tests"][1]
+
+
+_PARSE = _BASE["web/parse.test.js"]
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        (
+            {"web/parse.test.js": _PARSE.replace("describe('parser'", "describe.skip('parser'")},
+            "describe.skip('parser'",
+        ),
+        (
+            {"web/parse.test.js": _PARSE.replace("describe('parser'", "xdescribe('parser'")},
+            "xdescribe('parser'",
+        ),
+        (
+            {"web/parse.test.js": _PARSE.replace("test.each([1, 2])", "test.skip.each([1, 2])")},
+            "test.skip.each([1, 2])('parses %i'",
+        ),
+        (
+            {
+                "web/sum.test.js": "describe.skip('all', () => {\n"
+                + _BASE["web/sum.test.js"]
+                + "});\n"
+            },
+            "describe.skip('all'",
+        ),
+        (
+            {
+                "tests/test_calc.py": _BASE["tests/test_calc.py"].replace(
+                    "from calc import add\n",
+                    "from calc import add\n\npytestmark = pytest.mark.xfail\n",
+                )
+            },
+            "pytestmark = pytest.mark.xfail",
+        ),
+    ],
+)
+def test_skipped_describe_blocks_tables_and_modules_fail(
+    workspace: RepositoryWorkspace, files: dict[str, str], expected: str
+) -> None:
+    _write(workspace, files)
+
+    _, gates = _gates(workspace)
+
+    assert _failed(gates) == {"existing_tests"}
+    assert expected in gates["existing_tests"][1]
+
+
+def test_new_skipped_blocks_and_new_skipped_modules_pass(workspace: RepositoryWorkspace) -> None:
+    _write(
+        workspace,
+        {
+            "web/sum.test.js": _BASE["web/sum.test.js"]
+            + "describe.skip('later', () => {\n  it('works', () => {});\n});\n",
+            "tests/test_new.py": (
+                "import pytest\n\npytestmark = pytest.mark.skip\n\n\ndef test_x():\n    pass\n"
+            ),
+        },
+    )
+
+    _, gates = _gates(workspace)
+
+    assert not _failed(gates)
 
 
 def test_a_deleted_test_file_fails(workspace: RepositoryWorkspace) -> None:
