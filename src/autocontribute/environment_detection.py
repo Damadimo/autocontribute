@@ -43,7 +43,7 @@ from autocontribute.environments import (
     dependency_digest,
 )
 from autocontribute.exceptions import EnvironmentRecipeError
-from autocontribute.sandbox import SAFE_CONTAINER_PATH
+from autocontribute.sandbox import CONTAINER_TMP, SAFE_CONTAINER_PATH
 from autocontribute.workspace_files import CONTAINER_WORKSPACE
 
 # Setup runs as the command uid with HOME under the tool root (DESIGN §5.2); later containers
@@ -52,9 +52,9 @@ _TOOLS: Final = f"{TOOL_ROOT}/tools"
 _VENV: Final = f"{TOOL_ROOT}/venv"
 _UV_VERSION: Final = "0.12.24"
 _BASE_SYSTEM_PACKAGES: Final = ("ca-certificates", "git", "less", "locales")
-_JUNIT_REPORT: Final = "/tmp/ac-report.xml"
-_JSON_REPORT: Final = "/tmp/ac-report.json"
-_TEXT_REPORT: Final = "/tmp/ac-report.txt"
+_JUNIT_REPORT: Final = f"{CONTAINER_TMP}/ac-report.xml"
+_JSON_REPORT: Final = f"{CONTAINER_TMP}/ac-report.json"
+_TEXT_REPORT: Final = f"{CONTAINER_TMP}/ac-report.txt"
 # Stable CPython minor versions with full Debian images, newest first.
 _PYTHON_MINORS: Final = (14, 13, 12, 11, 10, 9)
 _PYTHON_TEST_GROUPS: Final = ("test", "tests", "testing", "dev")
@@ -366,7 +366,7 @@ def _python_recipe(repository: str, sources: CiSources) -> EnvironmentRecipe:
             "VIRTUAL_ENV": _VENV,
             "UV_PROJECT_ENVIRONMENT": _VENV,
             "UV_PYTHON_DOWNLOADS": "never",
-            "UV_CACHE_DIR": "/tmp/uv-cache",
+            "UV_CACHE_DIR": f"{CONTAINER_TMP}/uv-cache",
             "UV_LINK_MODE": "copy",
             "LANG": "C.UTF-8",
             **(tox.set_env if tox is not None else {}),
