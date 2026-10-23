@@ -33,6 +33,7 @@ _MAX_CAPTURE_BYTES: Final = 2_000_000
 _TRUNCATED_MARKER: Final = b"\n[output truncated by autocontribute]\n"
 SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _SESSION_SHELL: Final = "/bin/sh"
+MAX_COMMAND_CHARACTERS: Final = 20_000
 _SESSION_TMP_SIZE: Final = "1g"
 _SESSION_MAIN_UID: Final = 65_534
 # The container's own /tmp: a private tmpfs that no other container or host process shares.
@@ -1220,8 +1221,10 @@ def _workspace_path(workspace: RepositoryWorkspace | Path) -> Path:
 def _validate_command(command: str) -> None:
     if not isinstance(command, str) or not command.strip() or "\0" in command:
         raise SandboxError("Validation command must be a non-empty string without NUL bytes")
-    if len(command) > 20_000:
-        raise SandboxError("Validation command exceeds the 20,000-character safety limit")
+    if len(command) > MAX_COMMAND_CHARACTERS:
+        raise SandboxError(
+            f"Validation command exceeds the {MAX_COMMAND_CHARACTERS:,}-character safety limit"
+        )
 
 
 def _validate_image(image: str) -> None:
@@ -1348,6 +1351,7 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 __all__ = [
+    "MAX_COMMAND_CHARACTERS",
     "SAFE_CONTAINER_PATH",
     "SETUP_CAPABILITIES",
     "DockerDaemonMode",

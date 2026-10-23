@@ -49,6 +49,8 @@ class EditResult:
     # The workspace-relative path the call wrote or deleted, for the syntax check and
     # for loading guidance that applies to it.
     changed_path: str | None = None
+    # The arguments did not fit the tool, so the call did nothing.
+    invalid_arguments: bool = False
 
 
 class _CreateFile(DomainModel):
@@ -108,7 +110,7 @@ def apply_patch_operation(files: WorkspaceFiles, operation: Mapping[str, object]
     try:
         parsed = _PATCH_OPERATION.validate_python(operation)
     except ValidationError as exc:
-        return _failed(f"Invalid apply_patch operation: {_validation_message(exc)}")
+        return _invalid(f"Invalid apply_patch operation: {describe_validation_error(exc)}")
     if not isinstance(parsed, _DeleteFile) and _REDACTION_MARKER in parsed.diff:
         return _failed(_redaction_message("diff"))
     try:
@@ -145,7 +147,7 @@ def run_text_editor(
     try:
         call = _EDITOR_CALL.validate_python(arguments)
     except ValidationError as exc:
-        return _failed(f"Invalid text editor call: {_validation_message(exc)}")
+        return _invalid(f"Invalid text editor call: {describe_validation_error(exc)}")
     for name in ("file_text", "old_str", "new_str", "insert_text"):
         if _REDACTION_MARKER in getattr(call, name, ""):
             return _failed(_redaction_message(name))
@@ -320,7 +322,9 @@ def _redaction_message(name: str) -> str:
     )
 
 
-def _validation_message(error: ValidationError) -> str:
+def describe_validation_error(error: ValidationError) -> str:
+    """Return a validation error as one line of ``field: message`` parts for the model."""
+
     return "; ".join(
         ".".join(str(part) for part in item["loc"]) + f": {item['msg']}"
         if item["loc"]
@@ -333,4 +337,14 @@ def _failed(message: str) -> EditResult:
     return EditResult("failed", f"Error: {message}")
 
 
-__all__ = ["EditResult", "apply_patch_operation", "run_text_editor", "syntax_check"]
+def _invalid(message: str) -> EditResult:
+    return EditResult("failed", f"Error: {message}", invalid_arguments=True)
+
+
+__all__ = [
+    "EditResult",
+    "apply_patch_operation",
+    "describe_validation_error",
+    "run_text_editor",
+    "syntax_check",
+]
