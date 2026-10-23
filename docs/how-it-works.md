@@ -134,7 +134,7 @@ from `state.sqlite3`, `contribution.patch`, and `validation.json`, not `report.m
 comments, the full patch, all command output, the commit message and author, the PR title and body,
 the target repository and base commit, the publishing account, and a fingerprint over all of it.
 `approve` refuses if any of it changed. Only the approving GitHub account can publish, within
-`publishing.approval_expires_hours` (24, at most 168). `publish` refuses unless:
+`publishing.approval_expires_hours` (72, at most 168). `publish` refuses unless:
 
 - the approval is current and matches the stored patch and command results;
 - the repository is still in `github.repositories`, or its owner in `github.owners`;
@@ -153,8 +153,8 @@ starts the cooldown even if a later step fails. `publish` creates or reuses your
 `<login>@users.noreply.github.com`), and pushes the new branch
 `<publishing.branch_prefix>/issue-<number>-<run ID prefix>`, never overwriting an existing one. If
 the base, issue, or policy files changed meanwhile, it deletes the branch and the run ends `failed`;
-otherwise it opens a draft PR against the default branch (`publishing.draft`, true), then marks it
-ready for review if `publishing.ready_for_review` is true.
+otherwise it opens a PR against the default branch. With `publishing.draft: true` it opens a draft
+and then marks it ready for review if `publishing.ready_for_review` is true.
 
 ## Run states
 

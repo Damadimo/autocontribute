@@ -14,7 +14,7 @@ Autocontribute finds open issues in GitHub repositories you choose, prepares a s
 5. **Check:** your validation commands run in Docker with no network. A bug fix also needs a reproduction that fails before the change and passes after it.
 6. **Review:** a critic model reviews the diff, check output, and PR text in a fresh context, and hard gates on size, paths, secrets, and scores must all pass.
 7. **Approve:** you read the exact diff, check output, and PR text, then approve.
-8. **Publish:** Autocontribute rechecks that the issue, policy files, and base commit are unchanged, then opens a draft PR from your fork.
+8. **Publish:** Autocontribute rechecks that the issue, policy files, and base commit are unchanged, then opens a PR from your fork.
 
 [docs/how-it-works.md](docs/how-it-works.md) covers each step, the hard gates, and the run states.
 
@@ -81,8 +81,8 @@ Many runs end `skipped` or `rejected`: no issue passed the rules, the plan found
 
 - **Review required.** Nothing reaches GitHub until you approve the exact diff, and `publish` asks again before it writes. It never comments, reviews, reacts, merges, or opens issues.
 - **Isolated checks.** Repository commands run in Docker with no network, no credentials, no Linux capabilities, and CPU, memory, process, and time limits. Model calls run in a separate process that never sees your GitHub token.
-- **Disclosure.** Every PR body includes the `policy.ai_disclosure` text, and PRs open as drafts.
-- **Limits.** At most 1 new PR per UTC day and 2 open PRs, and none to a repository where your account has an open PR or a closed one updated in the last 7 days ([details](docs/configuration.md#publishing)).
+- **Disclosure.** Every PR body includes the `policy.ai_disclosure` text.
+- **Limits.** At most 1 new PR per UTC day and 3 open PRs, and none to a repository where your account has an open PR or a closed one updated in the last 7 days ([details](docs/configuration.md#publishing)).
 - **Repository policies.** It skips repositories whose policy files ban agent-made contributions or ask for human-written PR text (unless you opt in), repositories that take PRs only from collaborators or vouched contributors, and repositories that require a CLA or DCO until you attest with `policy attest` ([details](docs/configuration.md#legal-attestations)).
 - **Stops.** `lifecycle sync` checks the PRs Autocontribute opened; `publish` syncs first. Review requests and CI failures are noted on the run. A PR closed unmerged, a request to close it, or a maintainer turning away automated contributions holds that repository; a revert also holds all publication. An unexpected push to a PR branch, a suspended account, or `safety stop --actor NAME --reason TEXT` stops all work. `safety status` shows the stop and every hold; `safety release HOLD_ID` lifts a hold, and `safety resume` with the "Active trigger-set revision" lifts the stop ([details](docs/how-it-works.md#lifecycle-sync-holds-and-the-safety-stop)).
 

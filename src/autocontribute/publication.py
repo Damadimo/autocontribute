@@ -259,7 +259,7 @@ def _publication_context(
         committer_name=name,
         committer_email=email,
         draft=config.publishing.draft,
-        ready_for_review=config.publishing.ready_for_review,
+        ready_for_review=config.publishing.draft and config.publishing.ready_for_review,
     )
 
 

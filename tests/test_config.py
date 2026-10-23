@@ -24,7 +24,7 @@ def test_example_config_is_valid() -> None:
 
     assert config.models.builder.model == "gpt-5.6"
     assert config.models.critic.reasoning_mode == "pro"
-    assert config.publishing.draft is True
+    assert config.publishing.draft is False
     assert config.budget.max_model_cost_usd_per_run == Decimal("50")
     assert config.models.scout.pricing is not None
     assert all(
@@ -150,7 +150,6 @@ def test_defaults_disclose_autonomous_work_without_claiming_human_validation() -
     assert "automated checks" in disclosure
     assert "independently validated" not in disclosure
     assert "validated by the contributor" not in disclosure
-    assert config.publishing.draft is True
     assert config.github.max_repository_inactivity_days == 180
 
 
@@ -195,11 +194,13 @@ def test_publishing_mode_is_not_a_setting() -> None:
         AutocontributeConfig.model_validate({"publishing": {"mode": "review_required"}})
 
 
-def test_ready_for_review_requires_draft_staging() -> None:
-    with pytest.raises(ValueError, match=r"publishing\.draft must be true"):
-        AutocontributeConfig.model_validate(
-            {"publishing": {"draft": False, "ready_for_review": True}}
-        )
+def test_publishing_defaults_open_ready_pull_requests() -> None:
+    publishing = AutocontributeConfig().publishing
+
+    assert publishing.draft is False
+    assert publishing.ready_for_review is True
+    assert publishing.max_open_pull_requests == 3
+    assert publishing.approval_expires_hours == 72
 
 
 def _legal_attestation(**updates: object) -> dict[str, object]:

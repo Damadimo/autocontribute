@@ -110,12 +110,12 @@ There is no network setting: the `docker` backend always runs checks with no net
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `approval_expires_hours` | `24` | Hours an approval stays valid (1–168). |
+| `approval_expires_hours` | `72` | Hours an approval stays valid (1–168). |
 | `branch_prefix` | `autocontribute` | Branches are named `<prefix>/issue-<number>-<first 8 characters of the run ID>`. |
-| `draft` | `true` | Open PRs as drafts. |
-| `ready_for_review` | `false` | Mark the draft ready for review right after opening it. Needs `draft: true`. |
+| `draft` | `false` | Open PRs as drafts. |
+| `ready_for_review` | `true` | Mark a draft ready for review right after opening it. Has no effect when `draft` is `false`, because the PR is then ready from the start. |
 | `max_new_pull_requests_per_day` | `1` | Refuse to publish once your GitHub account has opened this many PRs in the current UTC day (1–5). |
-| `max_open_pull_requests` | `2` | Refuse to publish while your account has this many open PRs (1–20). |
+| `max_open_pull_requests` | `3` | Refuse to publish while your account has this many open PRs (1–20). |
 | `repository_cooldown_days` | `7` | Refuse a repository where your account has an open PR, or a closed one updated in this many days (0–365). |
 
 The three limits count every PR your GitHub account authored, including ones you opened yourself.
