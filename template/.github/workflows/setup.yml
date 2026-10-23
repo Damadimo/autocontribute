@@ -1,0 +1,36 @@
+name: setup
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  setup:
+    # A repository marked as a template only hands these files on; nothing runs in it.
+    if: ${{ !github.event.repository.is_template }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    concurrency:
+      group: autocontribute-state
+      queue: max
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+    steps:
+      - name: Check out the configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install autocontribute
+        uses: ./.github/actions/install-autocontribute
+      - name: Check the secrets, configuration and Docker, then turn preparation on or off
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTOCONTRIBUTE_GITHUB_TOKEN: ${{ secrets.AUTOCONTRIBUTE_GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: autocontribute actions setup

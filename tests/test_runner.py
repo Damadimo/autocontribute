@@ -45,6 +45,7 @@ from autocontribute.runner import (
     attention_items,
     check_runner,
     confirm_comment_unchanged,
+    create_runner_repository,
     file_sha256,
     load_runner_config,
     publishing_token_check,
@@ -52,6 +53,7 @@ from autocontribute.runner import (
     read_prepared,
     report_approval,
     sync_issues,
+    template_files,
     write_prepared,
 )
 from autocontribute.state_archive import export_state, import_state
@@ -805,6 +807,73 @@ def test_approval_report_announces_the_pull_request_or_explains_the_refusal(
     for closed in (failed_issue, missing_issue):
         assert github.issues[closed]["state_reason"] == "not_planned"
         assert github.issues[closed]["labels"] == []
+
+
+def test_template_files_hold_the_runner(tmp_path: Path) -> None:
+    files = template_files()
+
+    assert set(files) == {
+        ".github/actions/install-autocontribute/action.yml",
+        ".github/workflows/approve.yml",
+        ".github/workflows/prepare.yml",
+        ".github/workflows/setup.yml",
+        ".gitignore",
+        "README.md",
+        "autocontribute.yml",
+    }
+    config = tmp_path / "autocontribute.yml"
+    config.write_bytes(files["autocontribute.yml"])
+    assert load_runner_config(config, owner=OWNER).github.repositories == []
+
+
+def test_init_actions_creates_a_private_repository_from_the_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    pushed: dict[str, bytes] = {}
+
+    def run_command(
+        arguments: list[str], *, cwd: Path | None = None, extra_env: object = None
+    ) -> str:
+        calls.append(arguments)
+        if arguments[:3] == ["gh", "api", "user"]:
+            return json.dumps({"login": OWNER, "id": OWNER_ID})
+        if arguments[:3] == ["gh", "repo", "create"]:
+            source = Path(arguments[arguments.index("--source") + 1])
+            pushed.update(
+                {
+                    path.relative_to(source).as_posix(): path.read_bytes()
+                    for path in source.rglob("*")
+                    if path.is_file()
+                }
+            )
+        if "commit" in arguments:
+            assert extra_env == {
+                "GIT_AUTHOR_NAME": OWNER,
+                "GIT_AUTHOR_EMAIL": f"{OWNER_ID}+{OWNER}@users.noreply.github.com",
+                "GIT_COMMITTER_NAME": OWNER,
+                "GIT_COMMITTER_EMAIL": f"{OWNER_ID}+{OWNER}@users.noreply.github.com",
+            }
+        return ""
+
+    monkeypatch.setattr(runner_module, "_run_command", run_command)
+
+    result = cli_runner.invoke(app, ["init", "--actions", "--repo", "my-runner"])
+
+    assert result.exit_code == 0, result.output
+    create = next(call for call in calls if call[:3] == ["gh", "repo", "create"])
+    assert create[3:5] == ["my-runner", "--private"]
+    assert "--push" in create
+    assert pushed == template_files()
+    assert "gh secret set AUTOCONTRIBUTE_GITHUB_TOKEN --repo octocat/my-runner" in result.output
+    assert "gh secret set OPENAI_API_KEY --repo octocat/my-runner" in result.output
+    assert runner_module.TOKEN_URL in result.output
+
+    with pytest.raises(ConfigurationError, match="--repo"):
+        create_runner_repository("../escape", public=True)
+    refused = cli_runner.invoke(app, ["init", "--public", "--path", "x.yml"])
+    assert refused.exit_code == 1
+    assert "only with --actions" in refused.output
 
 
 # The commands, with GitHub, Docker and the orchestrator faked.

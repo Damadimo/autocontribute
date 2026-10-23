@@ -18,6 +18,8 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from importlib import resources
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
@@ -50,6 +52,7 @@ PREPARE_WORKFLOW = "prepare.yml"
 PUBLISHING_TOKEN_ENV = "AUTOCONTRIBUTE_GITHUB_TOKEN"
 MODEL_KEY_ENVS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")
 TOKEN_URL = "https://github.com/settings/tokens/new?scopes=public_repo&description=autocontribute"
+DEFAULT_RUNNER_NAME = "autocontribute-runner"
 APPROVAL_SYNTAX_REPLY = (
     "Not approved. An approval is a comment that holds only `/approve` and the first 12 "
     "characters of the fingerprint, exactly as the issue shows it. Write a new comment; edited "
@@ -66,6 +69,7 @@ _SETUP_MARKER = "<!-- autocontribute:setup -->"
 _RUN_MARKER = re.compile(r"<!-- autocontribute:run=([0-9a-f]{16}) -->")
 _APPROVE_COMMENT = re.compile(r"/approve ([0-9a-f]{12})\s*")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_RUNNER_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 _ACCOUNT_ID = re.compile(r"^[1-9][0-9]{0,18}$")
 _EXPIRY_FORMATS = ("%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%d %H:%M:%S %z")
 _EXPIRY_WARNING = timedelta(days=14)
@@ -919,6 +923,83 @@ def sync_issues(
     return lines
 
 
+def template_files() -> dict[str, bytes]:
+    """The runner template, by path relative to the new repository's root."""
+
+    files: dict[str, bytes] = {}
+
+    def collect(directory: Traversable, prefix: str) -> None:
+        for entry in directory.iterdir():
+            if entry.is_dir():
+                collect(entry, f"{prefix}{entry.name}/")
+            else:
+                files[f"{prefix}{entry.name}"] = entry.read_bytes()
+
+    collect(_template_root(), "")
+    return dict(sorted(files.items()))
+
+
+def create_runner_repository(name: str, *, public: bool) -> str:
+    """Create a GitHub repository from the runner template with ``gh``; return owner/name."""
+
+    if not _RUNNER_NAME.fullmatch(name) or name in {".", ".."}:
+        raise ConfigurationError("--repo must be a repository name such as autocontribute-runner")
+    try:
+        account = json.loads(_run_command(["gh", "api", "user"]))
+        login = account["login"]
+        account_id = account["id"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ConfigurationError("`gh api user` did not return your GitHub account") from exc
+    if not isinstance(login, str) or _integer(account_id) is None:
+        raise ConfigurationError("`gh api user` did not return your GitHub account")
+    email = f"{account_id}+{login}@users.noreply.github.com"
+    with tempfile.TemporaryDirectory(prefix="autocontribute-runner-") as work:
+        root = Path(work) / name
+        for relative, content in template_files().items():
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        identity = {
+            "GIT_AUTHOR_NAME": login,
+            "GIT_AUTHOR_EMAIL": email,
+            "GIT_COMMITTER_NAME": login,
+            "GIT_COMMITTER_EMAIL": email,
+        }
+        _run_command(["git", "init", "--quiet", "--initial-branch=main"], cwd=root)
+        _run_command(["git", "add", "--all"], cwd=root)
+        _run_command(
+            [
+                "git",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--message",
+                "Start an autocontribute runner",
+            ],
+            cwd=root,
+            extra_env=identity,
+        )
+        _run_command(
+            [
+                "gh",
+                "repo",
+                "create",
+                name,
+                "--public" if public else "--private",
+                "--description",
+                "Prepares open-source fixes with autocontribute; you approve each one",
+                "--source",
+                str(root),
+                "--remote",
+                "origin",
+                "--push",
+            ],
+            cwd=root,
+        )
+    return f"{login}/{name}"
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -1078,6 +1159,42 @@ def _token_expiry(value: str) -> datetime | None:
     return None
 
 
+def _template_root() -> Traversable:
+    packaged = resources.files("autocontribute") / "template"
+    if packaged.is_dir():
+        return packaged
+    # An editable install imports from the source tree, where the template sits at the root.
+    source = Path(__file__).resolve().parents[2] / "template"
+    if source.is_dir():
+        return source
+    raise ConfigurationError("This installation has no runner template; reinstall autocontribute")
+
+
+def _run_command(
+    arguments: list[str],
+    *,
+    cwd: Path | None = None,
+    extra_env: Mapping[str, str] | None = None,
+) -> str:
+    try:
+        result = subprocess.run(
+            arguments,
+            cwd=cwd,
+            env={**os.environ, **(extra_env or {})},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ConfigurationError(f"`{arguments[0]}` could not run: {type(exc).__name__}") from exc
+    if result.returncode != 0:
+        detail = redact_text((result.stderr or result.stdout).strip())[:1_000]
+        raise ConfigurationError(f"`{' '.join(arguments[:3])}` failed: {detail}")
+    return result.stdout
+
+
 @contextmanager
 def _askpass(token: str | None) -> Iterator[dict[str, str]]:
     """Hand ``token`` to git through a helper script, so it never appears in arguments."""
@@ -1138,6 +1255,7 @@ def _integer(value: object) -> int | None:
 __all__ = [
     "APPROVAL_SYNTAX_REPLY",
     "AWAITING_LABEL",
+    "DEFAULT_RUNNER_NAME",
     "MODEL_KEY_ENVS",
     "PREPARED_FILE",
     "PUBLISHED_LABEL",
@@ -1155,6 +1273,7 @@ __all__ = [
     "attention_items",
     "check_runner",
     "confirm_comment_unchanged",
+    "create_runner_repository",
     "file_sha256",
     "load_runner_config",
     "publishing_token_check",
@@ -1163,5 +1282,6 @@ __all__ = [
     "report_approval",
     "runner_token",
     "sync_issues",
+    "template_files",
     "write_prepared",
 ]

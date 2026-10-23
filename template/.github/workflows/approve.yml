@@ -1,0 +1,55 @@
+name: approve
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  approve:
+    # Only the owner's /approve comment on an open approval issue that this runner opened starts
+    # a job. The command checks every condition again from the event file.
+    if: >-
+      ${{
+        !github.event.repository.is_template &&
+        !github.event.issue.pull_request &&
+        github.event.issue.state == 'open' &&
+        github.event.issue.user.login == 'github-actions[bot]' &&
+        contains(github.event.issue.labels.*.name, 'autocontribute:awaiting-approval') &&
+        github.event.comment.user.id == github.repository_owner_id &&
+        github.event.comment.author_association == 'OWNER' &&
+        startsWith(github.event.comment.body, '/approve ')
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: autocontribute-state
+      queue: max
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - name: Check out the configuration
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out the state
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: autocontribute-state
+          path: state
+          persist-credentials: false
+      - name: Install autocontribute
+        uses: ./.github/actions/install-autocontribute
+      - name: Approve and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AUTOCONTRIBUTE_GITHUB_TOKEN: ${{ secrets.AUTOCONTRIBUTE_GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: >-
+          autocontribute actions approve
+          --issue "$ISSUE_NUMBER"
+          --comment-id "$COMMENT_ID"
+          --state state
