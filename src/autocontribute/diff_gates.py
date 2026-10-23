@@ -241,12 +241,15 @@ def diff_gates(
         if not removed
         else "existing tests are removed or skipped: " + "; ".join(removed[:_LISTED_PATHS]),
     )
+    # The added lines of a file are scanned together, so a key block's lines are matched as
+    # one; a key header alone, as in code that parses keys, does not count.
     findings = sorted(
         {
             f"{label} in {file.path}"
             for file in patch.files
-            for line in _added_lines(file)
-            for label in high_confidence_token_labels(line)
+            for label in high_confidence_token_labels(
+                "\n".join(_added_lines(file)), include_key_header=False
+            )
         }
     )
     host_secret = any(
