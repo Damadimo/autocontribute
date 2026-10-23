@@ -66,6 +66,7 @@ _CHECK_CONCLUSIONS = frozenset(
     }
 )
 _AUTHORED_PULL_REQUEST_LIMIT = 100
+_COMPARE_FILE_LIMIT = 300
 _GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _REPOSITORY_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -164,6 +165,16 @@ class RepositoryAccess:
     can_push: bool | None
     has_pull_requests: bool
     pull_requests_from_collaborators_only: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CommitComparison:
+    """How a later commit relates to an earlier one, and which paths changed between them."""
+
+    status: str
+    changed_paths: frozenset[str]
+    # GitHub lists at most 300 files, so a full list cannot prove the remaining paths unchanged.
+    complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -1402,6 +1413,34 @@ class GitHubClient:
         )
         return self.default_branch_sha(full_name, branch)
 
+    def compare_commits(self, repository: str, base: str, head: str) -> CommitComparison:
+        """Compare two commits by SHA; renames report both their old and new paths."""
+
+        base_sha = _full_git_sha(base, field="comparison base SHA")
+        head_sha = _full_git_sha(head, field="comparison head SHA")
+        data = _mapping(
+            self._request(
+                "GET",
+                f"/repos/{quote(repository, safe='/')}/compare/{base_sha}...{head_sha}",
+            ),
+            resource="commit comparison",
+        )
+        status = data.get("status")
+        if status not in {"ahead", "behind", "diverged", "identical"}:
+            raise GitHubError("GitHub returned an unsupported commit comparison status")
+        files = _mapping_list(data.get("files", []), resource="compared files")
+        paths: set[str] = set()
+        for item in files:
+            paths.add(_nonempty(item.get("filename"), field="compared file name"))
+            previous = item.get("previous_filename")
+            if previous is not None:
+                paths.add(_nonempty(previous, field="compared previous file name"))
+        return CommitComparison(
+            status=status,
+            changed_paths=frozenset(paths),
+            complete=len(files) < _COMPARE_FILE_LIMIT,
+        )
+
     def ref_sha(self, repository: str, ref: str) -> str | None:
         data = self._request(
             "GET",
@@ -2570,6 +2609,7 @@ def _parse_issue(data: dict[str, Any], repository: str) -> IssueCandidate:
         body=str(data.get("body") or ""),
         html_url=str(data["html_url"]),
         state=str(data["state"]),
+        locked=data.get("locked") is True,
         author=str((data.get("user") or {}).get("login") or "unknown"),
         labels=[str(label.get("name") or "") for label in data.get("labels", [])],
         assignees=[str(user.get("login") or "") for user in data.get("assignees", [])],
@@ -2672,6 +2712,7 @@ def _rate_limit_wait_seconds(response: httpx.Response, attempt: int) -> float:
 __all__ = [
     "BranchPush",
     "CheckRunDetails",
+    "CommitComparison",
     "CommitStatusDetails",
     "DirectoryEntry",
     "ForkIdentity",

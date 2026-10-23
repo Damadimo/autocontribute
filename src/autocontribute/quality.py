@@ -753,6 +753,20 @@ def _secret_findings(files: Sequence[_DiffFile]) -> list[str]:
     return sorted(findings)
 
 
+def patch_paths(diff: str) -> list[str]:
+    """Return every repository path a patch adds, changes, or removes."""
+
+    paths = {
+        path
+        for item in _parse_git_diff(diff)
+        for path in (item.old_path, item.new_path)
+        if path != "/dev/null"
+    }
+    if "<unparseable>" in paths:
+        raise ValueError("patch has a file header whose paths cannot be parsed")
+    return sorted(paths)
+
+
 def workflow_paths(diff: str) -> list[str]:
     """Return the CI configuration paths a patch adds, changes, or removes."""
 
@@ -785,6 +799,7 @@ __all__ = [
     "actionable_validation_failure_reason",
     "environment_failure_signature",
     "infrastructure_failure_reason",
+    "patch_paths",
     "secret_findings",
     "workflow_paths",
 ]

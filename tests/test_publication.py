@@ -46,6 +46,7 @@ from autocontribute.exceptions import (
 )
 from autocontribute.github import (
     CheckRunDetails,
+    CommitComparison,
     CommitStatusDetails,
     DirectoryEntry,
     ForkIdentity,
@@ -500,6 +501,8 @@ class FakePublishingGitHub:
         self.upstream_push = False
         self.upstream_has_pull_requests = True
         self.upstream_collaborators_only = False
+        # A newer base that touches the patched file keeps the strict "base moved" behavior.
+        self.base_changed_paths: frozenset[str] = frozenset({"fix.py"})
 
     def authenticated_login(self) -> str:
         self.calls.append("authenticated_login")
@@ -773,6 +776,14 @@ class FakePublishingGitHub:
     def ref_sha(self, repository: str, ref: str) -> str | None:
         self.calls.append("ref_sha")
         return self.branch_sha
+
+    def compare_commits(self, repository: str, base: str, head: str) -> CommitComparison:
+        self.calls.append("compare_commits")
+        return CommitComparison(
+            status="ahead",
+            changed_paths=self.base_changed_paths,
+            complete=True,
+        )
 
     def create_pull_request(self, *args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
         before_mutation = kwargs.pop("before_mutation", None)
@@ -1259,7 +1270,7 @@ def test_base_drift_stops_before_any_github_mutation(tmp_path: Path) -> None:
     github = FakePublishingGitHub(issue, "b" * 40)
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
 
-    with pytest.raises(PolicyError, match="base branch moved"):
+    with pytest.raises(PolicyError, match="base branch changed a path the patch touches"):
         publisher.publish(run_id)
 
     assert not github.mutated
@@ -1431,7 +1442,7 @@ def test_base_moves_after_push_deletes_exact_branch_without_post(
     monkeypatch.setattr(publisher, "_push", push)
     monkeypatch.setattr(publisher, "_delete_remote_branch", delete)
 
-    with pytest.raises(PolicyError, match="moved after the contribution branch was pushed"):
+    with pytest.raises(PolicyError, match="touches after the contribution branch was pushed"):
         publisher.publish(run_id)
 
     durable = store.get(run_id)
@@ -1502,14 +1513,25 @@ def test_post_race_persists_url_then_closes_pr_and_deletes_exact_branch(
     assert store.circuit_breaker_status().is_tripped
 
 
+def _issue_comment(author: str, body: str) -> IssueComment:
+    now = datetime.now(UTC)
+    return IssueComment(
+        author=author,
+        author_association="MEMBER" if author == "maintainer" else "NONE",
+        body=body,
+        html_url=f"https://github.com/example/project/issues/42#issuecomment-{len(body)}",
+        created_at=now,
+        updated_at=now,
+    )
+
+
 @pytest.mark.parametrize(
     ("changed_field", "expected_error"),
     [
-        ("body", r"Issue evidence changed.*body"),
-        ("labels", r"Issue evidence changed.*labels"),
-        ("discussion", r"Issue evidence changed.*discussion"),
         ("state", r"no longer passes deterministic eligibility.*issue is not open"),
         ("assignment", r"no longer passes deterministic eligibility.*already assigned"),
+        ("locked", r"Issue changed after preparation: issue is locked"),
+        ("claim", r"no longer passes deterministic eligibility.*claimed work by someone"),
     ],
 )
 def test_issue_evidence_drift_stops_before_any_github_mutation(
@@ -1519,25 +1541,19 @@ def test_issue_evidence_drift_stops_before_any_github_mutation(
 ) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
     manifest = store.get(run_id)
-    if changed_field == "body":
-        issue = issue.model_copy(update={"body": issue.body + "\nA new acceptance requirement."})
-    elif changed_field == "labels":
-        issue = issue.model_copy(update={"labels": [*issue.labels, "triaged"]})
-    elif changed_field == "discussion":
-        now = datetime.now(UTC)
-        comment = IssueComment(
-            author="maintainer",
-            author_association="MEMBER",
-            body="An additional implementation note.",
-            html_url="https://github.com/example/project/issues/42#issuecomment-1",
-            created_at=now,
-            updated_at=now,
-        )
-        issue = issue.model_copy(update={"comments": issue.comments + 1, "discussion": [comment]})
-    elif changed_field == "state":
+    if changed_field == "state":
         issue = issue.model_copy(update={"state": "closed"})
-    else:
+    elif changed_field == "assignment":
         issue = issue.model_copy(update={"assignees": ["another-contributor"]})
+    elif changed_field == "locked":
+        issue = issue.model_copy(update={"locked": True})
+    else:
+        issue = issue.model_copy(
+            update={
+                "comments": issue.comments + 1,
+                "discussion": [_issue_comment("someone", "I'm working on this already.")],
+            }
+        )
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
 
     with pytest.raises(PolicyError, match=expected_error):
@@ -1547,13 +1563,130 @@ def test_issue_evidence_drift_stops_before_any_github_mutation(
     assert all(event["event_type"] != "publication.reserved" for event in store.events(run_id))
 
 
+@pytest.mark.parametrize("changed_field", ["body", "labels", "discussion", "own_activity"])
+def test_routine_issue_activity_after_preparation_still_publishes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_field: str,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    later = issue.updated_at + timedelta(hours=5)
+    if changed_field == "body":
+        issue = issue.model_copy(
+            update={"body": issue.body + "\nMore context.", "updated_at": later}
+        )
+    elif changed_field == "labels":
+        issue = issue.model_copy(update={"labels": [*issue.labels, "triaged"], "updated_at": later})
+    elif changed_field == "discussion":
+        issue = issue.model_copy(
+            update={
+                "comments": issue.comments + 1,
+                "discussion": [_issue_comment("maintainer", "This also affects version 2.")],
+                "updated_at": later,
+            }
+        )
+    else:
+        issue = issue.model_copy(
+            update={
+                "assignees": ["OctoCat"],
+                "comments": issue.comments + 1,
+                "discussion": [_issue_comment("octocat", "I'm working on this.")],
+                "updated_at": later,
+            }
+        )
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+
+    assert publisher.publish(run_id).status == RunStatus.PR_OPEN
+
+
+def test_base_drift_that_leaves_patched_paths_alone_publishes_on_the_prepared_base(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    prepared_base = store.get(run_id).base_sha or ""
+    newer_base = "f" * 40
+    github = FakePublishingGitHub(issue, newer_base)
+    github.base_changed_paths = frozenset({"README.md", "docs/other.md"})
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    commits: list[str] = []
+    original_create = github.create_pull_request
+
+    def create_on_newer_base(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
+        created = original_create(*args, **kwargs)
+        return replace(created, base_sha=newer_base)
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        before_mutation()
+        commits.append(_git(workspace, "rev-parse", f"{commit_sha}^"))
+        github.branch_sha = commit_sha
+
+    monkeypatch.setattr(github, "create_pull_request", create_on_newer_base)
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert commits == [prepared_base]
+    assert published.base_sha == prepared_base
+    assert github.calls.count("compare_commits") == 1
+    assert not store.circuit_breaker_status().is_tripped
+
+
+@pytest.mark.parametrize(
+    ("status", "complete", "changed_path"),
+    [
+        ("diverged", True, "README.md"),
+        ("behind", True, "README.md"),
+        ("ahead", False, "README.md"),
+        ("ahead", True, "CONTRIBUTING.md"),
+    ],
+)
+def test_base_drift_is_unsafe_unless_policy_and_patch_paths_provably_stayed(
+    tmp_path: Path,
+    status: str,
+    complete: bool,
+    changed_path: str,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, "f" * 40)
+    github.compare_commits = lambda repository, base, head: CommitComparison(  # type: ignore[method-assign]
+        status=status,
+        changed_paths=frozenset({changed_path}),
+        complete=complete,
+    )
+
+    with pytest.raises(PolicyError, match="changed a path the patch touches"):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert not github.mutated
+
+
 @pytest.mark.parametrize(
     ("drift", "timing"),
     [
         ("state", "after_push"),
         ("labels", "after_push"),
         ("assignment", "after_push"),
-        ("discussion", "after_push"),
+        ("claim", "after_push"),
         ("security_discussion", "after_push"),
         ("archived", "after_push"),
         ("maintainer_stop", "after_push"),
@@ -1591,13 +1724,13 @@ def test_issue_or_repository_drift_after_push_compensates_before_pull_request(
         if drift == "state":
             github.issue = issue.model_copy(update={"state": "closed"})
         elif drift == "labels":
-            github.issue = issue.model_copy(update={"labels": ["bug", "good first issue"]})
+            github.issue = issue.model_copy(update={"labels": [*issue.labels, "blocked"]})
         elif drift == "assignment":
             github.issue = issue.model_copy(update={"assignees": ["another-contributor"]})
-        elif drift in {"discussion", "security_discussion", "maintainer_stop"}:
+        elif drift in {"claim", "security_discussion", "maintainer_stop"}:
             now = datetime.now(UTC)
             bodies = {
-                "discussion": "The expected output now includes an additional field.",
+                "claim": "I'm working on a fix for this already.",
                 "security_discussion": ("A private report confirms an authentication bypass."),
                 "maintainer_stop": (
                     "Please hold off; no pull request is needed until the design is settled."
@@ -1641,7 +1774,7 @@ def test_issue_or_repository_drift_after_push_compensates_before_pull_request(
             post_push_duplicate_searches += 1
             if (
                 timing == "during_closing_duplicate_search"
-                and post_push_duplicate_searches == 2
+                and post_push_duplicate_searches == 1
                 and not drift_applied
             ):
                 apply_drift()
@@ -3754,11 +3887,9 @@ def test_retry_compensates_reconciled_branch_after_push_event_save_crash(
     monkeypatch.setattr(store, "save", original_save)
     if drift == "base":
         github.sha = "d" * 40
-        expected_error = "upstream base branch moved after"
+        expected_error = "patch touches after the contribution branch was pushed"
     else:
-        github.issue = issue.model_copy(
-            update={"body": issue.body + "\nA new acceptance requirement."}
-        )
+        github.issue = issue.model_copy(update={"state": "closed"})
         expected_error = "Issue or repository freshness evidence changed after"
 
     with pytest.raises(PolicyError, match=expected_error):
@@ -5847,7 +5978,7 @@ def test_same_repository_compensation_deletes_only_the_exact_upstream_branch(
     )
     monkeypatch.setattr(publisher, "_delete_remote_branch", delete)
 
-    with pytest.raises(PolicyError, match="moved after the contribution branch was pushed"):
+    with pytest.raises(PolicyError, match="touches after the contribution branch was pushed"):
         publisher.publish(run_id)
 
     failed = store.get(run_id)

@@ -14,7 +14,7 @@ Autocontribute finds open issues in GitHub repositories you choose, prepares a s
 5. **Check:** your validation commands run in Docker with no network. A bug fix also needs a reproduction that fails before the change and passes after it.
 6. **Review:** a critic model reviews the diff, check output, and PR text in a fresh context, and hard gates on size, paths, secrets, and scores must all pass.
 7. **Approve:** you read the exact diff, check output, and PR text, then approve.
-8. **Publish:** Autocontribute rechecks that the issue, policy files, and base commit are unchanged, then opens a PR from your fork, or from a branch in the repository itself if you own it.
+8. **Publish:** Autocontribute rechecks that the issue is still open to a fix, the policy files are unchanged, and no newer commit touched the patched files, then opens a PR from your fork, or from a branch in the repository itself if you own it.
 
 [docs/how-it-works.md](docs/how-it-works.md) covers each step, the hard gates, and the run states.
 
