@@ -53,6 +53,7 @@ from autocontribute.lifecycle import LifecycleSyncResult, sync_open_pull_request
 from autocontribute.orchestrator import Orchestrator, RunInvocationMode
 from autocontribute.publication import Publisher, approve_run, build_approval_review
 from autocontribute.reporting import render_approval_review, render_run_report
+from autocontribute.state_archive import export_state, import_state
 from autocontribute.store import CandidateRetryAuthorization, RunStore
 
 app = typer.Typer(
@@ -78,7 +79,12 @@ app.add_typer(runs_app, name="runs")
 app.add_typer(config_app, name="config")
 app.add_typer(lifecycle_app, name="lifecycle")
 app.add_typer(safety_app, name="safety")
+state_app = typer.Typer(
+    help="Copy the local state to and from one archive, for runners without a disk.",
+    no_args_is_help=True,
+)
 app.add_typer(policy_app, name="policy")
+app.add_typer(state_app, name="state")
 
 console = Console()
 DEFAULT_CONFIG = Path("autocontribute.yml")
@@ -1058,6 +1064,63 @@ def safety_release(
         console.print(f"[yellow]Hold {hold_id} was already released.[/yellow]")
         return
     console.print(f"[green]Released hold {hold_id}.[/green]")
+
+
+@state_app.command(name="export")
+def state_export(
+    output: Annotated[
+        Path,
+        typer.Option("--output", "-o", help="The .tar.gz archive to write."),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Write the database and the evidence of unfinished runs to one archive."""
+
+    settings = _config(config)
+    try:
+        exported = export_state(RunStore(settings.storage.path), output)
+    except (AutocontributeError, OSError) as exc:
+        _fail(str(exc))
+    console.print(
+        f"Exported state with {exported.unfinished_runs} unfinished run(s) to {output} "
+        f"(SHA-256 {exported.sha256})",
+        markup=False,
+    )
+
+
+@state_app.command(name="import")
+def state_import(
+    archive: Annotated[Path, typer.Argument(help="An archive written by `state export`.")],
+    config: ConfigOption = DEFAULT_CONFIG,
+    release_leases: Annotated[
+        bool,
+        typer.Option(
+            "--release-leases",
+            help="Drop leases held when the archive was written; only when none of those "
+            "processes can still be running.",
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Replace state that already exists."),
+    ] = False,
+) -> None:
+    """Verify an archive from `state export`, then make it the local state."""
+
+    settings = _config(config)
+    try:
+        released = import_state(
+            archive,
+            settings.storage.path,
+            force=force,
+            release_leases=release_leases,
+        )
+    except (AutocontributeError, OSError) as exc:
+        _fail(str(exc))
+    console.print(
+        f"Imported {archive} into {settings.storage.path}; released {released} lease(s).",
+        markup=False,
+    )
 
 
 @app.command()

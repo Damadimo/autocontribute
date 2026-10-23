@@ -11,7 +11,7 @@ import shutil
 import sqlite3
 import uuid
 from collections.abc import Collection, Iterator
-from contextlib import contextmanager, suppress
+from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -2911,6 +2911,16 @@ class RunStore:
                 raise StateError(f"Lease {lease_name} changed while releasing")
             return True
 
+    def release_all_leases(self) -> int:
+        """Drop every lease, for restored state whose holders can no longer be running.
+
+        Generation counters stay, so a holder that somehow survived is still fenced out.
+        """
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return connection.execute("DELETE FROM leases").rowcount
+
     def get_lease(self, name: str) -> Lease | None:
         lease_name = _lease_identity(name, field="lease name")
         with self._connection() as connection:
@@ -3413,6 +3423,17 @@ class RunStore:
                 ]
             ).encode()
         ).hexdigest()
+
+    def backup(self, target: Path) -> None:
+        """Copy the database to ``target`` through SQLite's backup API.
+
+        The copy is consistent even while other processes write, and it uses a rollback journal,
+        so it is one self-contained file.
+        """
+
+        with self._connection() as source, closing(sqlite3.connect(target)) as copy:
+            source.backup(copy)
+            copy.execute("PRAGMA journal_mode = DELETE")
 
     def artifact_dir(self, run_id: str) -> Path:
         path = self.runs_dir / run_id
