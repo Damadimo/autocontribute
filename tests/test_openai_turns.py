@@ -277,6 +277,7 @@ def test_a_refusal_ends_the_run_without_echoing_it(monkeypatch: pytest.MonkeyPat
     assert not isinstance(raised.value, ModelRequestError)
 
 
+@pytest.mark.parametrize("usage_reported", [True, False], ids=["usage", "no-usage"])
 @pytest.mark.parametrize(
     ("code", "message", "retried"),
     [
@@ -295,8 +296,13 @@ def test_failed_responses_map_into_the_retry_classification(
     code: str,
     message: str,
     retried: bool,
+    usage_reported: bool,
 ) -> None:
-    _client(monkeypatch, _response(status="failed", error_code=code))
+    response = _response(status="failed", error_code=code)
+    if not usage_reported:
+        # A response that failed before generating anything can carry usage=null.
+        response.usage = None
+    _client(monkeypatch, response)
 
     with pytest.raises(ModelRequestError) as raised:
         openai_adapter.step(_request())
