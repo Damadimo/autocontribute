@@ -302,9 +302,12 @@ def _execute_turn(envelope: dict[str, object]) -> bytes:
 
 
 def _step(request: TurnRequest) -> Turn:
-    if request.spec.provider == "openai":
-        return openai_adapter.step(request)
-    raise ModelError(f"Unsupported model provider: {request.spec.provider}")
+    if request.spec.provider == "anthropic":
+        # Imported on demand so that OpenAI turns do not load a second SDK.
+        from autocontribute import anthropic_adapter
+
+        return anthropic_adapter.step(request)
+    return openai_adapter.step(request)
 
 
 def main() -> int:
