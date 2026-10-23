@@ -41,11 +41,13 @@ from autocontribute.exceptions import (
     GitHubSafetyError,
     PolicyError,
     StateError,
+    StopScope,
 )
 from autocontribute.github import DirectoryEntry, LinkedPullRequest
 from autocontribute.store import (
     CandidateAttemptDisposition,
     CandidateAttemptState,
+    Hold,
     RunStore,
 )
 
@@ -178,6 +180,9 @@ class DispositionStore:
 
     def list_open_pull_request_runs(self) -> list[RunManifest]:
         return self.open_pull_request_runs
+
+    def active_holds(self) -> list[Hold]:
+        return []
 
     def candidate_attempt_disposition(
         self,
@@ -1580,7 +1585,7 @@ def test_discussion_stop_is_reported_again_without_raising_on_every_discovery(
     assert not service.store.circuit_breaker_status().is_tripped
 
 
-def test_stop_aimed_at_automation_holds_the_repository_for_the_run(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_stop_aimed_at_automation_holds_the_repository_until_released(tmp_path) -> None:  # type: ignore[no-untyped-def]
     held = [
         _repository_issue("example/project", 40),
         _repository_issue(
@@ -1624,6 +1629,85 @@ def test_stop_aimed_at_automation_holds_the_repository_for_the_run(tmp_path) -> 
         "other/project#7",
     ]
     assert not service.store.circuit_breaker_status().is_tripped
+    (hold,) = service.store.active_holds()
+    assert (hold.scope, hold.scope_key) == (StopScope.REPOSITORY, "example/project")
+    assert hold.source == "github_issue_discussion:example/project#41"
+
+    again = service.discover()
+
+    assert again.skipped_repositories == (
+        (
+            "example/project",
+            f"held since {hold.created_at.date().isoformat()} (hold {hold.hold_id}): "
+            "a maintainer comment turns away automated or AI contributions: "
+            "https://github.com/example/project/issues/42#maintainer-0",
+        ),
+    )
+    assert [evaluation.issue.reference for evaluation in again.evaluations] == ["other/project#7"]
+    assert len(service.store.active_holds()) == 1
+
+    assert service.store.release_hold(hold.hold_id, actor="operator", reason="reviewed")
+    released = service.discover()
+
+    assert released.skipped_repositories == ()
+    assert [evaluation.issue.reference for evaluation in released.evaluations] == [
+        "example/project#40",
+        "example/project#41",
+        "example/project#42",
+        "other/project#7",
+    ]
+    assert "stop request" in released.evaluations[1].blocker_kinds
+    assert service.store.active_holds() == []
+
+
+def test_held_repositories_are_not_searched_and_held_issues_not_read(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path)
+    store.record_stop(
+        CircuitBreakerTrigger(
+            source="github_lifecycle:held/project#3:closed_unmerged",
+            reason="Pull request was closed without being merged",
+            trigger_hash="held-repository",
+            scope=StopScope.REPOSITORY,
+            scope_key="held/project",
+            expires_at=datetime.now(UTC) + timedelta(days=30),
+        )
+    )
+    store.record_stop(
+        CircuitBreakerTrigger(
+            source="operator",
+            reason="maintainer asked us to leave this one alone",
+            trigger_hash="held-issue",
+            scope=StopScope.ISSUE,
+            scope_key="example/project#41",
+        )
+    )
+    github = IsolationGitHub(
+        {
+            "held/project": [_repository_issue("held/project", 1)],
+            "example/project": [
+                _repository_issue("example/project", 41),
+                _repository_issue("example/project", 42),
+            ],
+        },
+        failures={
+            "search:held/project": AssertionError("a held repository must not be searched"),
+            "issue:example/project#41": AssertionError("a held issue must not be read"),
+        },
+    )
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("held/project", "example/project"), github, store
+    )
+
+    outcome = service.discover()
+
+    assert outcome.selection is not None
+    assert outcome.selection[0].reference == "example/project#42"
+    assert outcome.held_candidates == 1
+    assert [name for name, _ in outcome.skipped_repositories] == ["held/project"]
+    assert outcome.skipped_repositories[0][1].endswith(
+        "Pull request was closed without being merged"
+    )
+    assert "1 issue is held" in outcome.summary
 
 
 def test_issue_description_stop_request_fails_closed_without_tripping_global_breaker(

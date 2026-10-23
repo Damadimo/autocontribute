@@ -35,10 +35,12 @@ from autocontribute.domain import (
 )
 from autocontribute.exceptions import (
     AutocontributeError,
+    CircuitBreakerTrigger,
     GitHubError,
     GitHubSafetyError,
     PolicyError,
     StateError,
+    StopScope,
 )
 from autocontribute.github import GitHubClient, LinkedPullRequest
 from autocontribute.github_origin import web_origin_for_api
@@ -510,7 +512,7 @@ class IssueEvaluation:
     eligibility: EligibilityResult
     blocker_kinds: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
-    repository_hold: str | None = None
+    repository_hold: CircuitBreakerTrigger | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -520,6 +522,7 @@ class DiscoveryOutcome:
     selection: DiscoverySelection | None
     active_candidates: int = 0
     suppressed_candidates: int = 0
+    held_candidates: int = 0
     evaluations: tuple[IssueEvaluation, ...] = ()
     skipped_repositories: tuple[tuple[str, str], ...] = ()
     repository_errors: tuple[tuple[str, str], ...] = ()
@@ -578,6 +581,14 @@ class DiscoveryOutcome:
                     self.active_candidates,
                     singular="candidate already has an active run",
                     plural="candidates already have active runs",
+                )
+            )
+        if self.held_candidates:
+            explanations.append(
+                _counted_reason(
+                    self.held_candidates,
+                    singular="issue is held",
+                    plural="issues are held",
                 )
             )
         if self.ineligible_candidates:
@@ -667,16 +678,32 @@ class DiscoveryService:
             for manifest in self.store.list_open_pull_request_runs()
             if manifest.candidate is not None
         }
+        holds = self.store.active_holds()
+        held_repositories = {
+            hold.scope_key.casefold(): hold for hold in holds if hold.scope is StopScope.REPOSITORY
+        }
+        held_issues = {hold.scope_key.casefold() for hold in holds if hold.scope is StopScope.ISSUE}
         evaluations: list[IssueEvaluation] = []
         eligible: list[IssueEvaluation] = []
         skipped_repositories: list[tuple[str, str]] = []
         issue_errors: list[tuple[str, str]] = []
         active_candidates = 0
         suppressed_candidates = 0
+        held_candidates = 0
         candidate_limit = self.config.budget.max_candidates_per_run
         for repository in repositories:
             if len(eligible) >= candidate_limit:
                 break
+            hold = held_repositories.get(repository.full_name.casefold())
+            if hold is not None:
+                skipped_repositories.append(
+                    (
+                        repository.full_name,
+                        f"held since {hold.created_at.date().isoformat()} "
+                        f"(hold {hold.hold_id}): {hold.reason}",
+                    )
+                )
+                continue
             if not self._repository_baseline(repository):
                 skipped_repositories.append((repository.full_name, _REPOSITORY_BASELINE_REASON))
                 continue
@@ -723,6 +750,9 @@ class DiscoveryService:
             for snapshot in found:
                 if len(eligible) >= candidate_limit:
                     break
+                if snapshot.reference.casefold() in held_issues:
+                    held_candidates += 1
+                    continue
                 try:
                     # Search results omit the discussion and may contain a shortened body. Fetch
                     # the canonical issue before spending model budget or deciding that work is
@@ -742,8 +772,13 @@ class DiscoveryService:
                     issue_errors.append((snapshot.reference, str(exc)))
                     continue
                 evaluations.append(evaluation)
-                if evaluation.repository_hold is not None:
-                    skipped_repositories.append((repository.full_name, evaluation.repository_hold))
+                # Recorded evidence that an operator released no longer skips the repository.
+                if evaluation.repository_hold is not None and self.store.record_stop(
+                    evaluation.repository_hold
+                ):
+                    skipped_repositories.append(
+                        (repository.full_name, evaluation.repository_hold.reason)
+                    )
                     eligible = [
                         candidate
                         for candidate in eligible
@@ -763,6 +798,7 @@ class DiscoveryService:
             ),
             active_candidates=active_candidates,
             suppressed_candidates=suppressed_candidates,
+            held_candidates=held_candidates,
             evaluations=tuple(evaluations),
             skipped_repositories=tuple(skipped_repositories),
             repository_errors=tuple(repository_errors),
@@ -974,7 +1010,7 @@ class DiscoveryService:
         # A stop in the discussion blocks this issue only. It also holds the whole repository
         # when it turns away automated or AI contributions in general.
         stops = [comment for comment in maintainer_comments if _is_maintainer_stop(comment.body)]
-        repository_hold: str | None = None
+        repository_hold: CircuitBreakerTrigger | None = None
         if stops:
             blockers.append(
                 (
@@ -985,10 +1021,7 @@ class DiscoveryService:
             )
             hold = next((comment for comment in stops if _targets_automation(comment.body)), None)
             if hold is not None:
-                repository_hold = (
-                    "a maintainer comment turns away automated or AI contributions: "
-                    f"{hold.html_url}"
-                )
+                repository_hold = _automation_stop_hold(issue, repository, hold)
 
         evidence: dict[str, str] = {}
         evidence["discussion"] = (
@@ -1758,6 +1791,32 @@ def _is_security_sensitive(text: str) -> bool:
 
 def _is_maintainer_stop(body: str) -> bool:
     return bool(_maintainer_stop_sentences(body))
+
+
+def _automation_stop_hold(
+    issue: IssueCandidate,
+    repository: RepositoryInfo,
+    comment: IssueComment,
+) -> CircuitBreakerTrigger:
+    """A repository hold for a maintainer comment that turns automated contributions away."""
+
+    evidence = {
+        "author": comment.author,
+        "body": comment.body,
+        "comment": comment.html_url,
+        "updated_at": comment.updated_at.isoformat(),
+    }
+    return CircuitBreakerTrigger(
+        source=f"github_issue_discussion:{issue.reference}",
+        reason=(
+            f"a maintainer comment turns away automated or AI contributions: {comment.html_url}"
+        ),
+        # An edited comment is new evidence, so a hold released after review can return.
+        trigger_hash=hashlib.sha256(_canonical_json(evidence)).hexdigest(),
+        scope=StopScope.REPOSITORY,
+        scope_key=repository.full_name,
+        maintainer_stop=True,
+    )
 
 
 def _targets_automation(body: str) -> bool:
