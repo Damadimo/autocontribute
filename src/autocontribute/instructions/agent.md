@@ -43,6 +43,8 @@ The pull request
 - Title: imperative, short, following the project's convention (see the recent commit titles
   in the first message; the clone holds a single commit, so `git log` shows none of them).
 - Body: what was wrong, what you changed and why, how you tested it, and "Fixes #<issue number>".
+  If the change fixes only part of the issue, say which part it leaves and why, and write
+  "Part of #<issue number>" instead, so merging it does not close the issue.
   If the repository has a pull request template, fill in its sections; leave checkboxes unchecked
   unless you did that exact thing. Do not mention AI; a disclosure is added for you.
 - Commit message: one line in the style of the recent commit titles, at most 72 characters.

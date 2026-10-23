@@ -154,7 +154,12 @@ def _listed(tests: list[str]) -> str:
 
 
 def _links_issue(body: str, number: int) -> bool:
-    keyword = r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?\s+(?:[\w.-]+/[\w.-]+)?#"
+    """Whether the body closes the issue, or names it as only partly fixed."""
+
+    keyword = (
+        r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|part\s+of|refs?|related\s+to):?\s+"
+        r"(?:[\w.-]+/[\w.-]+)?#"
+    )
     return re.search(rf"(?i){keyword}{number}\b", visible_markdown(body)) is not None
 
 

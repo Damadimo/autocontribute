@@ -117,6 +117,8 @@ def test_the_body_gets_the_testing_note_and_a_visible_disclosure() -> None:
         ("Closes #7.", True),
         ("This resolved acme/calc#7", True),
         ("Fixes #70", False),
+        ("Part of #7: the invalid forms still parse.", True),
+        ("Refs #7", True),
         ("See #7", False),
         ("<!-- Fixes #7 -->", False),
     ],
