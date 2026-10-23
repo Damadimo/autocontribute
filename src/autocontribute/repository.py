@@ -103,6 +103,17 @@ class TextMatch:
     line: str
 
 
+@dataclass(frozen=True, slots=True)
+class TreeEntry:
+    """One file or submodule in the tree of the base commit."""
+
+    path: str
+    mode: str
+    object_id: str
+    # None for a submodule, whose object is a commit of another repository.
+    size: int | None
+
+
 class RepositoryWorkspace:
     """A repository checked out at an immutable base commit.
 
@@ -582,6 +593,42 @@ class RepositoryWorkspace:
         self._git_bytes(["apply", "--check", "--whitespace=nowarn", "-"], input_bytes=content)
         self._git_bytes(["apply", "--whitespace=nowarn", "-"], input_bytes=content)
 
+    def base_tree(self) -> list[TreeEntry]:
+        """List every file and submodule of the base commit.
+
+        This reads Git objects only, so neither the working tree nor the index, which a
+        container may have changed, affects the result. Paths that are not UTF-8 are left out.
+        """
+
+        output = self._git_bytes(["ls-tree", "-r", "-l", "-z", "--full-tree", self.base_sha])
+        entries: list[TreeEntry] = []
+        for record in output.split(b"\0"):
+            metadata, separator, raw_path = record.partition(b"\t")
+            fields = metadata.split()
+            if not separator or len(fields) != 4:
+                continue
+            try:
+                path = raw_path.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            mode, kind, object_id, size = (field.decode("ascii") for field in fields)
+            if kind not in {"blob", "commit"}:
+                continue
+            entries.append(
+                TreeEntry(path, mode, object_id, None if kind == "commit" else int(size))
+            )
+        return entries
+
+    def read_blob(self, object_id: str, *, max_bytes: int) -> bytes:
+        """Return a blob's committed content; no clean, smudge or textconv filter runs."""
+
+        if not _FULL_SHA.fullmatch(object_id):
+            raise RepositoryError("Blob object ID must be a complete hexadecimal SHA")
+        data = self._git_bytes(["cat-file", "blob", object_id])
+        if len(data) > max_bytes:
+            raise RepositoryError(f"Blob {object_id} exceeds the {max_bytes}-byte limit")
+        return data
+
     def _tracked_paths(self) -> list[str]:
         output = self._git_bytes(["ls-files", "-z", "--cached"])
         return sorted(
@@ -1037,4 +1084,4 @@ def _guidance_sort_key(relative_path: str) -> tuple[int, int, str]:
     return 7, len(pure_path.parts), lowered
 
 
-__all__ = ["ContextEntry", "RepositoryWorkspace", "TextMatch"]
+__all__ = ["ContextEntry", "RepositoryWorkspace", "TextMatch", "TreeEntry"]
