@@ -1067,7 +1067,7 @@ def _closing_note(run_id: str, manifest: RunManifest | None) -> str:
     if manifest is None:
         return f"Run {code_span(run_id)} is not in the saved state, so it will not be published."
     note = f"Run {code_span(run_id)} is {manifest.status.value}, so it will not be published."
-    reason = manifest.error or manifest.skip_reason
+    reason = manifest.error or manifest.reject_reason or manifest.skip_reason
     if reason:
         note += "\n\n" + fenced_block(reason, "text")
     return note

@@ -19,12 +19,11 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Final, Generic, Literal, NoReturn, Protocol, TypeVar, cast
+from typing import Final, NoReturn, Protocol, TypeVar, cast
 
-from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
+from pydantic import BaseModel, JsonValue, ValidationError
 
-from autocontribute.config import ModelProfile, validate_model_identifier
-from autocontribute.domain import ContributionPlan, CriticReview, PatchProposal
+from autocontribute.config import validate_model_identifier
 from autocontribute.exceptions import (
     ConfigurationError,
     ModelError,
@@ -43,10 +42,8 @@ from autocontribute.transcript import (
     tool_call_names,
 )
 
-OutputT = TypeVar("OutputT", bound=BaseModel)
 _ResultT = TypeVar("_ResultT")
 
-_MODEL_WORKER_PROTOCOL = "autocontribute.model-call.v1"
 _MODEL_TURN_PROTOCOL = "autocontribute.model-turn.v1"
 # A transcript near the 200K-token limit, encrypted reasoning included, is a few MB.
 _MAX_MODEL_REQUEST_BYTES = 32 * 1024 * 1024
@@ -62,42 +59,6 @@ OPAQUE_FIELDS: Final[Mapping[str, str]] = MappingProxyType(
 _WORKER_TERM_GRACE_SECONDS = 0.25
 _WORKER_POLL_SECONDS = 0.05
 _WORKER_ENV_ALLOWLIST = ("LANG", "LC_ALL", "PATH")
-
-
-@dataclass(frozen=True)
-class ModelResult(Generic[OutputT]):
-    output: OutputT
-    response_id: str
-    model: str
-    usage: ModelUsage
-
-
-class ModelCapabilityResponse(BaseModel):
-    """Allowlisted doctor response shared with the isolated model worker."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    status: Literal["ready"]
-
-
-_OUTPUT_SCHEMAS: dict[str, type[BaseModel]] = {
-    "contribution_plan": ContributionPlan,
-    "patch_proposal": PatchProposal,
-    "critic_review": CriticReview,
-    "model_capability": ModelCapabilityResponse,
-}
-
-
-class ModelProvider(Protocol):
-    def generate(
-        self,
-        *,
-        instructions: str,
-        prompt: str,
-        output_type: type[OutputT],
-        max_output_tokens: int | None = None,
-        timeout_seconds: float | None = None,
-    ) -> ModelResult[OutputT]: ...
 
 
 class TurnProvider(Protocol):
@@ -187,27 +148,13 @@ def _model_output_strings(value: object) -> Iterator[str]:
             yield from _model_output_strings(item)
 
 
-def _assert_secret_free_model_output(
-    api_key_env: str,
-    api_key: str,
-    *values: object,
-) -> None:
-    """Reject credential reflection without returning or logging the reflected value."""
-
-    for value in values:
-        for text in _model_output_strings(value):
-            if api_key in text or redact_model_input(text, secret_env_names=(api_key_env,)) != text:
-                raise ModelError("Model provider response contained credential material")
-
-
 def _safe_request_id(request_id: object, *, api_key_env: str, api_key: str) -> str | None:
     """Return a provider request ID that is safe to put in an error message, else None."""
 
     if not isinstance(request_id, str) or not _SAFE_REQUEST_ID.fullmatch(request_id):
         return None
-    try:
-        _assert_secret_free_model_output(api_key_env, api_key, request_id)
-    except ModelError:
+    redacted = redact_model_input(request_id, secret_env_names=(api_key_env,))
+    if api_key in request_id or redacted != request_id:
         return None
     return request_id
 
@@ -224,17 +171,13 @@ def _response_identity(response: object) -> tuple[str, str]:
     return response_id, resolved_model
 
 
-def _effective_output_tokens(configured: int, requested: int | None) -> int:
-    if requested is None:
-        return configured
+def _effective_output_tokens(configured: int, requested: int) -> int:
     if isinstance(requested, bool) or not isinstance(requested, int) or requested < 1:
         raise ModelError("Model request output-token limit must be a positive integer")
     return min(configured, requested)
 
 
-def _effective_timeout(configured: float, requested: float | None) -> float:
-    if requested is None:
-        return configured
+def _effective_timeout(configured: float, requested: float) -> float:
     if (
         isinstance(requested, bool)
         or not isinstance(requested, (int, float))
@@ -243,37 +186,6 @@ def _effective_timeout(configured: float, requested: float | None) -> float:
     ):
         raise ModelError("Model request timeout must be positive")
     return min(configured, float(requested))
-
-
-def _require_expected_response_model(profile: ModelProfile, model: str) -> None:
-    expected = profile.expected_response_model
-    if expected is not None and model != expected:
-        raise ModelError(
-            "Model provider resolved a different model ID than expected_response_model; "
-            "set it to the exact provider-returned snapshot"
-        )
-
-
-def _scrub_request_text(profile: ModelProfile, instructions: str, prompt: str) -> tuple[str, str]:
-    secret_names = (profile.api_key_env,)
-    return (
-        redact_model_input(instructions, secret_env_names=secret_names),
-        redact_model_input(prompt, secret_env_names=secret_names),
-    )
-
-
-def _output_schema_id(output_type: type[BaseModel]) -> str:
-    for schema_id, allowed_type in _OUTPUT_SCHEMAS.items():
-        if output_type is allowed_type:
-            return schema_id
-    raise ModelError("Model request used an output schema outside the production allowlist")
-
-
-def _output_schema_type(schema_id: str) -> type[BaseModel]:
-    output_type = _OUTPUT_SCHEMAS.get(schema_id)
-    if output_type is None:
-        raise ModelError("Model worker received an output schema outside the production allowlist")
-    return output_type
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -522,30 +434,6 @@ def _envelope_usage(envelope: dict[str, object]) -> ModelUsage:
     return _validate_usage(ModelUsage(**counts))
 
 
-def _worker_result(
-    payload: bytes,
-    *,
-    output_type: type[OutputT],
-    output_schema: str,
-) -> ModelResult[OutputT]:
-    envelope = _success_envelope(
-        payload,
-        protocol=_MODEL_WORKER_PROTOCOL,
-        result_keys=frozenset({"output_schema", "output", "response_id", "model", "usage"}),
-    )
-    if envelope.get("output_schema") != output_schema:
-        raise ModelError("Model worker returned output for a different schema")
-    response_id, model = _envelope_identity(envelope)
-    usage = _envelope_usage(envelope)
-    try:
-        output = output_type.model_validate(envelope.get("output"))
-    except ValidationError as exc:
-        raise ModelError(
-            "Model worker returned output that violated its allowlisted schema"
-        ) from exc
-    return ModelResult(output=output, response_id=response_id, model=model, usage=usage)
-
-
 def _turn_result(
     payload: bytes,
     *,
@@ -727,57 +615,6 @@ def _run_worker(
                 os.close(result_read_fd)
 
 
-class SubprocessModelProvider:
-    """Run one built-in provider call in a killable, isolated process group."""
-
-    def __init__(self, profile: ModelProfile) -> None:
-        if os.name != "posix":  # pragma: no cover - supported hosts are POSIX
-            raise ModelError("Hard model deadlines require a POSIX process-group runtime")
-        profile.require_api_key()
-        self.profile = profile.model_copy(deep=True)
-
-    def generate(
-        self,
-        *,
-        instructions: str,
-        prompt: str,
-        output_type: type[OutputT],
-        max_output_tokens: int | None = None,
-        timeout_seconds: float | None = None,
-    ) -> ModelResult[OutputT]:
-        output_schema = _output_schema_id(output_type)
-        output_limit = _effective_output_tokens(self.profile.max_output_tokens, max_output_tokens)
-        request_timeout = _effective_timeout(self.profile.timeout_seconds, timeout_seconds)
-        started = time.monotonic()
-        safe_instructions, safe_prompt = _scrub_request_text(self.profile, instructions, prompt)
-        request = _canonical_json_bytes(
-            {
-                "protocol": _MODEL_WORKER_PROTOCOL,
-                "profile": self.profile.model_dump(mode="json"),
-                "instructions": safe_instructions,
-                "prompt": safe_prompt,
-                "output_schema": output_schema,
-                "max_output_tokens": output_limit,
-                "timeout_seconds": request_timeout,
-            }
-        )
-
-        def parse(payload: bytes) -> ModelResult[OutputT]:
-            result = _worker_result(payload, output_type=output_type, output_schema=output_schema)
-            _require_expected_response_model(self.profile, result.model)
-            return result
-
-        return _run_worker(
-            request,
-            environment=_worker_environment(
-                self.profile.api_key_env, self.profile.require_api_key()
-            ),
-            timeout_seconds=request_timeout,
-            started=started,
-            parse=parse,
-        )
-
-
 class SubprocessTurnProvider:
     """Send each transcript request from a fresh, killable worker process.
 
@@ -835,23 +672,12 @@ class SubprocessTurnProvider:
         )
 
 
-def create_provider(profile: ModelProfile) -> ModelProvider:
-    """Create the production provider with an application-owned hard deadline."""
-
-    return SubprocessModelProvider(profile)
-
-
 __all__ = [
     "MAX_TOOL_ARGUMENT_BYTES",
     "MAX_TURN_SECONDS",
     "OPAQUE_FIELDS",
-    "ModelCapabilityResponse",
-    "ModelProvider",
-    "ModelResult",
     "ModelUsage",
-    "SubprocessModelProvider",
     "SubprocessTurnProvider",
     "TurnProvider",
     "TurnRequest",
-    "create_provider",
 ]

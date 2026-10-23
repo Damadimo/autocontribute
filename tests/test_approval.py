@@ -15,7 +15,6 @@ from autocontribute.approval import (
 )
 from autocontribute.config import PublishingConfig
 from autocontribute.domain import (
-    FileEdit,
     IssueCandidate,
     PatchProposal,
     RepositoryInfo,
@@ -170,21 +169,12 @@ def test_build_manifest_extracts_current_run_publication_fields() -> None:
     )
     proposal = PatchProposal(
         summary="Handle the boundary and add a regression test.",
-        edits=[
-            FileEdit(
-                operation="create",
-                path="tests/test_boundary.py",
-                content="def test_boundary(): pass\n",
-                rationale="Regression coverage.",
-                find=None,
-                replace=None,
-            )
-        ],
-        validation_commands=["pytest tests/test_boundary.py"],
         commit_message="Fix the parser boundary",
         pull_request_title="Fix parser boundary handling",
-        pull_request_body="Fixes #42.",
-        limitations=[],
+        pull_request_body="Fixes #42.\n\n---\n\nReviewed AI-assisted contribution.",
+        test_files=["tests/test_boundary.py"],
+        test_command="pytest tests/test_boundary.py",
+        disclosure="Reviewed AI-assisted contribution.",
     )
     run = RunManifest(
         run_id="run-1",
@@ -215,12 +205,7 @@ def test_build_manifest_extracts_current_run_publication_fields() -> None:
         proposal=proposal,
     )
 
-    manifest = build_approval_manifest(
-        run,
-        diff="diff bytes",
-        disclosure="Reviewed AI-assisted contribution.",
-        draft=True,
-    )
+    manifest = build_approval_manifest(run, diff="diff bytes", draft=True)
 
     assert manifest.repository == issue.repository
     assert manifest.issue_number == issue.number
@@ -238,6 +223,7 @@ def test_build_manifest_extracts_current_run_publication_fields() -> None:
     assert manifest.commit_message == proposal.commit_message
     assert manifest.pull_request_title == proposal.pull_request_title
     assert manifest.pull_request_body == proposal.pull_request_body
+    assert manifest.disclosure == proposal.disclosure
 
 
 def test_build_manifest_fails_closed_when_run_is_incomplete() -> None:
@@ -249,12 +235,7 @@ def test_build_manifest_fails_closed_when_run_is_incomplete() -> None:
     )
 
     with pytest.raises(PolicyError, match="issue candidate"):
-        build_approval_manifest(
-            run,
-            diff="diff",
-            disclosure="Reviewed.",
-            draft=False,
-        )
+        build_approval_manifest(run, diff="diff", draft=False)
 
 
 def test_blank_attestation_and_naive_times_are_rejected() -> None:

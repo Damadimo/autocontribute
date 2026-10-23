@@ -1,51 +1,65 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
+from test_task_messages import _check, _facts
 
+import autocontribute.orchestrator as orchestrator_module
+from autocontribute import __version__
+from autocontribute.agent_loop import (
+    CheckReport,
+    DidNotFinish,
+    LoopFailure,
+    SkippedIssue,
+    SolverOutcome,
+    SubmittedFix,
+)
 from autocontribute.config import AutocontributeConfig
+from autocontribute.critic import CriticOutcome, CriticRound
 from autocontribute.domain import (
-    CommandResult,
-    ContributionPlan,
-    CriticReview,
-    FileEdit,
     IssueCandidate,
     IssueComment,
-    PatchProposal,
     RepositoryInfo,
-    ReviewScores,
-    RunManifest,
     RunStatus,
 )
+from autocontribute.environment_builder import PreparedEnvironment
+from autocontribute.environment_setup import EnvironmentImage
+from autocontribute.evidence import read_validation_evidence
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
-    ModelRequestError,
-    ModelTimeoutError,
-    PolicyError,
+    ConfigurationError,
+    EnvironmentUnavailable,
+    SandboxError,
     StateError,
     StopScope,
 )
 from autocontribute.github import DirectoryEntry
 from autocontribute.orchestrator import Orchestrator, RunInvocationMode
-from autocontribute.preparation import validate_preparation_fingerprint
-from autocontribute.providers import ModelResult, ModelUsage
-from autocontribute.redaction import MAX_ARTIFACT_CHARACTERS, MODEL_INPUT_REDACTION
+from autocontribute.preparation import (
+    validate_preparation_config_fingerprint,
+    validate_preparation_fingerprint,
+    validate_validation_artifact,
+)
+from autocontribute.pricing import ModelSpec
 from autocontribute.repository import RepositoryWorkspace
-from autocontribute.sandbox import SandboxRunner
 from autocontribute.store import (
     CandidateAttemptState,
     CandidateRetryAuthorization,
     Lease,
     RunStore,
 )
+from autocontribute.submissions import AgentSubmission, ReviewBlocker, ReviewSubmission
+from autocontribute.transcript import Transcript, Turn
 
-REPRODUCTION_COMMAND = "python -c 'from app import value; assert value() == 2'"
-TRUSTED_COMMAND = "python -m pytest"
+_GITHUB_TOKEN = "fake-github-token-for-tests"
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -109,7 +123,19 @@ def _repository(base_sha: str) -> RepositoryInfo:
     )
 
 
+def _config(tmp_path: Path, **sections: object) -> AutocontributeConfig:
+    return AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "storage": {"path": tmp_path / "state"},
+            **sections,
+        }
+    )
+
+
 class FakeGitHub:
+    token = _GITHUB_TOKEN
+
     def __init__(self, issue: IssueCandidate, repository: RepositoryInfo, sha: str) -> None:
         self.issue = issue
         self.repository = repository
@@ -148,6 +174,9 @@ class FakeGitHub:
         del repository, ref
         return None if path else [DirectoryEntry(path="CONTRIBUTING.md", kind="file")]
 
+    def recent_commit_titles(self, repository: str, sha: str) -> list[str]:
+        return ["Fix the parser boundary", "Add a changelog entry"]
+
 
 class CountingGitHub(FakeGitHub):
     def __init__(self, issue: IssueCandidate, repository: RepositoryInfo, sha: str) -> None:
@@ -184,196 +213,216 @@ class DiscoveryGitHub(CountingGitHub):
         return [self.issue.model_copy(update={"discussion": []})] if page == 1 else []
 
 
-class FixedProvider:
-    def __init__(self, output: Any, model: str, *, usage: ModelUsage | None = None) -> None:
-        self.output = output
-        self.model = model
-        self.calls = 0
-        self.requests: list[dict[str, object]] = []
-        self.usage = usage or ModelUsage(input_tokens=10, output_tokens=5, total_tokens=15)
+class NoTurns:
+    """A provider for runs that must not reach a model."""
 
-    def generate(self, **request: object) -> ModelResult[Any]:
-        self.calls += 1
-        self.requests.append(request)
-        return ModelResult(
-            output=self.output,
-            response_id=f"response-{self.model}-{self.calls}",
-            model=self.model,
-            usage=self.usage,
-        )
+    def step(
+        self, *, transcript: Transcript, max_output_tokens: int, timeout_seconds: float
+    ) -> Turn:
+        raise AssertionError(f"unexpected {transcript.kind} turn")
 
 
-class SequenceProvider(FixedProvider):
-    def __init__(self, outputs: list[Any], model: str) -> None:
-        if not outputs:
-            raise ValueError("SequenceProvider requires at least one output")
-        self.outputs = outputs
-        super().__init__(outputs[0], model)
-
-    def generate(self, **request: object) -> ModelResult[Any]:
-        if self.calls >= len(self.outputs):
-            raise AssertionError("SequenceProvider received an unexpected extra call")
-        self.output = self.outputs[self.calls]
-        return super().generate(**request)
+AgentStep = Callable[["FakeChecks"], SolverOutcome]
 
 
-class PassingSandbox:
-    def __init__(self, *, remaining_commands: int = 8) -> None:
-        self.remaining_commands = remaining_commands
-        self.baseline_commands: list[str] = []
-        self.validation_batches: list[list[str]] = []
+class Pipeline:
+    """Fakes for the Docker- and model-backed steps; each test scripts what they return."""
 
-    def run_isolated(self, workspace: RepositoryWorkspace, command: str) -> CommandResult:
-        self.baseline_commands.append(command)
-        self.remaining_commands -= 1
-        return CommandResult(
-            command=command,
-            exit_code=1,
-            duration_seconds=0.1,
-            stdout="",
-            stderr="AssertionError",
-        )
+    def __init__(self) -> None:
+        facts = _facts()
+        self.environment: Exception | None = None
+        self.recipe = facts.recipe
+        self.baseline = facts.baseline
+        self.agent: list[AgentStep] = [fixes()]
+        self.reviews: list[CriticOutcome] = [review("approve")]
+        self.prepared: list[tuple[str, str]] = []
+        self.blockers: list[list[ReviewBlocker]] = []
+        self.patches: list[str] = []
+        self.sessions = 0
+        self.leftover_sweeps: list[frozenset[str]] = []
 
-    def run_all_isolated(
+    def remove_leftovers(self, store_root: Path, unfinished: frozenset[str]) -> None:
+        self.leftover_sweeps.append(unfinished)
+
+    def provider(self, spec: ModelSpec, host_values: frozenset[str]) -> NoTurns:
+        assert _GITHUB_TOKEN in host_values
+        return NoTurns()
+
+    def builder(self, config: object, store: RunStore, *, run_id: str) -> FakeBuilder:
+        return FakeBuilder(self)
+
+    def validation(self, *_: object) -> FakeValidation:
+        return FakeValidation(self)
+
+    def checks(self, workspace: RepositoryWorkspace, *_: object, **__: object) -> FakeChecks:
+        return FakeChecks(workspace)
+
+    def solver(self, transcript: Transcript, *, checker: FakeChecks, **_: object) -> FakeSolver:
+        assert transcript.kind == "agent" and transcript.model == "gpt-5.6-sol"
+        return FakeSolver(self, checker)
+
+    def critic(self, *_: object, model: str, **__: object) -> FakeCritic:
+        assert model == "gpt-5.6-sol"
+        return FakeCritic(self)
+
+
+class FakeBuilder:
+    def __init__(self, pipeline: Pipeline) -> None:
+        self.pipeline = pipeline
+
+    def prepare(
         self,
+        repository: str,
         workspace: RepositoryWorkspace,
-        commands: list[str],
-    ) -> list[CommandResult]:
-        self.validation_batches.append(list(commands))
-        self.remaining_commands -= len(commands)
-        return [
-            CommandResult(
-                command=command,
-                exit_code=0,
-                duration_seconds=0.1,
-                stdout="1 passed",
-                stderr="",
-            )
-            for command in commands
-        ]
-
-
-class SequenceSandbox(PassingSandbox):
-    """Return actionable failures for selected validation calls."""
-
-    def __init__(
-        self,
-        *,
-        remaining_commands: int = 10,
-        failure_stderr: str = "AssertionError: expected the repaired boundary",
-        failing_validation_calls: set[int] | None = None,
-    ) -> None:
-        super().__init__(remaining_commands=remaining_commands)
-        self.validation_calls = 0
-        self.failure_stderr = failure_stderr
-        self.failing_validation_calls = frozenset(
-            {1} if failing_validation_calls is None else failing_validation_calls
+        override: object,
+        setup_agent: object,
+    ) -> PreparedEnvironment:
+        self.pipeline.prepared.append((repository, workspace.base_sha))
+        if self.pipeline.environment is not None:
+            raise self.pipeline.environment
+        image = EnvironmentImage(
+            image_id="sha256:" + "e" * 64,
+            tag="autocontribute-env/example__project:abc",
+            base_image="python:3.12-bookworm",
+            base_digest="sha256:" + "f" * 64,
+            cache_key="c" * 64,
+            reused=False,
         )
-
-    def run_all_isolated(
-        self,
-        workspace: RepositoryWorkspace,
-        commands: list[str],
-    ) -> list[CommandResult]:
-        del workspace
-        self.validation_batches.append(list(commands))
-        self.validation_calls += 1
-        results: list[CommandResult] = []
-        for command in commands:
-            failed = self.validation_calls in self.failing_validation_calls and not results
-            result = CommandResult(
-                command=command,
-                exit_code=1 if failed else 0,
-                duration_seconds=0.1,
-                stdout="" if failed else "1 passed",
-                stderr=self.failure_stderr if failed else "",
-            )
-            results.append(result)
-            self.remaining_commands -= 1
-            if not result.passed:
-                break
-        return results
+        snapshot = workspace.path.with_name("repository.snapshot")
+        return PreparedEnvironment(image, self.pipeline.recipe, self.pipeline.baseline, snapshot)
 
 
-def _take_over_run_lease(orchestrator: Orchestrator, store: RunStore) -> Lease:
-    guard = orchestrator._lease_guard
-    assert guard is not None
-    current = guard.assert_owned()
-    takeover = store.acquire_lease(
-        "autocontribute.run",
-        "takeover-worker",
-        ttl=timedelta(minutes=5),
-        now=current.expires_at,
-    )
-    assert takeover is not None
-    assert takeover.generation > current.generation
-    return takeover
+class FakeValidation:
+    def __init__(self, pipeline: Pipeline) -> None:
+        self.pipeline = pipeline
+        self.environment = {"PATH": "/usr/bin:/bin"}
+
+    @contextmanager
+    def session(self, workspace: Path, *, timeout_seconds: int) -> Iterator[object]:
+        assert timeout_seconds >= 1
+        self.pipeline.sessions += 1
+        yield object()
 
 
-def _providers(
-    *,
-    validation_commands: list[str] | None = None,
-    reproduction_command: str = REPRODUCTION_COMMAND,
-) -> dict[str, FixedProvider]:
-    commands = [TRUSTED_COMMAND] if validation_commands is None else validation_commands
-    plan = ContributionPlan(
-        decision="proceed",
-        decision_reason="The requested bug fix is narrow and testable.",
-        contribution_kind="bugfix",
-        issue_understanding="Return the documented boundary value.",
-        acceptance_criteria=["value() returns 2"],
-        implementation_steps=["Correct the returned value", "Run the focused test"],
-        files_to_read=["app.py"],
-        reproduction_command=reproduction_command,
-        validation_commands=commands,
-        risks=["Behavior is intentionally changed only at the boundary"],
-        maintainer_fit="Directly resolves the labeled issue.",
-    )
-    proposal = PatchProposal(
-        summary="Return the documented value.",
-        edits=[
-            FileEdit(
-                operation="replace",
-                path="app.py",
-                find="    return 1\n",
-                replace="    return 2\n",
-                content=None,
-                rationale="Match the documented boundary behavior.",
-            )
-        ],
-        validation_commands=commands,
-        commit_message="Fix documented boundary value",
-        pull_request_title="Fix documented boundary value",
-        pull_request_body="Fixes #42. Corrects the boundary return value.",
-        limitations=[],
-    )
-    review = CriticReview(
-        verdict="approve",
-        summary="The patch is narrow, clear, and validated.",
-        scores=ReviewScores(
-            correctness=96,
-            issue_alignment=98,
-            tests=95,
-            repository_conventions=95,
-            diff_hygiene=98,
-            maintainer_clarity=95,
-        ),
-        blocking_findings=[],
-        non_blocking_findings=[],
-        issue_requirements_met=["value() returns 2"],
-        issue_requirements_missing=[],
-        test_evidence_assessment="The configured command passed.",
-        maintainer_perspective="Ready for review.",
-    )
-    return {
-        "scout": FixedProvider(plan, "gpt-5.6"),
-        "builder": FixedProvider(proposal, "gpt-5.6"),
-        "critic": FixedProvider(review, "gpt-5.6"),
+class FakeChecks:
+    def __init__(self, workspace: RepositoryWorkspace) -> None:
+        self.workspace = workspace
+        self.results: dict[str, Any] = {}
+        self.validated = workspace.path.with_name("repository.validation")
+
+
+class FakeSolver:
+    def __init__(self, pipeline: Pipeline, checks: FakeChecks) -> None:
+        self.pipeline = pipeline
+        self.checks = checks
+
+    def run(self) -> SolverOutcome:
+        return self.pipeline.agent.pop(0)(self.checks)
+
+    def address_blockers(self, blockers: list[ReviewBlocker]) -> SolverOutcome:
+        self.pipeline.blockers.append(list(blockers))
+        return self.pipeline.agent.pop(0)(self.checks)
+
+
+class FakeCritic:
+    def __init__(self, pipeline: Pipeline) -> None:
+        self.pipeline = pipeline
+        self.rounds: list[CriticRound] = []
+
+    def review(
+        self, fix: SubmittedFix, check: object, *, patch: str, validated: Path
+    ) -> CriticOutcome:
+        self.pipeline.patches.append(patch)
+        outcome = self.pipeline.reviews.pop(0)
+        if isinstance(outcome, CriticRound):
+            outcome = outcome.model_copy(update={"number": len(self.rounds) + 1})
+            self.rounds.append(outcome)
+        return outcome
+
+
+def _submission(**changes: object) -> AgentSubmission:
+    fields: dict[str, object] = {
+        "outcome": "fixed",
+        "skip_reason": None,
+        "summary": "value() returned 1; it returns the documented 2 now.",
+        "pr_title": "Fix documented boundary value",
+        "pr_body": "value() returned 1 at the boundary. It returns 2 now.",
+        "commit_message": "Fix documented boundary value",
+        "test_files": ["tests/test_app.py"],
+        "test_command": "python -m pytest tests/test_app.py",
     }
+    return AgentSubmission.model_validate({**fields, **changes})
 
 
-def test_full_prepare_pipeline_reaches_exact_approval_boundary(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    source, sha = _source_repository(tmp_path)
+def fixes(source: str = "def value():\n    return 2\n", **submission: object) -> AgentStep:
+    """The agent writes ``source`` to app.py and submits a fix that passed its checks."""
+
+    def act(checks: FakeChecks) -> SolverOutcome:
+        (checks.workspace.path / "app.py").write_text(source, encoding="utf-8")
+        sha = hashlib.sha256(checks.workspace.patch_bytes()).hexdigest()
+        checks.results[sha] = _check(diff_sha256=sha)
+        return SubmittedFix(
+            submission=_submission(**submission),
+            check=CheckReport(passed=True, diff_sha256=sha, text="Checks passed."),
+        )
+
+    return act
+
+
+def ends(outcome: SolverOutcome) -> AgentStep:
+    return lambda _checks: outcome
+
+
+def _blocker() -> ReviewBlocker:
+    return ReviewBlocker(
+        category="weak_test",
+        path="tests/test_app.py",
+        line=3,
+        evidence="The test passes without the fix.",
+        check_command="python -m pytest tests/test_app.py",
+        fix_hint="Assert the documented value.",
+    )
+
+
+def review(
+    decision: str, *, blockers: list[ReviewBlocker] | None = None, reason: str = ""
+) -> CriticRound:
+    verdict = {"approve": "approve", "request_changes": "request_changes", "reject": "abandon"}
+    return CriticRound(
+        number=1,
+        decision=decision,  # type: ignore[arg-type]
+        reason=reason,
+        review=ReviewSubmission(
+            verdict=verdict[decision],  # type: ignore[arg-type]
+            blockers=blockers or [],
+            notes=["The test could also cover negative numbers."],
+            no_test_needed=False,
+            summary=f"Review: {decision}.",
+        ),
+        confirmed=blockers or [],
+        dropped=[],
+    )
+
+
+@pytest.fixture
+def pipeline(monkeypatch: pytest.MonkeyPatch) -> Pipeline:
+    fakes = Pipeline()
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-test-key-placeholder")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(orchestrator_module, "remove_leftover_containers", fakes.remove_leftovers)
+    monkeypatch.setattr(orchestrator_module, "EnvironmentBuilder", fakes.builder)
+    monkeypatch.setattr(orchestrator_module, "DockerValidation", fakes.validation)
+    monkeypatch.setattr(orchestrator_module, "FixChecks", fakes.checks)
+    monkeypatch.setattr(orchestrator_module, "Solver", fakes.solver)
+    monkeypatch.setattr(orchestrator_module, "Critic", fakes.critic)
+    return fakes
+
+
+@pytest.fixture
+def source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str]:
+    """A local repository that every clone comes from."""
+
+    repository, sha = _source_repository(tmp_path)
     original_clone = RepositoryWorkspace.clone
 
     def local_clone(
@@ -383,692 +432,350 @@ def test_full_prepare_pipeline_reaches_exact_approval_boundary(tmp_path: Path, m
         destination: Path,
         **_: object,
     ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+        return original_clone(str(repository), base_sha, destination, allow_local_source=True)
 
     monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    github = FakeGitHub(_issue(), _repository(sha), sha)
-    sandbox = PassingSandbox()
-
-    with Orchestrator(
-        config,
-        store=store,
-        github=github,  # type: ignore[arg-type]
-        providers=_providers(),  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.READY_FOR_APPROVAL
-    assert manifest.quality and manifest.quality.ready
-    assert manifest.model_calls == 3
-    assert manifest.model_input_tokens == 30
-    assert manifest.model_output_tokens == 15
-    assert manifest.model_cost_usd == 0
-    assert manifest.model_reservation is None
-    assert sandbox.baseline_commands == [REPRODUCTION_COMMAND]
-    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
-    patch = (store.artifact_dir(manifest.run_id) / "contribution.patch").read_text()
-    assert "+    return 2" in patch
-    assert "baseline-generated" not in patch
-    persisted = store.get(manifest.run_id)
-    assert persisted.preparation_fingerprint == manifest.preparation_fingerprint
-    assert persisted.preparation_fingerprint is not None
-    validate_preparation_fingerprint(persisted, diff=patch.encode("utf-8"))
-    assert config.policy.ai_disclosure in manifest.proposal.pull_request_body  # type: ignore[union-attr]
-    report = (store.artifact_dir(manifest.run_id) / "report.md").read_text(encoding="utf-8")
-    assert "Recorded model cost: unknown" in report
-    model_calls = json.loads(
-        (store.artifact_dir(manifest.run_id) / "model-calls.json").read_text(encoding="utf-8")
-    )
-    assert all(call["cost_usd"] == "unknown" for call in model_calls)
+    return repository, sha
 
 
-def test_actionable_validation_failure_uses_the_single_repair_opportunity(
+def _run(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "sandbox": {"max_commands": 10},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    initial_proposal = providers["builder"].output
-    assert isinstance(initial_proposal, PatchProposal)
-    repair_only_command = "python -m unittest discover -s tests/repair -v"
-    repair_proposal = initial_proposal.model_copy(
-        update={
-            "summary": "Repair the boundary implementation after validation.",
-            "validation_commands": [repair_only_command],
-            "edits": [
-                FileEdit(
-                    operation="replace",
-                    path="app.py",
-                    find="    return 2\n",
-                    replace="    return 2  # repaired after validation\n",
-                    content=None,
-                    rationale="Resolve the actionable validation failure.",
-                )
-            ],
-        }
-    )
-    providers["builder"] = SequenceProvider([initial_proposal, repair_proposal], "gpt-5.6")
-    sandbox = SequenceSandbox()
-    store = RunStore(config.storage.path)
-
+    pipeline: Pipeline,
+    sha: str,
+    *,
+    config: AutocontributeConfig | None = None,
+    github: FakeGitHub | None = None,
+) -> tuple[Any, RunStore]:
+    settings = config or _config(tmp_path)
+    store = RunStore(settings.storage.path)
     with Orchestrator(
-        config,
+        settings,
         store=store,
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
+        github=github or FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        provider_factory=pipeline.provider,
     ) as orchestrator:
         manifest = orchestrator.run(
             issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
         )
+    return manifest, store
 
-    expected_suite = [TRUSTED_COMMAND, REPRODUCTION_COMMAND]
-    assert manifest.status == RunStatus.READY_FOR_APPROVAL
-    assert manifest.model_calls == 4
-    assert providers["builder"].calls == 2
-    assert providers["critic"].calls == 1
-    assert sandbox.validation_batches == [expected_suite, expected_suite]
-    assert repair_only_command not in [
-        command for batch in sandbox.validation_batches for command in batch
-    ]
-    assert manifest.proposal is not None
-    assert manifest.proposal.validation_commands == [TRUSTED_COMMAND]
-    repair_prompt = str(providers["builder"].requests[1]["prompt"])
-    assert "AssertionError: expected the repaired boundary" in repair_prompt
-    critic_prompt = str(providers["critic"].requests[0]["prompt"])
-    assert "repaired after validation" in critic_prompt
-    assert "1 passed" in critic_prompt
-    events = store.events(manifest.run_id)
-    assert [event["event_type"] for event in events].count("validation.repair.completed") == 1
-    transitions = [
-        json.loads(event["details"])
-        for event in events
+
+def _statuses(store: RunStore, run_id: str) -> list[str]:
+    return [
+        json.loads(event["details"])["to"]
+        for event in store.events(run_id)
         if event["event_type"] == "run.transitioned"
     ]
-    assert [(event["from"], event["to"]) for event in transitions[-5:]] == [
-        ("implementing", "validating"),
-        ("validating", "implementing"),
-        ("implementing", "validating"),
-        ("validating", "critiquing"),
-        ("critiquing", "ready_for_approval"),
+
+
+def test_a_fix_the_critic_approves_is_ready_with_sealed_evidence(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str]
+) -> None:
+    _, sha = source
+
+    manifest, store = _run(tmp_path, pipeline, sha)
+
+    assert manifest.status == RunStatus.READY_FOR_APPROVAL, manifest.error
+    assert _statuses(store, manifest.run_id) == [
+        "discovering",
+        "candidate_selected",
+        "eligibility_checked",
+        "setting_up",
+        "implementing",
+        "validating",
+        "critiquing",
+        "ready_for_approval",
+    ]
+    assert manifest.models is not None
+    assert manifest.models.model_dump() == {
+        "agent": "gpt-5.6-sol",
+        "critic": "gpt-5.6-sol",
+        "setup": "gpt-5.6-terra",
+        "triage": "gpt-5.6-luna",
+    }
+    assert manifest.environment is not None
+    assert manifest.environment.recipe_source == "detected"
+    assert manifest.environment.base_digest == "sha256:" + "f" * 64
+    proposal = manifest.proposal
+    assert proposal is not None
+    assert proposal.pull_request_title == "Fix documented boundary value"
+    assert proposal.pull_request_body.startswith("Fixes #42\n\nvalue() returned 1")
+    assert "Testing (run by autocontribute):" in proposal.pull_request_body
+    assert proposal.disclosure == (
+        f"AI assistance: an AI coding agent (autocontribute {__version__}, gpt-5.6-sol) drafted "
+        "this change and its test and ran the tests listed above in a sandbox. I reviewed the "
+        "diff and the test results before opening this PR and will handle the review."
+    )
+    assert proposal.pull_request_body.endswith(f"\n\n---\n\n{proposal.disclosure}")
+    assert proposal.summary == "value() returned 1; it returns the documented 2 now."
+    assert proposal.test_files == ["tests/test_app.py"]
+    assert manifest.quality is not None and manifest.quality.ready
+    assert manifest.quality.review_summary == "Review: approve."
+    artifacts = store.artifact_dir(manifest.run_id)
+    patch = (artifacts / "contribution.patch").read_bytes()
+    assert b"+    return 2" in patch
+    assert pipeline.patches == [patch.decode("utf-8")]
+    validation = (artifacts / "validation.json").read_bytes()
+    validate_validation_artifact(manifest, artifact=validation)
+    evidence = read_validation_evidence(validation)
+    assert evidence.recipe == pipeline.recipe and evidence.baseline == pipeline.baseline
+    assert evidence.check is not None
+    assert evidence.check.diff_sha256 == hashlib.sha256(patch).hexdigest()
+    assert [round_.decision for round_ in evidence.critic_rounds] == ["approve"]
+    persisted = store.get(manifest.run_id)
+    validate_preparation_fingerprint(persisted, diff=patch)
+    validate_preparation_config_fingerprint(persisted, _config(tmp_path))
+    assert (artifacts / "report.md").is_file()
+    # Publication clones the repository again; nothing of the preparation stays.
+    assert not (store.workspaces_dir / manifest.run_id).exists()
+    assert pipeline.prepared == [("example/project", sha)]
+    assert pipeline.sessions == 1
+    assert pipeline.leftover_sweeps == [frozenset()]
+    events = [event["event_type"] for event in store.events(manifest.run_id)]
+    assert "environment.accepted" in events and "critic.reviewed" in events
+
+
+def test_blockers_go_back_to_the_agent_and_the_next_fix_gets_a_new_round(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str]
+) -> None:
+    _, sha = source
+    pipeline.agent = [fixes(), fixes("def value():\n    return 1 + 1\n")]
+    pipeline.reviews = [review("request_changes", blockers=[_blocker()]), review("approve")]
+
+    manifest, store = _run(tmp_path, pipeline, sha)
+
+    assert manifest.status == RunStatus.READY_FOR_APPROVAL, manifest.error
+    assert pipeline.blockers == [[_blocker()]]
+    assert _statuses(store, manifest.run_id)[4:] == [
+        "implementing",
+        "validating",
+        "critiquing",
+        "implementing",
+        "validating",
+        "critiquing",
+        "ready_for_approval",
+    ]
+    patch = (store.artifact_dir(manifest.run_id) / "contribution.patch").read_text()
+    assert "+    return 1 + 1" in patch
+    assert manifest.quality is not None and manifest.quality.review_rounds == 2
+    evidence = read_validation_evidence(
+        (store.artifact_dir(manifest.run_id) / "validation.json").read_bytes()
+    )
+    assert [round_.decision for round_ in evidence.critic_rounds] == [
+        "request_changes",
+        "approve",
     ]
 
 
-def test_actionable_validation_failure_skips_repair_when_suite_exceeds_remaining_budget(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_no_buildable_environment_skips_the_run(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str]
 ) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
+    _, sha = source
+    pipeline.environment = EnvironmentUnavailable("No Python, JavaScript, Go or Rust project")
 
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+    manifest, store = _run(tmp_path, pipeline, sha)
 
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "sandbox": {"max_commands": 3},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
+    assert manifest.status == RunStatus.SKIPPED
+    assert manifest.skip_reason == "environment: No Python, JavaScript, Go or Rust project"
+    assert manifest.environment is None
+    assert not (store.artifact_dir(manifest.run_id) / "validation.json").exists()
+    assert pipeline.sessions == 0
+
+
+def test_a_sandbox_failure_while_setting_up_fails_the_run(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str]
+) -> None:
+    _, sha = source
+    pipeline.environment = SandboxError("Could not verify Docker daemon runtime information")
+
+    manifest, _store = _run(tmp_path, pipeline, sha)
+
+    assert manifest.status == RunStatus.FAILED
+    assert manifest.error == "Could not verify Docker daemon runtime information"
+
+
+def test_the_agent_can_decline_the_issue(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str]
+) -> None:
+    _, sha = source
+    declined = _submission(
+        outcome="skip",
+        skip_reason="Maintainers must first choose between two behaviours.",
+        pr_title=None,
+        pr_body=None,
+        commit_message=None,
     )
-    providers = _providers()
-    sandbox = SequenceSandbox(remaining_commands=3)
+    pipeline.agent = [ends(SkippedIssue(reason=declined.skip_reason or "", submission=declined))]
 
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
+    manifest, store = _run(tmp_path, pipeline, sha)
+
+    assert manifest.status == RunStatus.SKIPPED
+    assert manifest.skip_reason == (
+        "the agent skipped the issue: Maintainers must first choose between two behaviours."
+    )
+    evidence = read_validation_evidence(
+        (store.artifact_dir(manifest.run_id) / "validation.json").read_bytes()
+    )
+    assert evidence.check is None and evidence.critic_rounds == []
+    assert manifest.validation_sha256 is None
+
+
+def test_an_agent_that_does_not_finish_rejects_the_run(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str]
+) -> None:
+    _, sha = source
+    pipeline.agent = [ends(DidNotFinish("turns", "The transcript reached its turn cap of 100"))]
+
+    manifest, _store = _run(tmp_path, pipeline, sha)
 
     assert manifest.status == RunStatus.REJECTED
-    assert manifest.error is None
-    assert manifest.model_calls == 3
-    assert providers["builder"].calls == 1
-    assert providers["critic"].calls == 1
-    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
+    assert manifest.reject_reason == (
+        "agent did not finish: The transcript reached its turn cap of 100"
+    )
 
 
-def test_actionable_validation_failure_skips_repair_when_prompt_exceeds_model_profile(
+@pytest.mark.parametrize(
+    ("failing", "error"),
+    [("provider", "Model refused the request"), ("sandbox", "the sandbox container stopped")],
+)
+def test_a_provider_or_sandbox_failure_in_the_loop_fails_the_run(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    pipeline: Pipeline,
+    source: tuple[Path, str],
+    failing: str,
+    error: str,
 ) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
+    _, sha = source
+    pipeline.agent = [ends(LoopFailure(failing, error))]  # type: ignore[arg-type]
 
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+    manifest, _store = _run(tmp_path, pipeline, sha)
 
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "models": {"builder": {"max_input_tokens": 20_000}},
-            "sandbox": {"max_commands": 10},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    sandbox = SequenceSandbox(
-        failure_stderr="AssertionError: actionable but oversized\n" + ("x" * 30_000)
-    )
+    assert manifest.status == RunStatus.FAILED
+    assert manifest.error == error
 
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
+
+def test_a_critic_rejection_rejects_the_run_with_its_reason(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str]
+) -> None:
+    _, sha = source
+    pipeline.reviews = [review("reject", reason="the reviewer abandoned the change: unsafe")]
+
+    manifest, store = _run(tmp_path, pipeline, sha)
 
     assert manifest.status == RunStatus.REJECTED
-    assert manifest.error is None
-    assert manifest.model_calls == 3
-    assert providers["builder"].calls == 1
-    assert providers["critic"].calls == 1
-    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
+    assert manifest.reject_reason == "the reviewer abandoned the change: unsafe"
+    assert manifest.quality is not None and not manifest.quality.ready
+    assert not (store.artifact_dir(manifest.run_id) / "contribution.patch").exists()
+    evidence = read_validation_evidence(
+        (store.artifact_dir(manifest.run_id) / "validation.json").read_bytes()
+    )
+    assert [round_.decision for round_ in evidence.critic_rounds] == ["reject"]
 
 
-def test_failed_validation_repair_is_not_retried(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_review_that_does_not_finish_rejects_the_run(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str]
 ) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
+    _, sha = source
+    pipeline.reviews = [DidNotFinish("budget", "The critic budget has $0.0000 left")]
 
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "sandbox": {"max_commands": 10},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    initial_proposal = providers["builder"].output
-    assert isinstance(initial_proposal, PatchProposal)
-    repair_proposal = initial_proposal.model_copy(
-        update={
-            "edits": [
-                FileEdit(
-                    operation="replace",
-                    path="app.py",
-                    find="    return 2\n",
-                    replace="    return 2  # repaired after validation\n",
-                    content=None,
-                    rationale="Resolve the actionable validation failure.",
-                )
-            ]
-        }
-    )
-    providers["builder"] = SequenceProvider([initial_proposal, repair_proposal], "gpt-5.6")
-    sandbox = SequenceSandbox(failing_validation_calls={1, 2})
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    expected_suite = [TRUSTED_COMMAND, REPRODUCTION_COMMAND]
-    assert manifest.status == RunStatus.REJECTED
-    assert manifest.error is None
-    assert manifest.model_calls == 4
-    assert providers["builder"].calls == 2
-    assert providers["critic"].calls == 1
-    assert sandbox.validation_batches == [expected_suite, expected_suite]
-
-
-def test_validation_repair_consumes_the_only_repair_opportunity_before_critic(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "sandbox": {"max_commands": 10},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    initial_proposal = providers["builder"].output
-    approved_review = providers["critic"].output
-    assert isinstance(initial_proposal, PatchProposal)
-    assert isinstance(approved_review, CriticReview)
-    repair_proposal = initial_proposal.model_copy(
-        update={
-            "edits": [
-                FileEdit(
-                    operation="replace",
-                    path="app.py",
-                    find="    return 2\n",
-                    replace="    return 2  # repaired after validation\n",
-                    content=None,
-                    rationale="Resolve the actionable validation failure.",
-                )
-            ]
-        }
-    )
-    rejecting_review = approved_review.model_copy(
-        update={
-            "verdict": "reject",
-            "summary": "The repaired patch still has a blocker.",
-            "blocking_findings": ["The final implementation remains unclear."],
-            "issue_requirements_missing": ["Clear final implementation"],
-        }
-    )
-    providers["builder"] = SequenceProvider([initial_proposal, repair_proposal], "gpt-5.6")
-    providers["critic"] = SequenceProvider([rejecting_review], "gpt-5.6")
-    sandbox = SequenceSandbox()
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    expected_suite = [TRUSTED_COMMAND, REPRODUCTION_COMMAND]
-    assert manifest.status == RunStatus.REJECTED
-    assert manifest.error is None
-    assert manifest.model_calls == 4
-    assert providers["builder"].calls == 2
-    assert providers["critic"].calls == 1
-    assert sandbox.validation_batches == [expected_suite, expected_suite]
-
-
-def test_infrastructure_validation_failure_is_not_sent_to_builder_for_repair(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "sandbox": {"max_commands": 10},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    failure_stderr = (
-        "AssertionError: visible but infrastructure-tainted failure\n"
-        + ("verbose validation output\n" * 5_000)
-        + ("ImportError: No module named fixture_dependency")
-    )
-    assert len(failure_stderr) > 100_000
-    sandbox = SequenceSandbox(failure_stderr=failure_stderr)
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
+    manifest, _store = _run(tmp_path, pipeline, sha)
 
     assert manifest.status == RunStatus.REJECTED
-    assert manifest.error is None
-    assert manifest.model_calls == 3
-    assert providers["builder"].calls == 1
-    assert providers["critic"].calls == 1
-    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
-
-
-def test_truncated_model_visible_failure_is_not_sent_to_builder_for_repair(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "sandbox": {"max_commands": 10},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
+    assert manifest.reject_reason == (
+        "the review did not finish: The critic budget has $0.0000 left"
     )
-    providers = _providers()
-    failure_stderr = "AssertionError: visible\n" + ("x" * (MAX_ARTIFACT_CHARACTERS + 100))
-    sandbox = SequenceSandbox(failure_stderr=failure_stderr)
 
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
+
+def test_pull_request_text_that_cannot_be_published_rejects_the_run(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str]
+) -> None:
+    _, sha = source
+    pipeline.agent = [fixes(pr_title="Fix the boundary @everyone should see")]
+
+    manifest, _store = _run(tmp_path, pipeline, sha)
 
     assert manifest.status == RunStatus.REJECTED
-    assert manifest.error is None
-    assert manifest.model_calls == 3
-    assert providers["builder"].calls == 1
-    assert providers["critic"].calls == 1
-    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
+    assert manifest.reject_reason == (
+        "the pull request text cannot be published: The pull request title mentions @everyone "
+        "or @here"
+    )
+    assert manifest.preparation_fingerprint is None
 
 
-def test_redaction_created_failure_signature_cannot_authorize_repair(
+def test_a_policy_trailer_goes_in_the_commit_message(
     tmp_path: Path,
+    pipeline: Pipeline,
+    source: tuple[Path, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
+    _, sha = source
+    policy = _facts().ai_policy
+    assert policy is not None
+    monkeypatch.setattr(orchestrator_module, "_ai_policy", lambda _eligibility: policy)
 
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+    manifest, _store = _run(tmp_path, pipeline, sha)
 
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    secret = "AssertionError-secret-value-472839"
-    monkeypatch.setenv("ASSERTIONERROR", secret)
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "models": {"builder": {"api_key_env": "ASSERTIONERROR"}},
-            "sandbox": {"max_commands": 10},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    sandbox = SequenceSandbox(failure_stderr=secret)
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.REJECTED
-    assert manifest.error is None
-    assert manifest.model_calls == 3
-    assert providers["builder"].calls == 1
-    assert providers["critic"].calls == 1
-    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
-    critic_prompt = str(providers["critic"].requests[0]["prompt"])
-    assert secret not in critic_prompt
-    assert MODEL_INPUT_REDACTION in critic_prompt
-
-
-def test_critic_repair_is_skipped_when_exact_validation_suite_exceeds_remaining_budget(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "sandbox": {"max_commands": 3},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    approved_review = providers["critic"].output
-    assert isinstance(approved_review, CriticReview)
-    providers["critic"].output = approved_review.model_copy(
-        update={
-            "verdict": "reject",
-            "summary": "The patch still has one blocking concern.",
-            "blocking_findings": ["Add a clarifying implementation comment."],
-            "issue_requirements_missing": ["Clarifying comment"],
-        }
-    )
-    sandbox = PassingSandbox(remaining_commands=3)
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.REJECTED
-    assert manifest.error is None
-    assert manifest.model_calls == 3
-    assert providers["builder"].calls == 1
-    assert providers["critic"].calls == 1
-    assert sandbox.remaining_commands == 0
-    assert sandbox.validation_batches == [[TRUSTED_COMMAND, REPRODUCTION_COMMAND]]
-
-
-def test_critic_repair_reuses_exact_validation_suite_when_it_fits_remaining_budget(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "sandbox": {"max_commands": 5},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    initial_proposal = providers["builder"].output
-    approved_review = providers["critic"].output
-    assert isinstance(initial_proposal, PatchProposal)
-    assert isinstance(approved_review, CriticReview)
-    repair_proposal = initial_proposal.model_copy(
-        update={
-            "summary": "Return the documented value with the requested clarification.",
-            "validation_commands": [
-                TRUSTED_COMMAND,
-                "python -m unittest discover -s tests/repair -v",
-            ],
-            "edits": [
-                FileEdit(
-                    operation="replace",
-                    path="app.py",
-                    find="    return 2\n",
-                    replace="    return 2  # documented boundary\n",
-                    content=None,
-                    rationale="Resolve the independent review blocker.",
-                )
-            ],
-        }
-    )
-    rejecting_review = approved_review.model_copy(
-        update={
-            "verdict": "reject",
-            "summary": "The patch still has one blocking concern.",
-            "blocking_findings": ["Add a clarifying implementation comment."],
-            "issue_requirements_missing": ["Clarifying comment"],
-        }
-    )
-    providers["builder"] = SequenceProvider(
-        [initial_proposal, repair_proposal],
-        "gpt-5.6",
-    )
-    providers["critic"] = SequenceProvider(
-        [rejecting_review, approved_review],
-        "gpt-5.6",
-    )
-    sandbox = PassingSandbox(remaining_commands=5)
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.READY_FOR_APPROVAL
-    assert manifest.model_calls == 5
-    assert providers["builder"].calls == 2
-    assert providers["critic"].calls == 2
-    assert sandbox.remaining_commands == 0
     assert manifest.proposal is not None
-    assert manifest.proposal.validation_commands == [TRUSTED_COMMAND]
-    assert sandbox.validation_batches == [
-        [TRUSTED_COMMAND, REPRODUCTION_COMMAND],
-        [TRUSTED_COMMAND, REPRODUCTION_COMMAND],
-    ]
+    assert manifest.proposal.commit_message == (
+        f"Fix documented boundary value\n\nAssisted-by: autocontribute {__version__}, gpt-5.6-sol"
+    )
+
+
+def test_the_daily_budget_skips_the_run_before_discovery(
+    tmp_path: Path, pipeline: Pipeline
+) -> None:
+    config = _config(tmp_path, budget={"max_cost_usd_per_run": 10, "max_cost_usd_per_day": 2})
+
+    class NoGitHubWork(FakeGitHub):
+        def get_repository(self, full_name: str) -> RepositoryInfo:
+            raise AssertionError("a run over the daily budget must not reach GitHub")
+
+    manifest, _store = _run(
+        tmp_path,
+        pipeline,
+        "a" * 40,
+        config=config,
+        github=NoGitHubWork(_issue(), _repository("a" * 40), "a" * 40),
+    )
+
+    assert manifest.status == RunStatus.SKIPPED
+    assert (manifest.skip_reason or "").startswith("daily budget: ")
+
+
+def test_models_are_resolved_once_from_the_keys_set_when_the_orchestrator_starts(
+    tmp_path: Path, pipeline: Pipeline, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    github = FakeGitHub(_issue(assigned=True), _repository("a" * 40), "a" * 40)
+    with Orchestrator(
+        config,
+        store=RunStore(config.storage.path),
+        github=github,  # type: ignore[arg-type]
+        provider_factory=pipeline.provider,
+    ) as orchestrator:
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "anthropic-test-key-placeholder")
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
+
+    assert manifest.models is not None and manifest.models.agent == "gpt-5.6-sol"
+
+
+def test_orchestrator_needs_a_model_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    with pytest.raises(ConfigurationError, match="ANTHROPIC_API_KEY or OPENAI_API_KEY"):
+        Orchestrator(
+            _config(tmp_path),
+            github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
+        )
 
 
 def test_clone_uses_the_exact_sha_used_for_repository_policy_reads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    pipeline: Pipeline,
 ) -> None:
     sha = "a" * 40
     policy_reads: list[tuple[str, str]] = []
@@ -1084,12 +791,7 @@ def test_clone_uses_the_exact_sha_used_for_repository_policy_reads(
             max_bytes: int = 1_000_000,
         ) -> str | None:
             policy_reads.append((repository, ref))
-            return super().get_file(
-                repository,
-                path,
-                ref=ref,
-                max_bytes=max_bytes,
-            )
+            return super().get_file(repository, path, ref=ref, max_bytes=max_bytes)
 
     def stop_after_clone_ref_is_captured(
         cls: type[RepositoryWorkspace],
@@ -1107,23 +809,10 @@ def test_clone_uses_the_exact_sha_used_for_repository_policy_reads(
         "clone",
         classmethod(stop_after_clone_ref_is_captured),
     )
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
+
+    manifest, _store = _run(
+        tmp_path, pipeline, sha, github=TrackingGitHub(_issue(), _repository(sha), sha)
     )
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=TrackingGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=_providers(),  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
 
     repository_policy_refs = {
         ref for repository, ref in policy_reads if repository == "example/project"
@@ -1133,173 +822,28 @@ def test_clone_uses_the_exact_sha_used_for_repository_policy_reads(
     assert repository_policy_refs == {sha}
 
 
-def test_a_host_secret_in_the_patch_trips_global_breaker_without_retaining_value(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:  # type: ignore[no-untyped-def]
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
+class NoGitHubWork:
+    token = _GITHUB_TOKEN
 
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    providers = _providers()
-    secret = "ghp_" + "A" * 36
-    monkeypatch.setenv(config.github.token_env, secret)
-    proposal = providers["builder"].output
-    assert isinstance(proposal, PatchProposal)
-    providers["builder"].output = proposal.model_copy(
-        update={
-            "edits": [
-                FileEdit(
-                    operation="replace",
-                    path="app.py",
-                    find="    return 1\n",
-                    replace=f"    return 2  # {secret}\n",
-                    content=None,
-                    rationale="Match the documented boundary behavior.",
-                )
-            ]
-        }
-    )
-
-    with Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.FAILED
-    assert manifest.proposal is None
-    assert not store.workspace_dir(manifest.run_id).joinpath("repository").exists()
-    breaker = store.circuit_breaker_status()
-    assert breaker.is_tripped
-    assert breaker.source == f"secret_scanner:{manifest.run_id}"
-    assert secret not in (breaker.reason or "")
-    for path in config.storage.path.rglob("*"):
-        if path.is_file():
-            assert secret.encode() not in path.read_bytes()
-
-    with pytest.raises(StateError, match="Circuit breaker is tripped"):
-        Orchestrator(
-            config,
-            store=store,
-            github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-            providers=_providers(),  # type: ignore[arg-type]
-            sandbox=PassingSandbox(),  # type: ignore[arg-type]
-        ).run(issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL)
+    def __getattr__(self, name: str) -> object:
+        raise AssertionError(f"unexpected GitHub access: {name}")
 
 
-def test_a_token_in_the_patch_rejects_the_run_without_a_global_stop(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:  # type: ignore[no-untyped-def]
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    providers = _providers()
-    # A fixture token: credential-shaped, but no secret of this machine (DESIGN §3.6).
-    token = "ghp_" + "B" * 36
-    proposal = providers["builder"].output
-    assert isinstance(proposal, PatchProposal)
-    providers["builder"].output = proposal.model_copy(
-        update={
-            "edits": [
-                FileEdit(
-                    operation="replace",
-                    path="app.py",
-                    find="    return 1\n",
-                    replace=f"    return 2  # {token}\n",
-                    content=None,
-                    rationale="Match the documented boundary behavior.",
-                )
-            ]
-        }
-    )
-
-    with Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.REJECTED
-    assert not store.circuit_breaker_status().is_tripped
-    assert manifest.quality is not None
-    gates = {gate.gate: gate.passed for gate in manifest.quality.gates}
-    assert gates["secret_scan"] is False
-
-
-def test_breaker_blocks_before_github_or_model_work(tmp_path: Path) -> None:
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
+def test_breaker_blocks_before_github_or_model_work(tmp_path: Path, pipeline: Pipeline) -> None:
+    config = _config(tmp_path)
     store = RunStore(config.storage.path)
     store.trip_circuit_breaker(
         source="test-signal",
         reason="maintainer requested a stop",
         trigger_hash="test-trigger",
     )
-    providers = _providers()
-
-    class NoGitHubWork:
-        def __getattr__(self, name: str) -> object:
-            raise AssertionError(f"unexpected GitHub access: {name}")
 
     with (
         Orchestrator(
             config,
             store=store,
             github=NoGitHubWork(),  # type: ignore[arg-type]
-            providers=providers,  # type: ignore[arg-type]
-            sandbox=PassingSandbox(),  # type: ignore[arg-type]
+            provider_factory=pipeline.provider,
         ) as orchestrator,
         pytest.raises(StateError, match="Circuit breaker is tripped"),
     ):
@@ -1308,24 +852,17 @@ def test_breaker_blocks_before_github_or_model_work(tmp_path: Path) -> None:
         )
 
     assert store.list() == []
-    assert all(provider.calls == 0 for provider in providers.values())
+    assert pipeline.leftover_sweeps == []
 
 
-@pytest.mark.parametrize("invocation_mode", [RunInvocationMode.SCHEDULED])
 @pytest.mark.parametrize("with_retry_authorization", [False, True])
 def test_nonmanual_invocation_cannot_pin_or_authorize_an_issue_before_external_work(
     tmp_path: Path,
-    invocation_mode: RunInvocationMode,
+    pipeline: Pipeline,
     with_retry_authorization: bool,
 ) -> None:
     config = AutocontributeConfig.model_validate({"storage": {"path": tmp_path / "state"}})
     store = RunStore(config.storage.path)
-    providers = _providers()
-
-    class NoGitHubWork:
-        def __getattr__(self, name: str) -> object:
-            raise AssertionError(f"unexpected GitHub access: {name}")
-
     authorization = (
         CandidateRetryAuthorization(
             actor="release-operator",
@@ -1339,42 +876,36 @@ def test_nonmanual_invocation_cannot_pin_or_authorize_an_issue_before_external_w
             config,
             store=store,
             github=NoGitHubWork(),  # type: ignore[arg-type]
-            providers=providers,  # type: ignore[arg-type]
-            sandbox=PassingSandbox(),  # type: ignore[arg-type]
+            provider_factory=pipeline.provider,
         ) as orchestrator,
         pytest.raises(ValueError, match="explicit issue references require manual invocation mode"),
     ):
         orchestrator.run(
             issue_reference="example/project#42",
-            invocation_mode=invocation_mode,
+            invocation_mode=RunInvocationMode.SCHEDULED,
             retry_authorization=authorization,
         )
 
     assert store.list() == []
-    assert all(provider.calls == 0 for provider in providers.values())
 
 
-@pytest.mark.parametrize("invocation_mode", [RunInvocationMode.SCHEDULED])
 def test_nonmanual_invocation_cannot_supply_retry_authorization_without_an_issue(
-    tmp_path: Path,
-    invocation_mode: RunInvocationMode,
+    tmp_path: Path, pipeline: Pipeline
 ) -> None:
     config = AutocontributeConfig.model_validate({"storage": {"path": tmp_path / "state"}})
     store = RunStore(config.storage.path)
-    providers = _providers()
 
     with (
         Orchestrator(
             config,
             store=store,
-            github=object(),  # type: ignore[arg-type]
-            providers=providers,  # type: ignore[arg-type]
-            sandbox=PassingSandbox(),  # type: ignore[arg-type]
+            github=NoGitHubWork(),  # type: ignore[arg-type]
+            provider_factory=pipeline.provider,
         ) as orchestrator,
         pytest.raises(ValueError, match="retry authorization requires an explicit issue reference"),
     ):
         orchestrator.run(
-            invocation_mode=invocation_mode,
+            invocation_mode=RunInvocationMode.SCHEDULED,
             retry_authorization=CandidateRetryAuthorization(
                 actor="release-operator",
                 reason="Reviewed the prior terminal outcome.",
@@ -1382,73 +913,50 @@ def test_nonmanual_invocation_cannot_supply_retry_authorization_without_an_issue
         )
 
     assert store.list() == []
-    assert all(provider.calls == 0 for provider in providers.values())
 
 
-def test_run_recovers_stale_work_and_releases_singleton_lease(tmp_path: Path) -> None:
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
+def test_run_recovers_stale_work_and_releases_singleton_lease(
+    tmp_path: Path, pipeline: Pipeline
+) -> None:
+    config = _config(tmp_path)
     store = RunStore(config.storage.path)
     # Moments old: only the lease holder prepares runs, so the age of a run says nothing.
     abandoned = store.create_run()
     store.transition(abandoned, RunStatus.DISCOVERING, reason="worker started")
-    providers = _providers()
 
-    with Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(assigned=True), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        current = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
+    current, _store = _run(
+        tmp_path,
+        pipeline,
+        "a" * 40,
+        config=config,
+        github=FakeGitHub(_issue(assigned=True), _repository("a" * 40), "a" * 40),
+    )
 
     recovered = store.get(abandoned.run_id)
     assert recovered.status == RunStatus.FAILED
     assert "previous worker stopped" in (recovered.error or "")
     assert current.status == RunStatus.SKIPPED
-    assert all(provider.calls == 0 for provider in providers.values())
     lease = store.acquire_lease("autocontribute.run", "next-worker", ttl=timedelta(minutes=1))
     assert lease is not None
     assert store.release_lease("autocontribute.run", "next-worker", lease.generation)
 
 
 def test_an_interrupted_run_fails_and_releases_its_issue_and_lease(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pipeline: Pipeline
 ) -> None:
     def interrupted_clone(cls: type[RepositoryWorkspace], *_: object, **__: object) -> None:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(interrupted_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
+    store = RunStore(_config(tmp_path).storage.path)
     issue = _issue()
 
-    with (
-        Orchestrator(
-            config,
-            store=store,
-            github=FakeGitHub(issue, _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
-            providers=_providers(),  # type: ignore[arg-type]
-            sandbox=PassingSandbox(),  # type: ignore[arg-type]
-        ) as orchestrator,
-        pytest.raises(KeyboardInterrupt),
-    ):
-        orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+    with pytest.raises(KeyboardInterrupt):
+        _run(
+            tmp_path,
+            pipeline,
+            "a" * 40,
+            github=FakeGitHub(issue, _repository("a" * 40), "a" * 40),
         )
 
     [persisted] = store.list()
@@ -1460,95 +968,26 @@ def test_an_interrupted_run_fails_and_releases_its_issue_and_lease(
     assert lease is not None
 
 
-@pytest.mark.parametrize("provider_fails", [False, True])
-def test_run_lease_takeover_during_model_outcome_preserves_ambiguous_reservation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    provider_fails: bool,
-) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    class TakingProvider(FixedProvider):
-        orchestrator: Orchestrator | None = None
-        takeover: Lease | None = None
-
-        def generate(self, **request: object) -> ModelResult[Any]:
-            result = super().generate(**request)
-            assert self.orchestrator is not None
-            self.takeover = _take_over_run_lease(self.orchestrator, store)
-            if provider_fails:
-                raise RuntimeError("provider failed after lease takeover")
-            return result
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
+def _take_over_run_lease(orchestrator: Orchestrator, store: RunStore) -> Lease:
+    guard = orchestrator._lease_guard
+    assert guard is not None
+    current = guard.assert_owned()
+    takeover = store.acquire_lease(
+        "autocontribute.run",
+        "takeover-worker",
+        ttl=timedelta(minutes=5),
+        now=current.expires_at,
     )
-    store = RunStore(config.storage.path)
-    provider = TakingProvider(_providers()["scout"].output, "taking-scout")
-    providers = _providers()
-    providers["scout"] = provider
-
-    with Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        provider.orchestrator = orchestrator
-        with pytest.raises(StateError, match="ownership was lost"):
-            orchestrator.run(
-                issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-            )
-
-    assert provider.takeover is not None
-    assert store.release_lease(
-        provider.takeover.name,
-        provider.takeover.owner,
-        provider.takeover.generation,
-    )
-    [persisted] = store.list()
-    assert persisted.status == RunStatus.PLANNING
-    assert persisted.error is None
-    assert persisted.model_calls == 1
-    assert persisted.model_seconds == 0
-    assert persisted.model_reservation is not None
-    event_types = [event["event_type"] for event in store.events(persisted.run_id)]
-    assert "model.call.started" in event_types
-    assert "model.call.completed" not in event_types
-    assert "model.call.failed" not in event_types
-    run_artifacts = store.runs_dir / persisted.run_id
-    assert not (run_artifacts / "validation.json").exists()
-    assert not (run_artifacts / "model-calls.json").exists()
-    assert not (run_artifacts / "report.md").exists()
+    assert takeover is not None
+    assert takeover.generation > current.generation
+    return takeover
 
 
 def test_run_lease_takeover_during_github_read_stops_before_workspace_or_failure_write(
-    tmp_path: Path,
+    tmp_path: Path, pipeline: Pipeline
 ) -> None:
     sha = "a" * 40
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
+    config = _config(tmp_path)
     store = RunStore(config.storage.path)
 
     class TakingGitHub(FakeGitHub):
@@ -1562,13 +1001,11 @@ def test_run_lease_takeover_during_github_read_stops_before_workspace_or_failure
             return result
 
     github = TakingGitHub(_issue(), _repository(sha), sha)
-    providers = _providers()
     with Orchestrator(
         config,
         store=store,
         github=github,  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        provider_factory=pipeline.provider,
     ) as orchestrator:
         github.orchestrator = orchestrator
         with pytest.raises(StateError, match="ownership was lost"):
@@ -1586,908 +1023,60 @@ def test_run_lease_takeover_during_github_read_stops_before_workspace_or_failure
     assert persisted.status == RunStatus.DISCOVERING
     assert persisted.error is None
     assert persisted.base_sha is None
-    assert all(provider.calls == 0 for provider in providers.values())
+    assert pipeline.prepared == []
     assert not (store.workspaces_dir / persisted.run_id).exists()
     run_artifacts = store.runs_dir / persisted.run_id
     assert not (run_artifacts / "validation.json").exists()
-    assert not (run_artifacts / "model-calls.json").exists()
     assert not (run_artifacts / "report.md").exists()
 
 
-def test_breaker_trip_during_model_failure_still_records_safe_failure_bookkeeping(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_run_lease_takeover_while_the_agent_works_writes_nothing_more(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str]
 ) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
+    _, sha = source
+    config = _config(tmp_path)
     store = RunStore(config.storage.path)
-
-    class BreakerProvider:
-        def generate(self, **_: object) -> ModelResult[Any]:
-            store.trip_circuit_breaker(
-                source="test:model-call",
-                reason="stop while the provider call is in flight",
-                trigger_hash="model-call-stop",
-            )
-            raise RuntimeError("provider failed after safety stop")
-
-    providers = _providers()
-    providers["scout"] = BreakerProvider()  # type: ignore[assignment]
-    with Orchestrator(
+    takeovers: list[Lease] = []
+    running = Orchestrator(
         config,
         store=store,
         github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.FAILED
-    assert manifest.model_reservation is not None
-    event_types = [event["event_type"] for event in store.events(manifest.run_id)]
-    assert "model.call.started" in event_types
-    assert "model.call.failed" in event_types
-    assert "run.transitioned" in event_types
-    run_artifacts = store.runs_dir / manifest.run_id
-    assert (run_artifacts / "validation.json").is_file()
-    assert (run_artifacts / "model-calls.json").is_file()
-    assert (run_artifacts / "report.md").is_file()
-
-
-def test_planner_and_critic_receive_callers_tests_and_exact_publication_text(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
-    source, _ = _source_repository(tmp_path)
-    (source / "caller.py").write_text(
-        "from app import value\n\nRESULT = value()\n",
-        encoding="utf-8",
-    )
-    (source / "tests").mkdir()
-    (source / "tests" / "test_app.py").write_text(
-        "from app import value\n\ndef test_value():\n    assert value() == 1\n",
-        encoding="utf-8",
-    )
-    _git(source, "add", ".")
-    _git(source, "commit", "--quiet", "-m", "add references")
-    sha = _git(source, "rev-parse", "HEAD")
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    issue = _issue()
-    issue.title = "Fix the documented `value()` boundary"
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(issue, _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.READY_FOR_APPROVAL
-    planner_prompt = str(providers["scout"].requests[0]["prompt"])
-    assert "literal_repository_references" in planner_prompt
-    assert "caller.py" in planner_prompt
-    assert "tests/test_app.py" in planner_prompt
-    critic_prompt = str(providers["critic"].requests[0]["prompt"])
-    assert "affected_source_context" in critic_prompt
-    assert "caller.py" in critic_prompt
-    assert "tests/test_app.py" in critic_prompt
-    assert "proposed_publication_text" in critic_prompt
-    assert "Fix documented boundary value" in critic_prompt
-    assert "Fixes #42. Corrects the boundary return value." in critic_prompt
-    assert config.policy.ai_disclosure in critic_prompt
-
-
-def test_repository_pull_request_template_is_a_hard_pre_review_gate(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
-    source, _ = _source_repository(tmp_path)
-    template_dir = source / ".github"
-    template_dir.mkdir()
-    (template_dir / "pull_request_template.md").write_text(
-        "## Summary\n\n<!-- Describe the change. -->\n\n## Testing\n\n- [ ] Tests pass\n",
-        encoding="utf-8",
-    )
-    _git(source, "add", ".")
-    _git(source, "commit", "--quiet", "-m", "add pull request template")
-    sha = _git(source, "rev-parse", "HEAD")
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.FAILED
-    assert "missing template heading" in (manifest.error or "")
-    assert providers["builder"].calls == 1
-    assert providers["critic"].calls == 0
-
-
-def test_required_template_tasks_are_completed_only_after_validation(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
-    source, _ = _source_repository(tmp_path)
-    template_dir = source / ".github"
-    template_dir.mkdir()
-    (template_dir / "pull_request_template.md").write_text(
-        "## Summary\n\n## Testing\n\n- [ ] Tests pass\n",
-        encoding="utf-8",
-    )
-    _git(source, "add", ".")
-    _git(source, "commit", "--quiet", "-m", "add pull request template")
-    sha = _git(source, "rev-parse", "HEAD")
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    proposal = providers["builder"].output
-    assert isinstance(proposal, PatchProposal)
-    providers["builder"].output = proposal.model_copy(
-        update={
-            "pull_request_body": (
-                "## Summary\n\nFixes #42. Corrects the boundary return value.\n\n"
-                "## Testing\n\n- [ ] Tests pass\n"
-            )
-        }
+        provider_factory=pipeline.provider,
     )
 
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
+    def taken_over(checks: FakeChecks) -> SolverOutcome:
+        takeovers.append(_take_over_run_lease(running, store))
+        return fixes()(checks)
 
-    assert manifest.status == RunStatus.READY_FOR_APPROVAL
-    assert manifest.proposal is not None
-    assert "- [x] Tests pass" in manifest.proposal.pull_request_body
-    critic_prompt = str(providers["critic"].requests[0]["prompt"])
-    assert "- [x] Tests pass" in critic_prompt
-    assert "validation_results" in critic_prompt
+    pipeline.agent = [taken_over]
+    with running, pytest.raises(StateError, match="ownership was lost"):
+        running.run(issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL)
+
+    [persisted] = store.list()
+    assert persisted.status == RunStatus.IMPLEMENTING
+    assert persisted.error is None
+    run_artifacts = store.runs_dir / persisted.run_id
+    assert not (run_artifacts / "validation.json").exists()
+    assert not (run_artifacts / "contribution.patch").exists()
+    assert store.release_lease(takeovers[0].name, takeovers[0].owner, takeovers[0].generation)
 
 
-def test_failed_validation_never_completes_template_tasks(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    source, _ = _source_repository(tmp_path)
-    template_dir = source / ".github"
-    template_dir.mkdir()
-    (template_dir / "pull_request_template.md").write_text(
-        "## Summary\n\n## Testing\n\n- [ ] Tests pass\n",
-        encoding="utf-8",
-    )
-    _git(source, "add", ".")
-    _git(source, "commit", "--quiet", "-m", "add pull request template")
-    sha = _git(source, "rev-parse", "HEAD")
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "budget": {"max_model_calls_per_run": 3},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    proposal = providers["builder"].output
-    assert isinstance(proposal, PatchProposal)
-    providers["builder"].output = proposal.model_copy(
-        update={
-            "pull_request_body": (
-                "## Summary\n\nFixes #42. Corrects the boundary return value.\n\n"
-                "## Testing\n\n- [ ] Tests pass\n"
-            )
-        }
-    )
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=SequenceSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.REJECTED
-    assert manifest.proposal is not None
-    assert "- [ ] Tests pass" in manifest.proposal.pull_request_body
-    critic_prompt = str(providers["critic"].requests[0]["prompt"])
-    assert "- [ ] Tests pass" in critic_prompt
-    assert "- [x] Tests pass" not in critic_prompt
-
-
-def test_organization_default_pull_request_template_is_a_hard_gate(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    class OrganizationTemplateGitHub(FakeGitHub):
-        def get_file(
-            self,
-            repository: str,
-            path: str,
-            *,
-            ref: str,
-            max_bytes: int = 1_000_000,
-        ) -> str | None:
-            if repository == "example/.github" and path == "PULL_REQUEST_TEMPLATE.md":
-                return "## Organization verification\n"
-            return super().get_file(repository, path, ref=ref, max_bytes=max_bytes)
-
-        def list_directory(
-            self, repository: str, path: str, *, ref: str
-        ) -> list[DirectoryEntry] | None:
-            if repository == "example/.github":
-                return (
-                    None if path else [DirectoryEntry(path="PULL_REQUEST_TEMPLATE.md", kind="file")]
-                )
-            return super().list_directory(repository, path, ref=ref)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=OrganizationTemplateGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.FAILED
-    assert "organization verification" in (manifest.error or "")
-    assert providers["critic"].calls == 0
-
-
-def test_planner_selected_new_scope_triggers_one_instruction_aware_replan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_ineligible_explicit_issue_skips_without_environment_or_model_work(
+    tmp_path: Path, pipeline: Pipeline
 ) -> None:
-    source, _ = _source_repository(tmp_path)
-    (source / "AGENTS.md").write_text("ROOT_GUIDANCE_MARKER\n", encoding="utf-8")
-    component = source / "component"
-    component.mkdir()
-    (component / "AGENTS.md").write_text("COMPONENT_AGENT_MARKER\n", encoding="utf-8")
-    (component / "README.md").write_text("COMPONENT_README_MARKER\n", encoding="utf-8")
-    (component / "app.py").write_text("answer = 1\n", encoding="utf-8")
-    unrelated = source / "unrelated"
-    unrelated.mkdir()
-    (unrelated / "AGENTS.md").write_text("UNRELATED_AGENT_MARKER\n", encoding="utf-8")
-    (unrelated / "README.md").write_text("UNRELATED_README_MARKER\n", encoding="utf-8")
-    referenced = source / "referenced"
-    referenced.mkdir()
-    (referenced / "AGENTS.md").write_text("REFERENCE_AGENT_MARKER\n", encoding="utf-8")
-    (referenced / "probe.py").write_text("documented_boundary_value = 1\n", encoding="utf-8")
-    _git(source, "add", ".")
-    _git(source, "commit", "--quiet", "-m", "add scoped guidance")
-    sha = _git(source, "rev-parse", "HEAD")
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    providers = _providers()
-    plan = providers["scout"].output
-    proposal = providers["builder"].output
-    assert isinstance(plan, ContributionPlan)
-    assert isinstance(proposal, PatchProposal)
-    providers["scout"].output = plan.model_copy(update={"files_to_read": ["component/app.py"]})
-    providers["builder"].output = proposal.model_copy(
-        update={
-            "edits": [
-                FileEdit(
-                    operation="replace",
-                    path="component/app.py",
-                    find="answer = 1\n",
-                    replace="answer = 2\n",
-                    content=None,
-                    rationale="Match the documented boundary behavior.",
-                )
-            ]
-        }
-    )
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.READY_FOR_APPROVAL
-    assert providers["scout"].calls == 2
-    planner_prompt = str(providers["scout"].requests[0]["prompt"])
-    replanned_prompt = str(providers["scout"].requests[1]["prompt"])
-    builder_prompt = str(providers["builder"].requests[0]["prompt"])
-    critic_prompt = str(providers["critic"].requests[0]["prompt"])
-    assert "ROOT_GUIDANCE_MARKER" in planner_prompt
-    assert "REFERENCE_AGENT_MARKER" in planner_prompt
-    assert "COMPONENT_AGENT_MARKER" not in planner_prompt
-    assert "COMPONENT_README_MARKER" not in planner_prompt
-    for prompt in (replanned_prompt, builder_prompt, critic_prompt):
-        assert "ROOT_GUIDANCE_MARKER" in prompt
-        assert "COMPONENT_AGENT_MARKER" in prompt
-        assert "COMPONENT_README_MARKER" in prompt
-        assert "UNRELATED_AGENT_MARKER" not in prompt
-        assert "UNRELATED_README_MARKER" not in prompt
-
-
-def test_replan_cannot_expand_into_a_second_unseen_guidance_scope(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source, _ = _source_repository(tmp_path)
-    for directory in ("first", "second"):
-        scoped = source / directory
-        scoped.mkdir()
-        (scoped / "AGENTS.md").write_text(f"{directory.upper()}_SCOPE_MARKER\n", encoding="utf-8")
-        (scoped / "opaque.py").write_text(f"answer_{directory} = 1\n", encoding="utf-8")
-    _git(source, "add", ".")
-    _git(source, "commit", "--quiet", "-m", "add two scoped instruction sets")
-    sha = _git(source, "rev-parse", "HEAD")
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    providers = _providers()
-    initial_plan = providers["scout"].output
-    assert isinstance(initial_plan, ContributionPlan)
-    providers["scout"] = SequenceProvider(
-        [
-            initial_plan.model_copy(update={"files_to_read": ["first/opaque.py"]}),
-            initial_plan.model_copy(update={"files_to_read": ["second/opaque.py"]}),
-        ],
-        "gpt-5.6",
-    )
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.FAILED
-    assert "second/AGENTS.md" in (manifest.error or "")
-    assert providers["scout"].calls == 2
-    assert providers["builder"].calls == 0
-    assert providers["critic"].calls == 0
-
-
-def test_builder_edit_entering_unseen_agents_scope_fails_before_workspace_mutation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source, _ = _source_repository(tmp_path)
-    other = source / "other"
-    other.mkdir()
-    (other / "AGENTS.md").write_text("OTHER_SCOPE_MARKER\n", encoding="utf-8")
-    (other / "opaque.py").write_text("answer = 1\n", encoding="utf-8")
-    _git(source, "add", ".")
-    _git(source, "commit", "--quiet", "-m", "add other scope")
-    sha = _git(source, "rev-parse", "HEAD")
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    providers = _providers()
-    proposal = providers["builder"].output
-    assert isinstance(proposal, PatchProposal)
-    providers["builder"].output = proposal.model_copy(
-        update={
-            "edits": [
-                FileEdit(
-                    operation="replace",
-                    path="other/opaque.py",
-                    find="answer = 1\n",
-                    replace="answer = 2\n",
-                    content=None,
-                    rationale="Attempt to edit a path outside the supplied guidance scope.",
-                )
-            ]
-        }
-    )
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    contents_at_failure: list[str] = []
-    transition = store.transition
-
-    def record_contents_at_failure(
-        manifest: RunManifest, target: RunStatus, *, reason: str
-    ) -> RunManifest:
-        if target == RunStatus.FAILED:
-            workspace = store.workspaces_dir / manifest.run_id / "repository"
-            opaque = workspace / "other" / "opaque.py"
-            contents_at_failure.append(opaque.read_text(encoding="utf-8"))
-        return transition(manifest, target, reason=reason)
-
-    monkeypatch.setattr(store, "transition", record_contents_at_failure)
-
-    with Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.FAILED
-    assert "repository-guidance scope" in (manifest.error or "")
-    assert "other/AGENTS.md" in (manifest.error or "")
-    assert providers["builder"].calls == 1
-    assert providers["critic"].calls == 0
-    assert contents_at_failure == ["answer = 1\n"]
-    assert not (store.workspaces_dir / manifest.run_id).exists()
-
-
-def test_excess_global_guidance_fails_before_any_model_call(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source, _ = _source_repository(tmp_path)
-    for index in range(30):
-        (source / f"POLICY-{index:02d}.md").write_text(
-            f"Policy {index}.\n",
-            encoding="utf-8",
-        )
-    _git(source, "add", ".")
-    _git(source, "commit", "--quiet", "-m", "add excessive guidance")
-    sha = _git(source, "rev-parse", "HEAD")
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    providers = _providers()
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.FAILED
-    assert "above the configured limit of 30" in (manifest.error or "")
-    assert all(provider.calls == 0 for provider in providers.values())
-
-
-def test_excess_scoped_guidance_fails_after_planning_but_before_builder(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    source, _ = _source_repository(tmp_path)
-    component = source / "component"
-    component.mkdir()
-    (component / "app.py").write_text("answer = 1\n", encoding="utf-8")
-    (component / "AGENTS.md").write_text("x" * 80_001, encoding="utf-8")
-    _git(source, "add", ".")
-    _git(source, "commit", "--quiet", "-m", "add oversized scoped guidance")
-    sha = _git(source, "rev-parse", "HEAD")
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    providers = _providers()
-    plan = providers["scout"].output
-    assert isinstance(plan, ContributionPlan)
-    providers["scout"].output = plan.model_copy(update={"files_to_read": ["component/app.py"]})
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.FAILED
-    assert "Applicable repository guidance exceeds" in (manifest.error or "")
-    assert providers["scout"].calls == 1
-    assert providers["builder"].calls == 0
-    assert providers["critic"].calls == 0
-
-
-def test_operator_required_commands_run_when_models_omit_them(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": ["trusted-project-check"]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    sandbox = PassingSandbox()
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=_providers(validation_commands=[]),  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.READY_FOR_APPROVAL
-    assert sandbox.validation_batches == [["trusted-project-check", REPRODUCTION_COMMAND]]
-    assert manifest.quality
-    assert next(
-        gate for gate in manifest.quality.gates if gate.gate == "required_validation"
-    ).passed
-
-
-def test_missing_dynamic_repository_validation_fails_before_model_work(tmp_path: Path) -> None:
     sha = "a" * 40
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"owners": ["example"]},
-            "storage": {"path": tmp_path / "state"},
-        }
+
+    manifest, _store = _run(
+        tmp_path, pipeline, sha, github=FakeGitHub(_issue(assigned=True), _repository(sha), sha)
     )
-    providers = _providers()
-
-    with Orchestrator(
-        config,
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.FAILED
-    assert "no operator-owned validation.required_commands" in (manifest.error or "")
-    assert all(provider.calls == 0 for provider in providers.values())
-
-
-def test_insufficient_command_budget_fails_without_truncating_required_checks(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "sandbox": {"max_commands": 2},
-            "validation": {
-                "required_commands": {"example/project": ["trusted-check-one", "trusted-check-two"]}
-            },
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    sandbox = PassingSandbox(remaining_commands=2)
-
-    with Orchestrator(
-        config,
-        store=RunStore(config.storage.path),
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=_providers(validation_commands=[]),  # type: ignore[arg-type]
-        sandbox=sandbox,  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.FAILED
-    assert "refusing to truncate validation" in (manifest.error or "")
-    assert sandbox.validation_batches == []
-
-
-def test_isolated_validation_files_never_enter_the_contribution_patch(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    mutating_reproduction = (
-        "python -c 'from pathlib import Path; from app import value; "
-        'Path("validation-generated.txt").write_text("discard"); assert value() == 2\''
-    )
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "sandbox": {"backend": "local", "allow_unsafe_local": True},
-            "validation": {"required_commands": {"example/project": [mutating_reproduction]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-
-    with Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=_providers(validation_commands=[], reproduction_command=mutating_reproduction),  # type: ignore[arg-type]
-        sandbox=SandboxRunner(config.sandbox),
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
-
-    assert manifest.status == RunStatus.READY_FOR_APPROVAL
-    patch = (store.artifact_dir(manifest.run_id) / "contribution.patch").read_text()
-    assert "validation-generated.txt" not in patch
-    assert not (
-        store.workspace_dir(manifest.run_id) / "repository" / "validation-generated.txt"
-    ).exists()
-
-
-def test_ineligible_explicit_issue_skips_without_spending_model_tokens(tmp_path: Path) -> None:
-    sha = "a" * 40
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    providers = _providers()
-    github = FakeGitHub(_issue(assigned=True), _repository(sha), sha)
-
-    with Orchestrator(
-        config,
-        github=github,  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
 
     assert manifest.status == RunStatus.SKIPPED
     assert "already assigned" in (manifest.skip_reason or "")
-    assert all(provider.calls == 0 for provider in providers.values())
+    assert pipeline.prepared == []
 
 
-def test_explicit_issue_in_a_held_repository_skips(tmp_path: Path) -> None:
-    sha = "a" * 40
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
+def test_explicit_issue_in_a_held_repository_skips(tmp_path: Path, pipeline: Pipeline) -> None:
+    store = RunStore(_config(tmp_path).storage.path)
     store.record_stop(
         CircuitBreakerTrigger(
             source="github_issue_discussion:example/project#40",
@@ -2497,68 +1086,39 @@ def test_explicit_issue_in_a_held_repository_skips(tmp_path: Path) -> None:
             scope_key="example/project",
         )
     )
-    providers = _providers()
 
-    with Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
+    manifest, _store = _run(tmp_path, pipeline, "a" * 40)
 
     assert manifest.status == RunStatus.SKIPPED
     assert "the repository is held" in (manifest.skip_reason or "")
-    assert all(provider.calls == 0 for provider in providers.values())
+    assert pipeline.prepared == []
 
 
-def test_run_deletes_workspaces_left_by_finished_runs(tmp_path: Path) -> None:
+def test_run_deletes_workspaces_left_by_finished_runs(tmp_path: Path, pipeline: Pipeline) -> None:
     sha = "a" * 40
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
+    store = RunStore(_config(tmp_path).storage.path)
     finished = store.create_run()
     store.transition(finished, RunStatus.FAILED, reason="an earlier run failed")
     (store.workspace_dir(finished.run_id) / "repository").mkdir()
 
-    with Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(assigned=True), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=_providers(),  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
+    manifest, _store = _run(
+        tmp_path, pipeline, sha, github=FakeGitHub(_issue(assigned=True), _repository(sha), sha)
+    )
 
     assert manifest.status == RunStatus.SKIPPED
     assert not (store.workspaces_dir / finished.run_id).exists()
     assert (store.runs_dir / finished.run_id / "manifest.json").is_file()
+    assert pipeline.leftover_sweeps == [frozenset()]
 
 
 def test_candidate_claim_failure_cannot_attach_candidate_through_failure_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    pipeline: Pipeline,
 ) -> None:
     sha = "a" * 40
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
+    config = _config(tmp_path)
     store = RunStore(config.storage.path)
-    providers = _providers()
 
     def fail_claim(*_: object, **__: object) -> None:
         raise StateError("candidate claim failed before durable attachment")
@@ -2568,8 +1128,7 @@ def test_candidate_claim_failure_cannot_attach_candidate_through_failure_record(
         config,
         store=store,
         github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        provider_factory=pipeline.provider,
     ) as orchestrator:
         manifest = orchestrator.run(
             issue_reference="example/project#42",
@@ -2583,30 +1142,22 @@ def test_candidate_claim_failure_cannot_attach_candidate_through_failure_record(
     assert durable.status == RunStatus.FAILED
     assert durable.candidate is None
     assert durable.repository is None
-    assert all(provider.calls == 0 for provider in providers.values())
+    assert pipeline.prepared == []
 
 
 def test_unchanged_explicit_issue_is_deferred_before_eligibility_or_model_work(
-    tmp_path: Path,
+    tmp_path: Path, pipeline: Pipeline
 ) -> None:
     sha = "a" * 40
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
+    config = _config(tmp_path)
     store = RunStore(config.storage.path)
-    providers = _providers()
     github = CountingGitHub(_issue(assigned=True), _repository(sha), sha)
 
     with Orchestrator(
         config,
         store=store,
         github=github,  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        provider_factory=pipeline.provider,
     ) as orchestrator:
         first = orchestrator.run(
             issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
@@ -2621,7 +1172,6 @@ def test_unchanged_explicit_issue_is_deferred_before_eligibility_or_model_work(
     assert "unchanged since prior skipped run" in (second.skip_reason or "")
     assert "--retry-unchanged" in (second.skip_reason or "")
     assert github.default_branch_calls == 1
-    assert all(provider.calls == 0 for provider in providers.values())
     events = store.events(second.run_id)
     assert "candidate.retry_deferred" in [event["event_type"] for event in events]
     details = json.loads(
@@ -2647,18 +1197,11 @@ def test_unchanged_explicit_issue_is_deferred_before_eligibility_or_model_work(
 
 
 def test_unpinned_discovery_exhausts_suppressed_revision_without_model_work(
-    tmp_path: Path,
+    tmp_path: Path, pipeline: Pipeline
 ) -> None:
     sha = "a" * 40
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
+    config = _config(tmp_path)
     store = RunStore(config.storage.path)
-    providers = _providers()
     now = datetime.now(UTC)
     claimed = _issue().model_copy(
         update={
@@ -2681,8 +1224,7 @@ def test_unpinned_discovery_exhausts_suppressed_revision_without_model_work(
         config,
         store=store,
         github=github,  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        provider_factory=pipeline.provider,
     ) as orchestrator:
         prior = orchestrator.run(
             issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
@@ -2697,7 +1239,6 @@ def test_unpinned_discovery_exhausts_suppressed_revision_without_model_work(
         "prior skipped, rejected, or cancelled run."
     )
     assert github.search_calls == 1
-    assert all(provider.calls == 0 for provider in providers.values())
     exhaustion = next(
         event
         for event in store.events(discovered.run_id)
@@ -2711,26 +1252,18 @@ def test_unpinned_discovery_exhausts_suppressed_revision_without_model_work(
 
 
 def test_retry_unchanged_explicit_issue_records_override_and_rechecks_eligibility(
-    tmp_path: Path,
+    tmp_path: Path, pipeline: Pipeline
 ) -> None:
     sha = "a" * 40
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
+    config = _config(tmp_path)
     store = RunStore(config.storage.path)
-    providers = _providers()
     github = CountingGitHub(_issue(assigned=True), _repository(sha), sha)
 
     with Orchestrator(
         config,
         store=store,
         github=github,  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        provider_factory=pipeline.provider,
     ) as orchestrator:
         first = orchestrator.run(
             issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
@@ -2749,7 +1282,6 @@ def test_retry_unchanged_explicit_issue_records_override_and_rechecks_eligibilit
     assert retried.candidate is not None
     assert "already assigned" in (retried.skip_reason or "")
     assert github.default_branch_calls == 2
-    assert all(provider.calls == 0 for provider in providers.values())
     events = store.events(retried.run_id)
     override = next(event for event in events if event["event_type"] == "candidate.retry_override")
     details = json.loads(override["details"])
@@ -2760,713 +1292,18 @@ def test_retry_unchanged_explicit_issue_records_override_and_rechecks_eligibilit
     assert set(details["authorization_id"]) <= set("0123456789abcdef")
 
 
-def test_explicit_issue_cannot_bypass_repository_allowlist(tmp_path: Path) -> None:
-    sha = "a" * 40
+def test_explicit_issue_cannot_bypass_repository_allowlist(
+    tmp_path: Path, pipeline: Pipeline
+) -> None:
     config = AutocontributeConfig.model_validate(
         {
             "github": {"repositories": ["approved/project"]},
-            "validation": {"required_commands": {"approved/project": [TRUSTED_COMMAND]}},
             "storage": {"path": tmp_path / "state"},
         }
     )
-    providers = _providers()
-    github = FakeGitHub(_issue(), _repository(sha), sha)
 
-    with Orchestrator(
-        config,
-        github=github,  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-        )
+    manifest, _store = _run(tmp_path, pipeline, "a" * 40, config=config)
 
     assert manifest.status == RunStatus.FAILED
     assert "not in github.repositories" in (manifest.error or "")
-    assert all(provider.calls == 0 for provider in providers.values())
-
-
-def test_model_call_forwards_remaining_output_and_wall_clock_budgets(tmp_path: Path) -> None:
-    config = AutocontributeConfig.model_validate(
-        {
-            "models": {
-                role: {
-                    "pricing": {
-                        "input_usd_per_million_tokens": "2",
-                        "output_usd_per_million_tokens": "4",
-                    }
-                }
-                for role in ("scout", "builder", "critic")
-            },
-            "budget": {
-                "max_output_tokens_per_run": 1_000,
-                "max_model_seconds_per_run": 10,
-            },
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    provider = _providers()["scout"]
-    ticks = iter((5.0, 7.0))
-    orchestrator = Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
-        providers={"scout": provider},  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-        clock=lambda: next(ticks),
-    )
-    manifest = store.create_run()
-
-    orchestrator._call_model(
-        manifest,
-        role="scout",
-        instructions="Plan safely.",
-        prompt="Inspect one issue.",
-        output_type=ContributionPlan,
-    )
-
-    assert provider.requests[0]["max_output_tokens"] == 1_000
-    assert provider.requests[0]["timeout_seconds"] == 10
-    assert manifest.model_input_tokens == 10
-    assert manifest.model_output_tokens == 5
-    assert str(manifest.model_cost_usd) == "0.00004"
-    assert manifest.model_seconds == 2
-    persisted = store.get(manifest.run_id)
-    assert persisted.model_seconds == 2
-    assert persisted.model_reservation is None
-
-
-def test_cost_budget_rejects_request_before_provider_invocation(tmp_path: Path) -> None:
-    priced_profile = {
-        "pricing": {
-            "input_usd_per_million_tokens": "100",
-            "output_usd_per_million_tokens": "100",
-        }
-    }
-    config = AutocontributeConfig.model_validate(
-        {
-            "models": {
-                "scout": priced_profile,
-                "builder": priced_profile,
-                "critic": priced_profile,
-            },
-            "budget": {"max_model_cost_usd_per_run": "0.0001"},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    provider = _providers()["scout"]
-    orchestrator = Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
-        providers={"scout": provider},  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    )
-    manifest = store.create_run()
-
-    with pytest.raises(PolicyError, match="cost budget exhausted"):
-        orchestrator._call_model(
-            manifest,
-            role="scout",
-            instructions="Plan safely.",
-            prompt="Inspect one issue.",
-            output_type=ContributionPlan,
-        )
-
-    assert provider.calls == 0
-    assert manifest.model_calls == 0
-    assert manifest.model_reservation is None
-
-
-def test_failed_model_call_retains_durable_reservation(tmp_path: Path) -> None:
-    class FailingProvider:
-        def generate(self, **_: object) -> ModelResult[Any]:
-            raise RuntimeError("provider unavailable")
-
-    config = AutocontributeConfig.model_validate(
-        {
-            "budget": {"max_model_seconds_per_run": 10},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    ticks = iter((1.0, 2.5))
-    orchestrator = Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
-        providers={"scout": FailingProvider()},  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-        clock=lambda: next(ticks),
-    )
-    manifest = store.create_run()
-
-    with pytest.raises(RuntimeError, match="provider unavailable"):
-        orchestrator._call_model(
-            manifest,
-            role="scout",
-            instructions="Plan safely.",
-            prompt="Inspect one issue.",
-            output_type=ContributionPlan,
-        )
-
-    assert manifest.model_reservation is not None
-    assert manifest.model_seconds == 1.5
-    persisted = store.get(manifest.run_id)
-    assert persisted.model_reservation == manifest.model_reservation
-
-
-class FlakyProvider(FixedProvider):
-    def __init__(self, output: Any, model: str, failures: list[Exception]) -> None:
-        super().__init__(output, model)
-        self.failures = list(failures)
-
-    def generate(self, **request: object) -> ModelResult[Any]:
-        if self.failures:
-            self.calls += 1
-            self.requests.append(request)
-            raise self.failures.pop(0)
-        return super().generate(**request)
-
-
-def _retry_test_orchestrator(
-    tmp_path: Path,
-    provider: FixedProvider,
-    *,
-    ticks: tuple[float, ...],
-    budget: dict[str, object] | None = None,
-) -> tuple[RunStore, Orchestrator]:
-    config = AutocontributeConfig.model_validate(
-        {
-            "budget": budget or {},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    tick_iter = iter(ticks)
-    orchestrator = Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
-        providers={"scout": provider},  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-        clock=lambda: next(tick_iter),
-    )
-    return store, orchestrator
-
-
-def test_transient_provider_failure_is_retried_after_charging_its_reservation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    waits: list[float] = []
-    monkeypatch.setattr("autocontribute.orchestrator._sleep", waits.append)
-    plan = _providers()["scout"].output
-    provider = FlakyProvider(
-        plan,
-        "gpt-5.6",
-        [ModelRequestError("OpenAI Responses request failed (HTTP 503)", status_code=503)],
-    )
-    store, orchestrator = _retry_test_orchestrator(tmp_path, provider, ticks=(1.0, 2.5, 3.0, 4.5))
-    manifest = store.create_run()
-
-    result = orchestrator._call_model(
-        manifest,
-        role="scout",
-        instructions="Plan safely.",
-        prompt="Inspect one issue.",
-        output_type=ContributionPlan,
-    )
-
-    assert result.output == plan
-    assert waits == [10.0]
-    assert manifest.model_calls == 2
-    assert manifest.model_reservation is None
-    # The failed attempt is charged at its full reservation (output limit 40,000),
-    # then the successful attempt adds its real usage (5 output tokens).
-    assert manifest.model_output_tokens == 40_000 + 5
-    assert manifest.model_input_tokens > 10
-    model_events = [
-        event["event_type"]
-        for event in store.events(manifest.run_id)
-        if event["event_type"].startswith("model.call.")
-    ]
-    assert model_events == [
-        "model.call.started",
-        "model.call.failed",
-        "model.call.retry_scheduled",
-        "model.call.started",
-        "model.call.completed",
-    ]
-    retry_event = next(
-        event
-        for event in store.events(manifest.run_id)
-        if event["event_type"] == "model.call.retry_scheduled"
-    )
-    assert json.loads(retry_event["details"]) == {
-        "role": "scout",
-        "failed_call": "1",
-        "attempt": "1",
-        "reservation_settled": "charged_in_full",
-        "wait_seconds": "10.0",
-    }
-
-
-def test_hard_timeout_is_retried_when_the_wall_clock_budget_allows(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    waits: list[float] = []
-    monkeypatch.setattr("autocontribute.orchestrator._sleep", waits.append)
-    plan = _providers()["scout"].output
-    provider = FlakyProvider(
-        plan,
-        "gpt-5.6",
-        [
-            ModelTimeoutError(
-                timeout_seconds=900,
-                elapsed_seconds=900.4,
-                term_sent=True,
-                kill_sent=False,
-                child_exit_code=-15,
-            )
-        ],
-    )
-    store, orchestrator = _retry_test_orchestrator(tmp_path, provider, ticks=(1.0, 2.5, 3.0, 4.5))
-    manifest = store.create_run()
-
-    result = orchestrator._call_model(
-        manifest,
-        role="scout",
-        instructions="Plan safely.",
-        prompt="Inspect one issue.",
-        output_type=ContributionPlan,
-    )
-
-    assert result.output == plan
-    assert waits == [10.0]
-    assert manifest.model_calls == 2
-    assert manifest.model_reservation is None
-    model_events = [
-        event["event_type"]
-        for event in store.events(manifest.run_id)
-        if event["event_type"].startswith("model.call.")
-    ]
-    assert model_events == [
-        "model.call.started",
-        "model.call.timed_out",
-        "model.call.retry_scheduled",
-        "model.call.started",
-        "model.call.completed",
-    ]
-
-
-def test_non_retriable_provider_status_fails_without_retry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    waits: list[float] = []
-    monkeypatch.setattr("autocontribute.orchestrator._sleep", waits.append)
-    plan = _providers()["scout"].output
-    provider = FlakyProvider(
-        plan,
-        "gpt-5.6",
-        [ModelRequestError("OpenAI Responses request failed (HTTP 401)", status_code=401)],
-    )
-    store, orchestrator = _retry_test_orchestrator(tmp_path, provider, ticks=(1.0, 2.5))
-    manifest = store.create_run()
-
-    with pytest.raises(ModelRequestError, match="HTTP 401"):
-        orchestrator._call_model(
-            manifest,
-            role="scout",
-            instructions="Plan safely.",
-            prompt="Inspect one issue.",
-            output_type=ContributionPlan,
-        )
-
-    assert waits == []
-    assert manifest.model_calls == 1
-    assert manifest.model_reservation is not None
-    persisted = store.get(manifest.run_id)
-    assert persisted.model_reservation == manifest.model_reservation
-
-
-def test_persistent_transient_failure_stops_after_bounded_attempts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    waits: list[float] = []
-    monkeypatch.setattr("autocontribute.orchestrator._sleep", waits.append)
-    plan = _providers()["scout"].output
-    provider = FlakyProvider(
-        plan,
-        "gpt-5.6",
-        [ModelRequestError("OpenAI Responses request failed") for _ in range(3)],
-    )
-    store, orchestrator = _retry_test_orchestrator(
-        tmp_path, provider, ticks=(1.0, 2.5, 3.0, 4.5, 5.0, 6.5)
-    )
-    manifest = store.create_run()
-
-    with pytest.raises(ModelRequestError, match="request failed"):
-        orchestrator._call_model(
-            manifest,
-            role="scout",
-            instructions="Plan safely.",
-            prompt="Inspect one issue.",
-            output_type=ContributionPlan,
-        )
-
-    assert waits == [10.0, 30.0]
-    assert manifest.model_calls == 3
-    # The final attempt's reservation stays retained, exactly like a non-retried failure.
-    assert manifest.model_reservation is not None
-    assert manifest.model_reservation.call == 3
-    model_events = [
-        event["event_type"]
-        for event in store.events(manifest.run_id)
-        if event["event_type"].startswith("model.call.")
-    ]
-    assert model_events == [
-        "model.call.started",
-        "model.call.failed",
-        "model.call.retry_scheduled",
-        "model.call.started",
-        "model.call.failed",
-        "model.call.retry_scheduled",
-        "model.call.started",
-        "model.call.failed",
-    ]
-
-
-def test_transient_failure_is_not_retried_when_the_budget_cannot_cover_it(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    waits: list[float] = []
-    monkeypatch.setattr("autocontribute.orchestrator._sleep", waits.append)
-    plan = _providers()["scout"].output
-    provider = FlakyProvider(
-        plan,
-        "gpt-5.6",
-        [ModelRequestError("OpenAI Responses request failed (HTTP 503)", status_code=503)],
-    )
-    store, orchestrator = _retry_test_orchestrator(
-        tmp_path,
-        provider,
-        ticks=(1.0, 2.5),
-        budget={"max_model_seconds_per_run": 10},
-    )
-    manifest = store.create_run()
-
-    with pytest.raises(ModelRequestError, match="HTTP 503"):
-        orchestrator._call_model(
-            manifest,
-            role="scout",
-            instructions="Plan safely.",
-            prompt="Inspect one issue.",
-            output_type=ContributionPlan,
-        )
-
-    assert waits == []
-    assert manifest.model_calls == 1
-    assert manifest.model_reservation is not None
-
-
-def test_hard_model_timeout_retains_reservation_records_evidence_and_releases_lease(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    class TimedOutProvider:
-        def generate(self, **_: object) -> ModelResult[Any]:
-            raise ModelTimeoutError(
-                timeout_seconds=10,
-                elapsed_seconds=10.27,
-                term_sent=True,
-                kill_sent=True,
-                child_exit_code=-9,
-            )
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "budget": {"max_model_seconds_per_run": 10},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    providers = _providers()
-    providers["scout"] = TimedOutProvider()  # type: ignore[assignment]
-
-    with Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    ) as orchestrator:
-        manifest = orchestrator.run(
-            issue_reference="example/project#42",
-            invocation_mode=RunInvocationMode.MANUAL,
-        )
-
-    assert manifest.status == RunStatus.FAILED
-    assert manifest.model_reservation is not None
-    persisted = store.get(manifest.run_id)
-    assert persisted.model_reservation == manifest.model_reservation
-    events = store.events(manifest.run_id)
-    event_types = [event["event_type"] for event in events]
-    assert "model.call.started" in event_types
-    assert "model.call.timed_out" in event_types
-    assert "model.call.completed" not in event_types
-    timeout_event = next(event for event in events if event["event_type"] == "model.call.timed_out")
-    timeout_details = json.loads(timeout_event["details"])
-    assert timeout_details == {
-        "call": "1",
-        "child_exit_code": "-9",
-        "deadline_kind": "absolute_monotonic",
-        "deadline_seconds": "10",
-        "elapsed_seconds": timeout_details["elapsed_seconds"],
-        "kill_sent": "true",
-        "reservation_retained": "true",
-        "role": "scout",
-        "term_sent": "true",
-        "worker_elapsed_seconds": "10.27",
-    }
-    assert (
-        json.loads(
-            (store.artifact_dir(manifest.run_id) / "model-calls.json").read_text(encoding="utf-8")
-        )
-        == []
-    )
-    next_lease = store.acquire_lease(
-        "autocontribute.run",
-        "next-worker",
-        ttl=timedelta(minutes=1),
-    )
-    assert next_lease is not None
-    assert store.release_lease("autocontribute.run", "next-worker", next_lease.generation)
-
-
-def test_provider_usage_above_forwarded_limit_is_charged_then_rejected(tmp_path: Path) -> None:
-    config = AutocontributeConfig.model_validate(
-        {
-            "budget": {"max_output_tokens_per_run": 1_000},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    plan = _providers()["scout"].output
-    provider = FixedProvider(
-        plan,
-        "over-limit-model",
-        usage=ModelUsage(input_tokens=10, output_tokens=1_001, total_tokens=1_011),
-    )
-    orchestrator = Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
-        providers={"scout": provider},  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    )
-    manifest = store.create_run()
-
-    with pytest.raises(PolicyError, match="output usage exceeded"):
-        orchestrator._call_model(
-            manifest,
-            role="scout",
-            instructions="Plan safely.",
-            prompt="Inspect one issue.",
-            output_type=ContributionPlan,
-        )
-
-    assert provider.requests[0]["max_output_tokens"] == 1_000
-    assert manifest.model_output_tokens == 1_001
-    assert manifest.model_reservation is None
-    assert store.get(manifest.run_id).model_output_tokens == 1_001
-
-
-def test_provider_model_is_accepted_without_expected_response_model(
-    tmp_path: Path,
-) -> None:
-    config = AutocontributeConfig.model_validate({"storage": {"path": tmp_path / "state"}})
-    store = RunStore(config.storage.path)
-    provider = FixedProvider(_providers()["scout"].output, "provider-snapshot-2026-07-21")
-    orchestrator = Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
-        providers={"scout": provider},  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    )
-    manifest = store.create_run()
-
-    result = orchestrator._call_model(
-        manifest,
-        role="scout",
-        instructions="Plan safely.",
-        prompt="Inspect one issue.",
-        output_type=ContributionPlan,
-    )
-
-    assert result.model == "provider-snapshot-2026-07-21"
-
-
-def test_orchestrator_rejects_a_provider_model_other_than_the_expected_model(
-    tmp_path: Path,
-) -> None:
-    config = AutocontributeConfig.model_validate(
-        {
-            "models": {"scout": {"expected_response_model": "provider-snapshot-2026-07-21"}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    provider = FixedProvider(_providers()["scout"].output, "provider-snapshot-2026-07-22")
-    orchestrator = Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
-        providers={"scout": provider},  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    )
-    manifest = store.create_run()
-
-    with pytest.raises(PolicyError, match="other than expected_response_model"):
-        orchestrator._call_model(
-            manifest,
-            role="scout",
-            instructions="Plan safely.",
-            prompt="Inspect one issue.",
-            output_type=ContributionPlan,
-        )
-
-
-def test_reused_orchestrator_resets_per_run_model_call_artifact(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
-    source, sha = _source_repository(tmp_path)
-    original_clone = RepositoryWorkspace.clone
-
-    def local_clone(
-        cls: type[RepositoryWorkspace],
-        clone_url: str,
-        base_sha: str,
-        destination: Path,
-        **_: object,
-    ) -> RepositoryWorkspace:
-        return original_clone(str(source), base_sha, destination, allow_local_source=True)
-
-    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
-    config = AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
-            "storage": {"path": tmp_path / "state"},
-        }
-    )
-    store = RunStore(config.storage.path)
-    providers = _providers()
-    github = FakeGitHub(_issue(), _repository(sha), sha)
-    orchestrator = Orchestrator(
-        config,
-        store=store,
-        github=github,  # type: ignore[arg-type]
-        providers=providers,  # type: ignore[arg-type]
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    )
-
-    first = orchestrator.run(
-        issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
-    )
-    blocked = orchestrator.run(
-        issue_reference="example/project#42",
-        invocation_mode=RunInvocationMode.MANUAL,
-        retry_authorization=CandidateRetryAuthorization(
-            actor="release-operator",
-            reason="Attempted explicit retry while prior work remains active.",
-        ),
-    )
-    assert blocked.status == RunStatus.SKIPPED
-    assert blocked.candidate is None
-    assert "already has active run" in (blocked.skip_reason or "")
-    assert all(provider.calls == 1 for provider in providers.values())
-    assert "candidate.active_deferred" in [
-        event["event_type"] for event in store.events(blocked.run_id)
-    ]
-    github.issue = _issue().model_copy(
-        update={
-            "number": 43,
-            "html_url": "https://github.com/example/project/issues/43",
-        }
-    )
-    second = orchestrator.run(
-        issue_reference="example/project#43", invocation_mode=RunInvocationMode.MANUAL
-    )
-
-    assert first.status == RunStatus.READY_FOR_APPROVAL
-    assert second.status == RunStatus.READY_FOR_APPROVAL
-    first_events = json.loads(
-        (store.artifact_dir(first.run_id) / "model-calls.json").read_text(encoding="utf-8")
-    )
-    second_events = json.loads(
-        (store.artifact_dir(second.run_id) / "model-calls.json").read_text(encoding="utf-8")
-    )
-    assert len(first_events) == 3
-    assert len(second_events) == 3
-    assert second_events[0]["response_id"] == "response-gpt-5.6-2"
-
-
-def test_orchestrator_closes_only_factory_owned_provider_once(tmp_path: Path) -> None:
-    class CloseableProvider(FixedProvider):
-        def __init__(self, output: Any, model: str) -> None:
-            super().__init__(output, model)
-            self.close_calls = 0
-
-        def close(self) -> None:
-            self.close_calls += 1
-
-    config = AutocontributeConfig.model_validate({"storage": {"path": tmp_path / "state"}})
-    store = RunStore(config.storage.path)
-    created = CloseableProvider(_providers()["scout"].output, "gpt-5.6")
-    injected = CloseableProvider(_providers()["builder"].output, "gpt-5.6")
-    orchestrator = Orchestrator(
-        config,
-        store=store,
-        github=FakeGitHub(_issue(), _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
-        providers={"builder": injected},  # type: ignore[arg-type]
-        provider_factory=lambda _: created,
-        sandbox=PassingSandbox(),  # type: ignore[arg-type]
-    )
-    manifest = store.create_run()
-    orchestrator._call_model(
-        manifest,
-        role="scout",
-        instructions="Plan safely.",
-        prompt="Inspect one issue.",
-        output_type=ContributionPlan,
-    )
-
-    orchestrator.close()
-    orchestrator.close()
-
-    assert created.close_calls == 1
-    assert injected.close_calls == 0
+    assert pipeline.prepared == []

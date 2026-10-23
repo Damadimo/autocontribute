@@ -24,13 +24,7 @@ from typing import Final, Literal
 
 from autocontribute.agent_loop import CheckReport
 from autocontribute.config import PolicyConfig, QualityConfig
-from autocontribute.diff_gates import (
-    DEFAULT_MAX_SOURCE_FILES,
-    DEFAULT_MAX_SOURCE_LINES,
-    changed_tests,
-    diff_gates,
-    is_workflow_path,
-)
+from autocontribute.diff_gates import changed_tests, diff_gates, is_workflow_path
 from autocontribute.domain import DomainModel, GateResult
 from autocontribute.environment_builder import PreparedEnvironment
 from autocontribute.exceptions import (
@@ -181,8 +175,7 @@ class FixChecks:
     """The :class:`autocontribute.agent_loop.FixChecker` of one run.
 
     ``seconds_left`` returns the run's remaining time; no test run gets more, and none gets
-    more than ``command_timeout_seconds``. ``max_source_files`` and ``max_source_lines`` are
-    the limits for non-test files (``quality.max_source_*``).
+    more than ``command_timeout_seconds``.
     """
 
     def __init__(
@@ -198,8 +191,6 @@ class FixChecks:
         command_timeout_seconds: int,
         seconds_left: Callable[[], float],
         host_values: frozenset[str],
-        max_source_files: int = DEFAULT_MAX_SOURCE_FILES,
-        max_source_lines: int = DEFAULT_MAX_SOURCE_LINES,
     ) -> None:
         self._workspace = workspace
         self._recipe = environment.recipe
@@ -213,8 +204,6 @@ class FixChecks:
         self._timeout_limit = command_timeout_seconds
         self._seconds_left = seconds_left
         self._host_values = host_values
-        self._max_source_files = max_source_files
-        self._max_source_lines = max_source_lines
         self._base_paths: frozenset[str] | None = None
         self.results: dict[str, FixCheckResult] = {}
         # V of the latest check, present only when its gates passed; the critic reviews a
@@ -248,8 +237,6 @@ class FixChecks:
             quality=self._quality,
             policy=self._policy,
             host_values=self._host_values,
-            max_source_files=self._max_source_files,
-            max_source_lines=self._max_source_lines,
         )
         if outcome.host_secret:
             self._stop_for_host_secret(sha)

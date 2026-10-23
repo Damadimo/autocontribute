@@ -1,4 +1,6 @@
-# Copy this file to autocontribute.yml. Never put API keys or GitHub tokens here.
+# Copy this file to autocontribute.yml. Never put API keys or GitHub tokens here: set
+# OPENAI_API_KEY or ANTHROPIC_API_KEY, and sign in with `gh auth login` or set the variable
+# named by github.token_env. Every key and its default: docs/configuration.md.
 identity:  # empty = your GitHub login and its noreply email address
   name: ""
   email: ""
@@ -20,48 +22,27 @@ github:
   max_repository_inactivity_days: 180
 
 models:
-  scout: &builder_model
-    provider: openai
-    model: gpt-5.6
-    # Optional: refuse any response whose provider-reported model ID differs from this one.
-    # expected_response_model: gpt-5.6-YYYY-MM-DD
-    api_key_env: OPENAI_API_KEY
-    reasoning_effort: high
-    reasoning_mode: standard
-    max_input_tokens: 500000
-    max_output_tokens: 40000
-    timeout_seconds: 900
-    # Conservative price ceilings, not a built-in price table. Verify for the selected model.
-    pricing:
-      input_usd_per_million_tokens: 10
-      cached_input_usd_per_million_tokens: 10
-      cache_write_usd_per_million_tokens: 10
-      output_usd_per_million_tokens: 100
-  builder: *builder_model
-  critic:
-    <<: *builder_model
-    reasoning_mode: pro
+  # auto: Anthropic models when ANTHROPIC_API_KEY is set, otherwise OpenAI models. Or name a
+  # model from the table in docs/configuration.md, such as gpt-5.6-sol or claude-opus-5-5.
+  agent: auto
+  critic: auto   # auto = the agent's model, or the other provider's when both keys are set
+  setup: auto
+  triage: auto
+  effort: {}     # per role, such as {agent: xhigh}
+
+# Per repository, only where detection gets the test environment wrong:
+environments: {}
+#   your-org/your-repo:
+#     image: python:3.12-bookworm
+#     setup: ["pip install -e .[test]"]   # runs with network, through an allowlisting proxy
+#     test: python -m pytest -q          # runs offline
+#     allow_hosts: []                    # hosts the setup proxy allows beyond package registries
 
 sandbox:
-  backend: docker
-  # Validation always runs with networking disabled, so nothing can be installed at that time: this
-  # one global image must already contain the complete offline toolchain (pytest, project
-  # dependencies) for every configured repository. A bare interpreter image cannot run the commands
-  # below and fails doctor. Build, digest-pin, and pre-pull your own image first: see
-  # docs/sandbox-image.md.
-  image: >-
-    example.invalid/sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000
   command_timeout_seconds: 900
-  memory: 4g
+  memory: 6g
   cpus: 2
-
-validation:
-  # These commands are operator-owned and mandatory. Replace them with each repository's canonical
-  # checks; the sandbox image above must already contain everything they need to run offline
-  # (docs/sandbox-image.md covers building and pinning such an image).
-  required_commands:
-    your-org/your-repo:
-      - python -m pytest
+  pids_limit: 1024
 
 policy:
   require_maintainer_signal: true
@@ -73,17 +54,17 @@ policy:
   # `autocontribute policy inspect owner/repository`, then the explicitly confirmed `policy attest`
   # command. It emits one repository-scoped record bound to the stable legal-policy digest.
   legal_attestations: {}
+  # {version} and {model} are filled in when the change is prepared.
   ai_disclosure: >-
-    This contribution was prepared autonomously by an AI agent. Its validation
-    evidence comes from Autocontribute's configured automated checks; no human
-    review is implied.
+    AI assistance: an AI coding agent (autocontribute {version}, {model}) drafted this change
+    and its test and ran the tests listed above in a sandbox. I reviewed the diff and the test
+    results before opening this PR and will handle the review.
 
 quality:
-  min_readiness_score: 90
-  min_dimension_score: 80
   max_files_changed: 8
   max_changed_lines: 400
-  require_regression_evidence_for_bugfix: true
+  max_source_files: 3    # files that are not tests
+  max_source_lines: 150
 
 publishing:
   login: ""                        # empty = the GitHub token's account
@@ -97,13 +78,12 @@ publishing:
   max_open_pull_requests: 3
   repository_cooldown_days: 7
 
-budget:
-  max_model_calls_per_run: 9
+budget:                            # in US dollars, at the list prices of the model table
+  max_cost_usd_per_run: 10
+  max_cost_usd_per_day: 25
+  max_model_calls_per_run: 200
+  max_run_minutes: 90
   max_candidates_per_run: 25
-  max_input_tokens_per_run: 3000000
-  max_output_tokens_per_run: 240000
-  max_model_seconds_per_run: 3600
-  max_model_cost_usd_per_run: 50
 
 storage:
-  path: .autocontribute
+  path: .autocontribute  # with Colima on macOS, keep it under your home directory

@@ -523,7 +523,7 @@ def test_fresh_database_has_current_version_and_all_tables(tmp_path: Path) -> No
             ).fetchall()
         ]
 
-    assert store.schema_version == CURRENT_SCHEMA_VERSION == 11
+    assert store.schema_version == CURRENT_SCHEMA_VERSION == 12
     assert "issue_revision" in run_columns
     assert [row[2] for row in revision_index] == [
         "repository",
@@ -938,7 +938,7 @@ def test_future_older_or_malformed_schema_fails_closed(tmp_path: Path) -> None:
         RunStore(malformed_root)
 
 
-@pytest.mark.parametrize("schema_version", (7, 8, 9, 10))
+@pytest.mark.parametrize("schema_version", (7, 8, 9, 10, 11))
 def test_older_development_state_asks_for_a_fresh_state_directory(
     tmp_path: Path,
     schema_version: int,
@@ -2323,7 +2323,7 @@ def test_merged_compensation_requires_exact_marker_and_durable_pull_request_url(
 def test_recovery_only_fails_safe_in_flight_stages_and_is_idempotent(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     recoverable = store.create_run()
-    _set_status(store, recoverable, RunStatus.PLANNING)
+    _set_status(store, recoverable, RunStatus.SETTING_UP)
     preserved: dict[RunStatus, RunManifest] = {}
     for status in (
         RunStatus.READY_FOR_APPROVAL,
@@ -2362,7 +2362,7 @@ def test_unapproved_ready_runs_expire_to_cancelled(tmp_path: Path) -> None:
     expired = store.create_run()
     _set_status(store, expired, RunStatus.READY_FOR_APPROVAL)
     preserved = {}
-    for status in (RunStatus.APPROVED, RunStatus.PLANNING, RunStatus.PR_OPEN):
+    for status in (RunStatus.APPROVED, RunStatus.SETTING_UP, RunStatus.PR_OPEN):
         run = store.create_run()
         _set_status(store, run, status)
         preserved[status] = run
@@ -2443,7 +2443,7 @@ def test_unfinished_run_keeps_its_workspace(tmp_path: Path, status: RunStatus) -
 def test_stale_run_recovery_deletes_the_recovered_workspace(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     run = store.create_run()
-    _set_status(store, run, RunStatus.PLANNING)
+    _set_status(store, run, RunStatus.SETTING_UP)
     _workspace_with_clone(store, run)
 
     store.recover_stale_runs(
@@ -2540,7 +2540,7 @@ def test_workspace_cleanup_never_follows_a_symlinked_workspace(tmp_path: Path) -
 def test_recovery_rolls_back_all_rows_when_one_manifest_is_invalid(tmp_path: Path) -> None:
     store = RunStore(tmp_path / "state")
     first = store.create_run()
-    _set_status(store, first, RunStatus.PLANNING)
+    _set_status(store, first, RunStatus.SETTING_UP)
     second = store.create_run()
     _set_status(store, second, RunStatus.VALIDATING)
     with sqlite3.connect(store.database_path) as connection:
@@ -2554,7 +2554,7 @@ def test_recovery_rolls_back_all_rows_when_one_manifest_is_invalid(tmp_path: Pat
             reason="crash",
         )
 
-    assert store.get(first.run_id).status == RunStatus.PLANNING
+    assert store.get(first.run_id).status == RunStatus.SETTING_UP
     assert store.events(first.run_id)[-1]["event_type"] == "test.status"
 
 

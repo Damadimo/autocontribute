@@ -26,7 +26,7 @@ class RunStatus(StrEnum):
     DISCOVERING = "discovering"
     CANDIDATE_SELECTED = "candidate_selected"
     ELIGIBILITY_CHECKED = "eligibility_checked"
-    PLANNING = "planning"
+    SETTING_UP = "setting_up"
     IMPLEMENTING = "implementing"
     VALIDATING = "validating"
     CRITIQUING = "critiquing"
@@ -61,17 +61,19 @@ ALLOWED_TRANSITIONS: dict[RunStatus, set[RunStatus]] = {
         RunStatus.FAILED,
     },
     RunStatus.ELIGIBILITY_CHECKED: {
-        RunStatus.PLANNING,
+        RunStatus.SETTING_UP,
         RunStatus.SKIPPED,
         RunStatus.FAILED,
     },
-    RunStatus.PLANNING: {
+    RunStatus.SETTING_UP: {
         RunStatus.IMPLEMENTING,
         RunStatus.SKIPPED,
         RunStatus.FAILED,
     },
     RunStatus.IMPLEMENTING: {
         RunStatus.VALIDATING,
+        # The agent declines the issue.
+        RunStatus.SKIPPED,
         RunStatus.REJECTED,
         RunStatus.FAILED,
     },
@@ -154,61 +156,20 @@ class EligibilityResult(DomainModel):
     blockers: list[str]
 
 
-class ContributionPlan(DomainModel):
-    decision: Literal["proceed", "skip"]
-    decision_reason: str
-    contribution_kind: Literal["bugfix", "documentation", "test"]
-    issue_understanding: str
-    acceptance_criteria: list[str]
-    implementation_steps: list[str]
-    files_to_read: list[str]
-    reproduction_command: str | None
-    validation_commands: list[str]
-    risks: list[str]
-    maintainer_fit: str
-
-    @field_validator("files_to_read")
-    @classmethod
-    def unique_files(cls, values: list[str]) -> list[str]:
-        return list(dict.fromkeys(values))
-
-
-class FileEdit(DomainModel):
-    operation: Literal["replace", "create", "delete"]
-    path: str
-    find: str | None
-    replace: str | None
-    content: str | None
-    rationale: str
-
-    @model_validator(mode="after")
-    def operation_fields_match(self) -> FileEdit:
-        if self.operation == "replace" and (self.find is None or self.replace is None):
-            raise ValueError("replace edits require find and replace")
-        if self.operation == "create" and self.content is None:
-            raise ValueError("create edits require content")
-        if self.operation == "delete" and any(
-            value is not None for value in (self.find, self.replace, self.content)
-        ):
-            raise ValueError("delete edits cannot include find, replace, or content")
-        return self
-
-
 class PatchProposal(DomainModel):
+    """The pull request a prepared run proposes, as ``pr_text`` assembled it."""
+
+    # The agent's account of what was wrong and what changed: its claims, for the reviewer.
     summary: str
-    edits: list[FileEdit]
-    validation_commands: list[str]
     commit_message: str
     pull_request_title: str
     pull_request_body: str
-    limitations: list[str]
-
-    @field_validator("edits")
-    @classmethod
-    def requires_an_edit(cls, values: list[FileEdit]) -> list[FileEdit]:
-        if not values:
-            raise ValueError("a patch proposal must contain at least one edit")
-        return values
+    # The tests the agent added or changed, and the command it ran them with.
+    test_files: list[str]
+    test_command: str | None
+    # policy.ai_disclosure with {version} and {model} filled; the body shows it, and the
+    # approval binds it.
+    disclosure: str
 
 
 class CommandResult(DomainModel):
@@ -224,48 +185,6 @@ class CommandResult(DomainModel):
         return self.exit_code == 0 and not self.timed_out
 
 
-class ReviewScores(DomainModel):
-    correctness: int = Field(ge=0, le=100)
-    issue_alignment: int = Field(ge=0, le=100)
-    tests: int = Field(ge=0, le=100)
-    repository_conventions: int = Field(ge=0, le=100)
-    diff_hygiene: int = Field(ge=0, le=100)
-    maintainer_clarity: int = Field(ge=0, le=100)
-
-    def weighted_score(self) -> int:
-        value = (
-            self.correctness * 0.25
-            + self.issue_alignment * 0.25
-            + self.tests * 0.15
-            + self.repository_conventions * 0.15
-            + self.diff_hygiene * 0.10
-            + self.maintainer_clarity * 0.10
-        )
-        return round(value)
-
-    def minimum(self) -> int:
-        return min(
-            self.correctness,
-            self.issue_alignment,
-            self.tests,
-            self.repository_conventions,
-            self.diff_hygiene,
-            self.maintainer_clarity,
-        )
-
-
-class CriticReview(DomainModel):
-    verdict: Literal["approve", "reject"]
-    summary: str
-    scores: ReviewScores
-    blocking_findings: list[str]
-    non_blocking_findings: list[str]
-    issue_requirements_met: list[str]
-    issue_requirements_missing: list[str]
-    test_evidence_assessment: str
-    maintainer_perspective: str
-
-
 class GateResult(DomainModel):
     gate: str
     passed: bool
@@ -273,12 +192,18 @@ class GateResult(DomainModel):
 
 
 class QualityReport(DomainModel):
+    """The checks and the review of a run's fix; ``ready`` when both passed (DESIGN §7.2).
+
+    ``validation.json`` holds every review round in full.
+    """
+
     ready: bool
-    readiness_score: int = Field(ge=0, le=100)
+    # The gates of the fix's last check.
     gates: list[GateResult]
-    review: CriticReview
-    changed_files: int
-    changed_lines: int
+    review_rounds: int = Field(ge=1)
+    # The last round's summary and its notes that do not block the change.
+    review_summary: str
+    review_notes: list[str]
 
     @property
     def failed_gates(self) -> list[GateResult]:
@@ -312,13 +237,33 @@ class ModelBudgetReservation(DomainModel):
     """A durable, conservative charge recorded before one external model request."""
 
     call: int = Field(ge=1)
-    # The one-shot roles, then the budget scopes of the agent loop (``budget.py``).
-    role: Literal["scout", "builder", "critic", "setup", "agent", "triage"]
+    # The budget scope of the request (``budget.py``).
+    role: Literal["agent", "critic", "setup", "triage"]
     input_tokens: int = Field(ge=1)
     output_tokens: int = Field(ge=1)
     cost_usd: Decimal = Field(default=Decimal("0"), ge=0)
     timeout_seconds: float = Field(gt=0)
     started_at: datetime
+
+
+class RunModels(DomainModel):
+    """The model of each role in a run, after ``auto`` was resolved (DESIGN §2)."""
+
+    agent: str
+    critic: str
+    setup: str
+    triage: str
+
+
+class RunEnvironment(DomainModel):
+    """The accepted test environment of a run; ``validation.json`` has its full recipe."""
+
+    recipe_source: Literal["config", "cached", "detected", "agent"]
+    image_id: str
+    base_image: str
+    # What the base image's tag resolved to when the environment was built.
+    base_digest: str
+    test_command: str
 
 
 class RunManifest(DomainModel):
@@ -331,11 +276,13 @@ class RunManifest(DomainModel):
     eligibility: EligibilityResult | None = None
     repository: RepositoryInfo | None = None
     base_sha: str | None = None
-    plan: ContributionPlan | None = None
+    models: RunModels | None = None
+    environment: RunEnvironment | None = None
     proposal: PatchProposal | None = None
-    baseline_validation: CommandResult | None = None
-    patched_validation: list[CommandResult] = Field(default_factory=list)
     quality: QualityReport | None = None
+    # The SHA-256 of runs/<id>/validation.json, which the approval binds; set when the run
+    # becomes ready.
+    validation_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     preparation_config_fingerprint: str | None = Field(
         default=None,
         pattern=r"^[0-9a-f]{64}$",
@@ -388,6 +335,9 @@ class RunManifest(DomainModel):
     pull_request_merged_at: datetime | None = None
     pull_request_attention: list[PullRequestAttention] = Field(default_factory=list)
     skip_reason: str | None = None
+    # Why a prepared change was not good enough: the agent did not finish, the critic rejected
+    # it, or its pull request text cannot be published.
+    reject_reason: str | None = None
     error: str | None = None
     model_calls: int = 0
     model_input_tokens: int = Field(default=0, ge=0)
@@ -453,10 +403,7 @@ __all__ = [
     "TERMINAL_STATUSES",
     "Approval",
     "CommandResult",
-    "ContributionPlan",
-    "CriticReview",
     "EligibilityResult",
-    "FileEdit",
     "GateResult",
     "IssueCandidate",
     "IssueComment",
@@ -467,7 +414,9 @@ __all__ = [
     "PullRequestAttentionKind",
     "QualityReport",
     "RepositoryInfo",
+    "RunEnvironment",
     "RunManifest",
+    "RunModels",
     "RunStatus",
     "publication_head",
     "utc_now",

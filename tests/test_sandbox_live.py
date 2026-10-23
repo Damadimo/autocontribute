@@ -25,7 +25,6 @@ from autocontribute.edit_tools import apply_patch_operation, run_text_editor, sy
 from autocontribute.patches import extract_patch
 from autocontribute.repository import RepositoryWorkspace
 from autocontribute.sandbox import (
-    DockerSandbox,
     SessionContainer,
     detect_docker_daemon_mode,
     docker_client_environment,
@@ -157,19 +156,14 @@ def _passed(
 
 def test_live_container_cannot_reach_network_credentials_or_git_metadata(
     live_root: Path,
+    python_image: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if shutil.which("docker") is None:
-        pytest.fail("live Docker isolation was requested but Docker is not installed")
-
-    workspace = live_root / "untrusted-repository"
-    (workspace / ".git").mkdir(parents=True)
+    workspace = _workspace(live_root)
     (workspace / "README.md").write_text("fixture\n", encoding="utf-8")
-    workspace.chmod(0o700)
     host_secret = "must-not-cross-the-sandbox-boundary"
     monkeypatch.setenv("AUTOCONTRIBUTE_HOST_SECRET", host_secret)
-    runner = DockerSandbox(SandboxConfig(command_timeout_seconds=30))
-    daemon_mode = runner.docker_daemon_mode
+    daemon_mode = detect_docker_daemon_mode()
     uid_assertion = (
         'assert os.getuid() == 0, "rootless namespace root was not selected"'
         if daemon_mode == "rootless"
@@ -189,15 +183,15 @@ os.umask(0o077)
 Path("container-output").write_text("container-to-host\\n")
 
 cgroup = Path("/sys/fs/cgroup")
-assert (cgroup / "memory.max").read_text().strip() == "4294967296", (
+assert (cgroup / "memory.max").read_text().strip() == "536870912", (
     "memory limit was not enforced"
 )
 assert (cgroup / "memory.swap.max").read_text().strip() == "0", (
     "memory-swap limit was not enforced"
 )
-assert (cgroup / "pids.max").read_text().strip() == "256", "PID limit was not enforced"
+assert (cgroup / "pids.max").read_text().strip() == "64", "PID limit was not enforced"
 cpu_quota, cpu_period = (cgroup / "cpu.max").read_text().split()
-assert cpu_quota != "max" and int(cpu_quota) == 2 * int(cpu_period), (
+assert cpu_quota != "max" and int(cpu_quota) == int(cpu_period), (
     "CPU quota was not enforced"
 )
 
@@ -237,7 +231,8 @@ print("sandbox-isolation-ok")
 PY
 """
 
-    result = runner.run(workspace, command)
+    with _session(live_root, python_image) as session:
+        result = session.exec(command, timeout_seconds=60).result
 
     assert result.passed, result.stderr
     assert result.stdout.strip() == "sandbox-isolation-ok"
@@ -250,28 +245,6 @@ PY
     assert output_stat.st_uid == os.getuid()
     assert output_stat.st_gid == os.getgid()
     assert output_stat.st_mode & 0o777 == 0o600
-
-
-def test_live_validation_container_keeps_path_and_has_executable_tmp_and_dev_shm(
-    live_root: Path,
-    alpine_image: str,
-) -> None:
-    runner = DockerSandbox(SandboxConfig(image=alpine_image, command_timeout_seconds=30))
-
-    result = runner.run_isolated(
-        _workspace(live_root),
-        'echo "$PATH"\n'
-        "printf '#!/bin/sh\\necho exec-from-tmp\\n' > /tmp/probe && chmod +x /tmp/probe\n"
-        "/tmp/probe\n"
-        "echo shared > /dev/shm/probe && cat /dev/shm/probe",
-    )
-
-    assert result.passed, result.stderr
-    assert result.stdout.splitlines() == [
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "exec-from-tmp",
-        "shared",
-    ]
 
 
 def test_live_session_commands_keep_every_boundary(session: SessionContainer) -> None:
@@ -469,14 +442,6 @@ def test_live_docker_cli_proxies_are_blank_in_every_container(
     monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
     monkeypatch.setenv("DOCKER_CONFIG", str(client_config))
     blank = [f"{name}=" for name in _PROXY_NAMES]
-    runner = DockerSandbox(SandboxConfig(image=alpine_image, command_timeout_seconds=30))
-
-    # PID 1 of a validation container runs as the command's own uid, so it can read this.
-    validation = runner.run(_workspace(live_root), "tr '\\0' '\\n' < /proc/1/environ")
-
-    assert validation.passed, validation.stderr
-    assert secret not in validation.stdout
-    assert set(blank) <= set(validation.stdout.splitlines())
     with _session(live_root, alpine_image) as session:
         inspected = _docker(
             "container", "inspect", "--format", "{{json .Config.Env}}", session.name

@@ -9,76 +9,73 @@ from autocontribute.config import (
     CLA_ATTESTATION_STATEMENT,
     DCO_ATTESTATION_STATEMENT,
     AutocontributeConfig,
-    GitHubConfig,
-    ModelPricing,
+    ModelsConfig,
     RepositoryLabels,
     example_config,
     load_config,
     starter_placeholders,
 )
+from autocontribute.environments import EnvironmentOverride
 from autocontribute.exceptions import ConfigurationError
 
+ROOT = Path(__file__).resolve().parents[1]
+_OPENAI = "OPENAI_API_KEY"
+_ANTHROPIC = "ANTHROPIC_API_KEY"
+# Key-shaped values are assembled at runtime so the repository secret scan does not report them.
+_KEY = "sk-" + "test-value-0123456789"
 
-def test_example_config_is_valid() -> None:
-    config = AutocontributeConfig.model_validate(yaml.safe_load(example_config()))
 
-    assert config.models.builder.model == "gpt-5.6"
-    assert config.models.critic.reasoning_mode == "pro"
-    assert config.publishing.draft is False
-    assert config.budget.max_model_cost_usd_per_run == Decimal("50")
-    assert config.models.scout.pricing is not None
-    assert all(
-        config.validation.commands_for(repository) for repository in config.github.repositories
+def test_starter_file_is_short_and_lists_repositories_models_and_budget() -> None:
+    raw = yaml.safe_load(example_config())
+    config = AutocontributeConfig.model_validate(raw)
+
+    assert set(raw) == {"github", "models", "budget"}
+    assert config.github.repositories == ["your-org/your-repo"]
+    assert config.models == ModelsConfig()
+    assert config.budget.max_cost_usd_per_run == Decimal(10)
+    assert config.budget.max_cost_usd_per_day == Decimal(25)
+    assert "docs/configuration.md" in example_config()
+    assert starter_placeholders(config) == [
+        "github.repositories lists your-org/your-repo: replace it with the repositories you "
+        "want to contribute to"
+    ]
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ROOT / "autocontribute.example.yml",
+        ROOT / "autocontribute.staging.example.yml",
+        ROOT / "template" / "autocontribute.yml",
+    ],
+    ids=["example", "staging", "runner-template"],
+)
+def test_shipped_configs_parse(path: Path) -> None:
+    raw = path.read_text(encoding="utf-8")
+
+    config = AutocontributeConfig.model_validate(yaml.safe_load(raw))
+
+    # Comments must not pin store schema versions; those drift silently as the schema evolves.
+    assert "schema-v" not in raw
+    assert "sandbox-image.md" not in raw
+    assert config.models.agent == "auto"
+
+
+def test_example_names_only_placeholders_that_commands_refuse() -> None:
+    config = AutocontributeConfig.model_validate(
+        yaml.safe_load((ROOT / "autocontribute.example.yml").read_text(encoding="utf-8"))
     )
 
-
-def test_shipped_example_configs_are_valid_and_self_consistent() -> None:
-    root = Path(__file__).resolve().parents[1]
-    for name in ("autocontribute.example.yml", "autocontribute.staging.example.yml"):
-        raw = (root / name).read_text(encoding="utf-8")
-        config = AutocontributeConfig.model_validate(yaml.safe_load(raw))
-        assert all(
-            config.validation.commands_for(repository) for repository in config.github.repositories
-        )
-        # Comments must not pin store schema versions; those drift silently as the schema evolves.
-        assert "schema-v" not in raw
-        assert "docs/sandbox-image.md" in raw
-
-    example = (root / "autocontribute.example.yml").read_text(encoding="utf-8")
-    staging = (root / "autocontribute.staging.example.yml").read_text(encoding="utf-8")
-    # The starter repository's pytest command needs project dependencies. A pullable
-    # bare-interpreter image would pass config validation yet fail doctor, so the shipped image
-    # must be an unresolvable, unmistakable placeholder the operator has to replace.
-    placeholder = "example.invalid/sandbox@sha256:" + "0" * 64
-    assert placeholder in example
-    assert placeholder in example_config()
-    # The staging fixture's stdlib-only validation recipe is the one case a bare image satisfies.
-    assert "python:3.12-bookworm@sha256:" in staging
-    assert (root / "docs" / "sandbox-image.md").exists()
-
-
-def test_starter_configs_name_only_placeholders_that_commands_refuse() -> None:
-    root = Path(__file__).resolve().parents[1]
-    for raw in (
-        example_config(),
-        (root / "autocontribute.example.yml").read_text(encoding="utf-8"),
-    ):
-        config = AutocontributeConfig.model_validate(yaml.safe_load(raw))
-        # An empty identity falls back to the GitHub login and its noreply address.
-        assert config.identity.name == ""
-        assert config.identity.email == ""
-        assert config.github.repositories == ["your-org/your-repo"]
-        assert config.validation.commands_for("your-org/your-repo") == ["python -m pytest"]
-        # A label list in the file replaces the default, so a shorter starter list would drop
-        # deny labels for everyone who starts from it.
-        assert config.github.include_labels == GitHubConfig().include_labels
-        assert config.github.exclude_labels == GitHubConfig().exclude_labels
-
-        placeholders = starter_placeholders(config)
-
-        assert len(placeholders) == 2
-        assert "your-org/your-repo" in placeholders[0]
-        assert "example.invalid" in placeholders[1]
+    # An empty identity falls back to the GitHub login and its noreply address.
+    assert config.identity.name == ""
+    assert config.identity.email == ""
+    assert config.github.repositories == ["your-org/your-repo"]
+    # A label list in the file replaces the default, so a shorter list there would drop deny
+    # labels for everyone who starts from it.
+    assert config.github.include_labels == AutocontributeConfig().github.include_labels
+    assert config.github.exclude_labels == AutocontributeConfig().github.exclude_labels
+    assert config.policy.ai_disclosure == AutocontributeConfig().policy.ai_disclosure
+    assert len(starter_placeholders(config)) == 1
 
 
 def test_starter_placeholders_list_every_template_value_still_present() -> None:
@@ -89,23 +86,15 @@ def test_starter_placeholders_list_every_template_value_still_present() -> None:
                 "email": "your-handle@users.noreply.github.com",
             },
             "github": {"repositories": ["example/project", "Your-Org/Your-Repo"]},
-            "validation": {
-                "required_commands": {
-                    "example/project": ["python -m pytest"],
-                    "Your-Org/Your-Repo": ["python -m pytest"],
-                }
-            },
-            "sandbox": {"image": "example.invalid:5000/sandbox@sha256:" + "0" * 64},
         }
     )
 
     placeholders = starter_placeholders(template)
 
-    assert len(placeholders) == 4
+    assert len(placeholders) == 3
     assert "your-org/your-repo" in placeholders[0]
-    assert "example.invalid" in placeholders[1]
-    assert placeholders[2].startswith('identity.name is "Your Name"')
-    assert placeholders[3].startswith('identity.email is "your-handle@users.noreply.github.com"')
+    assert placeholders[1].startswith('identity.name is "Your Name"')
+    assert placeholders[2].startswith('identity.email is "your-handle@users.noreply.github.com"')
 
     completed = template.model_copy(
         update={
@@ -113,44 +102,176 @@ def test_starter_placeholders_list_every_template_value_still_present() -> None:
                 update={"name": "Octo Cat", "email": "octocat@users.noreply.github.com"}
             ),
             "github": template.github.model_copy(update={"repositories": ["example/project"]}),
-            "sandbox": template.sandbox.model_copy(
-                update={"image": "ghcr.io/example/sandbox@sha256:" + "1" * 64}
-            ),
         }
     )
     assert starter_placeholders(completed) == []
-    # Only the registry host is a placeholder; an image merely named after it is not.
-    renamed = completed.sandbox.model_copy(
-        update={"image": "ghcr.io/example.invalid/sandbox@sha256:" + "1" * 64}
+
+
+def test_default_disclosure_names_the_tool_and_model_and_the_human_review() -> None:
+    disclosure = AutocontributeConfig().policy.ai_disclosure
+
+    assert disclosure == (
+        "AI assistance: an AI coding agent (autocontribute {version}, {model}) drafted this "
+        "change and its test and ran the tests listed above in a sandbox. I reviewed the diff "
+        "and the test results before opening this PR and will handle the review."
     )
-    assert starter_placeholders(completed.model_copy(update={"sandbox": renamed})) == []
 
 
-def test_starter_image_is_not_a_placeholder_for_the_local_backend() -> None:
+def test_defaults_match_the_design() -> None:
+    config = AutocontributeConfig()
+
+    assert config.github.max_repository_inactivity_days == 180
+    assert (config.models.agent, config.models.critic) == ("auto", "auto")
+    assert (config.models.setup, config.models.triage) == ("auto", "auto")
+    assert config.models.effort == {}
+    assert config.environments == {}
+    sandbox = config.sandbox
+    assert (sandbox.command_timeout_seconds, sandbox.memory, sandbox.cpus) == (900, "6g", 2.0)
+    assert sandbox.pids_limit == 1024
+    budget = config.budget
+    assert (budget.max_cost_usd_per_run, budget.max_cost_usd_per_day) == (10, 25)
+    assert (budget.max_model_calls_per_run, budget.max_run_minutes) == (200, 90)
+    assert budget.max_candidates_per_run == 25
+    quality = config.quality
+    assert (quality.max_files_changed, quality.max_changed_lines) == (8, 400)
+    assert (quality.max_source_files, quality.max_source_lines) == (3, 150)
+
+
+@pytest.mark.parametrize(
+    "removed",
+    [
+        {"models": {"scout": {}}},
+        {"models": {"builder": {}}},
+        {"models": {"critic": {"provider": "openai"}}},
+        {"models": {"api_key_env": "OPENAI_API_KEY"}},
+        {"sandbox": {"backend": "docker"}},
+        {"sandbox": {"image": "python:3.12"}},
+        {"sandbox": {"allow_unsafe_local": True}},
+        {"sandbox": {"max_commands": 8}},
+        {"validation": {"required_commands": {}}},
+        {"quality": {"min_candidate_score": 60}},
+        {"quality": {"min_readiness_score": 90}},
+        {"quality": {"min_dimension_score": 80}},
+        {"quality": {"max_context_files": 20}},
+        {"quality": {"max_context_characters": 160_000}},
+        {"quality": {"require_regression_evidence_for_bugfix": True}},
+        {"budget": {"max_input_tokens_per_run": 1_000}},
+        {"budget": {"max_output_tokens_per_run": 1_000}},
+        {"budget": {"max_model_seconds_per_run": 60}},
+        {"budget": {"max_model_cost_usd_per_run": 5}},
+    ],
+)
+def test_removed_keys_are_unknown(removed: dict[str, object]) -> None:
+    with pytest.raises(ValueError):
+        AutocontributeConfig.model_validate(removed)
+
+
+def test_models_are_auto_or_from_the_model_table_and_errors_never_echo_them() -> None:
+    config = AutocontributeConfig.model_validate(
+        {"models": {"agent": "claude-opus-5-5", "effort": {"critic": "max"}}}
+    )
+    assert config.models.agent == "claude-opus-5-5"
+
+    with pytest.raises(ValueError, match=r"models\.agent must be auto or one of") as error:
+        AutocontributeConfig.model_validate({"models": {"agent": _KEY}})
+    assert _KEY not in str(error.value)
+    for effort in ({"agent": "extreme"}, {"scout": "high"}):
+        with pytest.raises(ValueError):
+            AutocontributeConfig.model_validate({"models": {"effort": effort}})
+
+
+def test_loading_needs_no_model_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(_OPENAI, raising=False)
+    # An Actions secret that is not set arrives as an empty variable.
+    monkeypatch.setenv(_ANTHROPIC, "")
+    path = tmp_path / "autocontribute.yml"
+    path.write_text(example_config(), encoding="utf-8")
+
+    config = load_config(path)
+
+    assert config.models.agent == "auto"
+    with pytest.raises(ConfigurationError, match="ANTHROPIC_API_KEY or OPENAI_API_KEY"):
+        config.models.resolve({_OPENAI: "", _ANTHROPIC: ""})
+
+
+def test_auto_prefers_the_anthropic_key_and_takes_each_providers_tiers() -> None:
+    anthropic = ModelsConfig().resolve({_ANTHROPIC: _KEY, _OPENAI: ""})
+    openai = ModelsConfig().resolve({_OPENAI: _KEY})
+
+    assert [anthropic.spec(role).id for role in ("agent", "critic", "setup", "triage")] == [
+        "claude-opus-5-5",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    ]
+    assert [openai.spec(role).id for role in ("agent", "critic", "setup", "triage")] == [
+        "gpt-5.6-sol",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    ]
+    assert dict(openai.efforts) == {
+        "agent": "high",
+        "critic": "high",
+        "setup": "medium",
+        "triage": "low",
+    }
+
+
+def test_auto_critic_uses_the_other_provider_when_both_keys_are_set() -> None:
+    models = ModelsConfig().resolve({_ANTHROPIC: _KEY, _OPENAI: _KEY})
+
+    assert (models.agent.id, models.critic.id) == ("claude-opus-5-5", "gpt-5.6-sol")
+
+
+def test_an_explicit_model_needs_its_providers_key() -> None:
+    with pytest.raises(ConfigurationError, match=r"models\.critic is claude-opus-5-5; set ANTH"):
+        ModelsConfig(critic="claude-opus-5-5").resolve({_OPENAI: _KEY})
+
+
+def test_an_effort_override_must_suit_the_model() -> None:
+    models = ModelsConfig(agent="gpt-5.6-sol", effort={"agent": "max"}).resolve({_OPENAI: _KEY})
+    assert models.efforts["agent"] == "max"
+
+    with pytest.raises(ConfigurationError, match=r"effort\.agent is max, which gpt-5\.5 does not"):
+        ModelsConfig(agent="gpt-5.5", effort={"agent": "max"}).resolve({_OPENAI: _KEY})
+
+
+def test_environments_are_keyed_by_case_folded_repository() -> None:
     config = AutocontributeConfig.model_validate(
         {
-            "github": {"repositories": ["example/project"]},
-            "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-            "sandbox": {
-                "backend": "local",
-                "allow_unsafe_local": True,
-                "image": "example.invalid/sandbox@sha256:" + "0" * 64,
-            },
+            "environments": {
+                "Example/Project": {
+                    "image": "python:3.12-bookworm",
+                    "setup": ["pip install -e .[test]"],
+                    "test": "python -m pytest -q",
+                    "allow_hosts": ["Files.Example.org"],
+                }
+            }
         }
     )
 
-    assert starter_placeholders(config) == []
+    assert config.environment_for("EXAMPLE/project") == EnvironmentOverride(
+        image="python:3.12-bookworm",
+        setup=["pip install -e .[test]"],
+        test="python -m pytest -q",
+        allow_hosts=["files.example.org"],
+    )
+    assert config.environment_for("example/other") is None
+    for environments, message in (
+        ({"*/*": {}}, "owner/name"),
+        ({"a/b": {}, "A/B": {}}, "duplicate environments repository"),
+        ({"a/b": {"commands": []}}, "Extra inputs are not permitted"),
+        ({"a/b": {"allow_hosts": ["https://example.org"]}}, "DNS host names"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            AutocontributeConfig.model_validate({"environments": environments})
 
 
-def test_defaults_disclose_autonomous_work_without_claiming_human_validation() -> None:
-    config = AutocontributeConfig()
-    disclosure = config.policy.ai_disclosure.casefold()
+def test_secret_env_names_are_the_github_token_and_both_model_keys() -> None:
+    config = AutocontributeConfig.model_validate({"github": {"token_env": "MY_TOKEN"}})
 
-    assert "autonomously" in disclosure
-    assert "automated checks" in disclosure
-    assert "independently validated" not in disclosure
-    assert "validated by the contributor" not in disclosure
-    assert config.github.max_repository_inactivity_days == 180
+    assert config.secret_env_names() == {"MY_TOKEN", _OPENAI, _ANTHROPIC}
 
 
 def test_discovery_defaults_search_listed_repositories_and_spare_newcomer_issues() -> None:
@@ -375,36 +496,6 @@ def test_repository_inactivity_window_is_bounded(days: int) -> None:
         AutocontributeConfig.model_validate({"github": {"max_repository_inactivity_days": days}})
 
 
-def test_explicit_repositories_require_operator_owned_validation_commands() -> None:
-    with pytest.raises(ValueError, match="explicit repositories require"):
-        AutocontributeConfig.model_validate({"github": {"repositories": ["example/project"]}})
-
-
-def test_trusted_validation_commands_must_not_be_empty() -> None:
-    with pytest.raises(ValueError, match="non-empty"):
-        AutocontributeConfig.model_validate(
-            {
-                "github": {"repositories": ["example/project"]},
-                "validation": {"required_commands": {"example/project": ["  "]}},
-            }
-        )
-
-
-def test_required_validation_commands_must_fit_the_sandbox_budget() -> None:
-    with pytest.raises(ValueError, match=r"exceed sandbox\.max_commands"):
-        AutocontributeConfig.model_validate(
-            {
-                "github": {"repositories": ["example/project"]},
-                "sandbox": {"max_commands": 1},
-                "validation": {
-                    "required_commands": {
-                        "example/project": ["python -m pytest", "python -m ruff check ."]
-                    }
-                },
-            }
-        )
-
-
 def test_load_config_resolves_storage_relative_to_config(tmp_path: Path) -> None:
     path = tmp_path / "autocontribute.yml"
     path.write_text("storage:\n  path: state\n", encoding="utf-8")
@@ -416,92 +507,7 @@ def test_load_config_resolves_storage_relative_to_config(tmp_path: Path) -> None
 
 def test_secret_value_cannot_be_mistaken_for_environment_name() -> None:
     with pytest.raises(ValueError, match="environment variable name"):
-        AutocontributeConfig.model_validate(
-            {"models": {"builder": {"api_key_env": "sk-live-secret"}}}
-        )
-
-
-def test_local_execution_requires_explicit_unsafe_opt_in() -> None:
-    with pytest.raises(ValueError, match="allow_unsafe_local"):
-        AutocontributeConfig.model_validate({"sandbox": {"backend": "local"}})
-
-
-def test_partial_model_profiles_keep_role_specific_reasoning_defaults() -> None:
-    config = AutocontributeConfig.model_validate(
-        {
-            "models": {
-                "scout": {"model": "scout-model"},
-                "builder": {"model": "builder-model"},
-                "critic": {"model": "critic-model"},
-            }
-        }
-    )
-
-    assert config.models.scout.reasoning_mode == "standard"
-    assert config.models.builder.reasoning_mode == "standard"
-    assert config.models.critic.reasoning_mode == "pro"
-
-
-def test_cost_budget_requires_pricing_for_every_model_role() -> None:
-    with pytest.raises(ValueError, match=r"requires token pricing.*scout, builder, critic"):
-        AutocontributeConfig.model_validate({"budget": {"max_model_cost_usd_per_run": "5.00"}})
-
-
-def test_partial_model_pricing_is_rejected_to_prevent_underreported_cost() -> None:
-    with pytest.raises(ValueError, match="pricing must be configured for every role"):
-        AutocontributeConfig.model_validate(
-            {
-                "models": {
-                    "scout": {
-                        "pricing": {
-                            "input_usd_per_million_tokens": "2",
-                            "output_usd_per_million_tokens": "10",
-                        }
-                    }
-                }
-            }
-        )
-
-
-def test_decimal_model_pricing_handles_cached_and_cache_write_tokens_exactly() -> None:
-    pricing = ModelPricing(
-        input_usd_per_million_tokens="2",
-        cached_input_usd_per_million_tokens="0.5",
-        cache_write_usd_per_million_tokens="3",
-        output_usd_per_million_tokens="10",
-    )
-
-    cost = pricing.cost(
-        input_tokens=1_000_000,
-        cached_input_tokens=200_000,
-        cache_write_tokens=100_000,
-        output_tokens=50_000,
-    )
-
-    assert cost == Decimal("2.3")
-
-
-@pytest.mark.parametrize("value", ["NaN", "Infinity", "-1", "0"])
-def test_model_pricing_rejects_non_finite_or_non_positive_rates(value: str) -> None:
-    with pytest.raises(ValueError):
-        ModelPricing(
-            input_usd_per_million_tokens=value,
-            output_usd_per_million_tokens="10",
-        )
-
-
-def test_compatible_provider_rejects_nonportable_pro_mode() -> None:
-    with pytest.raises(ValueError, match="cannot portably enforce pro"):
-        AutocontributeConfig.model_validate(
-            {
-                "models": {
-                    "critic": {
-                        "provider": "openai_compatible",
-                        "base_url": "https://models.example.test/v1",
-                    }
-                }
-            }
-        )
+        AutocontributeConfig.model_validate({"github": {"token_env": "ghp-live-secret"}})
 
 
 def test_missing_config_has_actionable_error(tmp_path: Path) -> None:
@@ -520,28 +526,6 @@ def test_missing_config_has_actionable_error(tmp_path: Path) -> None:
 def test_github_api_url_cannot_expose_credentials(api_url: str) -> None:
     with pytest.raises(ValueError, match="api_url"):
         AutocontributeConfig.model_validate({"github": {"api_url": api_url}})
-
-
-@pytest.mark.parametrize(
-    "base_url",
-    [
-        "http://models.example.test/v1",
-        "https://api-key@models.example.test/v1",
-        "https://models.example.test/v1?key=secret",
-    ],
-)
-def test_model_base_url_cannot_expose_credentials(base_url: str) -> None:
-    with pytest.raises(ValueError, match="base_url"):
-        AutocontributeConfig.model_validate(
-            {
-                "models": {
-                    "builder": {
-                        "provider": "openai_compatible",
-                        "base_url": base_url,
-                    }
-                }
-            }
-        )
 
 
 def test_conditional_ai_policy_opt_ins_are_case_folded_repository_names() -> None:

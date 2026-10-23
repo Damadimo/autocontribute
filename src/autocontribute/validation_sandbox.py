@@ -111,7 +111,7 @@ class DockerValidation:
         ) as container:
             build = run_build_commands(container, self.recipe, timeout_seconds=timeout_seconds)
             if build is not None:
-                raise SandboxError(f"The review session could not be built: {build[1]}")
+                raise SandboxError(f"The session could not be built: {build[1]}")
             yield container
 
 

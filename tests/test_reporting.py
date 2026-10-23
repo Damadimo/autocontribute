@@ -5,6 +5,7 @@ import re
 from datetime import UTC, datetime
 
 import pytest
+from test_evidence import ENVIRONMENT, MODELS, ready_quality, validation_evidence
 
 from autocontribute.approval import (
     ApprovalManifest,
@@ -13,23 +14,22 @@ from autocontribute.approval import (
     manifest_fingerprint,
 )
 from autocontribute.domain import (
-    CommandResult,
-    CriticReview,
     EligibilityResult,
-    GateResult,
     IssueCandidate,
-    QualityReport,
-    ReviewScores,
+    PatchProposal,
     RunManifest,
     RunStatus,
 )
+from autocontribute.evidence import render_validation_evidence
 from autocontribute.exceptions import ReviewTooLargeError
 from autocontribute.reporting import (
     AI_POLICY_EVIDENCE_KEY,
     GITHUB_TEXT_LIMIT,
     MAX_PATCH_PARTS,
+    render_approval_review,
     render_github_review,
 )
+from autocontribute.submissions import ReviewBlocker
 
 NOW = datetime(2026, 10, 22, 12, tzinfo=UTC)
 RUN_ID = "0123456789abcdef"
@@ -47,7 +47,7 @@ def _review(
     *,
     patch: str = SMALL_PATCH,
     pull_request_body: str = "Fixes the widget.\n\n---\n\nAI assistance: disclosed.",
-    stdout: str = "1 passed",
+    output_tail: str = "RUN_OUTPUT_MARKER",
     critic_summary: str = "CRITIC_SUMMARY_MARKER",
     ai_policy: str | None = None,
 ) -> ApprovalReview:
@@ -65,31 +65,10 @@ def _review(
         created_at=NOW,
         updated_at=NOW,
     )
-    quality = QualityReport(
-        ready=True,
-        readiness_score=93,
-        gates=[GateResult(gate="scope", passed=True, evidence="1 file")],
-        review=CriticReview(
-            verdict="approve",
-            summary=critic_summary,
-            scores=ReviewScores(
-                correctness=95,
-                issue_alignment=95,
-                tests=95,
-                repository_conventions=95,
-                diff_hygiene=95,
-                maintainer_clarity=95,
-            ),
-            blocking_findings=[],
-            non_blocking_findings=[],
-            issue_requirements_met=[],
-            issue_requirements_missing=[],
-            test_evidence_assessment="Passed.",
-            maintainer_perspective="Small.",
-        ),
-        changed_files=1,
-        changed_lines=2,
-    )
+    evidence = validation_evidence()
+    assert evidence.check is not None and evidence.check.red_green is not None
+    evidence.check.red_green.runs[0].output_tail = output_tail
+    evidence.critic_rounds[0].review.summary = critic_summary
     run = RunManifest(
         run_id=RUN_ID,
         status=RunStatus.READY_FOR_APPROVAL,
@@ -102,23 +81,18 @@ def _review(
             evidence={} if ai_policy is None else {AI_POLICY_EVIDENCE_KEY: ai_policy},
             blockers=[],
         ),
-        baseline_validation=CommandResult(
-            command="python -m pytest tests/test_widget.py",
-            exit_code=1,
-            duration_seconds=1.5,
-            stdout="BASELINE_STDOUT_MARKER",
-            stderr="",
+        models=MODELS,
+        environment=ENVIRONMENT,
+        proposal=PatchProposal(
+            summary="AGENT_SUMMARY_MARKER",
+            commit_message="COMMIT_MESSAGE_MARKER",
+            pull_request_title="PR_TITLE_MARKER",
+            pull_request_body=pull_request_body,
+            test_files=["tests/test_widget.py"],
+            test_command="python -m pytest tests/test_widget.py",
+            disclosure="AI assistance: disclosed.",
         ),
-        patched_validation=[
-            CommandResult(
-                command="python -m pytest",
-                exit_code=0,
-                duration_seconds=2.25,
-                stdout=stdout,
-                stderr="",
-            )
-        ],
-        quality=quality,
+        quality=ready_quality(),
     )
     manifest = ApprovalManifest(
         schema_version=5,
@@ -145,7 +119,7 @@ def _review(
     return ApprovalReview(
         run=run,
         patch=patch.encode(),
-        validation_artifact=b'{"validation": true}',
+        validation_artifact=render_validation_evidence(evidence).encode(),
         manifest=manifest,
         fingerprint=manifest_fingerprint(manifest),
     )
@@ -194,9 +168,14 @@ def test_github_review_shows_every_bound_field_in_one_body() -> None:
         "Fixes the widget.",
         "COMMIT_MESSAGE_MARKER",
         "`Octo Cat <583231+octocat@users.noreply.github.com>`",
-        "BASELINE_STDOUT_MARKER",
+        "RUN_OUTPUT_MARKER",
         "CRITIC_SUMMARY_MARKER",
-        "Readiness 93/100; critic verdict: approve.",
+        "AGENT_SUMMARY_MARKER",
+        "The agent's summary is its own claim, not evidence.",
+        "Round 1: approve",
+        "Fails before, passes after: passed:",
+        "Patched tests against the baseline: passed: the full suite shows no new failure",
+        "Before the change: 4 tests: 2 passed in every run",
     ):
         assert marker in body
     assert _diff_blocks(body) == [SMALL_PATCH.removesuffix("\n")]
@@ -264,13 +243,13 @@ def test_github_review_splits_a_line_longer_than_a_part() -> None:
 
 
 def test_github_review_shortens_evidence_with_a_note_and_never_the_bound_text() -> None:
-    stdout = "".join(f"test {number} passed\n" for number in range(10_000))
+    output = "".join(f"test {number} passed\n" for number in range(10_000))
     long_body = "B" * 49_000 + "\n\n---\n\nAI assistance: disclosed."
-    review = _review(stdout=stdout, pull_request_body=long_body, critic_summary="C" * 20_000)
+    review = _review(output_tail=output, pull_request_body=long_body, critic_summary="C" * 20_000)
 
     rendered = render_github_review(review, approval_expires_hours=72)
 
-    assert rendered.shortened == ("validation output", "critic")
+    assert rendered.shortened == ("test output", "review")
     assert long_body in rendered.body
     assert "Output is shortened to fit; validation.json (SHA-256 `" in rendered.body
     assert "Shortened to fit: the first" in rendered.body
@@ -324,3 +303,46 @@ def test_github_review_shows_recorded_ai_policy_quotes() -> None:
     )
     assert "@bot-handle" not in _prose(shown)
     assert "The recorded AI-policy evidence could not be read." in unreadable
+
+
+def test_terminal_review_shows_claims_tests_review_and_policy_as_evidence() -> None:
+    policy = json.dumps(
+        {
+            "stance": "conditional",
+            "quotes": [{"repository": "example/project", "path": "AI.md", "text": "Disclose."}],
+        }
+    )
+    review = _review(ai_policy=policy, output_tail="1 passed\x1b[2J")
+    blocker = ReviewBlocker(
+        category="weak_test",
+        path="tests/test_widget.py",
+        line=3,
+        evidence="The test passes without the fix.",
+        check_command=None,
+        fix_hint="Assert the new value.",
+    )
+    evidence = validation_evidence()
+    first = evidence.critic_rounds[0].model_copy(
+        update={"decision": "request_changes", "confirmed": [blocker]}
+    )
+    second = evidence.critic_rounds[0].model_copy(update={"number": 2})
+    evidence.critic_rounds = [first, second]
+    review = ApprovalReview(
+        run=review.run,
+        patch=review.patch,
+        validation_artifact=render_validation_evidence(evidence).encode(),
+        manifest=review.manifest,
+        fingerprint=review.fingerprint,
+    )
+
+    text = render_approval_review(review)
+
+    assert "## The agent's summary\n\nThese are the agent's claims, not evidence." in text
+    assert "| AGENT_SUMMARY_MARKER" in text
+    assert "Test command: python -m pytest (pytest)" in text
+    assert "### Test run 1: red" in text
+    assert "### Round 1: request_changes" in text and "### Round 2: approve" in text
+    assert "| weak_test at tests/test_widget.py:3: The test passes without the fix." in text
+    assert "## Repository AI policy\n\nStance: conditional" in text
+    assert "| Disclose." in text
+    assert "\x1b" not in text

@@ -640,15 +640,7 @@ def test_issue_reference_parser_is_unambiguous() -> None:
 
 def _discovery_config(*repositories: str, **budget: int) -> AutocontributeConfig:
     return AutocontributeConfig.model_validate(
-        {
-            "github": {"repositories": list(repositories)},
-            "budget": budget,
-            "validation": {
-                "required_commands": {
-                    repository: ["python -m pytest"] for repository in repositories
-                }
-            },
-        }
+        {"github": {"repositories": list(repositories)}, "budget": budget}
     )
 
 

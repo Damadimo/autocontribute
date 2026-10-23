@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Final
 
+from autocontribute.ai_policy import RepositoryAiPolicy
 from autocontribute.approval import ApprovalManifest, ApprovalReview
-from autocontribute.domain import CommandResult, RunManifest
+from autocontribute.domain import RunManifest
+from autocontribute.evidence import ValidationEvidence, read_validation_evidence
 from autocontribute.exceptions import PolicyError, ReviewTooLargeError
+from autocontribute.fix_checks import SuiteRunEvidence
+from autocontribute.submissions import ReviewBlocker
+from autocontribute.task_messages import baseline_summary
 
 # GitHub refuses issue bodies and comments over 65,536 characters; the rest is margin.
 GITHUB_TEXT_LIMIT: Final = 60_000
@@ -28,47 +32,30 @@ _NAMED_ESCAPES: Final = {
     "\f": r"\f",
 }
 _BACKTICKS: Final = re.compile(r"`+")
-# Budgets for the validation, critic and AI-policy sections, tried in order until the review
+# Budgets for the testing, review and AI-policy sections, tried in order until the review
 # fits; a zero budget leaves only a note that names where the full evidence is.
 _EVIDENCE_BUDGETS: Final = ((8_000, 6_000, 6_000), (3_000, 2_000, 2_000), (0, 0, 0))
 _OUTPUT_TAILS: Final = (2_000, 1_000, 400, 0)
 
 
-def render_run_report(
-    manifest: RunManifest,
-    commands: list[CommandResult],
-    *,
-    model_cost_known: bool | None = None,
-) -> str:
-    if model_cost_known is None:
-        model_cost_known = not (
-            manifest.model_calls > 0
-            and manifest.model_cost_usd == 0
-            and (manifest.model_reservation is None or manifest.model_reservation.cost_usd == 0)
-        )
-    cost_summary = (
-        f"${manifest.model_cost_usd}"
-        if model_cost_known
-        else "unknown (token pricing was not configured)"
-    )
+def render_run_report(manifest: RunManifest) -> str:
     lines = [
         f"# Autocontribute run `{manifest.run_id}`",
         "",
         f"- Status: `{manifest.status.value}`",
         f"- Created: {manifest.created_at.isoformat()}",
         f"- Updated: {manifest.updated_at.isoformat()}",
-        f"- Model usage: {manifest.model_input_tokens} input, "
+        f"- Model usage: {manifest.model_calls} call(s), {manifest.model_input_tokens} input, "
         f"{manifest.model_output_tokens} output tokens",
         f"- Model time: {manifest.model_seconds:.2f}s",
-        f"- Recorded model cost: {cost_summary}",
+        f"- Recorded model cost: ${manifest.model_cost_usd}",
     ]
     if manifest.model_reservation:
         reservation = manifest.model_reservation
         lines.append(
             "- Unresolved model reservation: "
             f"call {reservation.call} ({reservation.role}), {reservation.input_tokens} input, "
-            f"{reservation.output_tokens} output tokens, "
-            f"{'$' + str(reservation.cost_usd) if model_cost_known else 'unknown cost'}, "
+            f"{reservation.output_tokens} output tokens, ${reservation.cost_usd}, "
             f"{reservation.timeout_seconds:.2f}s"
         )
     if manifest.candidate:
@@ -80,30 +67,25 @@ def render_run_report(
         )
     if manifest.base_sha:
         lines.append(f"- Pinned base: `{manifest.base_sha}`")
-    if manifest.quality:
-        lines.extend(
-            [
-                f"- Patch readiness: {manifest.quality.readiness_score}/100",
-                f"- Changed scope: {manifest.quality.changed_files} files, "
-                f"{manifest.quality.changed_lines} lines",
-            ]
+    if manifest.models:
+        models = manifest.models
+        lines.append(
+            f"- Models: agent `{models.agent}`, critic `{models.critic}`, setup "
+            f"`{models.setup}`, triage `{models.triage}`"
+        )
+    if manifest.environment:
+        environment = manifest.environment
+        lines.append(
+            f"- Environment: {environment.recipe_source} recipe on `{environment.base_image}` "
+            f"(`{environment.base_digest}`), image `{environment.image_id}`"
         )
 
     if manifest.skip_reason:
         lines.extend(["", "## Skip reason", "", manifest.skip_reason])
+    if manifest.reject_reason:
+        lines.extend(["", "## Rejection reason", "", manifest.reject_reason])
     if manifest.error:
         lines.extend(["", "## Error", "", manifest.error])
-    if manifest.plan:
-        lines.extend(
-            [
-                "",
-                "## Plan",
-                "",
-                manifest.plan.issue_understanding,
-                "",
-                *[f"- {step}" for step in manifest.plan.implementation_steps],
-            ]
-        )
     if manifest.proposal:
         lines.extend(
             [
@@ -116,39 +98,27 @@ def render_run_report(
             ]
         )
         _append_exact_text(lines, "Commit message", manifest.proposal.commit_message)
-    if commands:
-        lines.extend(["", "## Validation evidence", ""])
-        if manifest.baseline_validation:
-            baseline = manifest.baseline_validation
-            marker = "EXPECTED FAIL" if not baseline.passed else "UNEXPECTED PASS"
-            lines.append(
-                f"- **{marker} (pristine upstream)** `{baseline.command}` — "
-                f"exit {baseline.exit_code}, {baseline.duration_seconds:.2f}s"
-            )
-        for result in commands:
-            marker = "PASS" if result.passed else "FAIL"
-            lines.append(
-                f"- **{marker}** `{result.command}` — exit {result.exit_code}, "
-                f"{result.duration_seconds:.2f}s"
-            )
-    if manifest.quality:
-        lines.extend(["", "## Hard gates", ""])
-        for gate in manifest.quality.gates:
-            marker = "PASS" if gate.passed else "FAIL"
-            lines.append(f"- **{marker} {gate.gate}** — {gate.evidence}")
         lines.extend(
             [
                 "",
-                "## Independent review",
+                "## The agent's summary",
                 "",
-                manifest.quality.review.summary,
+                "These are the agent's claims, not evidence.",
+                "",
+                manifest.proposal.summary,
             ]
         )
-        if manifest.quality.review.blocking_findings:
-            lines.extend(
-                ["", "Blocking findings:", ""]
-                + [f"- {finding}" for finding in manifest.quality.review.blocking_findings]
-            )
+    if manifest.quality:
+        quality = manifest.quality
+        lines.extend(["", "## Gates", ""])
+        for gate in quality.gates:
+            marker = "PASS" if gate.passed else "FAIL"
+            lines.append(f"- **{marker} {gate.gate}** — {gate.evidence}")
+        lines.extend(
+            ["", f"## Review after {quality.review_rounds} round(s)", "", quality.review_summary]
+        )
+        if quality.review_notes:
+            lines.extend(["", *(f"- {note}" for note in quality.review_notes)])
     if manifest.approval:
         lines.extend(
             [
@@ -241,13 +211,68 @@ def render_approval_review(review: ApprovalReview) -> str:
     lines.extend(["", "## Full contribution patch"])
     _append_exact_text(lines, "contribution.patch", patch)
 
-    lines.extend(["", "## Complete validation output"])
-    if run.baseline_validation is None:
-        lines.extend(["", "No baseline command was recorded."])
-    else:
-        _append_command_result(lines, "Baseline command", run.baseline_validation)
-    for index, result in enumerate(run.patched_validation, start=1):
-        _append_command_result(lines, f"Patched command {index}", result)
+    evidence = read_validation_evidence(review.validation_artifact)
+    lines.extend(
+        [
+            "",
+            "## Testing",
+            "",
+            *_escape_review_value("\n".join(_testing_facts(run, evidence))).split("\n"),
+        ]
+    )
+    for index, test_run in enumerate(_test_runs(evidence), start=1):
+        lines.extend(
+            [
+                "",
+                f"### Test run {index}: {test_run.kind}",
+                "",
+                f"- Command: {_escape_review_value(test_run.command)}",
+                f"- Result: {_run_result(test_run)}",
+            ]
+        )
+        if test_run.failure:
+            lines.append(f"- Not usable: {_escape_review_value(test_run.failure)}")
+        _append_exact_text(lines, f"Test run {index} output tail", test_run.output_tail, level=4)
+
+    lines.extend(["", "## The agent's summary", "", "These are the agent's claims, not evidence."])
+    _append_exact_text(lines, "Agent summary", proposal.summary)
+    _append_exact_text(lines, "Agent's test files", "\n".join(proposal.test_files))
+    _append_exact_text(lines, "Agent's test command", proposal.test_command or "")
+
+    lines.extend(["", "## Review"])
+    for review_round in evidence.critic_rounds:
+        lines.extend(["", f"### Round {review_round.number}: {review_round.decision}"])
+        _append_exact_text(
+            lines, f"Round {review_round.number} summary", review_round.review.summary, level=4
+        )
+        _append_exact_text(
+            lines,
+            f"Round {review_round.number} notes",
+            "\n".join(review_round.review.notes),
+            level=4,
+        )
+        _append_exact_text(
+            lines,
+            f"Round {review_round.number} blockers sent back",
+            "\n".join(_blocker_line(blocker) for blocker in review_round.confirmed),
+            level=4,
+        )
+        _append_exact_text(
+            lines,
+            f"Round {review_round.number} blockers dropped",
+            "\n".join(
+                f"{_blocker_line(dropped.blocker)} ({dropped.reason})"
+                for dropped in review_round.dropped
+            ),
+            level=4,
+        )
+
+    policy = _ai_policy(run)
+    if policy is not None:
+        stance, quotes = policy
+        lines.extend(["", "## Repository AI policy", "", f"Stance: {_escape_review_value(stance)}"])
+        for index, (source, quote) in enumerate(quotes, start=1):
+            _append_exact_text(lines, f"Quote {index} from {_escape_review_value(source)}", quote)
 
     lines.extend(["", "## Exact commit identity and message", ""])
     _append_exact_text(lines, "Commit author name", approval.commit_author_name)
@@ -312,6 +337,7 @@ def render_github_review(review: ApprovalReview, *, approval_expires_hours: int)
         for number, text in enumerate(re.findall(r"[^\n]*\n|[^\n]+$", patch), start=1)
     ]
     validation_sha256 = hashlib.sha256(review.validation_artifact).hexdigest()
+    evidence = read_validation_evidence(review.validation_artifact)
     before = "\n".join(
         [
             *_github_header(
@@ -326,8 +352,8 @@ def render_github_review(review: ApprovalReview, *, approval_expires_hours: int)
     )
     for validation, critic, policy in _EVIDENCE_BUDGETS:
         sections = (
-            _github_validation(run, validation_sha256, budget=validation),
-            _github_critic(run, budget=critic),
+            _github_testing(run, evidence, validation_sha256, budget=validation),
+            _github_review(run, evidence, budget=critic),
             _github_ai_policy(run, budget=policy),
         )
         after = "".join(text for text, _ in sections)
@@ -519,100 +545,103 @@ def _patch_part(
     )
 
 
-def _github_validation(
+def _github_testing(
     run: RunManifest,
+    evidence: ValidationEvidence,
     artifact_sha256: str,
     *,
     budget: int,
 ) -> tuple[str, str | None]:
-    results: list[tuple[str, CommandResult]] = []
-    if run.baseline_validation is not None:
-        results.append(("Baseline on the unpatched code", run.baseline_validation))
-    results.extend(
-        (f"Patched command {index}", result)
-        for index, result in enumerate(run.patched_validation, start=1)
-    )
     reference = (
         f"validation.json (SHA-256 {code_span(artifact_sha256)}) in the run evidence has every "
-        "command's full output."
+        "test run and the baseline's test lists."
     )
+    facts = fenced_block("\n".join(_testing_facts(run, evidence)), "text")
+    runs = _test_runs(evidence)
     for tail in _OUTPUT_TAILS if budget else ():
-        lines = ["### Validation", ""]
+        lines = ["### Testing", "", "What autocontribute ran and saw:", "", facts, ""]
         cut = False
-        for heading, result in results:
+        for index, test_run in enumerate(runs, start=1):
             lines.extend(
                 [
-                    f"#### {heading}",
-                    "",
-                    f"Command {code_span(result.command)}: exit code {result.exit_code}, "
-                    f"{result.duration_seconds:.2f} seconds, timed out: "
-                    f"{'yes' if result.timed_out else 'no'}.",
+                    f"Test run {index}, {test_run.kind}: {code_span(test_run.command)}: "
+                    f"{_run_result(test_run)}"
+                    + (
+                        f"; not usable: {code_span(test_run.failure)}." if test_run.failure else "."
+                    ),
                     "",
                 ]
             )
-            for stream, output in (("stdout", result.stdout), ("stderr", result.stderr)):
-                if not output:
-                    lines.extend([f"{stream} is empty.", ""])
-                elif tail == 0:
-                    cut = True
-                    lines.extend([f"{stream}: {len(output):,} characters, not shown.", ""])
-                else:
-                    shown = output[-tail:]
-                    cut = cut or len(shown) < len(output)
-                    label = (
-                        f"Last {len(shown):,} of {len(output):,} characters of {stream}:"
-                        if len(shown) < len(output)
-                        else f"{stream}:"
-                    )
-                    lines.extend([label, "", fenced_block(shown, "text"), ""])
-        if not results:
-            lines.extend(["No validation command was recorded.", ""])
+            output = test_run.output_tail
+            if not output:
+                continue
+            if tail == 0:
+                cut = True
+                continue
+            shown = output[-tail:]
+            cut = cut or len(shown) < len(output)
+            label = (
+                f"Last {len(shown):,} of {len(output):,} characters of its output:"
+                if len(shown) < len(output)
+                else "Its output:"
+            )
+            lines.extend([label, "", fenced_block(shown, "text"), ""])
         if cut:
             lines.extend([f"Output is shortened to fit; {reference}", ""])
         text = "\n".join(lines) + "\n"
         if len(text) <= budget:
-            return text, "validation output" if cut else None
-    note = f"### Validation\n\nValidation evidence is left out to fit; {reference}\n\n"
-    return note, "validation output"
+            return text, "test output" if cut else None
+    note = f"### Testing\n\nTest evidence is left out to fit; {reference}\n\n"
+    return note, "test output"
 
 
-def _github_critic(run: RunManifest, *, budget: int) -> tuple[str, str | None]:
-    quality = run.quality
-    if quality is None:
+def _github_review(
+    run: RunManifest, evidence: ValidationEvidence, *, budget: int
+) -> tuple[str, str | None]:
+    proposal = run.proposal
+    if proposal is None:
         return "", None
-    critic = quality.review
-    evidence = [
-        "Critic summary:",
-        critic.summary,
+    claims = [
+        "The agent's summary:",
+        proposal.summary,
         "",
-        "Blocking findings:",
-        *([f"- {finding}" for finding in critic.blocking_findings] or ["(none)"]),
-        "",
-        "Gates:",
-        *[
-            f"{'PASS' if gate.passed else 'FAIL'} {gate.gate}: {gate.evidence}"
-            for gate in quality.gates
-        ],
+        "Tests it added or changed: " + (", ".join(proposal.test_files) or "none"),
+        f"Its test command: {proposal.test_command or 'none'}",
     ]
+    review = []
+    for review_round in evidence.critic_rounds:
+        review += [
+            "",
+            f"Round {review_round.number}: {review_round.decision}",
+            review_round.review.summary,
+            *(f"- note: {note}" for note in review_round.review.notes),
+            *(f"- sent back: {_blocker_line(blocker)}" for blocker in review_round.confirmed),
+            *(
+                f"- dropped: {_blocker_line(dropped.blocker)} ({dropped.reason})"
+                for dropped in review_round.dropped
+            ),
+        ]
     heading = (
-        f"### Checks and critic\n\nReadiness {quality.readiness_score}/100; critic verdict: "
-        f"{critic.verdict}.\n\n"
+        "### The agent's account and the review\n\nThe agent's summary is its own claim, not "
+        "evidence. A fresh reviewer checked the change in each round.\n\n"
     )
-    full = "\n".join(evidence)
+    full = "\n".join([*claims, *review])
     text = heading + fenced_block(full, "text") + "\n\n"
     if len(text) <= budget:
         return text, None
     room = budget - len(heading) - 300
     if room <= 0:
-        note = "Critic and gate evidence is left out to fit; manifest.json has it in full.\n\n"
-        return heading + note, "critic"
+        note = (
+            "The agent's account and the review are left out to fit; validation.json has them.\n\n"
+        )
+        return heading + note, "review"
     shortened = (
         heading
         + fenced_block(full[:room], "text")
         + f"\n\nShortened to fit: the first {room:,} of {len(full):,} characters; "
-        "manifest.json has the rest.\n\n"
+        "validation.json and manifest.json have the rest.\n\n"
     )
-    return shortened, "critic"
+    return shortened, "review"
 
 
 def _github_ai_policy(run: RunManifest, *, budget: int) -> tuple[str, str | None]:
@@ -620,19 +649,10 @@ def _github_ai_policy(run: RunManifest, *, budget: int) -> tuple[str, str | None
     if raw is None:
         return "", None
     heading = "### Repository AI policy\n\n"
-    try:
-        policy = json.loads(raw)
-        stance = policy["stance"]
-        quotes = [
-            (f"{quote['repository']}/{quote['path']}", quote["text"])
-            for quote in policy.get("quotes", [])
-        ]
-        if not isinstance(stance, str) or not all(
-            isinstance(source, str) and isinstance(text, str) for source, text in quotes
-        ):
-            raise TypeError("AI policy evidence has unexpected types")
-    except (ValueError, KeyError, TypeError, AttributeError):
+    policy = _ai_policy(run)
+    if policy is None:
         return heading + "The recorded AI-policy evidence could not be read.\n\n", None
+    stance, quotes = policy
     text = heading + f"Stance: {code_span(stance)}.\n\n"
     shown = 0
     for source, quote in quotes:
@@ -646,6 +666,75 @@ def _github_ai_policy(run: RunManifest, *, budget: int) -> tuple[str, str | None
     omitted = len(quotes) - shown
     text += f"{omitted} more quote(s) are left out to fit; manifest.json has every quote.\n\n"
     return text, "AI policy"
+
+
+def _testing_facts(run: RunManifest, evidence: ValidationEvidence) -> list[str]:
+    """The environment, the baseline, and how the fix's checks came out, one fact a line."""
+
+    recipe = evidence.recipe
+    facts = [f"Test command: {recipe.test_command} ({recipe.test_framework})"]
+    environment = run.environment
+    if environment is not None:
+        facts.append(
+            f"Environment: {environment.recipe_source} recipe on {environment.base_image} "
+            f"({environment.base_digest}), image {environment.image_id}"
+        )
+    facts.append(f"Before the change: {baseline_summary(evidence.baseline)}")
+    check = evidence.check
+    if check is None:
+        facts.append("No fix was checked.")
+        return facts
+    failed = [gate.gate for gate in check.gates if not gate.passed]
+    facts.append("Gates: " + (f"failed: {', '.join(failed)}" if failed else "all passed"))
+    if check.red_green is not None:
+        red_green = check.red_green
+        facts.append(f"Fails before, passes after: {red_green.status}: {red_green.detail}")
+    if check.regression is not None:
+        regression = check.regression
+        facts.append(
+            f"Patched tests against the baseline: {regression.status}: {regression.detail}"
+        )
+    facts.extend(f"Note: {note}" for note in check.notes)
+    return facts
+
+
+def _test_runs(evidence: ValidationEvidence) -> list[SuiteRunEvidence]:
+    check = evidence.check
+    if check is None:
+        return []
+    red_green = check.red_green.runs if check.red_green is not None else []
+    regression = check.regression.runs if check.regression is not None else []
+    return [*red_green, *regression]
+
+
+def _run_result(run: SuiteRunEvidence) -> str:
+    result = (
+        f"{run.passed} passed, {run.failed} failed, {run.skipped} skipped, exit {run.exit_code}, "
+        f"{run.duration_seconds:.1f} s"
+    )
+    return result + ", timed out" if run.timed_out else result
+
+
+def _blocker_line(blocker: ReviewBlocker) -> str:
+    where = (
+        f" at {blocker.path}" + (f":{blocker.line}" if blocker.line else "") if blocker.path else ""
+    )
+    return f"{blocker.category}{where}: {blocker.evidence}"
+
+
+def _ai_policy(run: RunManifest) -> tuple[str, list[tuple[str, str]]] | None:
+    """The recorded AI policy's stance and quotes, or None when none was recorded or readable."""
+
+    raw = run.eligibility.evidence.get(AI_POLICY_EVIDENCE_KEY) if run.eligibility else None
+    if raw is None:
+        return None
+    try:
+        policy = RepositoryAiPolicy.model_validate_json(raw)
+    except ValueError:
+        return None
+    return policy.stance, [
+        (f"{quote.repository}/{quote.path}", quote.text) for quote in policy.quotes
+    ]
 
 
 def _github_visible(value: str) -> str:
@@ -692,22 +781,6 @@ def _head_repository_line(approval: ApprovalManifest) -> str:
         raise PolicyError("Approval review is missing its head repository")
     mode = "same repository" if head.casefold() == approval.repository.casefold() else "fork"
     return f"{head} ({mode})"
-
-
-def _append_command_result(lines: list[str], heading: str, result: CommandResult) -> None:
-    lines.extend(
-        [
-            "",
-            f"### {heading}",
-            "",
-            f"- Command: {result.command}",
-            f"- Exit code: {result.exit_code}",
-            f"- Timed out: {str(result.timed_out).lower()}",
-            f"- Duration seconds: {result.duration_seconds}",
-        ]
-    )
-    _append_exact_text(lines, f"{heading} stdout", result.stdout, level=4)
-    _append_exact_text(lines, f"{heading} stderr", result.stderr, level=4)
 
 
 def _append_exact_text(

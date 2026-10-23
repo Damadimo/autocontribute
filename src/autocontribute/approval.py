@@ -213,7 +213,6 @@ def build_approval_manifest(
     run: RunManifest,
     *,
     diff: str | bytes,
-    disclosure: str,
     draft: bool,
     ready_for_review: bool = False,
 ) -> ApprovalManifest:
@@ -268,7 +267,7 @@ def build_approval_manifest(
         commit_message=run.proposal.commit_message,
         pull_request_title=run.proposal.pull_request_title,
         pull_request_body=run.proposal.pull_request_body,
-        disclosure=disclosure,
+        disclosure=run.proposal.disclosure,
     )
 
 

@@ -21,7 +21,6 @@ from autocontribute.host_environment import proxy_environment
 from autocontribute.pricing import API_KEY_ENVS, MODELS, Effort, ModelUsage
 from autocontribute.providers import (
     _MODEL_TURN_PROTOCOL,
-    _MODEL_WORKER_PROTOCOL,
     _WORKER_ENV_ALLOWLIST,
     MAX_TOOL_ARGUMENT_BYTES,
     SubprocessTurnProvider,
@@ -417,7 +416,11 @@ def _oversized_arguments() -> dict[str, object]:
         ("agent", _reply(output_items=["not an object"]), "invalid turn"),
         ("agent", _reply(tool_calls={"call_id": "call_1"}), "invalid tool calls"),
         ("agent", {**_reply(), "usage": {**_USAGE, "output_tokens": True}}, "invalid usage field"),
-        ("agent", {**_reply(), "protocol": _MODEL_WORKER_PROTOCOL}, "incompatible IPC protocol"),
+        (
+            "agent",
+            {**_reply(), "protocol": "autocontribute.model-call.v1"},
+            "incompatible IPC protocol",
+        ),
         (
             "agent",
             {key: value for key, value in _reply().items() if key != "stop"},
