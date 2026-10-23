@@ -668,7 +668,6 @@ def test_session_command_gets_only_the_allowlisted_environment_and_a_plain_shell
             "TMPDIR=/tmp",
             "PATH=/opt/ac/venv/bin:/usr/bin:/bin",
             "CI=1",
-            "NO_COLOR=1",
             "PAGER=cat",
             "GIT_PAGER=cat",
             "GIT_TERMINAL_PROMPT=0",
