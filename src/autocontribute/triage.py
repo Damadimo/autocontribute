@@ -76,8 +76,11 @@ class _OneTurn:
         ).run()
         if isinstance(outcome, Finished):
             return outcome.submission
-        detail = outcome.detail if isinstance(outcome, DidNotFinish) else outcome.message
-        raise ModelError(f"The {kind} model gave no answer: {detail}")
+        if isinstance(outcome, DidNotFinish):
+            raise ModelError(f"The {kind} model gave no answer: {outcome.detail}")
+        # Discovery goes on to other questions, which must be able to reserve.
+        self._budget.charge_failed_request(reason=outcome.message)
+        raise ModelError(f"The {kind} model gave no answer: {outcome.message}")
 
 
 class ModelIssueTriage:

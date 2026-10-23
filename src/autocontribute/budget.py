@@ -354,6 +354,39 @@ class RunBudget:
             },
         )
 
+    def charge_failed_request(self, *, reason: str) -> None:
+        """Charge a failed request's pending reservation in full and clear it.
+
+        For a phase the run outlives, such as one triage question: the provider may have
+        billed anything up to the reservation, so all of it counts as spent, and later requests
+        can reserve again. The agent loop leaves its failed reservation pending, and the run
+        fails.
+        """
+
+        pending = self.manifest.model_reservation
+        if pending is None:
+            return
+        scope = next((name for name in SCOPES if name == pending.role), None)
+        if scope is None:
+            raise StateError(f"Model call {pending.call} was reserved outside the run's scopes")
+        self._assert_lease()
+        manifest = self.manifest
+        manifest.model_input_tokens += pending.input_tokens
+        manifest.model_output_tokens += pending.output_tokens
+        manifest.model_cost_usd += pending.cost_usd
+        manifest.model_reservation = None
+        self._spent[scope] += pending.cost_usd
+        self._store.save(
+            manifest,
+            event="model.call.failure_charged",
+            details={
+                "scope": scope,
+                "failed_call": str(pending.call),
+                "reason": reason[:500],
+                "reservation_settled": "charged_in_full",
+            },
+        )
+
     def _require_pending(self, reservation: Reservation) -> None:
         pending = self.manifest.model_reservation
         if pending is None or pending.call != reservation.call:
