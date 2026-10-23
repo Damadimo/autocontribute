@@ -111,7 +111,7 @@ reruns the same suite. A run whose validation still fails is reviewed anyway and
 | --- | --- | --- |
 | `diff_present`, `file_count`, `changed_lines` | 1 to N files change, with at most M added plus deleted lines | `quality.max_files_changed` (8), `quality.max_changed_lines` (400) |
 | `no_binary_files`, `no_symlinks`, `no_submodules`, `no_mode_changes`, `safe_paths` | no binary files, symlinks, submodules, or mode changes; no absolute paths or `..` | |
-| `forbidden_paths` | no changed path matches a glob | `quality.forbidden_paths` (`.github/workflows/**`, `.github/actions/**`, `**/*.pem`, `**/*.key`, `**/generated/**`, `vendor/**`) |
+| `forbidden_paths` | no changed path matches a glob | `quality.forbidden_paths` (`.github/**`, `**/*.pem`, `**/*.key`, `**/generated/**`, `vendor/**`, commit and install hooks, build scripts such as `build.rs`) |
 | `dependency_policy`, `workflow_policy` | no manifest or lock file (`pyproject.toml`, `package.json`, `go.mod`, `requirements*.txt`, `uv.lock`, ...) and no CI file (`.github/workflows/`, `.github/actions/`, `.circleci/`, `.buildkite/`, `.gitlab-ci.yml`, `azure-pipelines.yml`, `Jenkinsfile`) changes | `policy.allow_dependency_changes` (false), `policy.allow_workflow_changes` (false) |
 | `secret_scan` | no credential-like text in added lines; a hit fails the run and activates the safety stop | |
 | `required_validation`, `validation`, `regression_evidence` | every command passed; for a bug fix, the reproduction also failed on the base, not by a timeout or infrastructure failure | `validation.required_commands`, `quality.require_regression_evidence_for_bugfix` (true) |

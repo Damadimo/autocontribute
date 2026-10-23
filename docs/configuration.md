@@ -104,7 +104,7 @@ There is no network setting: the `docker` backend always runs checks with no net
 | `max_context_files` | `20` | Most repository files loaded as model context (1–100). |
 | `max_context_characters` | `160000` | Most characters across those files (10,000–2,000,000). |
 | `require_regression_evidence_for_bugfix` | `true` | A bug fix needs a reproduction command that fails before the change and passes after it. |
-| `forbidden_paths` | `.github/workflows/**`, `.github/actions/**`, `**/*.pem`, `**/*.key`, `**/generated/**`, `vendor/**` | Glob patterns. A patch that touches a match is rejected. |
+| `forbidden_paths` | `.github/**` (with `.github/workflows/**` and `.github/actions/**`), `**/*.pem`, `**/*.key`, `**/generated/**`, `vendor/**`, commit and install hooks (`**/.husky/**`, `**/.githooks/**`, `**/.pre-commit-config.yaml`, `**/lefthook.yml`), build scripts (`**/build.rs`, `**/binding.gyp`, `**/.cargo/config`, `**/.cargo/config.toml`) | Glob patterns. A patch that touches a match is rejected. |
 
 ## publishing
 

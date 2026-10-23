@@ -6,68 +6,15 @@ here is local, reproducible, and represented in the returned ``QualityReport``.
 
 from __future__ import annotations
 
-import fnmatch
 import re
 import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from autocontribute.config import AutocontributeConfig
+from autocontribute.diff_gates import is_dependency_path, is_workflow_path, path_matches
 from autocontribute.domain import CommandResult, CriticReview, GateResult, QualityReport
 from autocontribute.redaction import high_confidence_token_labels
-
-_DEPENDENCY_FILES = {
-    "build.sbt",
-    "cargo.toml",
-    "composer.json",
-    "deno.json",
-    "deno.jsonc",
-    "deps.edn",
-    "directory.packages.props",
-    "gemfile",
-    "go.mod",
-    "go.work",
-    "mix.exs",
-    "package.json",
-    "packages.config",
-    "pipfile",
-    "podfile",
-    "pom.xml",
-    "pubspec.yaml",
-    "pyproject.toml",
-    "setup.cfg",
-    "setup.py",
-}
-_LOCK_FILES = {
-    "bun.lock",
-    "bun.lockb",
-    "cargo.lock",
-    "composer.lock",
-    "deno.lock",
-    "flake.lock",
-    "gemfile.lock",
-    "go.sum",
-    "go.work.sum",
-    "gradle.lockfile",
-    "mix.lock",
-    "package-lock.json",
-    "package.resolved",
-    "packages.lock.json",
-    "paket.lock",
-    "pipfile.lock",
-    "pnpm-lock.yaml",
-    "podfile.lock",
-    "poetry.lock",
-    "pubspec.lock",
-    "renv.lock",
-    "uv.lock",
-    "yarn.lock",
-}
-_WORKFLOW_FILES = {
-    ".gitlab-ci.yml",
-    "azure-pipelines.yml",
-    "jenkinsfile",
-}
 
 # Tests run offline by design, so these alone do not mean the environment is broken.
 _NETWORK_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -333,7 +280,7 @@ class QualityEvaluator:
         forbidden_paths = [
             path
             for path in paths
-            if any(_path_matches(path, pattern) for pattern in self.config.quality.forbidden_paths)
+            if any(path_matches(path, pattern) for pattern in self.config.quality.forbidden_paths)
         ]
         gate(
             "forbidden_paths",
@@ -341,7 +288,7 @@ class QualityEvaluator:
             _path_evidence("configured forbidden path", forbidden_paths),
         )
 
-        dependency_paths = [path for path in paths if _is_dependency_path(path)]
+        dependency_paths = [path for path in paths if is_dependency_path(path)]
         dependency_allowed = self.config.policy.allow_dependency_changes
         gate(
             "dependency_policy",
@@ -352,7 +299,7 @@ class QualityEvaluator:
                 else _path_evidence("dependency or lock file", dependency_paths)
             ),
         )
-        workflow_paths = [path for path in paths if _is_workflow_path(path)]
+        workflow_paths = [path for path in paths if is_workflow_path(path)]
         workflow_allowed = self.config.policy.allow_workflow_changes
         gate(
             "workflow_policy",
@@ -684,38 +631,6 @@ def _safe_repository_path(path: str) -> bool:
     return ".." not in normalized.split("/") and not any(ord(char) < 32 for char in normalized)
 
 
-def _path_matches(path: str, pattern: str) -> bool:
-    normalized_path = path.replace("\\", "/").removeprefix("./")
-    normalized_pattern = pattern.replace("\\", "/").removeprefix("./")
-    if fnmatch.fnmatchcase(normalized_path, normalized_pattern):
-        return True
-    if normalized_pattern.startswith("**/"):
-        return fnmatch.fnmatchcase(normalized_path, normalized_pattern[3:])
-    return False
-
-
-def _is_dependency_path(path: str) -> bool:
-    lowered = path.casefold().replace("\\", "/")
-    name = lowered.rsplit("/", 1)[-1]
-    return (
-        name in _DEPENDENCY_FILES
-        or name in _LOCK_FILES
-        or (name.startswith("requirements") and name.endswith((".txt", ".in")))
-        or lowered.endswith("/gradle/libs.versions.toml")
-        or name in {"build.gradle", "build.gradle.kts"}
-        or name.endswith((".csproj", ".fsproj", ".gemspec", ".nuspec", ".vbproj"))
-    )
-
-
-def _is_workflow_path(path: str) -> bool:
-    lowered = path.casefold().replace("\\", "/").removeprefix("./")
-    name = lowered.rsplit("/", 1)[-1]
-    return (
-        lowered.startswith((".github/workflows/", ".github/actions/", ".circleci/", ".buildkite/"))
-        or name in _WORKFLOW_FILES
-    )
-
-
 def _secret_findings(files: Sequence[_DiffFile]) -> list[str]:
     # The high-confidence token patterns only: password-style assignments are mostly test
     # fixtures, and a hit here stops every run (G6).
@@ -751,7 +666,7 @@ def workflow_paths(diff: str) -> list[str]:
             path
             for item in _parse_git_diff(diff)
             for path in (item.old_path, item.new_path)
-            if path != "/dev/null" and _is_workflow_path(path)
+            if path != "/dev/null" and is_workflow_path(path)
         }
     )
 

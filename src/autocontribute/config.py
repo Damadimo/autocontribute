@@ -641,6 +641,16 @@ class QualityConfig(StrictModel):
             "**/*.key",
             "**/generated/**",
             "vendor/**",
+            ".github/**",
+            # Hooks that run on commit or install, and build scripts that run on build.
+            "**/.husky/**",
+            "**/.githooks/**",
+            "**/.pre-commit-config.yaml",
+            "**/lefthook.yml",
+            "**/build.rs",
+            "**/binding.gyp",
+            "**/.cargo/config",
+            "**/.cargo/config.toml",
         ]
     )
 
