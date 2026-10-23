@@ -711,6 +711,21 @@ class DiscoveryService:
                     )
                 )
                 continue
+            # A configured environment is tried again at once (DESIGN §5.6).
+            failed_environment = (
+                None
+                if self.config.environment_for(repository.full_name) is not None
+                else self.store.environment_block(repository.full_name)
+            )
+            if failed_environment is not None:
+                skipped_repositories.append(
+                    (
+                        repository.full_name,
+                        "its test environment could not be built in the last 7 days: "
+                        + failed_environment,
+                    )
+                )
+                continue
             if not self._repository_baseline(repository):
                 skipped_repositories.append((repository.full_name, _REPOSITORY_BASELINE_REASON))
                 continue

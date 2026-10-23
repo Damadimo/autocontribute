@@ -38,6 +38,7 @@ from autocontribute.domain import (
     RunManifest,
     RunStatus,
 )
+from autocontribute.environments import EnvironmentOverride
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     GitHubError,
@@ -187,6 +188,9 @@ class DispositionStore:
 
     def active_holds(self) -> list[Hold]:
         return []
+
+    def environment_block(self, repository: str) -> str | None:
+        return None
 
     def candidate_attempt_disposition(
         self,
@@ -1913,6 +1917,39 @@ def test_held_repositories_are_not_searched(tmp_path) -> None:  # type: ignore[n
     assert outcome.skipped_repositories[0][1].endswith(
         "Pull request was closed without being merged"
     )
+
+
+def test_repositories_whose_environment_failed_are_not_searched_unless_configured(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path)
+    store.mark_environment_failed("failing/project", reason="no test was collected")
+    github = IsolationGitHub(
+        {
+            "failing/project": [_repository_issue("failing/project", 1)],
+            "example/project": [_repository_issue("example/project", 42)],
+        },
+        failures={
+            "search:failing/project": AssertionError("a failed environment must not be searched"),
+        },
+    )
+    config = _discovery_config("failing/project", "example/project")
+
+    outcome = DiscoveryService(config, github, store).discover()  # type: ignore[arg-type]
+
+    assert outcome.selection is not None
+    assert outcome.selection[0].reference == "example/project#42"
+    assert outcome.skipped_repositories == (
+        (
+            "failing/project",
+            "its test environment could not be built in the last 7 days: no test was collected",
+        ),
+    )
+    configured = config.model_copy(
+        update={"environments": {"failing/project": EnvironmentOverride(test="make check")}}
+    )
+    with pytest.raises(AssertionError, match="a failed environment must not be searched"):
+        DiscoveryService(configured, github, store).discover()  # type: ignore[arg-type]
 
 
 def test_evaluate_reports_a_held_repository_and_records_a_new_hold(tmp_path) -> None:  # type: ignore[no-untyped-def]
