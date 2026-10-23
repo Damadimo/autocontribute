@@ -659,6 +659,12 @@ class RepositoryWorkspace:
             self._git_bytes(["checkout", "HEAD", "--", *restored], environment=literal)
         return sorted(path for _, path in changes)
 
+    def remove_ignored(self) -> None:
+        """Delete everything Git ignores, so a recipe is replayed on a pristine tree."""
+
+        # -f twice also removes ignored directories that hold a Git repository of their own.
+        self._git_bytes(["clean", "-f", "-f", "-d", "-X", "-q"])
+
     def ignored_paths(self) -> list[str]:
         """List untracked paths Git ignores; a directory ignored as a whole ends in ``/``."""
 

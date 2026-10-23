@@ -819,3 +819,8 @@ def test_restoring_the_base_undoes_tracked_and_new_files_but_keeps_ignored_ones(
     assert not os.path.lexists(workspace.path / "linked")
     assert (workspace.path / "build" / "out.o").is_file()
     assert workspace.ignored_paths() == ["build/", "setup.log"]
+
+    workspace.remove_ignored()
+
+    assert workspace.ignored_paths() == []
+    assert (workspace.path / "README.md").is_file()

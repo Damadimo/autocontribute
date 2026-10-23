@@ -156,6 +156,10 @@ class EnvironmentSetupError(AutocontributeError):
         self.log_tail = log_tail
 
 
+class EnvironmentUnavailable(AutocontributeError):
+    """No environment could be built for a repository; its run is skipped (DESIGN §1)."""
+
+
 class SuiteReportError(AutocontributeError):
     """A test runner's report is malformed, too large, or of an unsupported kind."""
 
