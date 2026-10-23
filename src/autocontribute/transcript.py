@@ -4,7 +4,8 @@ A transcript is bound to one model and effort, one tool set and one set of instr
 only grows.
 Every request replays all of its items byte for byte: that keeps the provider's prompt cache warm
 and keeps earlier Anthropic thinking blocks valid, and editing an earlier item breaks both.
-Callers truncate and scrub text before they append it; nothing here rewrites it later.
+Callers truncate text before they append it. The append functions scrub it with the host secret
+values (``scrub_for_model``), and nothing rewrites it later; model output is replayed as received.
 
 A conversation runs in this order:
 
@@ -32,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, m
 
 from autocontribute.domain import DomainModel
 from autocontribute.pricing import MODELS, Effort, ModelUsage, Provider
+from autocontribute.redaction import scrub_for_model
 from autocontribute.submissions import (
     AgentSubmission,
     PolicySubmission,
@@ -209,7 +211,7 @@ class ShellChunk(_Value):
 
 
 class ToolResult(_Value):
-    """The result of one tool call, already truncated and scrubbed by the caller.
+    """The result of one tool call, already truncated by the caller.
 
     OpenAI shell results are one chunk per command, in order, and report failures through their
     outcomes. Every other result is text, and ``is_error`` marks a failed call; OpenAI function
@@ -308,22 +310,28 @@ def start_transcript(
     run_id: str,
     instructions: str,
     task: str,
+    host_values: frozenset[str],
 ) -> Transcript:
     """Start a conversation of one kind with ``model``, with ``task`` as its first message.
 
     ``model`` is an id from the built-in table and ``effort`` one of its reasoning efforts, and
     ``run_id`` names the run in the provider's prompt cache key. ``instructions`` must stay
     byte-stable for the whole conversation, so per-run facts belong in ``task``.
+    ``host_values`` are the host secret values (``host_secret_values``) scrubbed from the text.
     """
 
     transcript = Transcript(
-        model=model, effort=effort, kind=kind, run_id=run_id, instructions=instructions
+        model=model,
+        effort=effort,
+        kind=kind,
+        run_id=run_id,
+        instructions=scrub_for_model(instructions, host_values),
     )
-    append_user_text(transcript, task)
+    append_user_text(transcript, task, host_values=host_values)
     return transcript
 
 
-def append_user_text(transcript: Transcript, text: str) -> None:
+def append_user_text(transcript: Transcript, text: str, *, host_values: frozenset[str]) -> None:
     """Append user text: a nudge after a turn without tool calls, a per-turn reminder after the
     tool results, or the critic's blockers. Like everything else it stays in the transcript.
 
@@ -333,6 +341,7 @@ def append_user_text(transcript: Transcript, text: str) -> None:
 
     if transcript.pending_calls:
         raise ValueError("tool calls are waiting for their results")
+    text = scrub_for_model(text, host_values)
     if transcript.provider == "openai":
         _append(transcript, [_openai_user_message(text)], counted_items=1)
         return
@@ -369,15 +378,20 @@ def append_turn(transcript: Transcript, turn: Turn) -> None:
     transcript.appended_items = 0
 
 
-def append_tool_results(transcript: Transcript, results: Sequence[ToolResult]) -> None:
-    """Append one result for each pending tool call, in call order."""
+def append_tool_results(
+    transcript: Transcript,
+    results: Sequence[ToolResult],
+    *,
+    host_values: frozenset[str],
+) -> None:
+    """Append one result for each pending tool call, in call order, scrubbing its text."""
 
     calls = transcript.pending_calls
     if not calls:
         raise ValueError("the transcript has no pending tool calls")
     if [result.call_id for result in results] != [call.call_id for call in calls]:
         raise ValueError("results must answer every pending tool call once, in call order")
-    pairs = zip(calls, results, strict=True)
+    pairs = zip(calls, (_scrubbed(result, host_values) for result in results), strict=True)
     items: list[dict[str, JsonValue]]
     if transcript.provider == "openai":
         items = [_openai_result(call, result) for call, result in pairs]
@@ -433,6 +447,21 @@ def _append(
     transcript.items.extend(items)
     transcript.appended_bytes += sum(len(canonical_json(item)) for item in items)
     transcript.appended_items += counted_items
+
+
+def _scrubbed(result: ToolResult, host_values: frozenset[str]) -> ToolResult:
+    if isinstance(result.output, str):
+        output: str | tuple[ShellChunk, ...] = scrub_for_model(result.output, host_values)
+    else:
+        output = tuple(
+            ShellChunk(
+                stdout=scrub_for_model(chunk.stdout, host_values),
+                stderr=scrub_for_model(chunk.stderr, host_values),
+                exit_code=chunk.exit_code,
+            )
+            for chunk in result.output
+        )
+    return result.model_copy(update={"output": output})
 
 
 def _text(result: ToolResult) -> str:

@@ -295,7 +295,7 @@ def test_next_request_replays_the_turn_unchanged_and_answers_it_in_one_user_mess
         run_id=_RUN_ID,
         instructions=_INSTRUCTIONS,
     )
-    append_user_text(transcript, "Fix issue 12 in /workspace.")
+    append_user_text(transcript, "Fix issue 12 in /workspace.", host_values=frozenset())
 
     append_turn(transcript, anthropic_adapter.step(_request(items=transcript.items)))
     append_tool_results(
@@ -307,8 +307,9 @@ def test_next_request_replays_the_turn_unchanged_and_answers_it_in_one_user_mess
                 is_error=True,
             )
         ],
+        host_values=frozenset(),
     )
-    append_user_text(transcript, "9 turns left.")
+    append_user_text(transcript, "9 turns left.", host_values=frozenset())
     anthropic_adapter.step(_request(items=transcript.items))
 
     first, second = (_body(request) for request in requests)

@@ -16,6 +16,7 @@ from pydantic import JsonValue
 
 from autocontribute.pricing import API_KEY_ENVS, MODELS, ROLE_MODELS, TURN_OUTPUT_CAPS, Provider
 from autocontribute.providers import SubprocessTurnProvider
+from autocontribute.redaction import host_secret_values
 from autocontribute.submissions import AgentSubmission
 from autocontribute.transcript import (
     NATIVE_CALL_NAMES,
@@ -252,6 +253,7 @@ def test_live_tool_loop_through_the_model_worker(provider: Provider) -> None:
     spec = MODELS[ROLE_MODELS[provider]["setup"]]
     output_cap = TURN_OUTPUT_CAPS[provider]["setup"]
     model = SubprocessTurnProvider(spec)
+    host_values = host_secret_values((), os.environ)
     transcript = start_transcript(
         model=spec.id,
         effort="low",
@@ -259,6 +261,7 @@ def test_live_tool_loop_through_the_model_worker(provider: Provider) -> None:
         run_id="live-canary",
         instructions=_INSTRUCTIONS,
         task=_TASK,
+        host_values=host_values,
     )
     workspace = _Workspace()
     turns: list[Turn] = []
@@ -279,7 +282,11 @@ def test_live_tool_loop_through_the_model_worker(provider: Provider) -> None:
         turns.append(turn)
         append_turn(transcript, turn)
         if not turn.tool_calls:
-            append_user_text(transcript, "Continue with the next step, using the tools.")
+            append_user_text(
+                transcript,
+                "Continue with the next step, using the tools.",
+                host_values=host_values,
+            )
             continue
         results = []
         for call in turn.tool_calls:
@@ -295,8 +302,10 @@ def test_live_tool_loop_through_the_model_worker(provider: Provider) -> None:
                 )
             else:
                 results.append(ToolResult(call_id=call.call_id, output="Submitted."))
-        append_tool_results(transcript, results)
-        append_user_text(transcript, f"{_MAX_TURNS - len(turns)} turns left.")
+        append_tool_results(transcript, results, host_values=host_values)
+        append_user_text(
+            transcript, f"{_MAX_TURNS - len(turns)} turns left.", host_values=host_values
+        )
 
     assert submission is not None, f"no valid submission in {len(turns)} turns"
     assert submission.outcome == "fixed"
