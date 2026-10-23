@@ -32,6 +32,7 @@ from autocontribute.pricing import DEFAULT_EFFORTS, Effort
 from autocontribute.providers import TurnProvider
 from autocontribute.store import RunStore
 from autocontribute.submissions import BlockerCategory, ReviewBlocker, ReviewSubmission
+from autocontribute.suite_runs import CheckRun
 from autocontribute.task_messages import RunFacts, critic_task
 from autocontribute.transcript import start_transcript
 from autocontribute.validation_sandbox import ValidationSandbox
@@ -43,6 +44,8 @@ MAX_CRITIC_ROUNDS: Final = 2
 QUOTED_CATEGORIES: Final[frozenset[BlockerCategory]] = frozenset(
     {"scope_creep", "policy_violation", "misleading_text"}
 )
+# A check that times out confirms these: the patch makes the code hang.
+HANG_CATEGORIES: Final[frozenset[BlockerCategory]] = frozenset({"regression", "issue_not_fixed"})
 # A shell's "cannot execute" and "not found": the check did not run.
 _NOT_RUN_EXIT_CODES: Final = frozenset({126, 127})
 # Shorter quotes match too much to prove anything.
@@ -174,7 +177,10 @@ class Critic:
         if not isinstance(outcome, Finished):
             return outcome
         review = outcome.submission
-        confirmed, dropped = self._confirm(review.blockers, fix, patch, validated)
+        confirmation = self._confirm(review.blockers, fix, patch, validated)
+        if confirmation is None:
+            return DidNotFinish("time", "The run reached its time limit while checking blockers")
+        confirmed, dropped = confirmation
         if check.test_waiver_needed and not review.no_test_needed:
             confirmed.append(_WAIVER_BLOCKER)
         decision, reason = _decide(number, review, confirmed, earlier)
@@ -191,37 +197,28 @@ class Critic:
 
     def _confirm(
         self, blockers: Sequence[ReviewBlocker], fix: SubmittedFix, patch: str, validated: Path
-    ) -> tuple[list[ReviewBlocker], list[DroppedBlocker]]:
+    ) -> tuple[list[ReviewBlocker], list[DroppedBlocker]] | None:
+        """Split the blockers into confirmed and dropped; None when the run runs out of time."""
+
         confirmed: list[ReviewBlocker] = []
         dropped: list[DroppedBlocker] = []
         for blocker in blockers:
+            command = (blocker.check_command or "").strip()
             if blocker.category in QUOTED_CATEGORIES:
                 reason = self._quote_missing(blocker, fix, patch, validated)
+            elif not command:
+                reason = "it has no check command"
             else:
-                reason = self._check_passes(blocker, validated)
+                timeout = min(self._timeout(), MAX_AGENT_COMMAND_SECONDS)
+                if timeout < 1:
+                    return None
+                run = self._sandbox.run_check(validated, command, timeout_seconds=timeout)
+                reason = _check_reason(blocker.category, run)
             if reason is None:
                 confirmed.append(blocker)
             else:
                 dropped.append(DroppedBlocker(blocker=blocker, reason=reason))
         return confirmed, dropped
-
-    def _check_passes(self, blocker: ReviewBlocker, validated: Path) -> str | None:
-        """Why the blocker's check does not confirm it, or None when it fails as it should."""
-
-        command = (blocker.check_command or "").strip()
-        if not command:
-            return "it has no check command"
-        timeout = min(self._timeout(), MAX_AGENT_COMMAND_SECONDS)
-        if timeout < 1:
-            return "the run is out of time for its check"
-        run = self._sandbox.run_check(validated, command, timeout_seconds=timeout)
-        if run.failure is not None:
-            return f"its check could not run: {run.failure}"
-        if run.timed_out or run.exit_code in _NOT_RUN_EXIT_CODES:
-            return "its check could not run"
-        if run.exit_code == 0:
-            return "its check passes"
-        return None
 
     def _quote_missing(
         self, blocker: ReviewBlocker, fix: SubmittedFix, patch: str, validated: Path
@@ -272,6 +269,21 @@ def _decide(
     return "approve", ""
 
 
+def _check_reason(category: BlockerCategory, run: CheckRun) -> str | None:
+    """Why a blocker's check does not confirm it, or None when it fails as it should."""
+
+    if run.failure is not None:
+        return f"its check could not run: {run.failure}"
+    if run.timed_out:
+        # A check that never returns shows a hang, which is the bug for these categories.
+        return None if category in HANG_CATEGORIES else "its check timed out"
+    if run.exit_code in _NOT_RUN_EXIT_CODES:
+        return "its check could not run"
+    if run.exit_code == 0:
+        return "its check passes"
+    return None
+
+
 def _same(blocker: ReviewBlocker, other: ReviewBlocker) -> bool:
     # Lines move when the agent edits, so a repeated blocker has the category and path.
     return blocker.category == other.category and blocker.path == other.path
@@ -303,6 +315,7 @@ def _collapsed(text: str) -> str:
 
 
 __all__ = [
+    "HANG_CATEGORIES",
     "MAX_CRITIC_ROUNDS",
     "QUOTED_CATEGORIES",
     "Critic",
