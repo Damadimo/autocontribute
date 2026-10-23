@@ -1449,8 +1449,14 @@ def test_claims_lapse_after_thirty_days(tmp_path) -> None:  # type: ignore[no-un
 @pytest.mark.parametrize(
     ("invitation", "invitation_days_ago", "reopened"),
     [
-        ("This is still open for anyone: feel free to open a PR.", 2, True),
+        ("This is still open for anyone: feel free to open a PR.", 9, True),
+        ("Still up for grabs. PRs welcome.", 9, True),
+        # The claimant has been quiet for 8 days.
         ("PRs welcome!", 2, True),
+        # Replies to the claim accept it.
+        ("Thanks! Feel free to open a PR.", 10, False),
+        ("Sounds good, PRs welcome.", 10, False),
+        ("Great, happy to review a PR.", 9, False),
         ("@claimant thanks, feel free to open a PR.", 2, False),
         ("Feel free to open a PR.", 20, False),
         ("I don't think PRs are welcome here yet.", 2, False),
@@ -1479,6 +1485,22 @@ def test_later_maintainer_invitation_reopens_claimed_work(
     result = service.evaluate(issue, _repository())
 
     assert ("claimed work" in " ".join(result.blockers)) is not reopened
+
+
+def test_claimant_activity_keeps_a_claim_through_a_later_invitation(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    issue = _issue(
+        comments=3,
+        discussion=[
+            _comment(body="I'll take this.", author="claimant", days_ago=10),
+            _comment(body="Pushed a first draft to my fork.", author="claimant", days_ago=3),
+            _comment(body="PRs welcome!", author="maintainer", association="MEMBER", days_ago=2),
+        ],
+    )
+
+    result = service.evaluate(issue, _repository())
+
+    assert result.blockers == ["issue discussion indicates claimed work by claimant"]
 
 
 @pytest.mark.parametrize(
