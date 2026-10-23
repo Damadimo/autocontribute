@@ -2164,33 +2164,54 @@ def test_legal_policy_content_change_invalidates_attestation(tmp_path) -> None:
     )
 
     assert not result.eligible
-    assert "inventories or contents changed" in " ".join(result.blockers)
+    assert "the CLA or DCO text of the policy files changed" in " ".join(result.blockers)
 
 
-def test_benign_legal_policy_inventory_change_invalidates_attestation(tmp_path) -> None:
-    github = PolicyGitHub(
-        {
-            ("example/project", "CONTRIBUTING.md"): (
-                "Contributors must complete our Contributor License Agreement before opening a PR."
-            ),
-        }
-    )
+def test_policy_edits_outside_legal_sections_keep_the_attestation(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    files = {
+        ("example/project", "CONTRIBUTING.md"): (
+            "# Contributing\n\nRun the tests.\n\n"
+            "## Legal\n\nContributors must complete our Contributor License Agreement.\n"
+        ),
+        ("example/project", "README.md"): "A parser.",
+    }
+    github = PolicyGitHub(files)
     snapshot = DiscoveryService(  # type: ignore[arg-type]
         AutocontributeConfig(), github, RunStore(tmp_path / "preview")
     ).policy_snapshot(_repository(), repository_ref=REPOSITORY_REF)
     config = _legal_config(snapshot)
-    github.files[("example/project", "docs/AI_POLICY.md")] = "AI contributions receive review."
+    files[("example/project", "docs/AI_POLICY.md")] = "AI contributions receive review."
+    files[("example/project", "README.md")] = "A fast parser."
+    files[("example/project", "CONTRIBUTING.md")] = files[
+        ("example/project", "CONTRIBUTING.md")
+    ].replace("Run the tests.", "Run the tests with uv.")
 
-    result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
+    edited = DiscoveryService(config, github, RunStore(tmp_path / "edited")).evaluate(  # type: ignore[arg-type]
         _issue(), _repository(), repository_ref="c" * 40
     )
+    files[("example/project", "CONTRIBUTING.md")] += "Corporate contributors also sign one.\n"
+    legal_edit = DiscoveryService(config, github, RunStore(tmp_path / "legal")).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref="d" * 40
+    )
 
-    assert not result.eligible
-    assert "inventories or contents changed" in " ".join(result.blockers)
+    assert edited.eligible, edited.blockers
+    assert edited.evidence[LEGAL_POLICY_EVIDENCE_KEY] == snapshot.legal_policy_sha256
+    assert edited.evidence[POLICY_SOURCES_EVIDENCE_KEY] != snapshot.policy_sources_sha256
+    assert not legal_edit.eligible
+    assert "the CLA or DCO text of the policy files changed" in " ".join(legal_edit.blockers)
 
 
-def test_organization_policy_repository_appearance_invalidates_absence_attestation(
+@pytest.mark.parametrize(
+    ("organization_files", "still_attested"),
+    [
+        ({("example/.github", "CODE_OF_CONDUCT.md"): "Be kind."}, True),
+        ({("example/.github", "CLA.md"): "Sign the CLA at cla.example.org."}, False),
+    ],
+)
+def test_organization_policy_repository_appearance_matters_only_with_legal_text(
     tmp_path,
+    organization_files: dict[tuple[str, str], str],
+    still_attested: bool,
 ) -> None:  # type: ignore[no-untyped-def]
     class MutableOrganizationGitHub(PolicyGitHub):
         organization_ref: str | None = None
@@ -2212,13 +2233,60 @@ def test_organization_policy_repository_appearance_invalidates_absence_attestati
     assert snapshot.organization_ref_evidence == "absent"
     config = _legal_config(snapshot)
     github.organization_ref = ORGANIZATION_REF
+    github.files.update(organization_files)
 
     result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
         _issue(), _repository(), repository_ref="c" * 40
     )
 
-    assert not result.eligible
-    assert "inventories or contents changed" in " ".join(result.blockers)
+    assert result.eligible is still_attested, result.blockers
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        # scikit-learn: reviewers sign off, contributors do not
+        "Pull requests are merged once they are signed off by two core developers.",
+        # requests
+        "We do not have a formal CLA.",
+        "There is no formal Contributor License Agreement.",
+        "You are not required to sign a CLA.",
+        "This project does not require a\nContributor License Agreement.",
+    ],
+)
+def test_negated_or_unrelated_legal_wording_creates_no_requirement(
+    tmp_path,
+    policy: str,
+) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub({("example/project", "CONTRIBUTING.md"): policy})
+
+    result = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path)
+    ).evaluate(_issue(), _repository())
+
+    assert result.eligible, result.blockers
+    assert result.evidence["legal_requirements"] == "none"
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        "Sign every commit with `git commit -s`.",
+        "Commit with --signoff.",
+        "Every commit needs a Signed-off-by trailer.",
+    ],
+)
+def test_dco_signoff_trailer_and_its_tooling_create_a_dco_requirement(
+    tmp_path,
+    policy: str,
+) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub({("example/project", "CONTRIBUTING.md"): policy})
+
+    result = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path)
+    ).evaluate(_issue(), _repository())
+
+    assert result.evidence["legal_requirements"] == "dco"
 
 
 def test_dco_authorization_produces_and_revalidates_exact_signoff(tmp_path) -> None:
