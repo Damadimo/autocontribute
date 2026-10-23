@@ -214,7 +214,7 @@ def test_blockers_are_kept_only_when_their_check_fails_or_their_quote_is_there(
         "its check passes",
         "it has no check command",
         "its check could not run",
-        "its check could not run",
+        "its check timed out",
         "its check could not run: the build command failed with exit 2: make",
         "the passage it quotes is not there",
     ]
@@ -292,3 +292,38 @@ def test_a_critic_that_never_submits_did_not_finish(tmp_path: Path) -> None:
 
     assert isinstance(outcome, DidNotFinish) and outcome.reason == "no_tool_call"
     assert harness.critic.rounds == []
+
+
+def test_a_check_that_hangs_confirms_only_a_regression_or_an_unfixed_issue(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, FakeSandbox({"check hang": _ran(124, timed_out=True)}), "openai")
+
+    outcome = harness.review(
+        _review(
+            "request_changes",
+            _blocker("regression", "parse('((') never returns", "check hang"),
+            _blocker("issue_not_fixed", "still hangs", "check hang", path="other.py"),
+            _blocker("definite_bug", "slow", "check hang", path="third.py"),
+        )
+    )
+
+    assert isinstance(outcome, CriticRound) and outcome.decision == "request_changes"
+    assert [blocker.category for blocker in outcome.confirmed] == ["regression", "issue_not_fixed"]
+    assert [dropped.reason for dropped in outcome.dropped] == ["its check timed out"]
+
+
+def test_running_out_of_time_while_checking_blockers_does_not_approve(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, FakeSandbox({"check bug": _ran(1)}), "openai")
+    left = harness.budget.seconds_left
+
+    def seconds_left() -> float:
+        # Time for the critic's turns, none once it has submitted.
+        return left() if harness.script.steps else 0.5
+
+    harness.budget.seconds_left = seconds_left  # type: ignore[method-assign]
+
+    outcome = harness.review(
+        _review("request_changes", _blocker("definite_bug", "add drops b", "check bug"))
+    )
+
+    assert isinstance(outcome, DidNotFinish) and outcome.reason == "time"
+    assert harness.sandbox.checked == [] and harness.critic.rounds == []
