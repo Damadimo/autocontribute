@@ -1407,6 +1407,18 @@ class RunStore:
             open_pull_requests_only=True,
         )
 
+    def list_merged_pull_request_runs(
+        self, *, merged_since: datetime, limit: int = 1_000
+    ) -> builtins.list[RunManifest]:
+        """Return every run whose pull request merged at or after ``merged_since``."""
+
+        return self._list_runs_with_status(
+            RunStatus.PR_OPEN,
+            limit=limit,
+            resource="recently merged pull-request",
+            merged_since=_aware_utc(merged_since, field="merge watch start"),
+        )
+
     def list_submitting_runs(self, *, limit: int = 100) -> builtins.list[RunManifest]:
         """Return every ambiguous publication intent for remote reconciliation."""
 
@@ -1423,24 +1435,34 @@ class RunStore:
         limit: int,
         resource: str,
         open_pull_requests_only: bool = False,
+        merged_since: datetime | None = None,
     ) -> builtins.list[RunManifest]:
         """Enumerate a complete bounded status set and validate row/manifest agreement."""
 
         if not 1 <= limit <= 10_000:
             raise ValueError(f"{resource} run limit must be between 1 and 10000")
-        state_filter = (
-            "AND coalesce(json_extract(manifest_json, '$.pull_request_state'), 'open') = 'open'"
-            if open_pull_requests_only
-            else ""
-        )
+        state_filter = ""
+        parameters: builtins.list[str | int] = [status.value]
+        if open_pull_requests_only:
+            state_filter = (
+                "AND coalesce(json_extract(manifest_json, '$.pull_request_state'), 'open') = 'open'"
+            )
+        elif merged_since is not None:
+            state_filter = (
+                "AND json_extract(manifest_json, '$.pull_request_state') = 'merged' "
+                "AND julianday(json_extract(manifest_json, '$.pull_request_merged_at')) "
+                ">= julianday(?)"
+            )
+            parameters.append(merged_since.isoformat())
+        parameters.append(limit + 1)
         with self._connection() as connection:
             rows = connection.execute(
-                # Only the fixed filter above is interpolated; values stay bound parameters.
+                # Only the fixed filters above are interpolated; values stay bound parameters.
                 f"""
                 SELECT run_id, manifest_json FROM runs
                 WHERE status = ? {state_filter} ORDER BY created_at ASC, run_id ASC LIMIT ?
                 """,
-                (status.value, limit + 1),
+                parameters,
             ).fetchall()
         if len(rows) > limit:
             raise StateError(f"{resource.capitalize()} run set exceeds the configured safety bound")

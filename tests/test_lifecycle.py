@@ -26,6 +26,7 @@ from autocontribute.github import (
 )
 from autocontribute.lifecycle import (
     REPOSITORY_COOLDOWN,
+    REVERT_WATCH,
     LifecycleObserver,
     LifecycleSignalKind,
     PullRequestLifecycleSnapshot,
@@ -955,6 +956,80 @@ def test_lifecycle_sync_keeps_attention_on_the_run_and_stops_after_close(tmp_pat
     assert store.list_open_pull_request_runs() == []
     assert sync_open_pull_requests(github, store).runs_checked == 0
     assert github.get_calls == 2
+
+
+def test_merged_pull_request_is_watched_only_for_a_later_revert(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    run = _published_run(store)
+    merged_at = datetime.now(UTC) - timedelta(days=2)
+    merged = _pull_request(
+        state="closed",
+        merged=True,
+        merged_at=merged_at,
+        closed_at=merged_at,
+        merge_commit_sha="b" * 40,
+    )
+    github = FakeLifecycleGitHub([merged] * 4)
+
+    first = sync_open_pull_requests(github, store)
+
+    observed = store.get(run.run_id)
+    assert (observed.pull_request_state, observed.pull_request_merged_at) == ("merged", merged_at)
+    assert store.list_open_pull_request_runs() == []
+    assert store.active_holds() == []
+
+    github.references = [
+        PullRequestReference(
+            identifier=1,
+            source_url="https://github.com/example/project/pull/8",
+            source_title="Revert parser fix",
+            source_body="Reverts example/project#7",
+            source_state="closed",
+            source_merged_at=merged_at + timedelta(days=2),
+            created_at=merged_at + timedelta(days=1),
+        )
+    ]
+    # Review text on a merged pull request no longer matters; only a revert does.
+    github.reviews = [_review(10, state="CHANGES_REQUESTED", body="Please close this PR.")]
+    second = sync_open_pull_requests(github, store)
+
+    assert (first.runs_checked, second.runs_checked) == (1, 1)
+    assert [signal.kind for watch in second.revert_watches for signal in watch.signals] == [
+        LifecycleSignalKind.REVERTED
+    ]
+    assert second.newly_recorded == 2
+    assert {(hold.scope, hold.scope_key) for hold in store.active_holds()} == {
+        (StopScope.REPOSITORY, "example/project"),
+        (StopScope.PUBLICATION, "https://api.github.com"),
+    }
+    assert github.reference_calls == 2
+
+
+@pytest.mark.parametrize(("hours_past_window", "watched"), [(-1, True), (1, False)])
+def test_merged_pull_request_is_watched_for_thirty_days(
+    tmp_path,
+    hours_past_window: int,
+    watched: bool,
+) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    run = _published_run(store)
+    run.pull_request_state = "merged"
+    run.pull_request_merged_at = (
+        datetime.now(UTC) - REVERT_WATCH - timedelta(hours=hours_past_window)
+    )
+    store.save(run, event="test.merged", details={})
+    merged = _pull_request(
+        state="closed",
+        merged=True,
+        merged_at=run.pull_request_merged_at,
+        closed_at=run.pull_request_merged_at,
+    )
+    github = FakeLifecycleGitHub([merged] * 2)
+
+    result = sync_open_pull_requests(github, store)
+
+    assert result.runs_checked == int(watched)
+    assert github.get_calls == 2 * int(watched)
 
 
 class PartlyUnreadableGitHub(FakeLifecycleGitHub):
