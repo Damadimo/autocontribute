@@ -31,6 +31,7 @@ from autocontribute.exceptions import (
     ModelRequestError,
     ModelTimeoutError,
 )
+from autocontribute.host_environment import proxy_environment
 from autocontribute.model_retry import PROVIDER_ERROR_CODES
 from autocontribute.pricing import API_KEY_ENVS, Effort, ModelSpec, ModelUsage
 from autocontribute.redaction import contains_host_secret, redact_model_input
@@ -60,14 +61,7 @@ _OPAQUE_FIELDS: Final[Mapping[str, str]] = MappingProxyType(
 )
 _WORKER_TERM_GRACE_SECONDS = 0.25
 _WORKER_POLL_SECONDS = 0.05
-_WORKER_ENV_ALLOWLIST = (
-    "LANG",
-    "LC_ALL",
-    "PATH",
-    "REQUESTS_CA_BUNDLE",
-    "SSL_CERT_DIR",
-    "SSL_CERT_FILE",
-)
+_WORKER_ENV_ALLOWLIST = ("LANG", "LC_ALL", "PATH")
 
 
 @dataclass(frozen=True)
@@ -296,11 +290,12 @@ def _model_worker_command() -> tuple[str, ...]:
 
 
 def _worker_environment(api_key_env: str, api_key: str) -> dict[str, str]:
-    """Give the worker its model credential without repository or GitHub credentials."""
+    """Give the worker its model credential and the operator's proxy, and no other secret."""
 
     environment = {
         name: value for name in _WORKER_ENV_ALLOWLIST if (value := os.environ.get(name)) is not None
     }
+    environment.update(proxy_environment())
     environment[api_key_env] = api_key
     return environment
 
