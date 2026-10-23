@@ -175,6 +175,11 @@ open PRs), `publish` deletes the branch and the run ends `failed` with GitHub's 
 answer is lost, that run stays `submitting` and never sends a second request; other runs are not
 affected.
 
+`publish RUN_ID --yes --json` prints the outcome as JSON, and the exit code tells a script what to
+do next: 0 the PR is open, 3 a limit (`limit`) or a failed recheck (`stale`) refused it, so wait
+for the limit or cancel the run and prepare the issue again, 4 an interrupted publication needs
+another `publish` after review, 5 a safety stop is active, and 1 anything else.
+
 ## Run states
 
 ```text

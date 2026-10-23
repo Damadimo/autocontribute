@@ -31,8 +31,11 @@ from autocontribute.domain import (
     RunStatus,
 )
 from autocontribute.exceptions import (
+    AutocontributeError,
     CircuitBreakerTrigger,
     GitHubError,
+    PolicyError,
+    PublicationLimitError,
     PublicationResumeRequired,
     StateError,
     StopScope,
@@ -1824,6 +1827,134 @@ def test_manual_publish_syncs_lifecycle_and_preserves_target_retry(
 
     assert result.exit_code == 0, result.output
     assert calls == [f"sync:{run.run_id}", "publish", "close"]
+
+
+class _ContextGitHub:
+    def __init__(self, *_: object, **__: object) -> None:
+        pass
+
+    def __enter__(self):  # type: ignore[no-untyped-def]
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        pass
+
+
+def _approved_state(tmp_path: Path) -> tuple[Path, RunStore, str]:
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+    store = RunStore(state)
+    run = store.create_run()
+    run.status = RunStatus.APPROVED
+    store.save(run, event="test.approved", details={})
+    return config, store, run.run_id
+
+
+def test_publish_json_reports_the_open_pull_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, run_id = _approved_state(tmp_path)
+
+    class FakePublisher:
+        def __init__(self, _: object, publisher_store: RunStore, github: object) -> None:
+            self.store = publisher_store
+
+        def publish(self, run_id: str):  # type: ignore[no-untyped-def]
+            manifest = self.store.get(run_id)
+            manifest.status = RunStatus.PR_OPEN
+            manifest.pull_request_url = "https://github.com/example/project/pull/7"
+            self.store.save(manifest, event="test.published", details={})
+            return manifest
+
+    monkeypatch.setattr(cli, "GitHubClient", _ContextGitHub)
+    monkeypatch.setattr(cli, "Publisher", FakePublisher)
+    monkeypatch.setattr(cli, "_sync_lifecycle", lambda *_, **__: None)
+
+    refused = runner.invoke(app, ["publish", run_id, "--json", "--config", str(config)])
+    published = runner.invoke(
+        app,
+        ["publish", run_id, "--yes", "--json", "--config", str(config)],
+    )
+
+    assert refused.exit_code == 1
+    assert json.loads(refused.output) == {
+        "run_id": run_id,
+        "outcome": "error",
+        "message": "--json cannot prompt; pass --yes",
+    }
+    assert published.exit_code == 0, published.output
+    assert json.loads(published.output) == {
+        "run_id": run_id,
+        "status": "pr_open",
+        "pull_request_url": "https://github.com/example/project/pull/7",
+        "outcome": "pr_open",
+        "message": "Pull request opened",
+    }
+
+
+@pytest.mark.parametrize(
+    ("error", "outcome", "exit_code"),
+    [
+        (PublicationLimitError("Daily new pull-request limit reached"), "limit", 3),
+        (PolicyError("Approval has expired"), "stale", 3),
+        (PublicationResumeRequired("resume the exact intent"), "resume_required", 4),
+        (StateError("Circuit breaker is tripped by operator:a: stop"), "safety_stop", 5),
+        (GitHubError("GitHub is unavailable"), "error", 1),
+    ],
+)
+def test_publish_failures_have_typed_outcomes_and_exit_codes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: AutocontributeError,
+    outcome: str,
+    exit_code: int,
+) -> None:
+    config, store, run_id = _approved_state(tmp_path)
+
+    class FailingPublisher:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def publish(self, run_id: str) -> None:
+            if outcome == "safety_stop":
+                store.trip_circuit_breaker(
+                    source="operator:a", reason="stop", trigger_hash="c" * 64
+                )
+            raise error
+
+    monkeypatch.setattr(cli, "GitHubClient", _ContextGitHub)
+    monkeypatch.setattr(cli, "Publisher", FailingPublisher)
+    monkeypatch.setattr(cli, "_sync_lifecycle", lambda *_, **__: None)
+
+    as_json = runner.invoke(app, ["publish", run_id, "--yes", "--json", "--config", str(config)])
+    as_text = runner.invoke(app, ["publish", run_id, "--yes", "--config", str(config)])
+
+    assert as_json.exit_code == exit_code, as_json.output
+    assert json.loads(as_json.output) == {
+        "run_id": run_id,
+        "status": "approved",
+        "pull_request_url": None,
+        "outcome": outcome,
+        "message": str(error),
+    }
+    assert as_text.exit_code == exit_code
+    assert str(error) in " ".join(as_text.output.split())
+
+
+def test_publish_json_reports_an_unknown_run(tmp_path: Path) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
+
+    result = runner.invoke(app, ["publish", "missing", "--yes", "--json", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output) == {
+        "run_id": "missing",
+        "outcome": "error",
+        "message": "Unknown run: missing",
+    }
 
 
 def test_manual_publish_returns_reconciled_target_without_a_new_publish_call(

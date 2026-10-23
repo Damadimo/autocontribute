@@ -40,6 +40,7 @@ from autocontribute.exceptions import (
     GitHubHTTPError,
     GitHubRequestNotSentError,
     PolicyError,
+    PublicationLimitError,
     PublicationResumeRequired,
     StateError,
     StopScope,
@@ -6308,7 +6309,7 @@ def test_account_limits_count_autocontribute_pull_requests(
     github.open_authored = open_authored
     github.recent_authored = recent_authored
 
-    with pytest.raises(PolicyError, match=expected):
+    with pytest.raises(PublicationLimitError, match=expected):
         Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
 
     assert not github.mutated
