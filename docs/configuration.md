@@ -138,7 +138,7 @@ The limits count only PRs Autocontribute opened, recognized by their `<branch_pr
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `max_cost_usd_per_run` | `10` | Dollar cap for one run's model calls (above 0, at most 1000). Every request reserves its worst case first. |
-| `max_cost_usd_per_day` | `25` | Dollar cap over the last 24 hours (above 0, at most 10000). A run starts only while a quarter of `max_cost_usd_per_run` is left; otherwise it is skipped with reason `daily budget`. |
+| `max_cost_usd_per_day` | `25` | Dollar cap over the last 24 hours (above 0, at most 10000). A run starts only while a quarter of `max_cost_usd_per_run` is left, and may spend no more than what is left; otherwise it is skipped with reason `daily budget`. |
 | `max_model_calls_per_run` | `200` | Model requests per run, retries included (10–1000). |
 | `max_run_minutes` | `90` | Time for one run, model and tool time together (5–360). |
 | `max_candidates_per_run` | `25` | Discovery stops after this many eligible issues and picks the highest score (1–200). |

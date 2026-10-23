@@ -11,7 +11,7 @@ from autocontribute.budget import (
     SCOPES,
     TRANSCRIPT_SCOPES,
     RunBudget,
-    daily_budget_allows_run,
+    daily_budget_left,
 )
 from autocontribute.domain import RunManifest, utc_now
 from autocontribute.exceptions import (
@@ -565,16 +565,20 @@ def test_a_run_starts_only_while_the_day_leaves_a_quarter_of_the_run_cap(
     spent = budget.settle(reservation, _turn(_usage(100_000, 10_000)))
     per_run = Decimal(4)
 
-    assert daily_budget_allows_run(
+    # What is left of the day, which caps the run when it is less than the per-run cap.
+    assert daily_budget_left(
         store, max_cost_usd_per_day=spent + 1, max_cost_usd_per_run=per_run
-    )
-    assert not daily_budget_allows_run(
-        store, max_cost_usd_per_day=spent + Decimal("0.99"), max_cost_usd_per_run=per_run
+    ) == Decimal(1)
+    assert (
+        daily_budget_left(
+            store, max_cost_usd_per_day=spent + Decimal("0.99"), max_cost_usd_per_run=per_run
+        )
+        is None
     )
     # Runs created more than a day ago no longer count.
-    assert daily_budget_allows_run(
+    assert daily_budget_left(
         store,
         max_cost_usd_per_day=Decimal(1),
         max_cost_usd_per_run=per_run,
         now=utc_now() + timedelta(hours=25),
-    )
+    ) == Decimal(1)

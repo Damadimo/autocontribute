@@ -393,23 +393,23 @@ class RunBudget:
             raise StateError(f"Model call {reservation.call} has no pending reservation")
 
 
-def daily_budget_allows_run(
+def daily_budget_left(
     store: RunStore,
     *,
     max_cost_usd_per_day: Decimal,
     max_cost_usd_per_run: Decimal,
     now: datetime | None = None,
-) -> bool:
-    """Return whether the last 24 hours leave room for another run.
+) -> Decimal | None:
+    """Return what the last 24 hours leave of the daily cap, or ``None`` when too little.
 
     The spend counts every run created in that window, pending reservations included. A run
-    may start while at least a quarter of the per-run cap is left; otherwise it is skipped
-    with reason ``daily budget``.
+    may start while at least a quarter of the per-run cap is left, with the smaller of the
+    per-run cap and what is left; otherwise it is skipped with reason ``daily budget``.
     """
 
     since = (now or utc_now()) - _DAILY_WINDOW
     left = max_cost_usd_per_day - store.model_cost_since(since)
-    return left >= max_cost_usd_per_run * DAILY_HEADROOM_SHARE
+    return left if left >= max_cost_usd_per_run * DAILY_HEADROOM_SHARE else None
 
 
 __all__ = [
@@ -419,5 +419,5 @@ __all__ = [
     "Reservation",
     "RunBudget",
     "ScopeLimits",
-    "daily_budget_allows_run",
+    "daily_budget_left",
 ]
