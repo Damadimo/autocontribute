@@ -20,7 +20,7 @@ from typing import BinaryIO
 
 from autocontribute.domain import TERMINAL_STATUSES, RunManifest, RunStatus
 from autocontribute.exceptions import StateError
-from autocontribute.store import RunStore
+from autocontribute.store import STATE_TABLES, RunStore
 
 _DATABASE_NAME = "state.sqlite3"
 _RUN_ID = re.compile(r"^[0-9a-f]{16}$")
@@ -31,8 +31,8 @@ _FINISHED_STATUSES = frozenset(status.value for status in TERMINAL_STATUSES)
 # Only an approval, given by a person outside any preparation, moves a run into these.
 _APPROVED_STATUSES = frozenset({RunStatus.APPROVED, RunStatus.SUBMITTING, RunStatus.PR_OPEN})
 _WAITING_STATUSES = frozenset({RunStatus.READY_FOR_APPROVAL, RunStatus.APPROVED})
-# Rows that _assert_extends compares itself, or bookkeeping that no decision reads; every other
-# table may only gain rows.
+# Rows that _assert_extends compares itself, bookkeeping that no decision reads, and caches and
+# counters a preparation updates; every other table, holds included, may only gain rows.
 _REWRITABLE_TABLES = frozenset(
     {
         "runs",
@@ -41,6 +41,9 @@ _REWRITABLE_TABLES = frozenset(
         "lease_generations",
         "manifest_artifact_sync",
         "schema_metadata",
+        "repository_policies",
+        "environment_recipes",
+        "secondary_rate_limit_streak",
     }
 )
 
@@ -146,9 +149,11 @@ def _assert_extends(trusted: RunStore, prepared: RunStore) -> None:
         for table in tables:
             if table in _REWRITABLE_TABLES:
                 continue
-            # Table names come from the trusted schema, which the store checked.
+            if table not in STATE_TABLES:
+                raise StateError(f"The saved state has an unknown table: {table}")
+            # SQL cannot bind a table name; it is one of the fixed STATE_TABLES names.
             (dropped,) = connection.execute(
-                f'SELECT count(*) FROM (SELECT * FROM trusted."{table}" '
+                f'SELECT count(*) FROM (SELECT * FROM trusted."{table}" '  # nosec B608
                 f'EXCEPT SELECT * FROM main."{table}")'
             ).fetchone()
             if dropped:
