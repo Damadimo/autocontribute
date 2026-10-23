@@ -117,7 +117,7 @@ def _transcript(
     transcript = Transcript(
         model=model, effort=effort, kind=kind, run_id=_RUN_ID, instructions="Fix the issue."
     )
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     return transcript
 
 
@@ -277,7 +277,7 @@ def test_oversized_request_is_refused_before_a_worker_starts(
     provider, record = _provider(tmp_path, monkeypatch, _reply())
     monkeypatch.setattr(providers, "_MAX_MODEL_REQUEST_BYTES", 4_096)
     transcript = _transcript()
-    append_user_text(transcript, "x" * 4_096)
+    append_user_text(transcript, "x" * 4_096, host_values=frozenset())
 
     with pytest.raises(ModelError, match="request exceeded the bounded IPC limit"):
         provider.step(transcript=transcript, max_output_tokens=1_000, timeout_seconds=30)

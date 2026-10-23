@@ -7,6 +7,7 @@ import pytest
 from pydantic import BaseModel, JsonValue, ValidationError
 
 from autocontribute.pricing import ModelUsage
+from autocontribute.redaction import MODEL_INPUT_REDACTION
 from autocontribute.submissions import AgentSubmission, ReviewSubmission, strict_json_schema
 from autocontribute.transcript import (
     NATIVE_CALL_NAMES,
@@ -252,7 +253,7 @@ def test_transcript_is_bound_to_a_table_model_its_effort_and_a_safe_run_id() -> 
 def test_user_text_is_a_provider_native_user_message(model: str, item: dict[str, Any]) -> None:
     transcript = _transcript(model)
 
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
 
     assert transcript.items == [item]
     assert transcript.appended_items == 1
@@ -262,7 +263,7 @@ def test_user_text_is_a_provider_native_user_message(model: str, item: dict[str,
 
 def test_openai_turn_appends_its_output_items_and_holds_its_calls() -> None:
     transcript = _transcript()
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     turn = _openai_turn(_OPENAI_REASONING, _OPENAI_SHELL_CALL, _OPENAI_PATCH_CALL)
 
     append_turn(transcript, turn)
@@ -278,7 +279,7 @@ def test_openai_turn_appends_its_output_items_and_holds_its_calls() -> None:
 
 def test_anthropic_turn_is_one_assistant_message_with_its_content_blocks() -> None:
     transcript = _transcript("claude-opus-5-5")
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
 
     append_turn(transcript, _anthropic_turn())
 
@@ -291,7 +292,7 @@ def test_anthropic_turn_is_one_assistant_message_with_its_content_blocks() -> No
 
 def test_openai_tool_results_become_native_call_outputs() -> None:
     transcript = _transcript()
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     append_turn(
         transcript,
         _openai_turn(_OPENAI_SHELL_CALL, _OPENAI_PATCH_CALL, _OPENAI_SUBMIT_CALL),
@@ -315,6 +316,7 @@ def test_openai_tool_results_become_native_call_outputs() -> None:
             ),
             ToolResult(call_id="call_3ef1b8c79a4d6520", output="Error: pr_title is missing."),
         ],
+        host_values=frozenset(),
     )
 
     appended = transcript.items[before:]
@@ -355,7 +357,7 @@ def test_openai_shell_output_echoes_max_output_length_only_when_the_call_set_it(
     assert isinstance(shell_call["action"], dict)
     del shell_call["action"]["max_output_length"]
     transcript = _transcript()
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     append_turn(transcript, _openai_turn(shell_call))
 
     append_tool_results(
@@ -366,6 +368,7 @@ def test_openai_shell_output_echoes_max_output_length_only_when_the_call_set_it(
                 output=(ShellChunk(stdout="", stderr="", exit_code=0),) * 2,
             )
         ],
+        host_values=frozenset(),
     )
 
     assert "max_output_length" not in transcript.items[-1]
@@ -373,7 +376,7 @@ def test_openai_shell_output_echoes_max_output_length_only_when_the_call_set_it(
 
 def test_anthropic_results_of_one_turn_and_the_text_after_them_share_one_user_message() -> None:
     transcript = _transcript("claude-opus-5-5")
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     second_call = {**_ANTHROPIC_BASH_CALL, "id": "toolu_02B", "input": {"command": "ls"}}
     turn = Turn(
         stop="tool_use",
@@ -394,8 +397,9 @@ def test_anthropic_results_of_one_turn_and_the_text_after_them_share_one_user_me
             ToolResult(call_id="toolu_01A09q90qw90lq917835lq9", output="print('hi')\n"),
             ToolResult(call_id="toolu_02B", output="ls: cannot access", is_error=True),
         ],
+        host_values=frozenset(),
     )
-    append_user_text(transcript, "10 turns left; submit soon.")
+    append_user_text(transcript, "10 turns left; submit soon.", host_values=frozenset())
 
     assert transcript.items[2:] == [
         {
@@ -422,8 +426,8 @@ def test_anthropic_results_of_one_turn_and_the_text_after_them_share_one_user_me
 
 def test_anthropic_user_text_joins_the_user_content_added_since_the_last_turn() -> None:
     transcript = _transcript("claude-opus-5-5")
-    append_user_text(transcript, "Fix issue 12.")
-    append_user_text(transcript, "AGENTS.md: run make test.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
+    append_user_text(transcript, "AGENTS.md: run make test.", host_values=frozenset())
 
     assert transcript.items == [
         {
@@ -447,8 +451,10 @@ def test_anthropic_user_text_joins_the_user_content_added_since_the_last_turn() 
         usage=_USAGE,
     )
     append_turn(transcript, turn)
-    append_user_text(transcript, "Continue; call submit when you are done.")
-    append_user_text(transcript, "Blockers from the review: none.")
+    append_user_text(
+        transcript, "Continue; call submit when you are done.", host_values=frozenset()
+    )
+    append_user_text(transcript, "Blockers from the review: none.", host_values=frozenset())
 
     assert [item["role"] for item in transcript.items] == ["user", "assistant", "user"]
     assert transcript.items[1:] == [
@@ -466,14 +472,15 @@ def test_anthropic_user_text_joins_the_user_content_added_since_the_last_turn() 
 
 def test_openai_text_after_the_results_is_a_user_message_of_its_own() -> None:
     transcript = _transcript()
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     append_turn(transcript, _openai_turn(_OPENAI_SUBMIT_CALL))
 
     append_tool_results(
         transcript,
         [ToolResult(call_id="call_3ef1b8c79a4d6520", output="Error: pr_title is missing.")],
+        host_values=frozenset(),
     )
-    append_user_text(transcript, "10 turns left; submit soon.")
+    append_user_text(transcript, "10 turns left; submit soon.", host_values=frozenset())
 
     assert transcript.items[-2:] == [
         {
@@ -502,13 +509,15 @@ def test_openai_text_after_the_results_is_a_user_message_of_its_own() -> None:
 )
 def test_results_must_answer_every_pending_call_once_in_order(call_ids: list[str]) -> None:
     transcript = _transcript()
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     append_turn(transcript, _openai_turn(_OPENAI_SHELL_CALL, _OPENAI_PATCH_CALL))
     before = transcript.model_copy(deep=True)
 
     with pytest.raises(ValueError, match="every pending tool call once"):
         append_tool_results(
-            transcript, [ToolResult(call_id=call_id, output="done") for call_id in call_ids]
+            transcript,
+            [ToolResult(call_id=call_id, output="done") for call_id in call_ids],
+            host_values=frozenset(),
         )
 
     assert transcript == before
@@ -516,10 +525,10 @@ def test_results_must_answer_every_pending_call_once_in_order(call_ids: list[str
 
 def test_results_need_pending_calls() -> None:
     transcript = _transcript()
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
 
     with pytest.raises(ValueError, match="no pending tool calls"):
-        append_tool_results(transcript, [])
+        append_tool_results(transcript, [], host_values=frozenset())
 
 
 @pytest.mark.parametrize(
@@ -568,13 +577,15 @@ def test_result_output_must_fit_the_call(
     error: str,
 ) -> None:
     transcript = _transcript(model)
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     turn = _anthropic_turn() if model.startswith("claude") else _openai_turn(item)
     append_turn(transcript, turn)
     call_id = turn.tool_calls[0].call_id
 
     with pytest.raises(ValueError, match=error):
-        append_tool_results(transcript, [ToolResult(call_id=call_id, output=output)])
+        append_tool_results(
+            transcript, [ToolResult(call_id=call_id, output=output)], host_values=frozenset()
+        )
 
 
 def test_shell_chunks_cannot_carry_the_error_flag() -> None:
@@ -588,7 +599,7 @@ def test_shell_chunks_cannot_carry_the_error_flag() -> None:
 
 def test_a_turn_cut_off_at_its_output_limit_is_never_appended() -> None:
     transcript = _transcript()
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     reserved = next_input_reservation(transcript)
     turn = Turn(
         stop="max_output_tokens",
@@ -612,20 +623,22 @@ def test_turns_alternate_with_the_callers_side() -> None:
     with pytest.raises(ValueError, match="not waiting for a model turn"):
         append_turn(transcript, _openai_turn(_OPENAI_REASONING))
 
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     append_turn(transcript, _openai_turn(_OPENAI_REASONING))
     with pytest.raises(ValueError, match="not waiting for a model turn"):
         append_turn(transcript, _openai_turn(_OPENAI_REASONING))
 
-    append_user_text(transcript, "Continue the task; call submit when you are done.")
+    append_user_text(
+        transcript, "Continue the task; call submit when you are done.", host_values=frozenset()
+    )
     append_turn(transcript, _openai_turn(_OPENAI_SHELL_CALL))
     with pytest.raises(ValueError, match="waiting for their results"):
-        append_user_text(transcript, "Submit now.")
+        append_user_text(transcript, "Submit now.", host_values=frozenset())
 
 
 def test_appending_never_changes_earlier_items() -> None:
     transcript = _transcript()
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     snapshots = [canonical_json(transcript.items)]
     turn = _openai_turn(_OPENAI_REASONING, _OPENAI_SHELL_CALL)
     append_turn(transcript, turn)
@@ -638,6 +651,7 @@ def test_appending_never_changes_earlier_items() -> None:
                 output=(ShellChunk(stdout="hi\n", stderr="", exit_code=0),) * 2,
             )
         ],
+        host_values=frozenset(),
     )
     snapshots.append(canonical_json(transcript.items))
     append_turn(transcript, _openai_turn(_OPENAI_SUBMIT_CALL))
@@ -651,7 +665,7 @@ def test_appending_never_changes_earlier_items() -> None:
 
 def test_first_reservation_counts_instructions_tools_and_items() -> None:
     transcript = _transcript(kind="triage")
-    append_user_text(transcript, "Assess issue 12.")
+    append_user_text(transcript, "Assess issue 12.", host_values=frozenset())
 
     expected = (
         len(canonical_json("Fix the issue."))
@@ -664,13 +678,14 @@ def test_first_reservation_counts_instructions_tools_and_items() -> None:
 
 def test_later_reservations_add_the_last_turn_and_what_followed_it() -> None:
     transcript = _transcript("claude-opus-5-5")
-    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
     append_turn(transcript, _anthropic_turn())
     append_tool_results(
         transcript,
         [ToolResult(call_id="toolu_01A09q90qw90lq917835lq9", output="print('hi')\n")],
+        host_values=frozenset(),
     )
-    append_user_text(transcript, "10 turns left.")
+    append_user_text(transcript, "10 turns left.", host_values=frozenset())
     appended_bytes = len(canonical_json(transcript.items[2]))
 
     assert len(transcript.items) == 3
@@ -728,6 +743,7 @@ def test_start_transcript_binds_the_conversation_and_adds_the_task() -> None:
         run_id=_RUN_ID,
         instructions="Set up the test environment.",
         task="Repository: octo/widgets.",
+        host_values=frozenset(),
     )
 
     assert (transcript.model, transcript.effort, transcript.kind, transcript.run_id) == (
@@ -802,3 +818,38 @@ def test_read_submission_rejects_calls_the_model_must_redo(
 ) -> None:
     with pytest.raises(ValueError, match=error):
         read_submission(call, submission)
+
+
+@pytest.mark.parametrize("model", ["gpt-5.6-sol", "claude-opus-5-5"])
+def test_appended_text_never_holds_a_host_value_or_a_token(model: str) -> None:
+    # Assembled at runtime so the repository secret scan does not report this file.
+    host_value = "-".join(("host", "github", "token", "8813"))
+    token = "ghp_" + "A1b2" * 9
+    host_values = frozenset({host_value})
+    transcript = start_transcript(
+        model=model,
+        effort="high",
+        kind="agent",
+        run_id=_RUN_ID,
+        instructions=f"Never print {host_value}.",
+        task=f"The issue quotes {token}.",
+        host_values=host_values,
+    )
+    turn = _anthropic_turn() if model.startswith("claude") else _openai_turn(_OPENAI_SHELL_CALL)
+    append_turn(transcript, turn)
+    output: str | tuple[ShellChunk, ...] = f"GH_TOKEN={host_value}\n"
+    if not model.startswith("claude"):
+        output = (ShellChunk(stdout=f"GH_TOKEN={host_value}\n", stderr=token, exit_code=0),) * 2
+    append_tool_results(
+        transcript,
+        [ToolResult(call_id=turn.tool_calls[0].call_id, output=output)],
+        host_values=host_values,
+    )
+    append_user_text(transcript, f"Do not echo {host_value}.", host_values=host_values)
+
+    stored = canonical_json([transcript.instructions, transcript.items]).decode()
+    assert host_value not in stored
+    assert token not in stored
+    assert transcript.instructions == f"Never print {MODEL_INPUT_REDACTION}."
+    assert f"GH_TOKEN={MODEL_INPUT_REDACTION}" in stored
+    assert stored.count(MODEL_INPUT_REDACTION) >= 4
