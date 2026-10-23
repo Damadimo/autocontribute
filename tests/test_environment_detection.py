@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from autocontribute.environment_detection import detect_recipe
+from autocontribute.environment_detection import detect_recipe, reported_test_command
 from autocontribute.environment_signals import RepositorySignals, read_signals
 from autocontribute.environments import EnvironmentOverride
 from autocontribute.exceptions import EnvironmentRecipeError
@@ -793,6 +793,19 @@ def test_override_test_commands_keep_their_text_unless_they_are_one_runner_call(
     )
     assert single.test_command == "go test -json ./cmd/... > /tmp/ac-report.json"
     assert hosts_only.source == "detected"
+
+
+def test_a_given_pytest_command_keeps_its_plugin_options_once() -> None:
+    # sqlfluff: the setup agent's command already turned the cache plugin off.
+    command, framework, report = reported_test_command(
+        "python -m pytest -n 4 -p no:cacheprovider test -m 'not integration'"
+    )
+
+    assert command == (
+        "python -m pytest -n 4 -p no:cacheprovider test -m 'not integration' "
+        "--junitxml=/tmp/ac-report.xml"
+    )
+    assert (framework, report) == ("pytest", "/tmp/ac-report.xml")
 
 
 def test_unknown_languages_need_a_complete_override(tmp_path: Path) -> None:
