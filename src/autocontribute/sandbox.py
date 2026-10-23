@@ -992,12 +992,12 @@ def tag_image(image_id: str, tag: str, *, docker_binary: str = "docker") -> None
             _docker_control(docker_binary, ["image", "rm", line.strip()], environment)
 
 
-def remove_image(image_id: str, *, docker_binary: str = "docker") -> None:
+def remove_image(image_id: str) -> None:
     """Delete an untagged image; best effort, as an image a container still uses stays."""
 
     if not _IMAGE_ID.fullmatch(image_id):
         raise SandboxError("Image ID must be sha256:<64 hex digits>")
-    _docker_control(docker_binary, ["image", "rm", image_id], docker_client_environment())
+    _docker_control("docker", ["image", "rm", image_id], docker_client_environment())
 
 
 def _registry_digest(reference: str, repository_digests: object) -> str | None:

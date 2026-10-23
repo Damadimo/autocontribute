@@ -189,6 +189,8 @@ def _recipe() -> EnvironmentRecipe:
         setup_commands=[
             # Setup sees .git read-only, like every container that mounts the workspace.
             "! touch .git/probe 2>/dev/null",
+            # Only the root bootstrap's container gets capabilities back.
+            "grep -Eq '^CapBnd:[[:space:]]+0+$' /proc/self/status",
             "python -m venv /opt/ac/venv",
             "pip install --no-cache-dir --disable-pip-version-check -e . pytest",
             # Left behind on purpose: setup must undo it before the snapshot.

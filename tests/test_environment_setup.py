@@ -180,7 +180,7 @@ def docker(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
     monkeypatch.setattr(
         environment_setup,
         "remove_image",
-        lambda image_id, **_: calls["removed"].append(image_id),
+        lambda image_id: calls["removed"].append(image_id),
     )
     return calls
 
