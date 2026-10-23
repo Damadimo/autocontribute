@@ -16,6 +16,8 @@ class _FakeUpstream:
 
     def __init__(self) -> None:
         self.heads: list[str] = []
+        # What arrived after a plain request's head, before the answer.
+        self.trailing: list[bytes] = []
 
     async def handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         head = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1")
@@ -26,6 +28,10 @@ class _FakeUpstream:
                 writer.write(data.upper())
                 await writer.drain()
         else:
+            try:
+                self.trailing.append(await asyncio.wait_for(reader.read(1024), 0.3))
+            except TimeoutError:
+                self.trailing.append(b"")
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
             await writer.drain()
         writer.close()
@@ -138,6 +144,21 @@ def test_plain_get_is_forwarded_without_hop_by_hop_headers() -> None:
         "Host: deb.debian.org\r\nuser-agent: apt\r\n"
         f"Proxy-Authorization: {_UPSTREAM_AUTHORIZATION}\r\nConnection: close\r\n\r\n"
     ]
+
+
+def test_plain_requests_forward_nothing_the_client_sends_after_the_head() -> None:
+    async def scenario(port: int, _fake: _FakeUpstream) -> None:
+        response = await _exchange(
+            port,
+            b"GET http://deb.debian.org/debian/ HTTP/1.1\r\nHost: deb.debian.org\r\n\r\n"
+            b"GET http://evil.example/ HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+        )
+        assert response.endswith(b"\r\n\r\nhello")
+
+    fake = _run(scenario)
+
+    assert len(fake.heads) == 1
+    assert fake.trailing == [b""]
 
 
 @pytest.mark.parametrize(

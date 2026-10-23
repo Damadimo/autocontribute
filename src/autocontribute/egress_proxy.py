@@ -155,7 +155,9 @@ class EgressProxy:
             if method == "CONNECT":
                 writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 await writer.drain()
-            await _relay(reader, writer, server_reader, server_writer)
+            # A GET or HEAD sends nothing after its head. Relaying what follows would let a
+            # second request reach the operator's proxy without the allowlist check.
+            await _relay(reader, writer, server_reader, server_writer, upload=method == "CONNECT")
         finally:
             server_writer.close()
 
@@ -340,8 +342,13 @@ async def _relay(
     client_writer: asyncio.StreamWriter,
     server_reader: asyncio.StreamReader,
     server_writer: asyncio.StreamWriter,
+    *,
+    upload: bool,
 ) -> None:
-    """Copy bytes both ways until both sides finish or neither sends anything for a while."""
+    """Copy the server's bytes to the client, and the client's to the server when ``upload``.
+
+    Stops when every direction finishes or nothing moves for a while.
+    """
 
     loop = asyncio.get_running_loop()
     last_activity = loop.time()
@@ -359,10 +366,9 @@ async def _relay(
                 with suppress(OSError, RuntimeError):
                     sink.write_eof()
 
-    tasks = {
-        asyncio.create_task(pump(client_reader, server_writer)),
-        asyncio.create_task(pump(server_reader, client_writer)),
-    }
+    tasks = {asyncio.create_task(pump(server_reader, client_writer))}
+    if upload:
+        tasks.add(asyncio.create_task(pump(client_reader, server_writer)))
     pending = tasks
     while pending:
         _, pending = await asyncio.wait(pending, timeout=_IDLE_CHECK_SECONDS)
@@ -393,8 +399,8 @@ def _log(decision: str, method: str, target: str, reason: str) -> None:
     print(f"{decision} {method} {shown}{f': {reason}' if reason else ''}", flush=True)
 
 
-async def _serve_forever(proxy: EgressProxy, port: int) -> None:
-    server = await proxy.start("0.0.0.0", port)
+async def _serve_forever(proxy: EgressProxy) -> None:
+    server = await proxy.start("0.0.0.0", LISTEN_PORT)
     print(READY_MESSAGE, flush=True)
     async with server:
         await server.serve_forever()
@@ -402,17 +408,14 @@ async def _serve_forever(proxy: EgressProxy, port: int) -> None:
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="egress-proxy")
-    parser.add_argument("--port", type=int, default=LISTEN_PORT)
     parser.add_argument("--allow", action="append", default=[], metavar="HOST")
-    parser.add_argument("--max-connections", type=int, default=_DEFAULT_MAX_CONNECTIONS)
     arguments = parser.parse_args(argv)
     proxy = EgressProxy(
         arguments.allow,
-        max_connections=arguments.max_connections,
         https_upstream=Upstream.from_environment(os.environ, "HTTPS_PROXY"),
         http_upstream=Upstream.from_environment(os.environ, "HTTP_PROXY"),
     )
-    asyncio.run(_serve_forever(proxy, arguments.port))
+    asyncio.run(_serve_forever(proxy))
 
 
 if __name__ == "__main__":
