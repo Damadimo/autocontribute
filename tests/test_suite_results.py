@@ -41,7 +41,11 @@ def test_junit_reports_give_each_test_its_worst_outcome_and_message() -> None:
             "tests.test_mod::test_skip", "skipped", 0.0, "needs network"
         ),
         "tests.test_broken": CaseResult(
-            "tests.test_broken", "error", None, "ImportError while importing test module"
+            "tests.test_broken",
+            "error",
+            None,
+            "ImportError while importing test module",
+            collection_error=True,
         ),
         "tests.test_mod.TestA::test_param[1-2]": CaseResult(
             "tests.test_mod.TestA::test_param[1-2]", "error", 0.01, "error in teardown"
@@ -117,7 +121,11 @@ def test_jest_and_vitest_reports_name_tests_by_file_and_full_name() -> None:
             ),
             "src/sum.test.js::later": CaseResult("src/sum.test.js::later", "skipped", None, ""),
             "src/broken.test.js": CaseResult(
-                "src/broken.test.js", "error", None, "SyntaxError: Unexpected token"
+                "src/broken.test.js",
+                "error",
+                None,
+                "SyntaxError: Unexpected token",
+                collection_error=True,
             ),
         }
 
@@ -187,7 +195,9 @@ def test_go_test_events_give_per_test_results_and_package_failures() -> None:
         "example.com/m/b::TestCrash": CaseResult(
             "example.com/m/b::TestCrash", "error", None, "the test did not finish"
         ),
-        "example.com/m/c": CaseResult("example.com/m/c", "error", 0.0, "# example.com/m/c"),
+        "example.com/m/c": CaseResult(
+            "example.com/m/c", "error", 0.0, "# example.com/m/c", collection_error=True
+        ),
     }
 
 
@@ -229,6 +239,31 @@ test src/lib.rs - add (line 3) ... ok
         "tests::slow": CaseResult("tests::slow", "skipped", None, ""),
         "src/lib.rs - add (line 3)": CaseResult("src/lib.rs - add (line 3)", "passed", None, ""),
     }
+    # The worse result stands whichever binary reports it first.
+    failed_first = parse_report("cargo", b"test a ... FAILED\ntest a ... ok\ntest a ... ignored\n")
+    assert failed_first["a"].status == "failed"
+
+
+def test_report_identifiers_and_messages_are_bounded() -> None:
+    body = "x" * 100_000
+    name = "n" * 5_000
+    junit = (
+        f'<testsuites><testcase classname="c" name="{name}">'
+        f'<failure message="">{body}</failure></testcase></testsuites>'
+    ).encode()
+    events = [
+        {"Action": "run", "Package": "p", "Test": "TestBig"},
+        *({"Action": "output", "Package": "p", "Test": "TestBig", "Output": "y" * 1_000},) * 100,
+        {"Action": "fail", "Package": "p", "Test": "TestBig"},
+    ]
+    go = b"\n".join(json.dumps(event).encode() for event in events)
+    libtest = f"test {name} ... FAILED\n---- {name} stdout ----\n{body}\n".encode()
+
+    for framework, report in (("pytest", junit), ("go", go), ("cargo", libtest)):
+        (result,) = parse_report(framework, report).values()
+        assert len(result.test_id) <= 1_000
+        assert result.status == "failed"
+        assert 0 < len(result.message) <= 2_000
 
 
 @pytest.mark.parametrize(

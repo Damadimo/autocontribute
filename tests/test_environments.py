@@ -39,7 +39,6 @@ def _recipe(**changes: Any) -> EnvironmentRecipe:
 def test_recipe_round_trips_through_json_with_defaults_for_setup_results() -> None:
     recipe = _recipe()
 
-    assert recipe.targeted is False
     assert recipe.setup_dirty_paths == []
     assert EnvironmentRecipe.model_validate_json(recipe.model_dump_json()) == recipe
 

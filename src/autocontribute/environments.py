@@ -60,8 +60,6 @@ class EnvironmentRecipe(DomainModel):
     # Setup fetches tags first, for versions derived from Git (research-envsetup.md §B5).
     fetch_tags: bool
     fetch_submodules: bool
-    # The full suite exceeds the time limit, so validation runs related tests only (§5.3).
-    targeted: bool = False
     # Tracked files setup changed and new files it left that Git does not ignore; they are
     # restored before the snapshot so they never reach a patch (§5.2).
     setup_dirty_paths: list[str] = Field(default_factory=list)

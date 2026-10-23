@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any, ClassVar
@@ -9,9 +10,9 @@ import pytest
 import autocontribute.suite_runs as suite_runs
 from autocontribute.config import SandboxConfig
 from autocontribute.domain import CommandResult
-from autocontribute.environments import EnvironmentBaseline, EnvironmentRecipe
+from autocontribute.environments import EnvironmentBaseline, EnvironmentRecipe, TestFramework
 from autocontribute.sandbox import SessionCommandResult
-from autocontribute.suite_results import CaseResult, CaseStatus
+from autocontribute.suite_results import CaseResult, CaseStatus, parse_report
 from autocontribute.suite_runs import (
     SUITE_TEST_ID,
     Reproduction,
@@ -259,17 +260,28 @@ def test_baseline_runs_twice_and_a_third_time_when_results_differ(
     assert baseline.collected == 4
     assert baseline.exit_codes == [1, 1, 1]
 
-    planned[:] = [_suite({}, timed_out=True), _suite({"a": "passed"})]
-    timed_out, runs = run_baseline(
-        SandboxConfig(),
-        image_id=_IMAGE,
-        recipe=_recipe(),
-        snapshot=tmp_path,
-        base_sha=_BASE_SHA,
-        run_id="run1",
-        store_root=tmp_path,
+    def baseline_runs(*suites: SuiteRun) -> int:
+        planned[:] = list(suites)
+        timeouts.clear()
+        _, runs = run_baseline(
+            SandboxConfig(),
+            image_id=_IMAGE,
+            recipe=_recipe(),
+            snapshot=tmp_path,
+            base_sha=_BASE_SHA,
+            run_id="run1",
+            store_root=tmp_path,
+        )
+        assert len(timeouts) == len(runs)
+        return len(runs)
+
+    same = _suite({"a": "passed", "b": "failed"})
+    assert baseline_runs(same, same, same) == 2
+    # A run that timed out or broke fails the gate; repeating it would only cost time.
+    assert baseline_runs(_suite({}, timed_out=True), same) == 1
+    assert (
+        baseline_runs(_suite({}, failure="the build command failed with exit 2: make"), same) == 1
     )
-    assert len(runs) == 1 and timed_out.timed_out
 
 
 def test_baseline_sorts_tests_by_how_their_results_held() -> None:
@@ -349,46 +361,163 @@ def test_acceptance_gate_refuses_failures_dominated_by_a_broken_environment() ->
     assert _accepted([suite(offline), suite(offline)]) is None
 
 
-def test_a_suite_over_the_time_limit_is_accepted_for_targeted_validation() -> None:
-    assert _accepted([_suite({}, timed_out=True)]) is None
-
-
-def _baseline() -> EnvironmentBaseline:
-    return summarize_baseline(
-        [_suite({"keep": "passed", "old_fail": "failed", "changed": "passed"})] * 2,
-        base_sha=_BASE_SHA,
+def test_a_suite_over_the_time_limit_is_refused() -> None:
+    # A hung test command collects nothing; acceptance needs a finished run.
+    assert _accepted([_suite({}, timed_out=True, duration_seconds=900.0)]) == (
+        "the test command did not finish within 900 s"
     )
+
+
+def _reported(framework: TestFramework, report: bytes) -> SuiteRun:
+    return _suite({}, results=parse_report(framework, report))
+
+
+def _junit(*cases: str) -> bytes:
+    return ("<testsuites><testsuite>" + "".join(cases) + "</testsuite></testsuites>").encode()
+
+
+def _case(classname: str, name: str, outcome: str = "") -> str:
+    return f'<testcase classname="{classname}" name="{name}" time="0.1">{outcome}</testcase>'
+
+
+_ASSERTION = '<failure message="AssertionError: assert 2 == 3">assert 2 == 3</failure>'
+_FIXTURE_ERROR = '<error message="failed on setup with &quot;KeyError&quot;">KeyError</error>'
+_COLLECTION_ERROR = '<error message="collection failure">ImportError: cannot import sub</error>'
 
 
 def test_red_step_finds_new_and_newly_failing_tests_and_what_they_reproduce() -> None:
-    red = _suite({"keep": "passed", "old_fail": "failed", "changed": "failed"})
-    red.results["new_assert"] = CaseResult("new_assert", "failed", None, "AssertionError")
-    red.results["new_import"] = CaseResult(
-        "new_import", "failed", None, "ImportError: cannot import name 'fix'"
+    base = _reported(
+        "pytest",
+        _junit(
+            _case("tests.test_calc", "test_add"),
+            _case("tests.test_cli", "test_run"),
+            _case("tests.test_cli", "test_old_fail", _ASSERTION),
+        ),
     )
-    red.results["new_pass"] = CaseResult("new_pass", "passed", None, "")
+    baseline = summarize_baseline([base, base], base_sha=_BASE_SHA)
+    # The patch adds tests to test_calc for a function that does not exist yet, changes
+    # test_run, and adds a test whose fixture errors.
+    red = _reported(
+        "pytest",
+        _junit(
+            _case("", "tests.test_calc", _COLLECTION_ERROR),
+            _case("tests.test_cli", "test_run", _ASSERTION),
+            _case("tests.test_cli", "test_old_fail", _ASSERTION),
+            _case("tests.test_cli.TestNew", "test_assert", _ASSERTION),
+            _case("tests.test_cli.TestNew", "test_fixture", _FIXTURE_ERROR),
+            _case("tests.test_cli.TestNew", "test_pass"),
+        ),
+    )
 
-    found = reproduction(_baseline(), red)
+    found = reproduction(baseline, red)
 
     assert found == Reproduction(
-        targets=("changed", "new_assert", "new_import", "new_pass"),
-        reproduced=("changed", "new_assert"),
+        targets=(
+            "tests.test_cli.TestNew::test_assert",
+            "tests.test_cli.TestNew::test_fixture",
+            "tests.test_cli.TestNew::test_pass",
+            "tests.test_cli::test_run",
+        ),
+        reproduced=("tests.test_cli.TestNew::test_assert", "tests.test_cli::test_run"),
+        uncollected=("tests.test_calc",),
     )
-    assert reproduction(_baseline(), _suite({}, timed_out=True)) == Reproduction((), ())
-    assert reproduction(_baseline(), _suite({"x": "failed"}, per_test=False)).targets == ()
+    assert reproduction(baseline, _suite({}, timed_out=True)) == Reproduction((), (), ())
+    assert reproduction(baseline, _suite({"x": "failed"}, per_test=False)).targets == ()
 
 
 def test_green_step_needs_every_target_to_pass_in_every_run() -> None:
-    found = Reproduction(targets=("changed", "new"), reproduced=("changed",))
-    passing = _suite({"changed": "passed", "new": "passed"})
+    found = Reproduction(
+        targets=("tests.test_cli::test_run",), reproduced=(), uncollected=("tests.test_calc",)
+    )
 
+    def green(*calc: str) -> SuiteRun:
+        return _reported("pytest", _junit(_case("tests.test_cli", "test_run"), *calc))
+
+    passing = green(
+        _case("tests.test_calc", "test_add"),
+        _case("tests.test_calc.TestSub", "test_sub"),
+        _case("tests.test_calc", "test_slow", '<skipped message="slow"/>'),
+    )
     assert green_failure(found, [passing, passing, passing]) is None
     assert green_failure(found, []) == "the patched tests were not run"
-    assert green_failure(found, [passing, _suite({"changed": "passed"})]) == (
-        "run 2 did not pass 1 patched tests: new"
+    assert green_failure(found, [passing, _suite({})]) == (
+        "run 2 did not pass 2 patched tests: tests.test_cli::test_run, tests.test_calc"
     )
+    assert green_failure(found, [green(_case("", "tests.test_calc", _COLLECTION_ERROR))]) == (
+        "run 1 did not pass 1 patched tests: tests.test_calc"
+    )
+    assert green_failure(
+        found,
+        [green(_case("tests.test_calc", "test_add"), _case("tests.test_calc", "b", _ASSERTION))],
+    ) == ("run 1 did not pass 1 patched tests: tests.test_calc::b")
     assert green_failure(found, [_suite({}, timed_out=True)]) == (
         "run 1 of the patched tests timed out"
+    )
+
+
+def _go_events(*events: dict[str, object]) -> bytes:
+    return b"\n".join(json.dumps(event).encode() for event in events)
+
+
+def test_red_green_on_a_go_package_that_does_not_build_without_the_fix() -> None:
+    package = "example.com/m/calc"
+    base = _reported(
+        "go",
+        _go_events(
+            {"Action": "run", "Package": package, "Test": "TestAdd"},
+            {"Action": "pass", "Package": package, "Test": "TestAdd"},
+            {"Action": "pass", "Package": package},
+        ),
+    )
+    baseline = summarize_baseline([base, base], base_sha=_BASE_SHA)
+    red = _reported(
+        "go",
+        _go_events(
+            {"Action": "output", "Package": package, "Output": "calc_test.go:9: undefined: Sub\n"},
+            {"Action": "fail", "Package": package},
+        ),
+    )
+
+    found = reproduction(baseline, red)
+
+    assert found == Reproduction(targets=(), reproduced=(), uncollected=(package,))
+    green = _reported(
+        "go",
+        _go_events(
+            {"Action": "run", "Package": package, "Test": "TestAdd"},
+            {"Action": "pass", "Package": package, "Test": "TestAdd"},
+            {"Action": "run", "Package": package, "Test": "TestSub"},
+            {"Action": "pass", "Package": package, "Test": "TestSub"},
+            {"Action": "pass", "Package": package},
+        ),
+    )
+    assert green_failure(found, [green] * 3) is None
+    assert green_failure(found, [red]) == f"run 1 did not pass 1 patched tests: {package}"
+
+
+def test_red_green_on_a_jest_file_that_fails_to_load_without_the_fix() -> None:
+    def jest(*suites: dict[str, object]) -> SuiteRun:
+        return _reported("jest", json.dumps({"testResults": list(suites)}).encode())
+
+    loading = {
+        "name": "/workspace/src/sub.test.js",
+        "status": "failed",
+        "message": "Cannot find module '../sub' from 'src/sub.test.js'",
+        "assertionResults": [],
+    }
+    passing = {
+        "name": "/workspace/src/sub.test.js",
+        "status": "passed",
+        "assertionResults": [{"fullName": "sub works", "status": "passed"}],
+    }
+    baseline = summarize_baseline([jest(), jest()], base_sha=_BASE_SHA)
+
+    found = reproduction(baseline, jest(loading))
+
+    assert found == Reproduction(targets=(), reproduced=(), uncollected=("src/sub.test.js",))
+    assert green_failure(found, [jest(passing)] * 3) is None
+    assert green_failure(found, [jest(loading)]) == (
+        "run 1 did not pass 1 patched tests: src/sub.test.js"
     )
 
 
