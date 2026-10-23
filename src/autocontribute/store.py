@@ -47,6 +47,9 @@ _HTTPS_KEY: Final = re.compile(r"^https://[^\s/]+(?:/\S*)?$")
 # Escalating holds in this many repositories within the window stop everything.
 _ESCALATION_REPOSITORIES: Final = 2
 _ESCALATION_WINDOW: Final = timedelta(days=30)
+# One run that ends on a GitHub secondary rate limit is transient; this many in a row stop
+# everything, because the schedule itself keeps provoking GitHub.
+_SECONDARY_RATE_LIMIT_ESCALATION_RUNS: Final = 3
 _INITIAL_EVENT_HASH: Final = "0" * 64
 _METADATA_COLUMNS: Final = {"singleton", "schema_version", "migrated_at"}
 _RUN_COLUMNS: Final = {
@@ -128,6 +131,7 @@ _REPOSITORY_POLICY_COLUMNS: Final = {
     "policy_json",
     "recorded_at",
 }
+_SECONDARY_RATE_LIMIT_STREAK_COLUMNS: Final = {"singleton", "consecutive_runs", "started_at"}
 _HOLD_COLUMNS: Final = {
     "id",
     "scope",
@@ -965,6 +969,7 @@ class RunStore:
             "candidate_retry_authorizations",
             "repository_policies",
             "holds",
+            "secondary_rate_limit_streak",
         }:
             raise StateError(f"Refusing to inspect unexpected state table: {table}")
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -1194,6 +1199,14 @@ class RunStore:
             CREATE INDEX holds_active_idx ON holds(scope, scope_key)
             WHERE released_at IS NULL
             """,
+            """
+            CREATE TABLE secondary_rate_limit_streak (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                consecutive_runs INTEGER NOT NULL CHECK(consecutive_runs >= 0),
+                started_at TEXT,
+                CHECK((consecutive_runs = 0) = (started_at IS NULL))
+            )
+            """,
         )
         for statement in statements:
             connection.execute(statement)
@@ -1205,6 +1218,12 @@ class RunStore:
             ) VALUES (1, 0, 1, ?, NULL, NULL, NULL)
             """,
             (created_at,),
+        )
+        connection.execute(
+            """
+            INSERT INTO secondary_rate_limit_streak(singleton, consecutive_runs, started_at)
+            VALUES (1, 0, NULL)
+            """
         )
         connection.execute(
             """
@@ -1268,6 +1287,7 @@ class RunStore:
             "candidate_retry_authorizations": _CANDIDATE_RETRY_AUTHORIZATION_COLUMNS,
             "repository_policies": _REPOSITORY_POLICY_COLUMNS,
             "holds": _HOLD_COLUMNS,
+            "secondary_rate_limit_streak": _SECONDARY_RATE_LIMIT_STREAK_COLUMNS,
         }
         tables = cls._table_names(connection)
         if tables != set(expected):
@@ -3024,6 +3044,52 @@ class RunStore:
                         ).hexdigest(),
                     )
         return True
+
+    def record_run_rate_limits(self, *, ended_on_secondary_limit: bool) -> bool:
+        """Count consecutive runs that end on a GitHub secondary rate limit; return whether this
+        run escalated them to the global stop.
+
+        A run without one ends the streak. Escalating starts a new streak, so a streak that goes
+        on after an operator resumes stops work again three runs later.
+        """
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT consecutive_runs, started_at FROM secondary_rate_limit_streak "
+                "WHERE singleton = 1"
+            ).fetchone()
+            if row is None:
+                raise StateError("Secondary rate-limit streak state is missing")
+            consecutive_runs = int(row["consecutive_runs"]) + 1
+            started_at = str(row["started_at"] or utc_now().isoformat())
+            if (
+                ended_on_secondary_limit
+                and consecutive_runs < _SECONDARY_RATE_LIMIT_ESCALATION_RUNS
+            ):
+                connection.execute(
+                    "UPDATE secondary_rate_limit_streak SET consecutive_runs = ?, started_at = ? "
+                    "WHERE singleton = 1",
+                    (consecutive_runs, started_at),
+                )
+                return False
+            connection.execute(
+                "UPDATE secondary_rate_limit_streak SET consecutive_runs = 0, started_at = NULL "
+                "WHERE singleton = 1"
+            )
+            if not ended_on_secondary_limit:
+                return False
+            return self._trip_circuit_breaker(
+                connection,
+                source="escalation:secondary_rate_limits",
+                reason=(
+                    f"{consecutive_runs} consecutive runs ended on a GitHub secondary rate limit, "
+                    f"the first at {started_at}; spread the schedule out before resuming"
+                ),
+                trigger_hash=hashlib.sha256(
+                    f"secondary-rate-limit-streak:{started_at}".encode()
+                ).hexdigest(),
+            )
 
     def active_holds(self) -> builtins.list[Hold]:
         """Return holds that are neither released nor expired, oldest first."""

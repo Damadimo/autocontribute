@@ -721,8 +721,10 @@ def test_secondary_limit_backs_off_within_the_run_budget_then_ends_the_run(
         )
 
     with _client(handler, safety_trigger_handler=store.record_stop) as github:
+        assert not github.secondary_limit_exhausted
         with pytest.raises(GitHubRateLimitError, match="secondary rate limit"):
             github.authenticated_login()
+        assert github.secondary_limit_exhausted
         assert waits == [60.0, 120.0, 240.0]
         with pytest.raises(GitHubRateLimitError, match="waited 600s"):
             github.authenticated_login()
@@ -758,6 +760,7 @@ def test_secondary_limit_waits_at_least_a_minute_and_recovers(tmp_path, monkeypa
 
     with _client(handler, safety_trigger_handler=store.record_stop) as github:
         assert github.authenticated_login() == "octocat"
+        assert not github.secondary_limit_exhausted
 
     assert waits == [60.0, 120.0, 300.0]
     assert not store.circuit_breaker_status().is_tripped

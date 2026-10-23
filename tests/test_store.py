@@ -565,6 +565,7 @@ def test_fresh_database_has_current_version_and_all_tables(tmp_path: Path) -> No
         "candidate_retry_authorizations",
         "repository_policies",
         "holds",
+        "secondary_rate_limit_streak",
     }
 
 
@@ -2970,6 +2971,36 @@ def test_maintainer_stops_in_a_second_repository_escalate_to_a_global_stop(
         "most recently example/second"
     )
     assert len(store.active_holds()) == 4
+
+
+def test_three_runs_in_a_row_on_secondary_rate_limits_trip_the_breaker(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+
+    assert not store.record_run_rate_limits(ended_on_secondary_limit=True)
+    assert not store.record_run_rate_limits(ended_on_secondary_limit=True)
+    # A run that finishes without one ends the streak.
+    assert not store.record_run_rate_limits(ended_on_secondary_limit=False)
+    assert not store.record_run_rate_limits(ended_on_secondary_limit=True)
+    assert not store.record_run_rate_limits(ended_on_secondary_limit=True)
+    assert not store.circuit_breaker_status().is_tripped
+
+    assert store.record_run_rate_limits(ended_on_secondary_limit=True)
+
+    status = store.circuit_breaker_status()
+    assert status.source == "escalation:secondary_rate_limits"
+    assert status.reason is not None
+    assert status.reason.startswith("3 consecutive runs ended on a GitHub secondary rate limit")
+    assert status.active_revision is not None
+    assert store.resume_circuit_breaker(
+        actor="operator",
+        reason="spread the schedule",
+        expected_trigger_hash=status.active_revision,
+    )
+    # The streak starts again after escalating, so it needs three more runs to stop work.
+    assert not store.record_run_rate_limits(ended_on_secondary_limit=True)
+    assert not store.record_run_rate_limits(ended_on_secondary_limit=True)
+    assert store.record_run_rate_limits(ended_on_secondary_limit=True)
+    assert store.circuit_breaker_status().is_tripped
 
 
 def test_escalating_holds_older_than_thirty_days_do_not_escalate(

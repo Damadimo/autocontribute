@@ -219,11 +219,14 @@ The safety stop is one global switch that never clears itself: while it is on, `
   but does not count, because it is addressed to every contributor);
 - the secret scanner finds credential-like text in a patch, GitHub reports the account suspended,
   or publishing cannot confirm what GitHub did;
+- three `run` invocations in a row end on a GitHub secondary rate limit;
 - you run `autocontribute safety stop --actor NAME --reason "TEXT"`.
 
-GitHub rate limits stop nothing. After a secondary rate limit, a command waits at least 1, then 2,
-then 4 minutes, and 10 minutes at most in total. If GitHub still refuses, the command ends with an
-error (a run ends `failed`), and the next run retries.
+A GitHub rate limit stops only the command that hit it. After a secondary rate limit, a command
+waits at least 1, then 2, then 4 minutes, and 10 minutes at most in total. If GitHub still refuses,
+the command ends with an error (a run ends `failed`), and the next run retries. When three `run`
+invocations in a row end this way, the schedule itself keeps provoking GitHub, and the safety stop
+turns on.
 
 ```bash
 autocontribute safety status   # the safety stop, its triggers, and every active hold
