@@ -42,7 +42,7 @@ from autocontribute.coordination import (
 )
 from autocontribute.discovery import DiscoveryOutcome, DiscoveryService, PolicySnapshot
 from autocontribute.doctor import DoctorCheck, run_doctor
-from autocontribute.domain import RunManifest, RunStatus
+from autocontribute.domain import RunManifest, RunStatus, utc_now
 from autocontribute.exceptions import (
     ApprovalMismatchError,
     AutocontributeError,
@@ -1333,8 +1333,9 @@ def actions_prepare(
     error: str | None = None
     try:
         with _github_client(settings, store) as github:
-            lifecycle = _sync_lifecycle(settings, store, github, reconcile_submitting=False)
-            attention = attention_items(lifecycle, store.list_open_pull_request_runs())
+            synced_from = utc_now()
+            _sync_lifecycle(settings, store, github, reconcile_submitting=False)
+            attention = attention_items(store.list_open_pull_request_runs(), since=synced_from)
             store.assert_circuit_breaker_clear()
             with Orchestrator(settings, store=store, github=github) as orchestrator:
                 manifest = orchestrator.run(
