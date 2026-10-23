@@ -307,6 +307,21 @@ def _oversized_arguments() -> dict[str, object]:
         ),
         (
             "agent",
+            _reply(tool_calls=[{"call_id": "call_1", "name": ["shell"], "arguments": {}}]),
+            "outside its transcript's tool set",
+        ),
+        (
+            "agent",
+            {
+                "protocol": _MODEL_TURN_PROTOCOL,
+                "status": "error",
+                "error_code": ["provider_error"],
+                "message": "Model provider request failed",
+            },
+            "unknown error code",
+        ),
+        (
+            "agent",
             _reply(
                 tool_calls=[
                     {"call_id": "call_1", "name": "shell", "arguments": {}},
@@ -353,6 +368,8 @@ def _oversized_arguments() -> dict[str, object]:
     ids=[
         "tool-outside-kind",
         "other-providers-tool",
+        "non-string-name",
+        "non-string-error-code",
         "repeated-call-id",
         "oversized-arguments",
         "other-model",

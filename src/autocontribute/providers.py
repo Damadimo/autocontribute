@@ -461,7 +461,11 @@ def _raise_worker_error(envelope: dict[str, object]) -> NoReturn:
     if set(envelope) != expected_keys:
         raise ModelError("Model worker returned an invalid error envelope")
     message = envelope.get("message")
-    if error_code not in {"provider_error", "provider_request_error", "worker_error"}:
+    if not isinstance(error_code, str) or error_code not in {
+        "provider_error",
+        "provider_request_error",
+        "worker_error",
+    }:
         raise ModelError("Model worker returned an unknown error code")
     if (
         not isinstance(message, str)
@@ -559,7 +563,8 @@ def _turn_result(payload: bytes, *, spec: ModelSpec, kind: TranscriptKind) -> Tu
         raise ModelError("Model worker returned invalid tool calls")
     allowed_names = tool_call_names(spec.provider, kind)
     for call in tool_calls:
-        if call.get("name") not in allowed_names:
+        name = call.get("name")
+        if not isinstance(name, str) or name not in allowed_names:
             raise ModelError("Model called a tool outside its transcript's tool set")
         if len(_canonical_json_bytes(call.get("arguments"))) > MAX_TOOL_ARGUMENT_BYTES:
             raise ModelError("Model tool call arguments exceeded the size limit")
