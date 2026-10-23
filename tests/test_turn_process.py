@@ -261,6 +261,45 @@ def test_step_refuses_a_transcript_that_is_not_waiting_for_the_model(
     assert not record.exists()
 
 
+def test_step_caps_the_output_limit_and_the_timeout_for_the_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, record = _provider(tmp_path, monkeypatch, _reply())
+
+    provider.step(transcript=_transcript(), max_output_tokens=200_000, timeout_seconds=900)
+
+    request = json.loads(record.read_text(encoding="utf-8"))["request"]
+    assert (request["max_output_tokens"], request["timeout_seconds"]) == (128_000, 600.0)
+
+
+@pytest.mark.parametrize(
+    ("max_output_tokens", "timeout_seconds", "message"),
+    [
+        (0, 30.0, "output-token limit must be a positive integer"),
+        (1_000, 0.0, "timeout must be positive"),
+        (1_000, float("nan"), "timeout must be positive"),
+    ],
+)
+def test_step_refuses_non_positive_limits_before_a_worker_starts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_output_tokens: int,
+    timeout_seconds: float,
+    message: str,
+) -> None:
+    provider, record = _provider(tmp_path, monkeypatch, _reply())
+
+    with pytest.raises(ModelError, match=message):
+        provider.step(
+            transcript=_transcript(),
+            max_output_tokens=max_output_tokens,
+            timeout_seconds=timeout_seconds,
+        )
+
+    assert not record.exists()
+
+
 def test_step_kills_a_worker_that_outlives_the_turn_deadline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

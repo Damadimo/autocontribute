@@ -500,10 +500,23 @@ def test_critic_declares_its_tools_and_submits_a_review(monkeypatch: pytest.Monk
         (_error(429, "rate_limit_error", {"retry-after-ms": "1500"}), 429, 1.5, True),
         (_error(500, "api_error"), 500, None, True),
         (_error_event("overloaded_error"), 529, None, True),
+        (_error_event("api_error"), 500, None, True),
+        (_error_event("rate_limit_error"), 429, None, True),
+        (_error_event("invalid_request_error"), 400, None, False),
         (_error(400, "invalid_request_error"), 400, None, False),
         (_error(402, "billing_error"), 402, None, False),
     ],
-    ids=["overloaded", "rate-limited", "server-error", "overloaded-mid-stream", "bad", "billing"],
+    ids=[
+        "overloaded",
+        "rate-limited",
+        "server-error",
+        "overloaded-mid-stream",
+        "server-error-mid-stream",
+        "rate-limited-mid-stream",
+        "bad-mid-stream",
+        "bad",
+        "billing",
+    ],
 )
 def test_http_errors_map_into_the_retry_classification(
     monkeypatch: pytest.MonkeyPatch,
@@ -535,6 +548,27 @@ def test_http_errors_map_into_the_retry_classification(
         jitter=0.0,
     )
     assert decision.retry is retried
+
+
+def test_an_unlisted_error_type_mid_stream_is_retried_like_a_dropped_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve(monkeypatch, _error_event("upstream_private_error"))
+
+    with pytest.raises(ModelRequestError) as raised:
+        anthropic_adapter.step(_request())
+
+    assert str(raised.value) == f"Anthropic Messages request failed (request ID: {_REQUEST_ID})"
+    assert raised.value.status_code is None
+    decision = retry_decision(
+        status_code=None,
+        provider_code=None,
+        retry_after=None,
+        timed_out=False,
+        attempt=1,
+        jitter=0.0,
+    )
+    assert (decision.retry, decision.reason) == (True, "connection error")
 
 
 def test_connection_errors_are_retried_without_a_status(monkeypatch: pytest.MonkeyPatch) -> None:
