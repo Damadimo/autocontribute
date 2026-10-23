@@ -150,7 +150,7 @@ jobs:
           AUTOCONTRIBUTE_RUN_DOCKER_TESTS: "1"
         run: >-
           uv run pytest -q tests/test_sandbox_live.py tests/test_environments_live.py
-          tests/test_agent_loop_live.py
+          tests/test_agent_loop_live.py tests/test_validation_live.py
 
   security-integration-gate:
     name: Security integration gate
