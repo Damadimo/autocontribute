@@ -16,6 +16,7 @@ from typing import Literal, Protocol
 from urllib.parse import unquote, urlparse
 
 from autocontribute.ai_policy import (
+    AGENT_INSTRUCTION_FILES,
     AiPolicyQuote,
     PolicyFile,
     RepositoryAiPolicy,
@@ -356,9 +357,6 @@ MAX_POLICY_TOTAL_BYTES = 4_000_000
 # policy review independent of repository size.
 _POLICY_DIRECTORIES = frozenset({".github", "docs"})
 _TEXT_SUFFIXES = frozenset({"", ".adoc", ".markdown", ".md", ".rst", ".txt"})
-_AGENT_INSTRUCTION_FILES = frozenset(
-    {"agents.md", "claude.md", "gemini.md", "copilot-instructions.md"}
-)
 _CONTRIBUTION_GUIDES = frozenset(
     {
         "contribute",
@@ -1336,14 +1334,15 @@ class DiscoveryService:
                     linked.append(path)
         linked_files, linked_problems = self._read_policy_files(repository, ref, linked, read=files)
         folded = [path.casefold() for path in listed]
-        if len(folded) != len(set(folded)):
-            linked_problems += (
-                f"policy paths of {repository} differ only by case; their precedence is ambiguous",
-            )
+        ambiguous = (
+            (f"policy paths of {repository} differ only by case; their precedence is ambiguous",)
+            if len(folded) != len(set(folded))
+            else ()
+        )
         return _PolicySource(
             files=(*files, *linked_files),
             vouched=vouched,
-            problems=(*problems, *linked_problems),
+            problems=(*problems, *linked_problems, *ambiguous),
         )
 
     def _list_policy_paths(self, repository: str, ref: str) -> tuple[list[str], bool]:
@@ -2016,7 +2015,7 @@ def _is_policy_path(path: str) -> bool:
         # Only the top-level README speaks for the whole repository.
         return "/" not in lowered
     return (
-        name in _AGENT_INSTRUCTION_FILES
+        name in AGENT_INSTRUCTION_FILES
         or _is_contribution_guidance(path)
         or _is_pull_request_template(path)
         or _POLICY_NAME.fullmatch(name) is not None
