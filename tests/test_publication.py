@@ -5978,6 +5978,32 @@ def test_same_repository_publication_resumes_after_a_crash_after_its_push(
     assert "ensure_fork" not in github.calls
 
 
+def test_same_repository_publication_resumes_after_a_crash_after_its_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, run_id, github, publisher, pushes = _same_repository_publisher(
+        tmp_path, monkeypatch, login="example"
+    )
+    original_find = github.find_pull_request
+
+    def crash_after_intent(repository: str, *, head: str) -> str | None:
+        raise RuntimeError("simulated crash after the publication intent")
+
+    monkeypatch.setattr(github, "find_pull_request", crash_after_intent)
+    with pytest.raises(RuntimeError, match="after the publication intent"):
+        publisher.publish(run_id)
+    monkeypatch.setattr(github, "find_pull_request", original_find)
+    assert store.get(run_id).status == RunStatus.SUBMITTING
+    assert not github.mutated
+
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert pushes == [("example/project", published.branch_name, published.commit_sha)]
+    assert "ensure_fork" not in github.calls
+
+
 def test_same_repository_compensation_deletes_only_the_exact_upstream_branch(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6112,7 +6138,10 @@ def test_same_repository_review_refuses_ci_configuration_changes() -> None:
     )
 
 
-@pytest.mark.parametrize("blocker", ["pull_requests_off", "collaborators_only", "unrelated_fork"])
+@pytest.mark.parametrize(
+    "blocker",
+    ["pull_requests_off", "collaborators_only", "unrelated_fork", "renamed_fork"],
+)
 def test_head_repository_checks_fail_before_the_publication_intent(
     tmp_path: Path,
     blocker: str,
@@ -6128,15 +6157,24 @@ def test_head_repository_checks_fail_before_the_publication_intent(
     else:
         original_access = github.get_repository_access
 
-        def unrelated_fork(full_name: str) -> RepositoryAccess | None:
+        def changed_fork(full_name: str) -> RepositoryAccess | None:
             access = original_access(full_name)
             if full_name == "octocat/project":
                 assert access is not None
+                if blocker == "renamed_fork":
+                    return replace(
+                        access,
+                        identity=replace(access.identity, full_name="octocat/project-old"),
+                    )
                 return replace(access, fork_parent=None)
             return access
 
-        github.get_repository_access = unrelated_fork  # type: ignore[method-assign]
-        expected = "octocat/project exists and is not a fork of example/project"
+        github.get_repository_access = changed_fork  # type: ignore[method-assign]
+        expected = (
+            "octocat/project now redirects to octocat/project-old"
+            if blocker == "renamed_fork"
+            else "octocat/project exists and is not a fork of example/project"
+        )
 
     with pytest.raises(PolicyError, match=expected):
         Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]

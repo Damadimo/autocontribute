@@ -86,6 +86,8 @@ quality:
   require_regression_evidence_for_bugfix: true
 
 publishing:
+  login: ""                        # empty = the GitHub token's account
+  head_strategy: auto              # auto | fork
   approval_expires_hours: 72
   draft: false
   ready_for_review: true           # applies only when draft is true
