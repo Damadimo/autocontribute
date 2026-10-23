@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Final, cast
+from typing import Final, Literal, cast
+
+from pydantic import ValidationError
 
 from autocontribute.ai_policy import RepositoryAiPolicy
 from autocontribute.domain import (
@@ -27,6 +29,7 @@ from autocontribute.domain import (
     RunStatus,
     utc_now,
 )
+from autocontribute.environments import EnvironmentBaseline, EnvironmentRecipe
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     PolicyError,
@@ -146,6 +149,18 @@ _HOLD_COLUMNS: Final = {
     "released_by",
     "release_reason",
 }
+_ENVIRONMENT_RECIPE_COLUMNS: Final = {
+    "repository",
+    "cache_key",
+    "recipe_json",
+    "baseline_json",
+    "status",
+    "failure_reason",
+    "updated_at",
+}
+# A repository whose environment could not be built is not retried for this long, unless the
+# configuration overrides its environment (DESIGN §5.6).
+ENVIRONMENT_FAILURE_BLOCK: Final = timedelta(days=7)
 _REQUIRED_INDEXES: Final = {
     "runs_status_idx",
     "runs_candidate_idx",
@@ -782,6 +797,21 @@ class Lease:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredEnvironment:
+    """A repository's last environment outcome, as the recipe cache keeps it (DESIGN §5.6)."""
+
+    repository: str
+    status: Literal["ok", "failed"]
+    # None only for a failure that came before the cache key could be computed.
+    cache_key: str | None
+    # The recipe that worked, or the one that failed when there was one.
+    recipe: EnvironmentRecipe | None
+    baseline: EnvironmentBaseline | None
+    failure_reason: str | None
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class CircuitBreakerStatus:
     is_tripped: bool
     epoch: int
@@ -970,6 +1000,7 @@ class RunStore:
             "repository_policies",
             "holds",
             "secondary_rate_limit_streak",
+            "environment_recipes",
         }:
             raise StateError(f"Refusing to inspect unexpected state table: {table}")
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -1207,6 +1238,29 @@ class RunStore:
                 CHECK((consecutive_runs = 0) = (started_at IS NULL))
             )
             """,
+            """
+            CREATE TABLE environment_recipes (
+                repository TEXT PRIMARY KEY COLLATE NOCASE,
+                cache_key TEXT CHECK(
+                    cache_key IS NULL OR (
+                        length(cache_key) = 64
+                        AND cache_key NOT GLOB '*[^0-9a-f]*'
+                    )
+                ),
+                recipe_json TEXT,
+                baseline_json TEXT,
+                status TEXT NOT NULL CHECK(status IN ('ok', 'failed')),
+                failure_reason TEXT,
+                updated_at TEXT NOT NULL,
+                CHECK(
+                    (status = 'ok' AND cache_key IS NOT NULL AND recipe_json IS NOT NULL
+                        AND baseline_json IS NOT NULL AND failure_reason IS NULL)
+                    OR
+                    (status = 'failed' AND baseline_json IS NULL
+                        AND failure_reason IS NOT NULL)
+                )
+            )
+            """,
         )
         for statement in statements:
             connection.execute(statement)
@@ -1288,6 +1342,7 @@ class RunStore:
             "repository_policies": _REPOSITORY_POLICY_COLUMNS,
             "holds": _HOLD_COLUMNS,
             "secondary_rate_limit_streak": _SECONDARY_RATE_LIMIT_STREAK_COLUMNS,
+            "environment_recipes": _ENVIRONMENT_RECIPE_COLUMNS,
         }
         tables = cls._table_names(connection)
         if tables != set(expected):
@@ -3363,6 +3418,128 @@ class RunStore:
             rows = connection.execute(query, finished).fetchall()
         return frozenset(str(row["run_id"]) for row in rows)
 
+    def environment(self, repository: str) -> StoredEnvironment | None:
+        """Return the repository's cached environment outcome, if any."""
+
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT repository, cache_key, recipe_json, baseline_json, status,
+                       failure_reason, updated_at
+                FROM environment_recipes WHERE repository = ?
+                """,
+                (_environment_repository(repository),),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            recipe = (
+                None
+                if row["recipe_json"] is None
+                else EnvironmentRecipe.model_validate_json(row["recipe_json"])
+            )
+            baseline = (
+                None
+                if row["baseline_json"] is None
+                else EnvironmentBaseline.model_validate_json(row["baseline_json"])
+            )
+        except ValidationError as exc:
+            raise StateError(f"Stored environment of {row['repository']} is invalid") from exc
+        return StoredEnvironment(
+            repository=str(row["repository"]),
+            status="ok" if row["status"] == "ok" else "failed",
+            cache_key=None if row["cache_key"] is None else str(row["cache_key"]),
+            recipe=recipe,
+            baseline=baseline,
+            failure_reason=None if row["failure_reason"] is None else str(row["failure_reason"]),
+            updated_at=_stored_datetime(row["updated_at"], field="environment update time"),
+        )
+
+    def save_environment(
+        self, recipe: EnvironmentRecipe, *, cache_key: str, baseline: EnvironmentBaseline
+    ) -> None:
+        """Record a recipe that built an accepted environment, replacing any earlier outcome."""
+
+        self._put_environment(
+            recipe.repository,
+            status="ok",
+            cache_key=cache_key,
+            recipe_json=recipe.model_dump_json(),
+            baseline_json=baseline.model_dump_json(),
+            failure_reason=None,
+        )
+
+    def mark_environment_failed(
+        self,
+        repository: str,
+        *,
+        reason: str,
+        cache_key: str | None = None,
+        recipe: EnvironmentRecipe | None = None,
+    ) -> None:
+        """Record that no environment could be built; see :meth:`environment_block`."""
+
+        self._put_environment(
+            repository,
+            status="failed",
+            cache_key=cache_key,
+            recipe_json=None if recipe is None else recipe.model_dump_json(),
+            baseline_json=None,
+            failure_reason=_bounded_text(reason, field="environment failure reason", maximum=2_000),
+        )
+
+    def environment_block(self, repository: str, *, now: datetime | None = None) -> str | None:
+        """Return why the repository's environment failed in the last 7 days, or ``None``."""
+
+        stored = self.environment(repository)
+        checked_at = _aware_utc(now or utc_now(), field="environment block check time")
+        if (
+            stored is None
+            or stored.status != "failed"
+            or stored.updated_at <= checked_at - ENVIRONMENT_FAILURE_BLOCK
+        ):
+            return None
+        return stored.failure_reason
+
+    def _put_environment(
+        self,
+        repository: str,
+        *,
+        status: Literal["ok", "failed"],
+        cache_key: str | None,
+        recipe_json: str | None,
+        baseline_json: str | None,
+        failure_reason: str | None,
+    ) -> None:
+        if cache_key is not None and not _SHA256.fullmatch(cache_key):
+            raise ValueError("environment cache key must be a lowercase SHA-256 hex digest")
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO environment_recipes(
+                    repository, cache_key, recipe_json, baseline_json, status,
+                    failure_reason, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repository) DO UPDATE SET
+                    repository = excluded.repository,
+                    cache_key = excluded.cache_key,
+                    recipe_json = excluded.recipe_json,
+                    baseline_json = excluded.baseline_json,
+                    status = excluded.status,
+                    failure_reason = excluded.failure_reason,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    _environment_repository(repository),
+                    cache_key,
+                    recipe_json,
+                    baseline_json,
+                    status,
+                    failure_reason,
+                    utc_now().isoformat(),
+                ),
+            )
+
     def _remove_workspace(self, run_id: str) -> None:
         """Best-effort deletion of a finished run's clone; its evidence in runs/ stays."""
 
@@ -4580,6 +4757,12 @@ def _repository_identity(value: str) -> str:
     return normalized
 
 
+def _environment_repository(value: str) -> str:
+    if not isinstance(value, str) or not _CANDIDATE_REPOSITORY.fullmatch(value):
+        raise ValueError("environment repository must use owner/name syntax")
+    return value
+
+
 def _candidate_identity(repository: str, issue_number: int) -> tuple[str, int]:
     normalized_repository = _repository_identity(repository)
     if repository != repository.strip() or any(
@@ -4634,6 +4817,7 @@ def _fsync_directory(directory: Path) -> None:
 
 __all__ = [
     "CURRENT_SCHEMA_VERSION",
+    "ENVIRONMENT_FAILURE_BLOCK",
     "RECOVERABLE_IN_FLIGHT_STATUSES",
     "CandidateAttemptDisposition",
     "CandidateAttemptState",
@@ -4643,4 +4827,5 @@ __all__ = [
     "Lease",
     "PublicationReservation",
     "RunStore",
+    "StoredEnvironment",
 ]

@@ -566,6 +566,7 @@ def test_fresh_database_has_current_version_and_all_tables(tmp_path: Path) -> No
         "repository_policies",
         "holds",
         "secondary_rate_limit_streak",
+        "environment_recipes",
     }
 
 
