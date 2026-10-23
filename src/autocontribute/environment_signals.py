@@ -100,6 +100,19 @@ _DEPENDENCY_FILE_NAMES: Final = frozenset(
         "yarn.lock",
     }
 )
+# Guidance only the setup agent reads; detection builds nothing from them, so editing one must
+# not discard a cached environment.
+_GUIDANCE_FILES: Final = frozenset(
+    {
+        ".cursor/environment.json",
+        ".devcontainer.json",
+        ".devcontainer/devcontainer.json",
+        ".gitattributes",
+        ".github/copilot-instructions.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+    }
+)
 # Files whose commands name scripts that CI or a task runner runs (§B7: one level deep).
 _COMMAND_FILES: Final = (
     "GNUmakefile",
@@ -122,7 +135,8 @@ class RepositorySignals:
     # The UTF-8 text of every signal file that was read, by path.
     files: Mapping[str, str]
     # (path, object ID) of every file the environment depends on, sorted: manifests and
-    # lockfiles anywhere in the tree, each signal file that was read, and submodule commits.
+    # lockfiles anywhere in the tree, each CI, task-runner and script file that was read, and
+    # submodule commits.
     dependency_files: tuple[tuple[str, str], ...]
 
 
@@ -149,7 +163,7 @@ def read_signals(workspace: RepositoryWorkspace) -> RepositorySignals:
         (entry.path, entry.object_id)
         for entry in entries.values()
         if entry.size is None
-        or entry.path in files
+        or (entry.path in files and not _is_guidance_file(entry.path))
         or PurePosixPath(entry.path).name in _DEPENDENCY_FILE_NAMES
         or _is_requirements_file(entry.path)
     }
@@ -157,17 +171,26 @@ def read_signals(workspace: RepositoryWorkspace) -> RepositorySignals:
 
 
 def _is_signal_file(path: str) -> bool:
-    if path in _ROOT_SIGNAL_FILES:
+    if path in _ROOT_SIGNAL_FILES or _is_contributing_guide(path):
         return True
     pure = PurePosixPath(path)
     directory, name = str(pure.parent), pure.name
     if directory == ".github/workflows":
         return name.endswith((".yml", ".yaml"))
-    if directory in {".", ".github", "docs"} and name.upper().startswith("CONTRIBUTING"):
-        return True
     return pure.suffix == ".txt" and (
         directory == "requirements" or (directory == "." and "requirements" in name)
     )
+
+
+def _is_contributing_guide(path: str) -> bool:
+    pure = PurePosixPath(path)
+    return str(pure.parent) in {".", ".github", "docs"} and pure.name.upper().startswith(
+        "CONTRIBUTING"
+    )
+
+
+def _is_guidance_file(path: str) -> bool:
+    return path in _GUIDANCE_FILES or _is_contributing_guide(path)
 
 
 def _is_requirements_file(path: str) -> bool:

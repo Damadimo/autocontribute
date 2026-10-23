@@ -51,6 +51,8 @@ _BASE = {
     "tools/unused": "#!/bin/sh\nexit 0\n",
     ".github/workflows/ci.yml": "jobs: {}\n",
     ".github/workflows/nested/ignored.yml": "jobs: {}\n",
+    "CONTRIBUTING.md": "Run make test.\n",
+    "AGENTS.md": "Use uv.\n",
     "web/package.json": "{}\n",
     "docs/requirements.txt": "sphinx\n",
 }
@@ -74,10 +76,14 @@ def test_signals_come_from_the_base_commit_not_the_working_tree(tmp_path: Path) 
     assert "uv.lock" not in signals.files
 
 
-def test_dependency_files_cover_manifests_anywhere_and_every_file_read(tmp_path: Path) -> None:
+def test_dependency_files_cover_manifests_anywhere_and_the_ci_files_read(tmp_path: Path) -> None:
     workspace = _commit(tmp_path / "repository", _BASE)
 
-    paths = {path for path, _ in read_signals(workspace).dependency_files}
+    signals = read_signals(workspace)
+    paths = {path for path, _ in signals.dependency_files}
+
+    # Guidance is read for the setup agent but builds nothing.
+    assert {"AGENTS.md", "CONTRIBUTING.md"} <= set(signals.files)
 
     assert paths == {
         ".github/workflows/ci.yml",
@@ -126,15 +132,30 @@ def test_submodule_commits_are_dependencies(tmp_path: Path) -> None:
 def test_dependency_digest_follows_lockfiles_and_ignores_unrelated_files(tmp_path: Path) -> None:
     root = tmp_path / "repository"
     first = dependency_digest(read_signals(_commit(root, _BASE)).dependency_files)
-    readme = dependency_digest(
-        read_signals(_commit(root, {"README.md": "new readme\n"})).dependency_files
+    # Guidance only the setup agent reads keeps the cached environment.
+    guidance = dependency_digest(
+        read_signals(
+            _commit(
+                root,
+                {
+                    "README.md": "new readme\n",
+                    "CONTRIBUTING.md": "Run tox.\n",
+                    "AGENTS.md": "Use pip.\n",
+                },
+            )
+        ).dependency_files
     )
     lockfile = dependency_digest(
         read_signals(_commit(root, {"uv.lock": "version = 2\n"})).dependency_files
     )
+    workflow = dependency_digest(
+        read_signals(
+            _commit(root, {".github/workflows/ci.yml": "jobs: {test: {}}\n"})
+        ).dependency_files
+    )
 
-    assert readme == first
-    assert lockfile != first
+    assert guidance == first
+    assert len({first, lockfile, workflow}) == 3
 
 
 def test_read_blob_refuses_malformed_ids_and_oversized_objects(tmp_path: Path) -> None:
