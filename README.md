@@ -113,6 +113,7 @@ cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod
 | `version` | Print the installed version. |
 | `runs list` | List recent runs and their status. |
 | `runs show RUN_ID` | Show the evidence for one run. |
+| `runs check RUN_ID` | Check, without writing anything, whether a ready or approved run could publish now. |
 | `runs cancel RUN_ID --reason TEXT` | Cancel a run that is ready for approval or approved. |
 | `config validate` | Check the config file and print a summary. |
 | `config show` | Print the config with defaults filled in; it shows secret names, never values. |

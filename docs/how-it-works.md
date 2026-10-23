@@ -153,6 +153,10 @@ the outcome instead of the review. Only the approving GitHub account can publish
 - the issue still passes every rule with no linked PR: edits, label changes, and comments are fine
   unless they close or lock it, assign it to someone else, or add a claim or a stop request.
 
+`runs check RUN_ID` runs the safety-stop, approval, limit, and recheck steps without writing
+anything and lists each result (`--json` for scripts); it exits 3 when one fails and 5 during a
+safety stop.
+
 A failed recheck pushes nothing and leaves the run `approved`: retry `publish` after a limit clears,
 or run `autocontribute runs cancel RUN_ID --reason "TEXT"` and [retry the issue](#run-states) (also
 the way past an expired approval). Once the rechecks pass, the attempt uses that day's slot and
