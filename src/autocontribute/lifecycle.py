@@ -227,7 +227,11 @@ class LifecycleSignal:
                     self._stop(StopScope.REPOSITORY, self.repository, expires_at=cooldown),
                 )
             case LifecycleSignalKind.AUTOMATION_STOP:
-                return (self._stop(StopScope.REPOSITORY, self.repository, maintainer_stop=True),)
+                return (
+                    self._stop(
+                        StopScope.REPOSITORY, self.repository, counts_toward_escalation=True
+                    ),
+                )
             case LifecycleSignalKind.REVERTED:
                 return (
                     self._stop(StopScope.REPOSITORY, self.repository),
@@ -241,7 +245,7 @@ class LifecycleSignal:
         scope_key: str = "",
         *,
         expires_at: datetime | None = None,
-        maintainer_stop: bool = False,
+        counts_toward_escalation: bool = False,
     ) -> CircuitBreakerTrigger:
         return CircuitBreakerTrigger(
             source=self.source,
@@ -254,7 +258,7 @@ class LifecycleSignal:
             scope=scope,
             scope_key=scope_key,
             expires_at=expires_at,
-            maintainer_stop=maintainer_stop,
+            counts_toward_escalation=counts_toward_escalation,
         )
 
 
