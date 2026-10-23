@@ -116,7 +116,7 @@ cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod
 | `runs review RUN_ID --format github --output-dir DIR` | Write the approval review as a GitHub issue body, plus comment parts for a long patch. |
 | `runs check RUN_ID` | Check, without writing anything, whether a ready or approved run could publish now. |
 | `runs cancel RUN_ID --reason TEXT` | Cancel a run that is ready for approval or approved. |
-| `runs abandon RUN_ID --reason TEXT` | End a `submitting` run `failed` after checking that GitHub has neither its branch nor its PR. |
+| `runs abandon RUN_ID --reason TEXT` | End a stuck `submitting` run `failed` after checking that GitHub has no PR from it. |
 | `state export --output FILE` | Write the state and the files of unfinished runs to one archive. |
 | `state import FILE` | Check an exported archive and make it the state (`--force` replaces existing state). |
 | `config validate` | Check the config file and print a summary. |

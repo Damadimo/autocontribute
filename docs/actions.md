@@ -62,17 +62,24 @@ share one queue, so they never write the state at the same time.
 state than the one `prepare` started from. It keeps the newer state, drops that preparation's
 result, and fails; the next run prepares again.
 
-To work on the state yourself, for example to end a safety stop:
+## Fix a run by hand
+
+Some things need you and the state on your own machine: ending a safety stop, or ending a run
+whose pull-request request GitHub never answered (the approval issue says so). In a checkout of
+the runner repository, with your publishing token in `AUTOCONTRIBUTE_GITHUB_TOKEN`:
 
 ```bash
 git fetch origin autocontribute-state && git show origin/autocontribute-state:state.tar.gz >state.tar.gz
-autocontribute state import state.tar.gz
+autocontribute state import state.tar.gz --release-leases
 autocontribute safety status
 autocontribute safety resume --actor NAME --reason TEXT --expected-trigger-hash REVISION
+autocontribute runs abandon RUN_ID --reason TEXT
 autocontribute state export --output state.tar.gz
 ```
 
-Then commit `state.tar.gz` to the `autocontribute-state` branch while no workflow runs.
+Run only the commands you need: `safety status` and `safety resume` end a safety stop, and
+`runs abandon` ends a stuck run once GitHub shows no pull request from it. Then commit
+`state.tar.gz` to the `autocontribute-state` branch while no workflow runs.
 
 ## Public or private
 

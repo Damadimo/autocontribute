@@ -774,11 +774,15 @@ def test_approval_report_announces_the_pull_request_or_explains_the_refusal(
     waiting_issue = github.add_issue("x", labels=(AWAITING_LABEL,))
     failed_issue = github.add_issue("x", labels=(AWAITING_LABEL,))
     missing_issue = github.add_issue("x", labels=(AWAITING_LABEL,))
+    interrupted_issue = github.add_issue("x", labels=(AWAITING_LABEL,))
+    unanswered_issue = github.add_issue("x", labels=(AWAITING_LABEL,))
     url = "https://github.com/example/project/pull/9"
     store = _ManifestStore(
         _manifest("cccccccccccccccc", RunStatus.PR_OPEN, pull_request_url=url),
         _manifest("aaaaaaaaaaaaaaaa", RunStatus.APPROVED),
         _manifest("bbbbbbbbbbbbbbbb", RunStatus.FAILED),
+        _manifest("eeeeeeeeeeeeeeee", RunStatus.SUBMITTING),
+        _manifest("ffffffffffffffff", RunStatus.SUBMITTING, pull_request_creation_started=True),
     )
 
     with github.repository(context, "runner-token") as repository:
@@ -787,6 +791,8 @@ def test_approval_report_announces_the_pull_request_or_explains_the_refusal(
             (waiting_issue, "aaaaaaaaaaaaaaaa", "limit", "At most 1 per day", "push rejected"),
             (failed_issue, "bbbbbbbbbbbbbbbb", "error", "GitHub refused the pull request", None),
             (missing_issue, "dddddddddddddddd", "error", "Unknown run", None),
+            (interrupted_issue, "eeeeeeeeeeeeeeee", "error", "Fork was not ready", None),
+            (unanswered_issue, "ffffffffffffffff", "resume_required", "No answer", None),
         ):
             report_approval(
                 repository,
@@ -808,6 +814,14 @@ def test_approval_report_announces_the_pull_request_or_explains_the_refusal(
     for closed in (failed_issue, missing_issue):
         assert github.issues[closed]["state_reason"] == "not_planned"
         assert github.issues[closed]["labels"] == []
+    (interrupted,) = github.issue_comments(interrupted_issue)
+    assert "Comment the same approval again to finish it" in interrupted
+    (unanswered,) = github.issue_comments(unanswered_issue)
+    assert "GitHub never answered" in unanswered
+    assert "docs/actions.md#fix-a-run-by-hand" in unanswered
+    for waiting in (interrupted_issue, unanswered_issue):
+        assert github.issues[waiting]["state"] == "open"
+        assert github.issues[waiting]["labels"] == [AWAITING_LABEL]
 
 
 def test_template_files_hold_the_runner(tmp_path: Path) -> None:
