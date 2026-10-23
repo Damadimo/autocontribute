@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -2826,6 +2827,50 @@ def test_tripped_circuit_breaker_blocks_submitting_recovery_before_github_work(
         "close_pull_request",
         "mark_pull_request_ready_for_review",
     }.intersection(github.calls)
+
+
+def test_approval_event_and_transition_commit_in_one_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, _issue = _ready_run(tmp_path, approved=False)
+    review = build_approval_review(config, store, run_id, actor="octocat")
+    append_event = store._append_event
+
+    def fail_transition_event(connection, run, event_type, details, **kwargs):  # type: ignore[no-untyped-def]
+        if event_type == "run.transitioned":
+            raise sqlite3.OperationalError("simulated disk failure")
+        append_event(connection, run, event_type, details, **kwargs)
+
+    monkeypatch.setattr(store, "_append_event", fail_transition_event)
+    with pytest.raises(sqlite3.OperationalError, match="simulated disk failure"):
+        approve_run(
+            config,
+            store,
+            run_id,
+            actor="octocat",
+            attestation="I reviewed the exact contribution.",
+            reviewed_fingerprint=review.fingerprint,
+        )
+    monkeypatch.undo()
+
+    durable = store.get(run_id)
+    assert durable.status == RunStatus.READY_FOR_APPROVAL
+    assert durable.approval is None
+    assert "approval.created" not in {event["event_type"] for event in store.events(run_id)}
+
+    approved = approve_run(
+        config,
+        store,
+        run_id,
+        actor="octocat",
+        attestation="I reviewed the exact contribution.",
+        reviewed_fingerprint=review.fingerprint,
+    )
+
+    assert approved.status == RunStatus.APPROVED
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert event_types[-2:] == ["approval.created", "run.transitioned"]
 
 
 def test_exact_human_approval_exposes_ledger_bound_intent_time(tmp_path: Path) -> None:

@@ -473,17 +473,19 @@ def approve_run(
         attestation=attestation,
         config=config.publishing,
     )
-    store.save(
+    return store.transition(
         manifest,
-        event="approval.created",
-        details={
-            "actor": actor,
-            "expires_at": manifest.approval.expires_at.isoformat(),
-            "manifest_hash": manifest.approval.manifest_hash,
-        },
+        RunStatus.APPROVED,
+        reason=f"approved by {actor}",
+        evidence=(
+            "approval.created",
+            {
+                "actor": actor,
+                "expires_at": manifest.approval.expires_at.isoformat(),
+                "manifest_hash": manifest.approval.manifest_hash,
+            },
+        ),
     )
-    store.transition(manifest, RunStatus.APPROVED, reason=f"approved by {actor}")
-    return manifest
 
 
 class Publisher:

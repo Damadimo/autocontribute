@@ -1788,6 +1788,16 @@ class RunStore:
         return disposition
 
     def save(self, manifest: RunManifest, *, event: str, details: dict[str, str]) -> None:
+        self._save(manifest, event=event, details=details)
+
+    def _save(
+        self,
+        manifest: RunManifest,
+        *,
+        event: str,
+        details: dict[str, str],
+        transitioned: dict[str, str] | None = None,
+    ) -> None:
         candidate = manifest.candidate
         issue_revision = compute_issue_revision(candidate) if candidate is not None else None
         event_details = dict(details)
@@ -1863,6 +1873,10 @@ class RunStore:
                         f"Run {manifest.run_id} changed while this manifest was being saved"
                     )
                 self._append_event(connection, manifest.run_id, event, event_details)
+                if transitioned is not None:
+                    self._append_event(
+                        connection, manifest.run_id, "run.transitioned", transitioned
+                    )
                 _mark_manifest_artifact_sync(
                     connection,
                     run_id=manifest.run_id,
@@ -1886,7 +1900,10 @@ class RunStore:
         target: RunStatus,
         *,
         reason: str,
+        evidence: tuple[str, dict[str, str]] | None = None,
     ) -> RunManifest:
+        """Change status; ``evidence`` is one event committed in the same transaction first."""
+
         if target == manifest.status:
             return manifest
         allowed = ALLOWED_TRANSITIONS.get(manifest.status, set())
@@ -1894,12 +1911,17 @@ class RunStore:
             raise StateError(f"Invalid run transition: {manifest.status.value} -> {target.value}")
         previous = manifest.status
         manifest.status = target
+        transitioned = {"from": previous.value, "to": target.value, "reason": reason}
         try:
-            self.save(
-                manifest,
-                event="run.transitioned",
-                details={"from": previous.value, "to": target.value, "reason": reason},
-            )
+            if evidence is None:
+                self._save(manifest, event="run.transitioned", details=transitioned)
+            else:
+                self._save(
+                    manifest,
+                    event=evidence[0],
+                    details=evidence[1],
+                    transitioned=transitioned,
+                )
         except _ManifestArtifactSyncError:
             raise
         except Exception:
