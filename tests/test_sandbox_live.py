@@ -431,6 +431,7 @@ def test_live_session_classifies_running_out_of_memory_and_recovers(
 
     assert not outcome.result.passed
     assert outcome.infrastructure_failure == "the sandbox ran out of memory (limit 512m)"
+    assert outcome.out_of_memory
     assert outcome.restarted
     # Docker's OOMKilled flag is sticky until a restart, so this also proves it was cleared.
     assert _passed(session, "test -e /tmp/fill || echo tmp-emptied") == "tmp-emptied\n"

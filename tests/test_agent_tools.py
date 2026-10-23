@@ -66,8 +66,13 @@ class FakeSession:
                 result = result.model_copy(update={"stderr": self.syntax_error})
         else:
             result = self.answer(command)
-        restarted = self.reap_failed or self.infrastructure_failure is not None
-        return SessionCommandResult(result, self.infrastructure_failure, restarted=restarted)
+        failure = self.infrastructure_failure
+        return SessionCommandResult(
+            result,
+            failure,
+            restarted=self.reap_failed or failure is not None,
+            out_of_memory=failure is not None and "out of memory" in failure,
+        )
 
     def save_output(self, number: int, text: str) -> str | None:
         self.saved.append((number, text))
@@ -305,12 +310,25 @@ def test_a_command_that_left_processes_behind_reports_the_restart(tmp_path: Path
     assert _chunks(shell.result.output)[0].stderr.endswith("/tmp is now empty.]")
 
 
-def test_a_failed_sandbox_is_an_infrastructure_error(tmp_path: Path) -> None:
+def test_a_stopped_sandbox_is_an_infrastructure_error(tmp_path: Path) -> None:
+    session = FakeSession()
+    session.infrastructure_failure = "the sandbox container stopped"
+
+    with pytest.raises(SandboxError, match="container stopped"):
+        _tools(session, tmp_path).run(_shell("pytest"))
+
+
+def test_a_command_over_the_memory_limit_is_reported_to_the_agent(tmp_path: Path) -> None:
     session = FakeSession()
     session.infrastructure_failure = "the sandbox ran out of memory (limit 6g)"
+    tools = _tools(session, tmp_path)
 
-    with pytest.raises(SandboxError, match="ran out of memory"):
-        _tools(session, tmp_path).run(_shell("pytest"))
+    bash = tools.run(_bash(command="cargo test"))
+    shell = tools.run(_shell("cargo test"))
+
+    for text in (str(bash.result.output), _chunks(shell.result.output)[0].stderr):
+        assert "The command was stopped: the sandbox ran out of memory (limit 6g)" in text
+        assert "Use less memory" in text
 
 
 def test_apply_patch_edits_on_the_host_and_checks_the_syntax(tmp_path: Path) -> None:

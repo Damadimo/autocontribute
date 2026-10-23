@@ -335,6 +335,8 @@ class SessionCommandResult:
     infrastructure_failure: str | None
     # The container was restarted after the command, which empties /tmp.
     restarted: bool
+    # The failure was the memory limit, which the command itself may have caused.
+    out_of_memory: bool = False
 
 
 class SessionContainer:
@@ -465,7 +467,12 @@ class SessionContainer:
         if failure is None and self._reap(user):
             return SessionCommandResult(result, None, restarted=False)
         self.restart()
-        return SessionCommandResult(result, failure, restarted=True)
+        return SessionCommandResult(
+            result,
+            failure,
+            restarted=True,
+            out_of_memory=failure == self._out_of_memory_failure(),
+        )
 
     @property
     def command_user(self) -> str:
@@ -689,10 +696,13 @@ class SessionContainer:
         if out_of_memory == "true":
             # Docker keeps this flag until the next start, so the restart that follows
             # keeps it from blaming later commands.
-            return f"the sandbox ran out of memory (limit {self.config.memory})"
+            return self._out_of_memory_failure()
         if running != "true":
             return "the sandbox container stopped"
         return None
+
+    def _out_of_memory_failure(self) -> str:
+        return f"the sandbox ran out of memory (limit {self.config.memory})"
 
     def _remove_container(self, name: str) -> None:
         # Best effort: remove_leftover_containers finds a survivor by its labels.

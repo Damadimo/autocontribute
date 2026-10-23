@@ -45,6 +45,16 @@ _RESTART_NOTE: Final = (
 _OUT_OF_TIME: Final = "Not run: the run is out of time."
 
 
+def _restart_note(outcome: SessionCommandResult) -> str:
+    if outcome.out_of_memory:
+        return (
+            f"\n[The command was stopped: {outcome.infrastructure_failure}. The sandbox "
+            "restarted and /tmp is now empty. Use less memory, for example fewer parallel "
+            "jobs or a smaller test selection.]"
+        )
+    return _RESTART_NOTE if outcome.restarted else ""
+
+
 class _ShellAction(DomainModel):
     commands: list[str]
     timeout_ms: int | None = Field(default=None, ge=1)
@@ -149,7 +159,7 @@ class SessionTools:
             chunks.append(
                 ShellChunk(
                     stdout=self._bounded(result.stdout, limit),
-                    stderr=stderr + _RESTART_NOTE if outcome.restarted else stderr,
+                    stderr=stderr + _restart_note(outcome),
                     exit_code=None if result.timed_out else result.exit_code,
                 )
             )
@@ -186,9 +196,11 @@ class SessionTools:
             return ToolOutcome(refused(call, _OUT_OF_TIME), out_of_time=True)
         outcome = self._exec(command, timeout)
         result = outcome.result
-        output = self._bounded(_combined(result), None) + _status(result, timeout)
-        if outcome.restarted:
-            output += _RESTART_NOTE
+        output = (
+            self._bounded(_combined(result), None)
+            + _status(result, timeout)
+            + _restart_note(outcome)
+        )
         return ToolOutcome(
             ToolResult(call_id=call.call_id, output=output or "(no output)"),
             commands=(CommandRun(command, result.passed),),
@@ -219,7 +231,9 @@ class SessionTools:
         outcome = self._session.exec(
             command, timeout_seconds=timeout, environment=self._environment
         )
-        if outcome.infrastructure_failure is not None:
+        # A command that exceeds the memory limit is the agent's to fix; the session has
+        # already restarted. A stopped or unreadable container is not.
+        if outcome.infrastructure_failure is not None and not outcome.out_of_memory:
             raise SandboxError(
                 f"The sandbox failed during an agent command: {outcome.infrastructure_failure}"
             )
