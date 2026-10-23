@@ -37,6 +37,7 @@ from autocontribute.exceptions import (
     PolicyError,
     PublicationLimitError,
     PublicationResumeRequired,
+    ReviewTooLargeError,
     StateError,
     StopScope,
 )
@@ -545,6 +546,88 @@ def test_approve_refuses_a_bad_source_and_an_expired_repeat(
 
     assert repeated.exit_code == 1, repeated.output
     assert "the approval expired" in json.loads(repeated.output)["message"]
+
+
+def test_runs_review_writes_a_github_issue_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, store, run_id = _ready_review_run(tmp_path)
+    fingerprint = _review_fingerprint(config_path, store, run_id)
+    monkeypatch.setattr(cli, "_github_client", lambda *_: _ReviewGitHub())
+    output = tmp_path / "issue"
+
+    result = runner.invoke(
+        app,
+        [
+            "runs",
+            "review",
+            run_id,
+            "--format",
+            "github",
+            "--output-dir",
+            str(output),
+            "--json",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    body = (output / "body.md").read_text(encoding="utf-8")
+    assert json.loads(result.output) == {
+        "run_id": run_id,
+        "fingerprint": fingerprint,
+        "approval_command": f"/approve {fingerprint[:12]}",
+        "body": str(output.resolve() / "body.md"),
+        "body_characters": len(body),
+        "parts": [],
+        "shortened": [],
+    }
+    assert body.startswith(f"<!-- autocontribute:run={run_id} -->\n")
+    assert f"/approve {fingerprint[:12]}" in body
+    assert "PR_BODY_EXACT_MARKER" in body
+    assert "+review_patch_new_marker = 2" in body
+    assert sorted(path.name for path in output.iterdir()) == ["body.md"]
+
+
+def test_runs_review_refuses_a_used_directory_and_reports_a_review_too_large(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, _, run_id = _ready_review_run(tmp_path)
+    used = tmp_path / "used"
+    used.mkdir()
+    (used / "body.md").write_text("old", encoding="utf-8")
+    command = ["runs", "review", run_id, "--format", "github", "--json"]
+    monkeypatch.setattr(cli, "_github_client", _forbid_github)
+
+    refused = runner.invoke(
+        app,
+        [*command, "--output-dir", str(used), "--config", str(config_path)],
+    )
+
+    def too_large(*_: object, **__: object) -> None:
+        raise ReviewTooLargeError("The review needs more than an issue body and 5 comments")
+
+    monkeypatch.setattr(cli, "_github_client", lambda *_: _ReviewGitHub())
+    monkeypatch.setattr(cli, "render_github_review", too_large)
+    fresh = tmp_path / "fresh"
+    oversized = runner.invoke(
+        app,
+        [*command, "--output-dir", str(fresh), "--config", str(config_path)],
+    )
+
+    assert refused.exit_code == 1
+    assert "must be a new or empty directory" in json.loads(refused.output)["message"]
+    assert (used / "body.md").read_text(encoding="utf-8") == "old"
+    assert oversized.exit_code == 4
+    assert json.loads(oversized.output) == {
+        "run_id": run_id,
+        "outcome": "too_large",
+        "message": "The review needs more than an issue body and 5 comments",
+    }
+    assert not fresh.exists()
 
 
 def test_init_and_config_validation_are_offline(tmp_path: Path) -> None:

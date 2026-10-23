@@ -138,8 +138,19 @@ prompt, and only when HEX is the fingerprint or at least its first 12 characters
 approve only a review you read; it exits 3 when the fingerprint no longer matches. `--source URL`
 records where you approved, such as an issue comment, in the run's ledger and the approval, and
 repeating an approval that is already recorded succeeds without writing anything. `--json` prints
-the outcome instead of the review. Only the approving GitHub account can publish, within
-`publishing.approval_expires_hours` (72, at most 168). `publish` refuses unless:
+the outcome instead of the review.
+
+`runs review RUN_ID --format github --output-dir DIR` writes the same review as `DIR/body.md`, at
+most 60,000 characters, to post as a GitHub issue: the `/approve` line with the first 12 characters
+of the fingerprint, a summary table, the exact PR title, body, and commit message, the patch, and
+the validation, critic, and AI-policy evidence. A patch too long for the body continues in
+`part-1.md` up to `part-5.md`, to post as comments. Evidence is shortened first, with a note; the
+PR text, commit message, and patch never are, and the command exits 4 when they do not fit. Issue
+and PR text sits in code blocks and code spans, so the issue mentions nobody and links nothing
+upstream.
+
+Only the approving GitHub account can publish, within `publishing.approval_expires_hours` (72, at
+most 168). `publish` refuses unless:
 
 - the approval is current and matches the stored patch and command results;
 - the repository is still in `github.repositories`, or its owner in `github.owners`;
