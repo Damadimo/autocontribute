@@ -358,3 +358,13 @@ def test_checks_that_cannot_find_their_files_or_tests_did_not_run(tmp_path: Path
     assert isinstance(outcome, CriticRound)
     assert [blocker.model_dump() for blocker in outcome.confirmed] == [kept]
     assert [dropped.reason for dropped in outcome.dropped] == ["its check could not run"] * 3
+
+
+def test_no_review_starts_with_less_than_a_second_left(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, FakeSandbox(), "openai")
+    harness.budget.seconds_left = lambda: 0.5  # type: ignore[method-assign]
+
+    outcome = harness.review(_review())
+
+    assert isinstance(outcome, DidNotFinish) and outcome.reason == "time"
+    assert harness.sandbox.sessions == [] and harness.critic.rounds == []
