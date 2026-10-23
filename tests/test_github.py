@@ -427,21 +427,30 @@ def _cross_reference_event(
     }
 
 
-def _authored_pull_request_search_item(
-    number: int = 7,
+def _authored_node(
+    number: int,
+    head_ref: str,
     *,
     repository: str = "example/project",
-    state: str = "open",
+    created_at: str = "2026-07-21T12:00:00Z",
 ) -> dict[str, object]:
     return {
         "number": number,
-        "state": state,
-        "html_url": f"https://github.com/{repository}/pull/{number}",
-        "url": f"https://api.github.com/repos/{repository}/issues/{number}",
-        "repository_url": f"https://api.github.com/repos/{repository}",
-        "pull_request": {
-            "url": f"https://api.github.com/repos/{repository}/pulls/{number}",
-        },
+        "url": f"https://github.com/{repository}/pull/{number}",
+        "headRefName": head_ref,
+        "createdAt": created_at,
+        "updatedAt": "2026-07-21T13:00:00Z",
+    }
+
+
+def _authored_page(nodes: list[dict[str, object]], *, cursor: str | None) -> dict[str, object]:
+    return {
+        "data": {
+            "search": {
+                "pageInfo": {"hasNextPage": cursor is not None, "endCursor": cursor},
+                "nodes": nodes,
+            }
+        }
     }
 
 
@@ -1572,117 +1581,112 @@ def test_competing_pull_request_search_fails_closed_on_incomplete_evidence(
         github.search_competing_pull_requests("example/project", 42)
 
 
-def test_authored_pull_request_search_requires_complete_canonical_results() -> None:
-    query: dict[str, str] = {}
+def test_authored_pull_request_search_pages_and_keeps_only_prefixed_branches() -> None:
+    variables: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        query.update(dict(request.url.params))
+        assert request.method == "POST" and request.url.path == "/graphql"
+        body = json.loads(request.content)
+        variables.append(body["variables"])
+        if body["variables"]["cursor"] is None:
+            return httpx.Response(
+                200,
+                json=_authored_page(
+                    [
+                        _authored_node(7, "autocontribute/issue-42-abcdef12"),
+                        _authored_node(8, "my-own-feature", repository="octocat/dotfiles"),
+                    ],
+                    cursor="Y3Vyc29yOjI=",
+                ),
+            )
         return httpx.Response(
             200,
-            json={
-                "total_count": 1,
-                "incomplete_results": False,
-                "items": [_authored_pull_request_search_item()],
-            },
+            json=_authored_page(
+                [_authored_node(9, "autocontribute/issue-7-12345678", repository="other/repo")],
+                cursor=None,
+            ),
         )
 
     with _client(handler) as github:
-        urls = github.authored_pull_requests(
+        found = github.authored_pull_requests(
             "octocat",
+            head_ref_prefix="autocontribute/issue-",
             state="open",
-            repository="example/project",
             updated_after="2026-07-01",
-            created_after="2026-07-20",
         )
 
-    assert urls == ["https://github.com/example/project/pull/7"]
-    assert query == {
-        "q": (
-            "is:pr is:open author:octocat repo:example/project "
-            "updated:>=2026-07-01 created:>=2026-07-20"
-        ),
-        "sort": "updated",
-        "per_page": "100",
-        "page": "1",
-    }
+    assert [(item.repository, item.head_ref) for item in found] == [
+        ("example/project", "autocontribute/issue-42-abcdef12"),
+        ("other/repo", "autocontribute/issue-7-12345678"),
+    ]
+    assert found[0].created_at == datetime(2026, 7, 21, 12, tzinfo=UTC)
+    assert variables == [
+        {"query": "is:pr author:octocat is:open updated:>=2026-07-01", "cursor": None},
+        {"query": "is:pr author:octocat is:open updated:>=2026-07-01", "cursor": "Y3Vyc29yOjI="},
+    ]
 
 
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
+        ({"errors": [{"message": "rate limited"}]}, "rejected the authored"),
         (
-            {"total_count": 0, "incomplete_results": True, "items": []},
-            "incomplete authored",
+            {"data": {"search": {"pageInfo": {"hasNextPage": None}, "nodes": []}}},
+            "malformed authored search pagination",
         ),
         (
-            {"total_count": 0, "items": []},
-            "malformed authored",
+            _authored_page(
+                [_authored_node(7, "autocontribute/a"), _authored_node(7, "autocontribute/a")],
+                cursor=None,
+            ),
+            "duplicate pull request",
         ),
         (
-            {"total_count": 101, "incomplete_results": False, "items": []},
-            "one-page safe limit",
+            _authored_page(
+                [
+                    {
+                        **_authored_node(7, "autocontribute/a"),
+                        "url": "https://evil.example/x/y/pull/7",
+                    }
+                ],
+                cursor=None,
+            ),
+            "noncanonical",
         ),
-        (
-            {
-                "total_count": 2,
-                "incomplete_results": False,
-                "items": [_authored_pull_request_search_item()],
-            },
-            "truncated authored",
-        ),
-        (
-            {"total_count": 0, "incomplete_results": False},
-            "malformed authored pull request search results",
-        ),
+        (_authored_page([{}], cursor=None), "invalid searched pull request identifier"),
     ],
 )
-def test_authored_pull_request_search_fails_closed_on_ambiguous_metadata(
-    payload: dict[str, object], message: str
+def test_authored_pull_request_search_fails_closed_on_malformed_results(
+    payload: dict[str, object],
+    message: str,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=payload)
 
     with _client(handler) as github, pytest.raises(GitHubError, match=message):
-        github.authored_pull_requests("octocat")
+        github.authored_pull_requests("octocat", head_ref_prefix="autocontribute/")
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"state": "closed"}, "different state"),
-        ({"number": 8}, "different number"),
-        ({"html_url": "https://attacker.invalid/example/project/pull/7"}, "noncanonical"),
-        ({"html_url": " https://github.com/example/project/pull/7"}, "noncanonical"),
-        ({"html_url": "https://github.com/other/project/pull/7"}, "different repository"),
-        ({"url": ""}, "invalid searched pull request issue API URL"),
-        ({"repository_url": "https://api.github.com/repos/other/project"}, "noncanonical"),
-        ({"pull_request": {}}, "searched pull request API URL"),
-    ],
-)
-def test_authored_pull_request_search_rejects_malformed_item_identity(
-    overrides: dict[str, object], message: str
-) -> None:
-    item = _authored_pull_request_search_item()
-    item.update(overrides)
+def test_authored_pull_request_search_stops_at_the_search_result_limit() -> None:
+    pages = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"total_count": 1, "incomplete_results": False, "items": [item]},
-        )
+        nonlocal pages
+        pages += 1
+        return httpx.Response(200, json=_authored_page([], cursor=f"cursor-{pages}"))
 
-    with _client(handler) as github, pytest.raises(GitHubError, match=message):
-        github.authored_pull_requests("octocat", repository="example/project")
+    with _client(handler) as github, pytest.raises(GitHubError, match="1000-result limit"):
+        github.authored_pull_requests("octocat", head_ref_prefix="autocontribute/")
+
+    assert pages == 10
 
 
 @pytest.mark.parametrize(
     "arguments",
     [
-        {"login": "octocat repo:other/project"},
-        {"login": "octocat", "state": "all"},
-        {"login": "octocat", "repository": "not-a-repository"},
-        {"login": "octocat", "updated_after": "2026-02-30"},
-        {"login": "octocat", "created_after": "2026-7-1"},
+        {"login": "octocat repo:other/project", "head_ref_prefix": "autocontribute/"},
+        {"login": "octocat", "head_ref_prefix": ""},
+        {"login": "octocat", "head_ref_prefix": "a/", "updated_after": "2026-02-30"},
     ],
 )
 def test_authored_pull_request_search_rejects_unsafe_inputs(
