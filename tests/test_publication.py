@@ -67,6 +67,7 @@ from autocontribute.preparation import (
     render_validation_artifact,
 )
 from autocontribute.publication import (
+    PublicationCheck,
     Publisher,
     approve_run,
     build_approval_review,
@@ -6342,6 +6343,93 @@ def test_account_limits_ignore_other_pull_requests_and_this_runs_own_branch(
     )
 
     assert publisher.publish(run_id).status == RunStatus.PR_OPEN
+
+
+def test_check_reports_an_approved_run_as_publishable_without_writing(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    events = store.events(run_id)
+
+    checks = Publisher(config, store, github).check(run_id)  # type: ignore[arg-type]
+
+    assert [(check.name, check.passed) for check in checks] == [
+        ("safety_stop", True),
+        ("approval", True),
+        ("limits", True),
+        ("freshness", True),
+    ]
+    assert checks[1].detail.startswith("approved by octocat until ")
+    assert not github.mutated
+    assert store.events(run_id) == events
+    assert store.get(run_id).status == RunStatus.APPROVED
+
+
+def test_check_reports_every_failing_check_of_a_waiting_run(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path, approved=False)
+    github = FakePublishingGitHub(issue.model_copy(update={"locked": True}), "")
+    github.sha = store.get(run_id).base_sha or ""
+    github.open_authored = [_authored("example/project", "autocontribute/issue-9-dddddddd")]
+    store.trip_circuit_breaker(source="operator:a", reason="stop", trigger_hash="c" * 64)
+
+    checks = Publisher(config, store, github).check(run_id)  # type: ignore[arg-type]
+
+    assert checks == (
+        PublicationCheck("safety_stop", False, "operator:a: stop"),
+        PublicationCheck("approval", False, "the run is waiting for approval"),
+        PublicationCheck(
+            "limits",
+            False,
+            "An autocontribute pull request is already open in this repository",
+        ),
+        PublicationCheck(
+            "freshness",
+            False,
+            "Issue changed after preparation: issue is locked",
+        ),
+    )
+    assert not github.mutated
+    assert store.get(run_id).status == RunStatus.READY_FOR_APPROVAL
+
+
+class _HeldStore(RunStore):
+    def assert_publication_not_held(
+        self,
+        repository: str,
+        pull_request_url: str | None = None,
+    ) -> None:
+        raise PolicyError(f"Publication is held for {repository}")
+
+
+def test_check_reports_holds_when_the_store_records_them(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    held = _HeldStore(store.root)
+
+    checks = Publisher(config, held, github).check(run_id)  # type: ignore[arg-type]
+
+    assert checks[1] == PublicationCheck(
+        "holds",
+        False,
+        "Publication is held for example/project",
+    )
+    assert [check.name for check in checks] == [
+        "safety_stop",
+        "holds",
+        "approval",
+        "limits",
+        "freshness",
+    ]
+
+
+def test_check_refuses_runs_that_are_not_waiting_to_publish(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    store.transition(store.get(run_id), RunStatus.CANCELLED, reason="fixture")
+    github = FakePublishingGitHub(issue, "")
+
+    with pytest.raises(StateError, match="only ready_for_approval or approved runs"):
+        Publisher(config, store, github).check(run_id)  # type: ignore[arg-type]
+
+    assert github.calls == []
 
 
 def test_account_limits_count_local_runs_still_submitting(tmp_path: Path) -> None:

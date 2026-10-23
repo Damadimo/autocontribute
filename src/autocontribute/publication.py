@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, NoReturn, cast
+from typing import Literal, NoReturn, Protocol, cast, runtime_checkable
 
 from autocontribute.approval import (
     FINGERPRINT_PREFIX,
@@ -106,6 +106,26 @@ class _ExactHumanApproval:
     """One ledger-bound approval that authorized an exact publication intent."""
 
     publication_intent_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationCheck:
+    """One answer to whether a run could publish now."""
+
+    name: str
+    passed: bool
+    detail: str
+
+
+@runtime_checkable
+class PublicationHolds(Protocol):
+    """A store that also records scoped holds that refuse publication."""
+
+    def assert_publication_not_held(
+        self,
+        repository: str,
+        pull_request_url: str | None = None,
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -1140,6 +1160,66 @@ class Publisher:
         self.store.assert_circuit_breaker_clear()
         lease_guard.assert_owned()
         self._wait_for_fork(fork, manifest.repository.default_branch)
+
+    def check(self, run_id: str) -> tuple[PublicationCheck, ...]:
+        """Report whether a prepared or approved run could publish now.
+
+        It runs the limit and freshness checks ``publish`` runs and changes nothing on GitHub or
+        in the run; a maintainer stop it reads still trips the breaker, as in discovery. Holds
+        are reported only by stores that record them.
+        """
+
+        manifest = self.store.get(run_id)
+        if manifest.status not in {RunStatus.READY_FOR_APPROVAL, RunStatus.APPROVED}:
+            raise StateError(
+                f"Run {run_id} is {manifest.status.value}; only ready_for_approval or approved "
+                "runs can be checked"
+            )
+        if manifest.candidate is None or manifest.repository is None or not manifest.base_sha:
+            raise PolicyError("Run is missing repository freshness evidence")
+        breaker = self.store.circuit_breaker_status()
+        checks = [
+            PublicationCheck(
+                "safety_stop",
+                not breaker.is_tripped,
+                f"{breaker.source}: {breaker.reason}"
+                if breaker.is_tripped
+                else "no safety stop is active",
+            )
+        ]
+        store = self.store
+        repository = manifest.candidate.repository
+        if isinstance(store, PublicationHolds):
+            checks.append(
+                _policy_check(
+                    "holds",
+                    lambda: store.assert_publication_not_held(repository),
+                    passed="no hold applies to this repository",
+                )
+            )
+        checks.append(_approval_check(manifest))
+        # A run waiting for approval has no bound login yet; the review would bind this one.
+        login = (
+            manifest.publishing_login
+            or publishing_account(self.config, self.github).login.strip().casefold()
+        )
+        subject = manifest.model_copy(update={"publishing_login": login})
+        branch = manifest.branch_name or self._branch_name(manifest)
+        checks.append(
+            _policy_check(
+                "limits",
+                lambda: self._check_account_limits(login, subject, branch=branch),
+                passed="every publication limit has room",
+            )
+        )
+        checks.append(
+            _policy_check(
+                "freshness",
+                lambda: self._check_freshness(subject),
+                passed="the issue, base branch and policy files still allow publishing",
+            )
+        )
+        return tuple(checks)
 
     def publish(self, run_id: str) -> RunManifest:
         with LeaseHeartbeatGuard(
@@ -4281,6 +4361,24 @@ class Publisher:
     def _branch_name(self, manifest: RunManifest) -> str:
         assert manifest.candidate
         return f"{self._branch_prefix()}/issue-{manifest.candidate.number}-{manifest.run_id[:8]}"
+
+
+def _policy_check(name: str, check: Callable[[], None], *, passed: str) -> PublicationCheck:
+    try:
+        check()
+    except PolicyError as exc:
+        return PublicationCheck(name, False, str(exc))
+    return PublicationCheck(name, True, passed)
+
+
+def _approval_check(manifest: RunManifest) -> PublicationCheck:
+    approval = manifest.approval
+    if approval is None:
+        return PublicationCheck("approval", False, "the run is waiting for approval")
+    expires_at = approval.expires_at.isoformat()
+    if approval.expires_at <= datetime.now(UTC):
+        return PublicationCheck("approval", False, f"the approval expired at {expires_at}")
+    return PublicationCheck("approval", True, f"approved by {approval.actor} until {expires_at}")
 
 
 def _definitive_refusal(exc: Exception) -> GitHubHTTPError | None:

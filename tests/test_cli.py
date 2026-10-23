@@ -53,6 +53,7 @@ from autocontribute.preparation import (
     compute_preparation_fingerprint,
     render_validation_artifact,
 )
+from autocontribute.publication import PublicationCheck
 from autocontribute.store import CandidateAttemptState, CandidateRetryAuthorization, RunStore
 
 runner = CliRunner()
@@ -1954,6 +1955,75 @@ def test_publish_json_reports_an_unknown_run(tmp_path: Path) -> None:
         "run_id": "missing",
         "outcome": "error",
         "message": "Unknown run: missing",
+    }
+
+
+@pytest.mark.parametrize(
+    ("failing", "exit_code"),
+    [((), 0), (("limits", "freshness"), 3), (("safety_stop", "limits"), 5)],
+)
+def test_runs_check_reports_each_check_as_json_with_a_typed_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: tuple[str, ...],
+    exit_code: int,
+) -> None:
+    config, _, run_id = _approved_state(tmp_path)
+    names = ("safety_stop", "approval", "limits", "freshness")
+
+    class CheckingPublisher:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def check(self, checked: str) -> tuple[PublicationCheck, ...]:
+            assert checked == run_id
+            return tuple(
+                PublicationCheck(name, name not in failing, f"{name} [detail]") for name in names
+            )
+
+    monkeypatch.setattr(cli, "GitHubClient", _ContextGitHub)
+    monkeypatch.setattr(cli, "Publisher", CheckingPublisher)
+
+    as_json = runner.invoke(app, ["runs", "check", run_id, "--json", "--config", str(config)])
+    as_text = runner.invoke(app, ["runs", "check", run_id, "--config", str(config)])
+
+    assert as_json.exit_code == exit_code, as_json.output
+    assert json.loads(as_json.output) == {
+        "run_id": run_id,
+        "status": "approved",
+        "publishable": not failing,
+        "checks": [
+            {"name": name, "passed": name not in failing, "detail": f"{name} [detail]"}
+            for name in names
+        ],
+    }
+    assert as_text.exit_code == exit_code
+    assert "freshness [detail]" in as_text.output
+
+
+def test_runs_check_reports_a_run_it_cannot_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, run_id = _approved_state(tmp_path)
+
+    class RefusingPublisher:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def check(self, checked: str) -> None:
+            raise StateError(f"Run {checked} is failed; only ready_for_approval or approved runs")
+
+    monkeypatch.setattr(cli, "GitHubClient", _ContextGitHub)
+    monkeypatch.setattr(cli, "Publisher", RefusingPublisher)
+
+    result = runner.invoke(app, ["runs", "check", run_id, "--json", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output) == {
+        "run_id": run_id,
+        "outcome": "error",
+        "message": f"Run {run_id} is failed; only ready_for_approval or approved runs",
     }
 
 

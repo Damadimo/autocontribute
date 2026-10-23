@@ -538,6 +538,61 @@ def show_run(
         _fail(str(exc))
 
 
+@runs_app.command(name="check")
+def check_run(
+    run_id: Annotated[str, typer.Argument(help="Run identifier to check.")],
+    config: ConfigOption = DEFAULT_CONFIG,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the checks as JSON."),
+    ] = False,
+) -> None:
+    """Check, without publishing, whether a ready or approved run could publish now.
+
+    Exit codes: 0 every check passed, 3 a check failed, 5 a safety stop is active, 1 the
+    checks could not run.
+    """
+
+    settings = _config(config, json_output=json_output)
+    store = RunStore(settings.storage.path)
+    try:
+        with _github_client(settings, store) as github:
+            checks = Publisher(settings, store, github).check(run_id)
+        manifest = store.get(run_id)
+    except AutocontributeError as exc:
+        outcome, exit_code = _publication_failure(store, exc)
+        _fail(
+            str(exc),
+            exit_code=exit_code,
+            json_output=json_output,
+            outcome=outcome,
+            context={"run_id": run_id},
+        )
+    failed = {check.name for check in checks if not check.passed}
+    if json_output:
+        _emit_json(
+            {
+                "run_id": run_id,
+                "status": manifest.status.value,
+                "publishable": not failed,
+                "checks": [
+                    {"name": check.name, "passed": check.passed, "detail": check.detail}
+                    for check in checks
+                ],
+            }
+        )
+    else:
+        table = Table("Check", "Result", "Detail")
+        for check in checks:
+            result = "[green]PASS[/green]" if check.passed else "[red]FAIL[/red]"
+            table.add_row(check.name, result, Text(check.detail))
+        console.print(table)
+    if "safety_stop" in failed:
+        raise typer.Exit(5)
+    if failed:
+        raise typer.Exit(3)
+
+
 @runs_app.command(name="cancel")
 def cancel_run(
     run_id: Annotated[str, typer.Argument(help="Run identifier to cancel.")],
