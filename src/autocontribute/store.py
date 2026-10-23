@@ -1461,28 +1461,35 @@ class RunStore:
 
         if not 1 <= limit <= 10_000:
             raise ValueError(f"{resource} run limit must be between 1 and 10000")
-        state_filter = ""
-        parameters: builtins.list[str | int] = [status.value]
-        if open_pull_requests_only:
-            state_filter = (
-                "AND coalesce(json_extract(manifest_json, '$.pull_request_state'), 'open') = 'open'"
-            )
-        elif merged_since is not None:
-            state_filter = (
-                "AND json_extract(manifest_json, '$.pull_request_state') = 'merged' "
-                "AND julianday(json_extract(manifest_json, '$.pull_request_merged_at')) "
-                ">= julianday(?)"
-            )
-            parameters.append(merged_since.isoformat())
-        parameters.append(limit + 1)
+        merged_after = (
+            None if open_pull_requests_only or merged_since is None else merged_since.isoformat()
+        )
         with self._connection() as connection:
             rows = connection.execute(
-                # Only the fixed filters above are interpolated; values stay bound parameters.
-                f"""
+                """
                 SELECT run_id, manifest_json FROM runs
-                WHERE status = ? {state_filter} ORDER BY created_at ASC, run_id ASC LIMIT ?
+                WHERE status = :status
+                    AND (
+                        NOT :open_only
+                        OR coalesce(json_extract(manifest_json, '$.pull_request_state'), 'open')
+                            = 'open'
+                    )
+                    AND (
+                        :merged_after IS NULL
+                        OR (
+                            json_extract(manifest_json, '$.pull_request_state') = 'merged'
+                            AND julianday(json_extract(manifest_json, '$.pull_request_merged_at'))
+                                >= julianday(:merged_after)
+                        )
+                    )
+                ORDER BY created_at ASC, run_id ASC LIMIT :limit
                 """,
-                parameters,
+                {
+                    "status": status.value,
+                    "open_only": open_pull_requests_only,
+                    "merged_after": merged_after,
+                    "limit": limit + 1,
+                },
             ).fetchall()
         if len(rows) > limit:
             raise StateError(f"{resource.capitalize()} run set exceeds the configured safety bound")
