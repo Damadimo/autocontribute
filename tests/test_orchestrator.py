@@ -6,6 +6,7 @@ import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ from autocontribute.agent_loop import (
     SolverOutcome,
     SubmittedFix,
 )
+from autocontribute.budget import RunBudget
 from autocontribute.config import AutocontributeConfig
 from autocontribute.critic import CriticOutcome, CriticRound
 from autocontribute.domain import (
@@ -741,6 +743,26 @@ def test_the_daily_budget_skips_the_run_before_discovery(
 
     assert manifest.status == RunStatus.SKIPPED
     assert (manifest.skip_reason or "").startswith("daily budget: ")
+
+
+def test_the_run_budget_is_what_the_day_leaves_when_that_is_less_than_the_run_cap(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, sha = source
+    caps: list[Decimal] = []
+    run_budget = orchestrator_module.RunBudget
+
+    def recording_budget(*args: Any, max_cost_usd: Decimal, **kwargs: Any) -> RunBudget:
+        caps.append(max_cost_usd)
+        return run_budget(*args, max_cost_usd=max_cost_usd, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "RunBudget", recording_budget)
+    config = _config(tmp_path, budget={"max_cost_usd_per_run": 10, "max_cost_usd_per_day": 4})
+
+    manifest, _store = _run(tmp_path, pipeline, sha, config=config)
+
+    assert manifest.status == RunStatus.READY_FOR_APPROVAL
+    assert caps == [Decimal(4)]
 
 
 def test_models_are_resolved_once_from_the_keys_set_when_the_orchestrator_starts(

@@ -26,7 +26,7 @@ from autocontribute.agent_loop import (
 )
 from autocontribute.agent_tools import SessionTools
 from autocontribute.ai_policy import RepositoryAiPolicy
-from autocontribute.budget import RunBudget, daily_budget_allows_run
+from autocontribute.budget import RunBudget, daily_budget_left
 from autocontribute.config import AutocontributeConfig, ResolvedModels
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.critic import Critic, CriticRound
@@ -248,11 +248,12 @@ class Orchestrator:
         self._assert_operational()
         self.store.transition(manifest, RunStatus.DISCOVERING, reason="starting candidate search")
         budget_config = self.config.budget
-        if not daily_budget_allows_run(
+        daily_left = daily_budget_left(
             self.store,
             max_cost_usd_per_day=budget_config.max_cost_usd_per_day,
             max_cost_usd_per_run=budget_config.max_cost_usd_per_run,
-        ):
+        )
+        if daily_left is None:
             return self._end(
                 manifest,
                 RunStatus.SKIPPED,
@@ -262,7 +263,7 @@ class Orchestrator:
         budget = RunBudget(
             self.store,
             manifest,
-            max_cost_usd=budget_config.max_cost_usd_per_run,
+            max_cost_usd=min(budget_config.max_cost_usd_per_run, daily_left),
             max_model_calls=budget_config.max_model_calls_per_run,
             max_run_minutes=budget_config.max_run_minutes,
             assert_lease=self._assert_run_lease_owned,
