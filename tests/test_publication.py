@@ -74,7 +74,7 @@ from autocontribute.publication import (
     validate_publication_text,
 )
 from autocontribute.repository import RepositoryWorkspace
-from autocontribute.store import RunStore
+from autocontribute.store import CandidateAttemptState, RunStore
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -902,6 +902,102 @@ def _strand_review_publication_after_intent(
     assert not github.mutated
     github.calls.clear()
     return config, store, run_id, github, publisher
+
+
+def test_abandon_fails_a_stranded_publication_after_proving_github_has_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, store, run_id, github, publisher = _strand_review_publication_after_intent(
+        tmp_path,
+        monkeypatch,
+    )
+    stranded = store.get(run_id)
+    assert stranded.candidate is not None
+
+    abandoned = publisher.abandon(run_id, reason="  The fork was renamed by hand.  ")
+
+    assert abandoned.status == RunStatus.FAILED
+    assert store.get(run_id).status == RunStatus.FAILED
+    assert not github.mutated
+    assert {"find_pull_request", "ref_sha"} <= set(github.calls)
+    events = store.events(run_id)
+    assert [event["event_type"] for event in events[-3:]] == [
+        "publication.absence.verified",
+        "publication.compensation.verified",
+        "run.transitioned",
+    ]
+    verified = json.loads(events[-2]["details"])
+    assert verified["reason"] == "abandoned by the operator: The fork was renamed by hand."
+    assert verified["fork"] == "octocat/project"
+    assert verified["pull_request"] == "absent"
+    assert verified["remote_branch"] == "absent"
+    released = store.candidate_attempt_disposition(stranded.candidate)
+    assert released.state is CandidateAttemptState.AVAILABLE
+
+
+def test_abandon_looks_for_a_same_repository_branch_in_the_upstream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, run_id, github, publisher, pushes = _same_repository_publisher(
+        tmp_path,
+        monkeypatch,
+        login="example",
+    )
+    assert store.get(run_id).head_repository == "example/project"
+    original_find = github.find_pull_request
+
+    def crash_after_intent(repository: str, *, head: str) -> str | None:
+        raise RuntimeError("simulated crash after publication intent")
+
+    monkeypatch.setattr(github, "find_pull_request", crash_after_intent)
+    with pytest.raises(RuntimeError, match="crash after publication intent"):
+        publisher.publish(run_id)
+    monkeypatch.setattr(github, "find_pull_request", original_find)
+    branches: list[tuple[str, str]] = []
+
+    def ref_sha(repository: str, ref: str) -> str | None:
+        branches.append((repository, ref))
+        return None
+
+    monkeypatch.setattr(github, "ref_sha", ref_sha)
+
+    assert publisher.abandon(run_id, reason="Stuck").status == RunStatus.FAILED
+    assert branches == [("example/project", f"heads/autocontribute/issue-42-{run_id[:8]}")]
+    assert pushes == []
+
+
+def test_abandon_refuses_when_github_has_the_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, store, run_id, github, publisher = _strand_review_publication_after_intent(
+        tmp_path,
+        monkeypatch,
+    )
+    github.branch_sha = "f" * 40
+    events = store.events(run_id)
+
+    with pytest.raises(PublicationResumeRequired, match="contribution branch exists"):
+        publisher.abandon(run_id, reason="Stuck")
+
+    assert store.get(run_id).status == RunStatus.SUBMITTING
+    assert store.events(run_id) == events
+
+
+def test_abandon_refuses_runs_that_are_not_submitting_and_blank_reasons(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+
+    with pytest.raises(StateError, match="only submitting runs can be abandoned"):
+        publisher.abandon(run_id, reason="Stuck")
+    with pytest.raises(PolicyError, match="1-1000 characters"):
+        publisher.abandon(run_id, reason=" ")
+
+    assert github.calls == []
+    assert store.get(run_id).status == RunStatus.APPROVED
 
 
 def test_publisher_commits_and_opens_exact_approved_artifact(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

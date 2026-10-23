@@ -1221,6 +1221,40 @@ class Publisher:
         )
         return tuple(checks)
 
+    def abandon(self, run_id: str, *, reason: str) -> RunManifest:
+        """Fail a submitting run after proving its publication left nothing on GitHub.
+
+        This releases a publication that can never finish, such as one stuck before
+        same-repository publishing existed. A run whose pull request may exist, or whose
+        cleanup already started, has to be resumed with ``publish`` instead.
+        """
+
+        normalized = reason.strip()
+        if not normalized or len(normalized) > 1_000 or "\0" in normalized:
+            raise PolicyError("An abandon reason must be 1-1000 characters")
+        with LeaseHeartbeatGuard(
+            self.store,
+            PUBLICATION_LEASE_NAME,
+            ttl=PUBLICATION_LEASE_TTL,
+            heartbeat_interval=PUBLICATION_HEARTBEAT_INTERVAL,
+        ) as lease_guard:
+            lease_guard.assert_owned()
+            manifest = self.store.get(run_id)
+            if manifest.status != RunStatus.SUBMITTING:
+                raise StateError(
+                    f"Run {run_id} is {manifest.status.value}; only submitting runs can be "
+                    "abandoned"
+                )
+            if manifest.publication_compensation_reason is not None:
+                raise PublicationResumeRequired(
+                    f"Run {run_id} already started cleaning up its publication"
+                )
+            return self._finalize_absent_pre_post_publication(
+                manifest,
+                reason=f"abandoned by the operator: {normalized}",
+                lease_guard=lease_guard,
+            )
+
     def publish(self, run_id: str) -> RunManifest:
         with LeaseHeartbeatGuard(
             self.store,

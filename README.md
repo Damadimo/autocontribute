@@ -115,6 +115,7 @@ cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod
 | `runs show RUN_ID` | Show the evidence for one run. |
 | `runs check RUN_ID` | Check, without writing anything, whether a ready or approved run could publish now. |
 | `runs cancel RUN_ID --reason TEXT` | Cancel a run that is ready for approval or approved. |
+| `runs abandon RUN_ID --reason TEXT` | End a `submitting` run `failed` after checking that GitHub has neither its branch nor its PR. |
 | `config validate` | Check the config file and print a summary. |
 | `config show` | Print the config with defaults filled in; it shows secret names, never values. |
 | `lifecycle sync` | Check the PRs Autocontribute opened, note routine events, and hold or stop work on adverse ones. |
