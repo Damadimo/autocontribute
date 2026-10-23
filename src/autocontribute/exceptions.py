@@ -164,6 +164,10 @@ class PatchEncodingError(PolicyError):
         self.paths = paths
 
 
+class PullRequestTextError(PolicyError):
+    """The assembled pull request text cannot be published as it is; the run is rejected."""
+
+
 class ApprovalMismatchError(PolicyError):
     """The fingerprint a person approved is not the run's current approval fingerprint."""
 
