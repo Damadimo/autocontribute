@@ -517,6 +517,8 @@ def attest_policy(
         markup=False,
         soft_wrap=True,
     )
+    if snapshot.problems:
+        _fail("The policy files could not all be read, so no attestation can cover them")
     required = set(snapshot.legal_requirements)
     if not required:
         _fail("No CLA or DCO requirement was detected in this exact policy snapshot")
@@ -769,6 +771,7 @@ def _render_policy_snapshot(snapshot: PolicySnapshot, *, web_origin: str) -> str
         f"Repository policy files: {len(snapshot.repository_paths)}",
         f"Organization policy files: {len(snapshot.organization_paths)}",
         f"Detected legal requirements: {requirements}",
+        *(f"Problem: {problem}" for problem in snapshot.problems),
         "Repository policy review URLs:",
         *_immutable_policy_urls(
             web_origin,

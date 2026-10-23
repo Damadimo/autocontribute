@@ -105,6 +105,9 @@ class RepositoryInfo(DomainModel):
     private: bool
     pushed_at: datetime | None
     license_spdx: str | None
+    # Maintainers can turn pull requests off or limit them to collaborators.
+    has_pull_requests: bool = True
+    pull_request_creation_policy: str | None = None
 
 
 class IssueComment(DomainModel):

@@ -18,6 +18,7 @@ from autocontribute.discovery import (
     DiscoveryService,
     PolicySnapshot,
     TriageVerdict,
+    _is_policy_path,
     apply_legal_commit_message,
     competing_pull_requests,
     parse_issue_reference,
@@ -37,7 +38,7 @@ from autocontribute.exceptions import (
     PolicyError,
     StateError,
 )
-from autocontribute.github import LinkedPullRequest
+from autocontribute.github import DirectoryEntry, LinkedPullRequest
 from autocontribute.store import (
     CandidateAttemptDisposition,
     CandidateAttemptState,
@@ -73,9 +74,27 @@ class FakeGitHub:
         del repository
         return ORGANIZATION_REF
 
-    def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
-        del repository, ref, max_files
-        return ["CONTRIBUTING.md"]
+    def list_directory(
+        self, repository: str, path: str, *, ref: str
+    ) -> list[DirectoryEntry] | None:
+        del repository, ref
+        return _listing(["CONTRIBUTING.md"], path)
+
+
+def _listing(paths: list[str], directory: str) -> list[DirectoryEntry] | None:
+    """List one directory of a repository that holds these files, as the contents API does."""
+
+    entries: dict[str, str] = {}
+    for path in paths:
+        parent = path.rpartition("/")[0]
+        if parent == directory:
+            entries[path] = "file"
+        elif not directory or parent.startswith(f"{directory}/"):
+            child = path.removeprefix(f"{directory}/").split("/", 1)[0]
+            entries[f"{directory}/{child}" if directory else child] = "dir"
+    if directory and not entries:
+        return None
+    return [DirectoryEntry(path=path, kind=kind) for path, kind in sorted(entries.items())]
 
 
 class PolicyGitHub(FakeGitHub):
@@ -93,9 +112,11 @@ class PolicyGitHub(FakeGitHub):
         del ref, max_bytes
         return self.files.get((repository, path))
 
-    def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
-        del ref, max_files
-        return [path for owner_repository, path in self.files if owner_repository == repository]
+    def list_directory(
+        self, repository: str, path: str, *, ref: str
+    ) -> list[DirectoryEntry] | None:
+        del ref
+        return _listing([name for owner, name in self.files if owner == repository], path)
 
 
 REPOSITORY_LABELS = ["help wanted", "bug", "Good First Issue", "security", "wontfix"]
@@ -784,7 +805,14 @@ def test_one_failing_repository_or_issue_cannot_abort_discovery(tmp_path) -> Non
     assert outcome.repository_errors == (
         ("missing/repository", "GitHub returned 404"),
         ("broken/search", "Search timed out"),
-        ("broken/policy", "GitHub policy file could not be decoded safely"),
+    )
+    # An unreadable policy file leaves the policy unknown, so the repository is skipped.
+    assert outcome.skipped_repositories == (
+        (
+            "broken/policy",
+            "policy file broken/policy/CONTRIBUTING.md could not be read: GitHub policy file "
+            "could not be decoded safely",
+        ),
     )
     assert outcome.issue_errors == (
         ("example/project#7", "Issue changed while its complete discussion was fetched"),
@@ -793,7 +821,8 @@ def test_one_failing_repository_or_issue_cannot_abort_discovery(tmp_path) -> Non
     assert outcome.blocker_counts == [("assigned", 1)]
     assert outcome.summary == (
         "2 issues evaluated, 1 eligible; 1 candidate failed discovery gates (assigned 1); "
-        "3 repositories could not be searched; 1 issue could not be evaluated."
+        "1 repository was skipped; 2 repositories could not be searched; 1 issue could not be "
+        "evaluated."
     )
 
 
@@ -1828,18 +1857,7 @@ def test_legal_configuration_and_extensionless_policy_paths_are_inventoried(
     contents: str,
     requirement: str,
 ) -> None:  # type: ignore[no-untyped-def]
-    class InventoryLegalGitHub(PolicyGitHub):
-        def list_repository_files(
-            self,
-            repository: str,
-            *,
-            ref: str,
-            max_files: int,
-        ) -> list[str]:
-            del ref, max_files
-            return ["CONTRIBUTING.md", path] if repository == "example/project" else []
-
-    github = InventoryLegalGitHub(
+    github = PolicyGitHub(
         {
             ("example/project", "CONTRIBUTING.md"): "Contribution guidelines.",
             ("example/project", path): contents,
@@ -1943,34 +1961,18 @@ def test_legal_policy_content_change_invalidates_attestation(tmp_path) -> None:
 
 
 def test_benign_legal_policy_inventory_change_invalidates_attestation(tmp_path) -> None:
-    class InventoryLegalGitHub(PolicyGitHub):
-        def __init__(self, files: dict[tuple[str, str], str]) -> None:
-            super().__init__(files)
-            self.repository_paths = ["CONTRIBUTING.md"]
-
-        def list_repository_files(
-            self,
-            repository: str,
-            *,
-            ref: str,
-            max_files: int,
-        ) -> list[str]:
-            del ref, max_files
-            return list(self.repository_paths) if repository == "example/project" else []
-
-    github = InventoryLegalGitHub(
+    github = PolicyGitHub(
         {
             ("example/project", "CONTRIBUTING.md"): (
                 "Contributors must complete our Contributor License Agreement before opening a PR."
             ),
-            ("example/project", "docs/AI_POLICY.md"): "AI contributions receive normal review.",
         }
     )
     snapshot = DiscoveryService(  # type: ignore[arg-type]
         AutocontributeConfig(), github, RunStore(tmp_path / "preview")
     ).policy_snapshot(_repository(), repository_ref=REPOSITORY_REF)
     config = _legal_config(snapshot)
-    github.repository_paths.append("docs/AI_POLICY.md")
+    github.files[("example/project", "docs/AI_POLICY.md")] = "AI contributions receive review."
 
     result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
         _issue(), _repository(), repository_ref="c" * 40
@@ -2224,8 +2226,8 @@ def test_organization_default_contribution_guidance_and_template_are_evidence(tm
     }
 
 
-def test_present_but_unreadable_policy_file_stops_discovery(tmp_path) -> None:
-    class UnreadablePolicyGitHub(FakeGitHub):
+def test_present_but_unreadable_policy_file_blocks_the_repository(tmp_path) -> None:
+    class UnreadablePolicyGitHub(PolicyGitHub):
         def get_file(
             self,
             repository: str,
@@ -2236,49 +2238,64 @@ def test_present_but_unreadable_policy_file_stops_discovery(tmp_path) -> None:
         ) -> str | None:
             if path == "SECURITY.md":
                 raise GitHubError("policy file could not be decoded safely")
-            return super().get_file(
-                repository,
-                path,
-                ref=ref,
-                max_bytes=max_bytes,
-            )
+            return super().get_file(repository, path, ref=ref, max_bytes=max_bytes)
 
-        def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
-            del repository, ref, max_files
-            return ["CONTRIBUTING.md", "SECURITY.md"]
+    github = UnreadablePolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): "Contribution guidelines.",
+            ("example/project", "SECURITY.md"): "",
+        }
+    )
+    service = DiscoveryService(AutocontributeConfig(), github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    evaluation = service._assess(_issue(), _repository())
+
+    assert not evaluation.eligibility.eligible
+    assert evaluation.blocker_kinds == ("policy files",)
+    assert evaluation.eligibility.blockers == [
+        "policy file example/project/SECURITY.md could not be read: policy file could not be "
+        "decoded safely"
+    ]
+
+
+def test_policy_listing_failure_blocks_the_repository(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    class UnlistablePolicyGitHub(FakeGitHub):
+        def list_directory(
+            self, repository: str, path: str, *, ref: str
+        ) -> list[DirectoryEntry] | None:
+            if path == "docs":
+                raise GitHubError("listing may be incomplete")
+            return [
+                DirectoryEntry(path="CONTRIBUTING.md", kind="file"),
+                DirectoryEntry(path="docs", kind="dir"),
+            ]
 
     service = DiscoveryService(  # type: ignore[arg-type]
-        AutocontributeConfig(), UnreadablePolicyGitHub(), RunStore(tmp_path)
+        AutocontributeConfig(), UnlistablePolicyGitHub(), RunStore(tmp_path)
     )
 
-    with pytest.raises(GitHubError, match="could not be decoded"):
-        service.evaluate(_issue(), _repository())
+    result = service.evaluate(_issue(), _repository())
+
+    assert not result.eligible
+    assert result.blockers == [
+        "the policy files of example/project could not be listed: listing may be incomplete",
+        "the policy files of example/.github could not be listed: listing may be incomplete",
+    ]
 
 
-def test_repository_inventory_discovers_named_organization_templates_and_alt_policies(
+def test_policy_surface_reads_fixed_directories_and_organization_template_directories(
     tmp_path,
 ) -> None:  # type: ignore[no-untyped-def]
-    class InventoryPolicyGitHub(PolicyGitHub):
-        def list_repository_files(
-            self,
-            repository: str,
-            *,
-            ref: str,
-            max_files: int,
-        ) -> list[str]:
-            del ref, max_files
-            if repository == "example/project":
-                return ["CONTRIBUTING.md", "governance/ai-generated-code.md"]
-            if repository == "example/.github":
-                return [".github/PULL_REQUEST_TEMPLATE/verification.md"]
-            return []
-
-    github = InventoryPolicyGitHub(
+    github = PolicyGitHub(
         {
             ("example/project", "CONTRIBUTING.md"): "Ordinary guidance.",
-            ("example/project", "governance/ai-generated-code.md"): (
-                "We reject AI-generated contributions."
-            ),
+            (
+                "example/project",
+                "docs/ai-contributions.md",
+            ): "We reject AI-generated contributions.",
+            ("example/project", "docs/dataclasses.md"): "We reject AI-generated contributions.",
+            ("example/project", "governance/ai-generated-code.md"): "Nested and never read.",
+            ("example/project", "src/README.md"): "Nested and never read.",
             ("example/.github", ".github/PULL_REQUEST_TEMPLATE/verification.md"): (
                 "## Verification\n"
             ),
@@ -2286,8 +2303,11 @@ def test_repository_inventory_discovers_named_organization_templates_and_alt_pol
     )
     service = DiscoveryService(AutocontributeConfig(), github, RunStore(tmp_path))  # type: ignore[arg-type]
 
+    snapshot = service.policy_snapshot(_repository())
     result = service.evaluate(_issue(), _repository())
 
+    assert snapshot.repository_paths == ("CONTRIBUTING.md", "docs/ai-contributions.md")
+    assert snapshot.organization_paths == (".github/PULL_REQUEST_TEMPLATE/verification.md",)
     assert not result.eligible
     assert "AI-assisted" in " ".join(result.blockers)
     assert service.organization_pull_request_templates("example/project") == {
@@ -2295,29 +2315,151 @@ def test_repository_inventory_discovers_named_organization_templates_and_alt_pol
     }
 
 
-def test_repository_inventory_rejects_too_many_matching_policy_files(tmp_path) -> None:
-    class ExcessivePolicyInventoryGitHub(PolicyGitHub):
-        def list_repository_files(
-            self,
-            repository: str,
-            *,
-            ref: str,
-            max_files: int,
-        ) -> list[str]:
-            del repository, ref, max_files
-            return [
-                f"docs/contributing-{index}.md"
-                for index in range(MAX_POLICY_FILES_PER_REPOSITORY + 1)
-            ]
+@pytest.mark.parametrize(
+    "path",
+    [
+        "AGENTS.md",
+        "CLAUDE.md",
+        "GEMINI.md",
+        ".github/copilot-instructions.md",
+        "AI_POLICY.md",
+        "docs/AIToolPolicy.md",
+        ".github/LLM_POLICY.md",
+        "docs/CONTRIBUTE.md",
+        "contributing-guide.md",
+        "docs/HOW_TO_CONTRIBUTE.rst",
+        "CODE_OF_CONDUCT.md",
+        ".github/SECURITY.md",
+        "GOVERNANCE.md",
+        "README.md",
+        "docs/pull_request_template.md",
+        ".github/dco.yml",
+        ".clabot",
+    ],
+)
+def test_policy_path_rules_cover_agent_ai_and_contribution_files(path: str) -> None:
+    assert _is_policy_path(path)
 
-    service = DiscoveryService(  # type: ignore[arg-type]
-        AutocontributeConfig(),
-        ExcessivePolicyInventoryGitHub({}),
-        RunStore(tmp_path),
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docs/dataclasses.md",
+        "docs/multiclass.rst",
+        "docs/README.md",
+        ".github/README.md",
+        "CONTRIBUTORS.md",
+        "docs/declaration.md",
+        "SECURITY.pdf",
+    ],
+)
+def test_policy_path_rules_skip_nested_readmes_and_cla_lookalikes(path: str) -> None:
+    assert not _is_policy_path(path)
+
+
+def test_contribution_guides_lead_one_hop_to_linked_policy_pages(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "Read [the AI tool policy](llvm/docs/AIToolPolicy.md) and the "
+                "[provenance rules](https://github.com/example/project/blob/main/docs/devel/"
+                "code-provenance.rst#ai), the [changelog](CHANGELOG.md), "
+                "[elsewhere](https://example.org/policy.md) and [a section](#ai)."
+            ),
+            ("example/project", "llvm/docs/AIToolPolicy.md"): "Linked once.",
+            ("example/project", "docs/devel/code-provenance.rst"): (
+                "See [the next hop](../../NEXT.md)."
+            ),
+            ("example/project", "NEXT.md"): "Two hops away and never read.",
+            ("example/project", "CHANGELOG.md"): "Release notes are never read.",
+        }
+    )
+    service = DiscoveryService(AutocontributeConfig(), github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    snapshot = service.policy_snapshot(_repository())
+
+    assert snapshot.repository_paths == (
+        "CONTRIBUTING.md",
+        "llvm/docs/AIToolPolicy.md",
+        "docs/devel/code-provenance.rst",
     )
 
-    with pytest.raises(GitHubError, match="more than 128 policy files"):
-        service.evaluate(_issue(), _repository())
+
+def test_linked_policy_page_that_cannot_be_read_blocks_the_repository(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): "See `the rules <docs/rules.rst>`_.",
+            ("example/project", "docs/rules.rst"): "x" * (MAX_POLICY_FILE_BYTES + 1),
+        }
+    )
+
+    result = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path)
+    ).evaluate(_issue(), _repository())
+
+    assert result.blockers == [
+        "policy file example/project/docs/rules.rst exceeds the 256000-byte limit"
+    ]
+
+
+def test_vouch_file_blocks_the_repository(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): "Contribution guidelines.",
+            ("example/project", ".github/VOUCHED.td"): "maintainer\n",
+        }
+    )
+
+    evaluation = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path)
+    )._assess(_issue(), _repository())
+
+    assert evaluation.blocker_kinds == ("vouch",)
+
+
+@pytest.mark.parametrize(
+    ("updates", "reason"),
+    [
+        ({"has_pull_requests": False}, "the repository has pull requests turned off"),
+        (
+            {"pull_request_creation_policy": "collaborators_only"},
+            "the repository takes pull requests only from collaborators",
+        ),
+    ],
+)
+def test_repository_that_restricts_pull_requests_is_skipped_before_searching(
+    tmp_path,
+    updates: dict[str, object],
+    reason: str,
+) -> None:  # type: ignore[no-untyped-def]
+    class RestrictedGitHub(CandidateDiscoveryGitHub):
+        def get_repository(self, full_name: str) -> RepositoryInfo:
+            return super().get_repository(full_name).model_copy(update=updates)
+
+        def search_issues(self, repository: str, **kwargs: object) -> list[IssueCandidate]:
+            raise AssertionError("a restricted repository is not searched")
+
+    github = RestrictedGitHub([_issue()])
+    service = DiscoveryService(_discovery_config("example/project"), github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    outcome = service.discover()
+    evaluation = service._assess(_issue(), _repository().model_copy(update=updates))
+
+    assert outcome.selection is None
+    assert outcome.skipped_repositories == (("example/project", reason),)
+    assert evaluation.blocker_kinds == ("pull requests restricted",)
+
+
+def test_repository_inventory_rejects_too_many_matching_policy_files(tmp_path) -> None:
+    files = {
+        ("example/project", f"docs/contributing-{index}.md"): "Guidance."
+        for index in range(MAX_POLICY_FILES_PER_REPOSITORY + 1)
+    }
+    service = DiscoveryService(AutocontributeConfig(), PolicyGitHub(files), RunStore(tmp_path))  # type: ignore[arg-type]
+
+    result = service.evaluate(_issue(), _repository())
+
+    assert "example/project has more than 128 policy files" in result.blockers
 
 
 def test_policy_reader_rechecks_size_when_github_adapter_ignores_limit(tmp_path) -> None:
@@ -2333,54 +2475,32 @@ def test_policy_reader_rechecks_size_when_github_adapter_ignores_limit(tmp_path)
             del repository, path, ref, max_bytes
             return "x" * (MAX_POLICY_FILE_BYTES + 1)
 
-        def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
-            del repository, ref, max_files
-            return ["CONTRIBUTING.md"]
-
     service = DiscoveryService(  # type: ignore[arg-type]
-        AutocontributeConfig(), OversizedPolicyGitHub({}), RunStore(tmp_path)
+        AutocontributeConfig(),
+        OversizedPolicyGitHub({("example/project", "CONTRIBUTING.md"): ""}),
+        RunStore(tmp_path),
     )
 
-    with pytest.raises(GitHubError, match="policy file exceeds the 256000-byte limit"):
-        service.evaluate(_issue(), _repository())
+    result = service.evaluate(_issue(), _repository())
+
+    assert (
+        "policy file example/project/CONTRIBUTING.md exceeds the 256000-byte limit"
+        in result.blockers
+    )
 
 
 def test_policy_fingerprint_rejects_aggregate_byte_overflow(tmp_path) -> None:
     policy_paths = ["CONTRIBUTING.md", *[f"docs/ai-policy-{index}.md" for index in range(15)]]
 
-    class AggregatePolicyGitHub(PolicyGitHub):
-        def list_repository_files(
-            self,
-            repository: str,
-            *,
-            ref: str,
-            max_files: int,
-        ) -> list[str]:
-            del ref, max_files
-            return policy_paths if repository == "example/project" else []
+    files = {("example/project", path): "x" * MAX_POLICY_FILE_BYTES for path in policy_paths}
+    service = DiscoveryService(AutocontributeConfig(), PolicyGitHub(files), RunStore(tmp_path))  # type: ignore[arg-type]
 
-        def get_file(
-            self,
-            repository: str,
-            path: str,
-            *,
-            ref: str,
-            max_bytes: int = 1_000_000,
-        ) -> str | None:
-            del ref, max_bytes
-            if repository == "example/project" and path in policy_paths:
-                return "x" * MAX_POLICY_FILE_BYTES
-            return None
+    result = service.evaluate(_issue(), _repository())
 
-    service = DiscoveryService(  # type: ignore[arg-type]
-        AutocontributeConfig(), AggregatePolicyGitHub({}), RunStore(tmp_path)
+    assert (
+        f"policy files of example/project exceed the {MAX_POLICY_TOTAL_BYTES}-byte limit"
+        in result.blockers
     )
-
-    with pytest.raises(
-        GitHubError,
-        match=rf"policy evidence exceeds the {MAX_POLICY_TOTAL_BYTES}-byte limit",
-    ):
-        service.evaluate(_issue(), _repository())
 
 
 def test_repository_and_organization_policy_reads_use_their_pinned_shas(tmp_path) -> None:
@@ -2392,21 +2512,14 @@ def test_repository_and_organization_policy_reads_use_their_pinned_shas(tmp_path
                     ("example/.github", "AI_POLICY.md"): "AI contributions are reviewed.",
                 }
             )
-            self.tree_reads: list[tuple[str, str]] = []
+            self.directory_reads: list[tuple[str, str, str]] = []
             self.content_reads: list[tuple[str, str, str]] = []
 
-        def list_repository_files(
-            self,
-            repository: str,
-            *,
-            ref: str,
-            max_files: int,
-        ) -> list[str]:
-            del max_files
-            self.tree_reads.append((repository, ref))
-            if repository == "example/project":
-                return ["CONTRIBUTING.md"]
-            return ["AI_POLICY.md"]
+        def list_directory(
+            self, repository: str, path: str, *, ref: str
+        ) -> list[DirectoryEntry] | None:
+            self.directory_reads.append((repository, path, ref))
+            return super().list_directory(repository, path, ref=ref)
 
         def get_file(
             self,
@@ -2426,9 +2539,9 @@ def test_repository_and_organization_policy_reads_use_their_pinned_shas(tmp_path
     ).evaluate(_issue(), _repository())
 
     assert result.eligible
-    assert github.tree_reads == [
-        ("example/project", REPOSITORY_REF),
-        ("example/.github", ORGANIZATION_REF),
+    assert github.directory_reads == [
+        ("example/project", "", REPOSITORY_REF),
+        ("example/.github", "", ORGANIZATION_REF),
     ]
     assert github.content_reads == [
         ("example/project", "CONTRIBUTING.md", REPOSITORY_REF),

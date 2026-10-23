@@ -9,7 +9,7 @@ import pytest
 
 from autocontribute.config import GitHubConfig
 from autocontribute.exceptions import GitHubError, GitHubRequestNotSentError, GitHubSafetyError
-from autocontribute.github import GitHubClient, resolve_github_token
+from autocontribute.github import DirectoryEntry, GitHubClient, resolve_github_token
 from autocontribute.store import RunStore
 
 
@@ -191,19 +191,22 @@ def test_get_file_enforces_declared_and_decoded_byte_limits(
         github.get_file("example/project", "POLICY.md", ref="a" * 40, max_bytes=8)
 
 
-def test_policy_tree_and_content_requests_are_bound_to_an_immutable_ref() -> None:
+def test_policy_directory_and_content_requests_are_bound_to_an_immutable_ref() -> None:
     seen: list[tuple[str, str | None]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append((request.url.path, request.url.params.get("ref")))
-        if "/git/trees/" in request.url.path:
+        if request.url.path == "/repos/example/project/contents":
             return httpx.Response(
                 200,
-                json={
-                    "truncated": False,
-                    "tree": [{"type": "blob", "path": "CONTRIBUTING.md"}],
-                },
+                json=[
+                    {"type": "file", "path": "README.md"},
+                    {"type": "dir", "path": ".github"},
+                    {"type": "file", "path": "CONTRIBUTING.md"},
+                ],
             )
+        if request.url.path == "/repos/example/project/contents/docs":
+            return httpx.Response(404, json={"message": "Not Found"})
         content = b"Policy text.\n"
         return httpx.Response(
             200,
@@ -217,13 +220,75 @@ def test_policy_tree_and_content_requests_are_bound_to_an_immutable_ref() -> Non
 
     ref = "b" * 40
     with _client(handler) as github:
-        assert github.list_repository_files("example/project", ref=ref) == ["CONTRIBUTING.md"]
+        assert github.list_directory("example/project", "", ref=ref) == [
+            DirectoryEntry(path=".github", kind="dir"),
+            DirectoryEntry(path="CONTRIBUTING.md", kind="file"),
+            DirectoryEntry(path="README.md", kind="file"),
+        ]
+        assert github.list_directory("example/project", "docs", ref=ref) is None
         assert github.get_file("example/project", "CONTRIBUTING.md", ref=ref) == "Policy text.\n"
 
     assert seen == [
-        (f"/repos/example/project/git/trees/{ref}", None),
+        ("/repos/example/project/contents", ref),
+        ("/repos/example/project/contents/docs", ref),
         ("/repos/example/project/contents/CONTRIBUTING.md", ref),
     ]
+
+
+def test_directory_path_that_is_a_file_is_not_a_directory() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json={"type": "symlink", "target": "documentation"})
+
+    with _client(handler) as github:
+        assert github.list_directory("example/project", "docs", ref="b" * 40) is None
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [{"type": "file", "path": "docs/README.md"}],
+        [{"type": "file", "path": "../README.md"}],
+        [{"type": "file", "path": "README.md"}, {"type": "file", "path": "README.md"}],
+        [{"type": "unknown", "path": "README.md"}],
+        [{"type": "file", "path": f"file-{index}.md"} for index in range(1_000)],
+    ],
+)
+def test_directory_listing_rejects_unsafe_or_possibly_truncated_entries(
+    entries: list[dict[str, object]],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=entries)
+
+    with _client(handler) as github, pytest.raises(GitHubError):
+        github.list_directory("example/project", "", ref="b" * 40)
+
+
+def test_repository_reads_pull_request_access_settings() -> None:
+    payload = _repository_payload("example/project")
+    payload["has_pull_requests"] = False
+    payload["pull_request_creation_policy"] = "collaborators_only"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=payload)
+
+    with _client(handler) as github:
+        restricted = github.get_repository("example/project")
+
+    assert not restricted.has_pull_requests
+    assert restricted.pull_request_creation_policy == "collaborators_only"
+
+    def default_handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(200, json=_repository_payload("example/project"))
+
+    with _client(default_handler) as github:
+        default = github.get_repository("example/project")
+
+    assert default.has_pull_requests
+    assert default.pull_request_creation_policy is None
 
 
 def test_optional_policy_repository_resolves_one_full_default_branch_sha() -> None:
