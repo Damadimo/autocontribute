@@ -1864,10 +1864,21 @@ def test_base_drift_that_adds_a_policy_file_is_unsafe(tmp_path: Path) -> None:
     github = FakePublishingGitHub(issue, newer_base)
     github.base_changed_paths = frozenset({"AI_POLICY.md"})
 
-    def files_at(repository: str, *, ref: str, max_files: int) -> list[str]:
-        return ["CONTRIBUTING.md", "AI_POLICY.md"] if ref == newer_base else ["CONTRIBUTING.md"]
+    def listing_at(repository: str, path: str, *, ref: str) -> list[DirectoryEntry] | None:
+        if path:
+            return None
+        names = ["CONTRIBUTING.md", "AI_POLICY.md"] if ref == newer_base else ["CONTRIBUTING.md"]
+        return [DirectoryEntry(path=name, kind="file") for name in names]
 
-    github.list_repository_files = files_at  # type: ignore[method-assign]
+    github.list_directory = listing_at  # type: ignore[method-assign]
+    read_file = github.get_file
+
+    def file_at(repository: str, path: str, *, ref: str, max_bytes: int = 1_000_000) -> str | None:
+        if path == "AI_POLICY.md":
+            return "Contributions written with AI tools are welcome." if ref == newer_base else None
+        return read_file(repository, path, ref=ref, max_bytes=max_bytes)
+
+    github.get_file = file_at  # type: ignore[method-assign]
 
     with pytest.raises(PolicyError, match="changed a path the patch touches"):
         Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]

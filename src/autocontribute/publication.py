@@ -4004,6 +4004,10 @@ class Publisher:
                     manifest.repository,
                     repository_ref=ref,
                 )
+                if snapshot.problems:
+                    # A policy file that could not be read may be the one that changed.
+                    self._safe_bases[key] = False
+                    return False
                 touched.update(snapshot.repository_paths)
             comparison = self.github.compare_commits(
                 manifest.candidate.repository,
