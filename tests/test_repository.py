@@ -824,3 +824,71 @@ def test_restoring_the_base_undoes_tracked_and_new_files_but_keeps_ignored_ones(
 
     assert workspace.ignored_paths() == []
     assert (workspace.path / "README.md").is_file()
+
+
+def _workspace_with_submodule(
+    source_repository: tuple[Path, str, str], tmp_path: Path
+) -> RepositoryWorkspace:
+    source, _, _ = source_repository
+    library = tmp_path / "library"
+    library.mkdir()
+    _git(library, "init", "--quiet")
+    (library / "lib.txt").write_text("vendored\n", encoding="utf-8")
+    _git(library, "add", "lib.txt")
+    _git(library, "-c", "user.name=F", "-c", "user.email=f@example.invalid", "commit", "-qm", "l")
+    _git(
+        source, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(library), "vendor"
+    )
+    _git(source, "commit", "--quiet", "-m", "add submodule")
+    return _clone(source, _git(source, "rev-parse", "HEAD"), tmp_path / "workspace")
+
+
+def test_host_git_never_enters_a_repository_planted_at_a_submodule_path(
+    source_repository: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    # `git add --all` ran `git status` inside a submodule whose checkout matched the recorded
+    # commit, and that child git ran the clean filter a container planted in its config.
+    workspace = _workspace_with_submodule(source_repository, tmp_path)
+    program, marker = _plant_program(tmp_path, "nested")
+    nested = workspace.path / "vendor"
+    _git(nested, "init", "--quiet")
+    (nested / "file.txt").write_text("one\n", encoding="utf-8")
+    _git(nested, "add", "file.txt")
+    _git(nested, "-c", "user.name=F", "-c", "user.email=f@example.invalid", "commit", "-qm", "n")
+    with (nested / ".git" / "config").open("a", encoding="utf-8") as config:
+        config.write(f'[filter "planted"]\n\tclean = {program}\n')
+    (nested / ".gitattributes").write_text("* filter=planted\n", encoding="utf-8")
+    (nested / "file.txt").write_text("two\n", encoding="utf-8")
+    recorded = _git(workspace.path, "ls-tree", "HEAD", "vendor").split()[2]
+    branch = _git(nested, "symbolic-ref", "HEAD")
+    (nested / ".git" / branch).write_text(f"{recorded}\n", encoding="utf-8")
+    (workspace.path / "README.md").write_text("changed\n", encoding="utf-8")
+
+    patch = workspace.patch_bytes()
+    changed = workspace.changed_paths()
+    restored = workspace.restore_base()
+
+    assert not marker.exists()
+    assert b"+changed" in patch and b"vendor" not in patch
+    assert changed == ["README.md"]
+    assert restored == ["README.md"]
+
+
+def test_restoring_the_base_deletes_a_new_nested_repository(
+    source_repository: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+    nested = workspace.path / "cache" / "checkout"
+    nested.mkdir(parents=True)
+    _git(nested, "init", "--quiet")
+    (nested / "file.txt").write_text("fetched\n", encoding="utf-8")
+    _git(nested, "add", "file.txt")
+    _git(nested, "-c", "user.name=F", "-c", "user.email=f@example.invalid", "commit", "-qm", "n")
+    (nested / "outside").symlink_to(tmp_path)
+
+    assert workspace.restore_base() == ["cache/checkout"]
+
+    assert not (workspace.path / "cache" / "checkout").exists()
+    assert (tmp_path / "workspace" / "README.md").is_file()
+    assert workspace.changed_paths() == []
