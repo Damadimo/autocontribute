@@ -23,7 +23,8 @@ from autocontribute.config import (
     ModelProfile,
     validate_model_identifier,
 )
-from autocontribute.exceptions import SandboxError
+from autocontribute.discovery import DiscoveryService
+from autocontribute.exceptions import AutocontributeError, SandboxError
 from autocontribute.github import GitHubClient
 from autocontribute.providers import ModelCapabilityResponse, create_provider
 from autocontribute.redaction import redact_text
@@ -361,6 +362,7 @@ def _github_checks(
             )
             target_access = _github_target_access_check(config, github)
             permissions = _github_permission_check(scopes=scopes)
+            ai_policies = [_ai_policy_check(config, github, store)] if store is not None else []
     except Exception as exc:
         detail = _safe_detail(str(exc))
         return [
@@ -377,7 +379,7 @@ def _github_checks(
             ),
         ]
     else:
-        return [authentication, target_access, permissions]
+        return [authentication, target_access, permissions, *ai_policies]
     finally:
         if github_token is not None:
             _DOCTOR_SECRET_VALUES.reset(github_token)
@@ -449,6 +451,37 @@ def _github_target_access_check(
         True,
         f"read-only access verified for {repository_count} repository target(s) and "
         f"{owner_count} owner target(s)",
+    )
+
+
+def _ai_policy_check(
+    config: AutocontributeConfig,
+    github: GitHubClient,
+    store: RunStore,
+) -> DoctorCheck:
+    """Name each configured repository whose AI policy rules out this tool, with its quotes."""
+
+    discovery = DiscoveryService(config, github, store)
+    ruled_out: list[str] = []
+    for name in config.github.repositories:
+        try:
+            reason = discovery.ai_policy_blocker(github.get_repository(name))
+        except AutocontributeError as exc:
+            reason = f"the AI policy could not be read: {exc}"
+        if reason is not None:
+            ruled_out.append(f"{name}: {reason}")
+    if not ruled_out:
+        return DoctorCheck(
+            "repository AI policies",
+            True,
+            f"no AI policy rules out any of {len(config.github.repositories)} configured "
+            "repository target(s)",
+        )
+    return DoctorCheck(
+        "repository AI policies",
+        True,
+        _safe_detail("discovery skips " + "; ".join(ruled_out)),
+        warning=True,
     )
 
 

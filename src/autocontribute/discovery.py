@@ -1189,6 +1189,12 @@ class DiscoveryService:
         self._repository_reviews[key] = result
         return result
 
+    def ai_policy_blocker(self, repository: RepositoryInfo) -> str | None:
+        """Why the repository's AI policy rules it out, with its quotes; None when it does not."""
+
+        snapshot = self.policy_snapshot(repository)
+        return self._ai_policy_blocker(repository.full_name, self._ai_policy(repository, snapshot))
+
     def _ai_policy(
         self, repository: RepositoryInfo, snapshot: PolicySnapshot
     ) -> RepositoryAiPolicy:
