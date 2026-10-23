@@ -31,6 +31,7 @@ from autocontribute.sandbox import SETUP_CAPABILITIES, ImageIdentity, SessionCom
 _KEY = "d" * 64
 _BASE = ImageIdentity("sha256:" + "1" * 64, "sha256:" + "2" * 64, {}, "linux/arm64")
 _COMMITTED = "sha256:" + "3" * 64
+_BOOTSTRAPPED = "sha256:" + "5" * 64
 
 
 def _git(directory: Path, *arguments: str) -> str:
@@ -150,7 +151,7 @@ class _FakeContainer:
 
     def commit(self, labels: Mapping[str, str]) -> str:
         self.labels = labels
-        return _COMMITTED
+        return _BOOTSTRAPPED if self.options.get("capabilities") else _COMMITTED
 
 
 @pytest.fixture
@@ -158,7 +159,7 @@ def docker(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
     _FakeNetwork.instances = []
     _FakeContainer.instances = []
     _FakeContainer.effects = {}
-    calls: dict[str, list[Any]] = {"tag": [], "inspect": []}
+    calls: dict[str, list[Any]] = {"tag": [], "inspect": [], "removed": []}
     monkeypatch.setattr(environment_setup, "EgressNetwork", _FakeNetwork)
     monkeypatch.setattr(environment_setup, "SessionContainer", _FakeContainer)
     monkeypatch.setattr(environment_setup, "detect_docker_daemon_mode", lambda *_: "rootful")
@@ -172,6 +173,11 @@ def docker(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
         environment_setup,
         "inspect_image",
         lambda reference, **_: calls["inspect"].append(reference) or None,
+    )
+    monkeypatch.setattr(
+        environment_setup,
+        "remove_image",
+        lambda image_id, **_: calls["removed"].append(image_id),
     )
     return calls
 
@@ -208,17 +214,25 @@ def test_setup_runs_behind_the_proxy_undoes_tracked_changes_and_commits(
     network = _FakeNetwork.instances[0]
     assert network.allowed_hosts == DEFAULT_ALLOWED_HOSTS | {"npm.example.org"}
     assert network.removed
-    container = _FakeContainer.instances[0]
+    # Only the root bootstrap's container gets capabilities, and it runs nothing else.
+    bootstrap, container = _FakeContainer.instances
+    assert bootstrap.removed
+    assert bootstrap.options["image"] == _BASE.image_id
+    assert bootstrap.options["network"] == "ac-run1-net-1"
+    assert bootstrap.options["writable_root"] is True
+    assert bootstrap.options["capabilities"] == SETUP_CAPABILITIES
+    ((script, environment, as_root),) = bootstrap.execs
+    assert as_root
+    assert "apt-get install" in script
+    assert environment["HTTPS_PROXY"] == "http://ac-run1-proxy-1:3128"
+    assert bootstrap.labels == {}
     assert container.removed
     assert container.config.pids_limit == 4_096
-    assert container.options["image"] == _BASE.image_id
+    assert container.options["image"] == _BOOTSTRAPPED
     assert container.options["network"] == "ac-run1-net-1"
     assert container.options["writable_root"] is True
-    assert container.options["capabilities"] == SETUP_CAPABILITIES
-    bootstrap, install = container.execs
-    assert bootstrap[2] is True
-    assert "apt-get install" in bootstrap[0]
-    assert bootstrap[1]["HTTPS_PROXY"] == "http://ac-run1-proxy-1:3128"
+    assert "capabilities" not in container.options
+    (install,) = container.execs
     assert install == (
         "npm ci",
         {
@@ -240,6 +254,7 @@ def test_setup_runs_behind_the_proxy_undoes_tracked_changes_and_commits(
     assert container.labels == {IMAGE_LABEL: label}
     tag = "autocontribute-env/acme__demo:dddddddddddd"
     assert docker["tag"] == [(_COMMITTED, tag)]
+    assert docker["removed"] == []
     assert image == EnvironmentImage(
         _COMMITTED, tag, "node:24-bookworm", _BASE.digest, _KEY, reused=False
     )
@@ -254,8 +269,8 @@ def test_python_setup_checks_where_the_project_imports_from(
         workspace, recipe, base=_BASE, cache_key=_KEY, allow_hosts=(), distribution="demo-pkg"
     )
 
-    container = _FakeContainer.instances[0]
-    assert container.options["capabilities"] == {"CHOWN"}
+    bootstrap, container = _FakeContainer.instances
+    assert bootstrap.options["capabilities"] == {"CHOWN"}
     probe, environment, as_root = container.execs[-1]
     assert probe.startswith("python -c ") and probe.endswith(" demo-pkg")
     assert environment == recipe.env
@@ -277,8 +292,9 @@ def test_a_failed_setup_step_reports_its_output_and_refused_hosts(
         "deny CONNECT evil.example:443: the host is not on the setup allowlist"
     )
     assert _FakeNetwork.instances[0].removed
-    assert _FakeContainer.instances[0].removed
+    assert all(container.removed for container in _FakeContainer.instances)
     assert docker["tag"] == []
+    assert docker["removed"] == [_BOOTSTRAPPED]
 
 
 def test_a_matching_local_image_is_reused_with_its_workspace_output(

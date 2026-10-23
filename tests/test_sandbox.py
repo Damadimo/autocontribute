@@ -872,6 +872,25 @@ def test_session_is_removed_when_the_run_is_interrupted(
     assert docker.calls[-1] == ["rm", "--force", "--volumes", names[0]]
 
 
+def test_session_restarts_when_a_process_of_another_uid_survives(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The command user's `kill -1` cannot reach a process that changed its uid, so it is
+    # looked for by every uid but the main process's.
+    docker = _ScriptedDocker()
+    session = _session(tmp_path, monkeypatch, docker, mode="rootless")
+    session.start()
+    name = session.name
+    docker.leftovers = ["4300   1\n"] * 3
+
+    outcome = session.exec("make test &", timeout_seconds=30)
+
+    assert docker.calls.count(["top", name, "-o", "pid,uid"]) == 3
+    assert ["kill", name] in docker.calls
+    assert outcome.restarted
+
+
 def test_rootless_session_runs_and_reaps_commands_as_namespace_root(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -977,6 +996,12 @@ def test_setup_session_has_a_writable_root_its_network_and_bootstrap_capabilitie
         "--cap-add=CHOWN",
         "--cap-add=SETUID",
     ]
+
+    steps = _session(tmp_path, monkeypatch, docker, network="ac-run-net-1234", writable_root=True)
+    steps.start()
+    steps_run = [call for call in docker.calls if call[0] == "run"][-1]
+    assert f"--name={steps.name}" in steps_run
+    assert [flag for flag in steps_run if flag.startswith("--cap-")] == ["--cap-drop=ALL"]
 
 
 def test_environment_session_gets_a_fresh_volume_for_tool_homes(
