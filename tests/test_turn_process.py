@@ -17,6 +17,7 @@ from autocontribute.exceptions import (
     ModelRequestError,
     ModelTimeoutError,
 )
+from autocontribute.host_environment import proxy_environment
 from autocontribute.pricing import API_KEY_ENVS, MODELS, Effort, ModelUsage
 from autocontribute.providers import (
     _MODEL_TURN_PROTOCOL,
@@ -211,11 +212,13 @@ def test_worker_environment_holds_only_allowlisted_names_and_the_model_key(
         "AWS_SECRET_ACCESS_KEY": "aws-secret-placeholder",
         "DATABASE_PASSWORD": "database-password-placeholder",
         "DOCKER_HOST": "unix:///var/run/docker.sock",
-        "HTTPS_PROXY": "http://user:pass@proxy.example:3128",
         "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
     }
     for name, value in sensitive.items():
         monkeypatch.setenv(name, value)
+    # The worker reaches the model API through the operator's proxy and trust store.
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    monkeypatch.setenv("SSL_CERT_FILE", "/etc/ssl/corporate.pem")
 
     provider.step(transcript=_transcript(model), max_output_tokens=1_000, timeout_seconds=30)
 
@@ -223,7 +226,10 @@ def test_worker_environment_holds_only_allowlisted_names_and_the_model_key(
     # The interpreter adds LC_CTYPE when it coerces the C locale; macOS adds the last name.
     added_by_runtime = {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
     allowlisted = {name for name in _WORKER_ENV_ALLOWLIST if name in os.environ}
-    assert set(recorded["environment"]) - added_by_runtime == allowlisted | {own_key}
+    assert set(recorded["environment"]) - added_by_runtime == (
+        allowlisted | set(proxy_environment()) | {own_key}
+    )
+    assert {"HTTPS_PROXY", "SSL_CERT_FILE"} <= set(recorded["environment"])
     assert not set(sensitive) & set(recorded["environment"])
     assert recorded["model_keys"] == {own_key: _API_KEY, other_key: None}
 
