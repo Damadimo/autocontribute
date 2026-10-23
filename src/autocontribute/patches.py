@@ -322,12 +322,8 @@ def _header_path(line: str, *, strict: bool = True) -> str:
         destination, rest = _unquote(rest[1:], strict=strict) if rest.startswith(' "') else ("", "")
     else:
         middle = (len(rest) - 1) // 2
-        source, separator, destination = (
-            rest[:middle],
-            rest[middle : middle + 1],
-            rest[middle + 1 :],
-        )
-        rest = separator.strip()
+        source, destination = rest[:middle], rest[middle + 1 :]
+        rest = rest[middle : middle + 1].strip()
     if rest or not source.startswith("a/") or destination != f"b/{source[2:]}":
         raise RepositoryError(f"Cannot read the path of patch header: {line}")
     return destination[2:]

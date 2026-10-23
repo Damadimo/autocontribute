@@ -24,7 +24,7 @@ _FULL_SHA: Final = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _GIT_TIMEOUT_SECONDS: Final = 120
 _MAX_ERROR_CHARACTERS: Final = 4_000
 _DEFAULT_MAX_FILE_BYTES: Final = 1_000_000
-_FILTER_COMMAND_KEY: Final = re.compile(r"^filter\..+\.(?:clean|smudge|process)$", re.DOTALL)
+_FILTER_COMMAND_KEY: Final = re.compile(r"filter\..+\.(?:clean|smudge|process)", re.DOTALL)
 _PATCH_DIFF_ARGUMENTS: Final = (
     "diff",
     "--cached",
