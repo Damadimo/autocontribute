@@ -139,6 +139,10 @@ class SandboxError(AutocontributeError):
     """An isolated validation command could not be executed."""
 
 
+class EnvironmentRecipeError(AutocontributeError):
+    """No recipe for building a repository's test environment could be found."""
+
+
 class StateError(AutocontributeError):
     """A run attempted an invalid or stale state transition."""
 
