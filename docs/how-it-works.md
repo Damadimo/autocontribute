@@ -212,8 +212,9 @@ The safety stop is one global switch that never clears itself: while it is on, `
 
 - a published PR's head changed, and either the prepared commit is gone or a new commit comes from
   your account or from no known GitHub account (this tool never pushes to an open PR);
-- maintainers of two repositories turn away automated contributions within 30 days, counting only
-  holds you have not released;
+- maintainers of two repositories turn away your PRs as automated contributions within 30 days,
+  counting only holds you have not released (a comment on a candidate issue holds its repository
+  but does not count, because it is addressed to every contributor);
 - the secret scanner finds credential-like text in a patch, GitHub reports the account suspended,
   or publishing cannot confirm what GitHub did;
 - you run `autocontribute safety stop --actor NAME --reason "TEXT"`.

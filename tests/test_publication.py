@@ -1186,7 +1186,7 @@ def test_held_repository_stops_before_any_github_mutation(tmp_path: Path) -> Non
             trigger_hash="c" * 64,
             scope=StopScope.REPOSITORY,
             scope_key=manifest.repository.full_name,
-            maintainer_stop=True,
+            counts_toward_escalation=True,
         )
     )
     github = FakePublishingGitHub(issue, manifest.base_sha or "")

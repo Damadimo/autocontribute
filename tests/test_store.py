@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import autocontribute.store as store_module
 from autocontribute.ai_policy import RepositoryAiPolicy
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.domain import IssueCandidate, RunManifest, RunStatus
@@ -2821,7 +2822,7 @@ def _hold(
     *,
     reason: str = "maintainer asked to stop",
     expires_at: datetime | None = None,
-    maintainer_stop: bool = False,
+    counts_toward_escalation: bool = False,
 ) -> CircuitBreakerTrigger:
     return CircuitBreakerTrigger(
         source=f"fixture:{key}",
@@ -2830,7 +2831,7 @@ def _hold(
         scope=scope,
         scope_key=key,
         expires_at=expires_at,
-        maintainer_stop=maintainer_stop,
+        counts_toward_escalation=counts_toward_escalation,
     )
 
 
@@ -2936,19 +2937,25 @@ def test_maintainer_stops_in_a_second_repository_escalate_to_a_global_stop(
 ) -> None:
     store = RunStore(tmp_path / "state")
     assert store.record_stop(
-        _hold(StopScope.REPOSITORY, "example/released", "released", maintainer_stop=True)
+        _hold(StopScope.REPOSITORY, "example/released", "released", counts_toward_escalation=True)
     )
     assert store.release_hold(
         store.active_holds(StopScope.REPOSITORY, "example/released")[0].hold_id,
         actor="operator",
         reason="the comment was about a different bot",
     )
-    store.record_stop(_hold(StopScope.REPOSITORY, "example/first", "first-a", maintainer_stop=True))
-    store.record_stop(_hold(StopScope.REPOSITORY, "example/first", "first-b", maintainer_stop=True))
+    store.record_stop(
+        _hold(StopScope.REPOSITORY, "example/first", "first-a", counts_toward_escalation=True)
+    )
+    store.record_stop(
+        _hold(StopScope.REPOSITORY, "example/first", "first-b", counts_toward_escalation=True)
+    )
     store.record_stop(_hold(StopScope.REPOSITORY, "example/closed", "cooldown"))
     assert not store.circuit_breaker_status().is_tripped
 
-    store.record_stop(_hold(StopScope.REPOSITORY, "example/second", "second", maintainer_stop=True))
+    store.record_stop(
+        _hold(StopScope.REPOSITORY, "example/second", "second", counts_toward_escalation=True)
+    )
 
     status = store.circuit_breaker_status()
     assert status.is_tripped
@@ -2958,6 +2965,24 @@ def test_maintainer_stops_in_a_second_repository_escalate_to_a_global_stop(
         "most recently example/second"
     )
     assert len(store.active_holds(StopScope.REPOSITORY)) == 4
+
+
+def test_escalating_holds_older_than_thirty_days_do_not_escalate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RunStore(tmp_path / "state")
+    now = datetime.now(UTC)
+    monkeypatch.setattr(store_module, "utc_now", lambda: now - timedelta(days=31))
+    store.record_stop(
+        _hold(StopScope.REPOSITORY, "example/first", "first", counts_toward_escalation=True)
+    )
+    monkeypatch.setattr(store_module, "utc_now", lambda: now)
+
+    store.record_stop(
+        _hold(StopScope.REPOSITORY, "example/second", "second", counts_toward_escalation=True)
+    )
+
+    assert not store.circuit_breaker_status().is_tripped
 
 
 def test_publication_refuses_held_repositories_pull_requests_and_publication(

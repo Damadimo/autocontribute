@@ -1813,8 +1813,8 @@ def _automation_stop_hold(
         # An edited comment is new evidence, so a hold released after review can return.
         trigger_hash=hashlib.sha256(_canonical_json(evidence)).hexdigest(),
         scope=StopScope.REPOSITORY,
+        # Addressed to every contributor rather than to this tool, so it does not escalate.
         scope_key=repository.full_name,
-        maintainer_stop=True,
     )
 
 

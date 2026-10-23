@@ -46,9 +46,9 @@ class CircuitBreakerTrigger:
     scope: StopScope = StopScope.GLOBAL
     scope_key: str = ""
     expires_at: datetime | None = None
-    # Maintainer text turning away automated work; holds from it in two repositories within 30
-    # days escalate to a global stop.
-    maintainer_stop: bool = False
+    # A maintainer turned this tool's own pull request away as automation. Such holds in two
+    # repositories within 30 days escalate to a global stop.
+    counts_toward_escalation: bool = False
 
 
 class GitHubSafetyError(GitHubError):

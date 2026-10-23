@@ -331,7 +331,7 @@ def test_observer_records_attention_and_each_stop_once_across_observations() -> 
         for item in second.attention
     )
     (hold,) = store.triggers.values()
-    assert (hold.scope, hold.scope_key, hold.maintainer_stop) == (
+    assert (hold.scope, hold.scope_key, hold.counts_toward_escalation) == (
         StopScope.REPOSITORY,
         "example/project",
         True,

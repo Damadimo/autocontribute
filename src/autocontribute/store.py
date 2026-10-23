@@ -45,9 +45,9 @@ _GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SHA256: Final = re.compile(r"^[0-9a-f]{64}$")
 _ISSUE_KEY: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$")
 _HTTPS_KEY: Final = re.compile(r"^https://[^\s/]+(?:/\S*)?$")
-# Holds from maintainer stop text in this many repositories within the window stop everything.
-_MAINTAINER_STOP_ESCALATION_REPOSITORIES: Final = 2
-_MAINTAINER_STOP_ESCALATION_WINDOW: Final = timedelta(days=30)
+# Escalating holds in this many repositories within the window stop everything.
+_ESCALATION_REPOSITORIES: Final = 2
+_ESCALATION_WINDOW: Final = timedelta(days=30)
 _INITIAL_EVENT_HASH: Final = "0" * 64
 _METADATA_COLUMNS: Final = {"singleton", "schema_version", "migrated_at"}
 _RUN_COLUMNS: Final = {
@@ -136,7 +136,7 @@ _HOLD_COLUMNS: Final = {
     "source",
     "reason",
     "trigger_hash",
-    "maintainer_stop",
+    "counts_toward_escalation",
     "created_at",
     "expires_at",
     "released_at",
@@ -1176,7 +1176,9 @@ class RunStore:
                 source TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 trigger_hash TEXT NOT NULL UNIQUE,
-                maintainer_stop INTEGER NOT NULL CHECK(maintainer_stop IN (0, 1)),
+                counts_toward_escalation INTEGER NOT NULL CHECK(
+                    counts_toward_escalation IN (0, 1)
+                ),
                 created_at TEXT NOT NULL,
                 expires_at TEXT,
                 released_at TEXT,
@@ -2922,14 +2924,18 @@ class RunStore:
         """
 
         if trigger.scope is StopScope.GLOBAL:
-            if trigger.scope_key or trigger.expires_at is not None or trigger.maintainer_stop:
+            if (
+                trigger.scope_key
+                or trigger.expires_at is not None
+                or trigger.counts_toward_escalation
+            ):
                 raise ValueError("a global stop has no scope key, expiry, or escalation")
             return self.trip_circuit_breaker(
                 source=trigger.source,
                 reason=trigger.reason,
                 trigger_hash=trigger.trigger_hash,
             )
-        if trigger.maintainer_stop and trigger.scope is not StopScope.REPOSITORY:
+        if trigger.counts_toward_escalation and trigger.scope is not StopScope.REPOSITORY:
             raise ValueError("only repository holds count toward escalation")
         scope_key = _hold_key(trigger.scope, trigger.scope_key)
         source = _bounded_text(trigger.source, field="hold source", maximum=255)
@@ -2946,7 +2952,7 @@ class RunStore:
             inserted = connection.execute(
                 """
                 INSERT INTO holds(
-                    scope, scope_key, source, reason, trigger_hash, maintainer_stop,
+                    scope, scope_key, source, reason, trigger_hash, counts_toward_escalation,
                     created_at, expires_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trigger_hash) DO NOTHING
@@ -2957,7 +2963,7 @@ class RunStore:
                     source,
                     reason,
                     trigger_hash,
-                    int(trigger.maintainer_stop),
+                    int(trigger.counts_toward_escalation),
                     created_at.isoformat(),
                     expires_at,
                 ),
@@ -2975,16 +2981,16 @@ class RunStore:
                 ) != (trigger.scope.value, scope_key.casefold(), source, reason):
                     raise StateError("Hold trigger hash was reused for different evidence")
                 return False
-            if trigger.maintainer_stop:
+            if trigger.counts_toward_escalation:
                 held = connection.execute(
                     """
                     SELECT DISTINCT scope_key FROM holds
-                    WHERE scope = 'repository' AND maintainer_stop = 1
+                    WHERE scope = 'repository' AND counts_toward_escalation = 1
                         AND released_at IS NULL AND created_at >= ?
                     """,
-                    ((created_at - _MAINTAINER_STOP_ESCALATION_WINDOW).isoformat(),),
+                    ((created_at - _ESCALATION_WINDOW).isoformat(),),
                 ).fetchall()
-                if len(held) >= _MAINTAINER_STOP_ESCALATION_REPOSITORIES:
+                if len(held) >= _ESCALATION_REPOSITORIES:
                     self._trip_circuit_breaker(
                         connection,
                         source="escalation:maintainer_stops",

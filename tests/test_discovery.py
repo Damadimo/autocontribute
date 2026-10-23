@@ -1666,6 +1666,39 @@ def test_stop_aimed_at_automation_holds_the_repository_until_released(tmp_path) 
     assert service.store.active_holds() == []
 
 
+def test_issue_discussion_holds_do_not_escalate_to_a_global_stop(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # The comments are addressed to every contributor, not to this tool's own pull requests.
+    turned_away = {
+        repository: [
+            _repository_issue(
+                repository,
+                41,
+                comments=1,
+                discussion=[
+                    _comment(
+                        body="We do not accept AI-generated pull requests.",
+                        author="maintainer",
+                        association="MEMBER",
+                    )
+                ],
+            )
+        ]
+        for repository in ("example/project", "other/project")
+    }
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config(*turned_away), IsolationGitHub(turned_away), RunStore(tmp_path)
+    )
+
+    outcome = service.discover()
+
+    assert outcome.selection is None
+    assert [hold.scope_key for hold in service.store.active_holds()] == [
+        "example/project",
+        "other/project",
+    ]
+    assert not service.store.circuit_breaker_status().is_tripped
+
+
 def test_held_repositories_are_not_searched_and_held_issues_not_read(tmp_path) -> None:  # type: ignore[no-untyped-def]
     store = RunStore(tmp_path)
     store.record_stop(
