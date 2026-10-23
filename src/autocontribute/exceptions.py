@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 
 class AutocontributeError(Exception):
@@ -141,6 +142,17 @@ class RepositoryError(AutocontributeError):
 
 class PolicyError(AutocontributeError):
     """A contribution violated a non-negotiable policy."""
+
+
+class BudgetExhaustedError(PolicyError):
+    """A model request does not fit what is left of the run's cost, model calls or time.
+
+    The agent loop ends its transcript as "did not finish" instead of failing the run.
+    """
+
+    def __init__(self, message: str, *, limit: Literal["cost", "calls", "time"]) -> None:
+        super().__init__(message)
+        self.limit = limit
 
 
 class PatchEncodingError(PolicyError):

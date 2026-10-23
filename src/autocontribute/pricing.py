@@ -234,7 +234,9 @@ def _table_model(name: str, role: Role) -> ModelSpec:
     return spec
 
 
-def _rates(spec: ModelSpec, input_tokens: int) -> Rates:
+def tier_rates(spec: ModelSpec, input_tokens: int) -> Rates:
+    """Return the rates of the tier a request with ``input_tokens`` input falls in."""
+
     tier = spec.long_context
     if tier is not None and input_tokens > tier.above_input_tokens:
         return tier.rates
@@ -247,7 +249,7 @@ def cost(spec: ModelSpec, usage: ModelUsage) -> Decimal:
     regular_input_tokens = usage.input_tokens - usage.cached_input_tokens - usage.cache_write_tokens
     if regular_input_tokens < 0:
         raise ValueError("cached and cache-write tokens cannot exceed input tokens")
-    rates = _rates(spec, usage.input_tokens)
+    rates = tier_rates(spec, usage.input_tokens)
     return (
         Decimal(regular_input_tokens) * rates.input
         + Decimal(usage.cached_input_tokens) * rates.cached_input
@@ -259,7 +261,7 @@ def cost(spec: ModelSpec, usage: ModelUsage) -> Decimal:
 def upper_bound_cost(spec: ModelSpec, *, input_tokens: int, output_tokens: int) -> Decimal:
     """Price a reservation without assuming a cache hit, in the tier its input falls in."""
 
-    rates = _rates(spec, input_tokens)
+    rates = tier_rates(spec, input_tokens)
     input_rate = max(rates.input, rates.cached_input, rates.cache_write)
     return (
         Decimal(input_tokens) * input_rate + Decimal(output_tokens) * rates.output
@@ -285,5 +287,6 @@ __all__ = [
     "cost",
     "resolve_critic",
     "resolve_model",
+    "tier_rates",
     "upper_bound_cost",
 ]

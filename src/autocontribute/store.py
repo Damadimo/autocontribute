@@ -14,6 +14,7 @@ from collections.abc import Collection, Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from pathlib import Path
 from typing import Final, Literal, cast
@@ -1437,6 +1438,30 @@ class RunStore:
                 "SELECT manifest_json FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [RunManifest.model_validate_json(row["manifest_json"]) for row in rows]
+
+    def model_cost_since(self, created_since: datetime) -> Decimal:
+        """Return the model cost of runs created at or after ``created_since``.
+
+        A run's pending reservation counts as spent: the provider may have billed all of it.
+        """
+
+        since = _aware_utc(created_since, field="model cost window start")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT run_id,
+                    json_extract(manifest_json, '$.model_cost_usd') AS settled,
+                    json_extract(manifest_json, '$.model_reservation.cost_usd') AS pending
+                FROM runs WHERE julianday(created_at) >= julianday(?)
+                """,
+                (since.isoformat(),),
+            ).fetchall()
+        total = Decimal(0)
+        for row in rows:
+            for value in (row["settled"], row["pending"]):
+                if value is not None:
+                    total += _stored_cost(value, run_id=str(row["run_id"]))
+        return total
 
     def repository_ai_policy(
         self, repository: str, policy_sha256: str
@@ -4531,6 +4556,19 @@ def _aware_utc(value: datetime, *, field: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field} must be timezone-aware")
     return value.astimezone(UTC)
+
+
+def _stored_cost(value: object, *, run_id: str) -> Decimal:
+    # Manifests store USD amounts as decimal strings, so no float rounding reaches the sum.
+    if not isinstance(value, str):
+        raise StateError(f"Run {run_id} stores a model cost that is not a decimal string")
+    try:
+        cost = Decimal(value)
+    except InvalidOperation as exc:
+        raise StateError(f"Run {run_id} stores an invalid model cost") from exc
+    if not cost.is_finite() or cost < 0:
+        raise StateError(f"Run {run_id} stores an invalid model cost")
+    return cost
 
 
 def _stored_datetime(value: object, *, field: str) -> datetime:
