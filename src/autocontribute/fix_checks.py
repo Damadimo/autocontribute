@@ -165,6 +165,8 @@ class FixCheckResult(DomainModel):
     # The patch changes source files without a test, outside documentation, typing, build
     # and CI configuration: only the critic's ``no_test_needed`` allows that (§7.1, item 5).
     test_waiver_needed: bool
+    # The test command reports each test; without that, the suite counts as one test.
+    per_test: bool
     notes: list[str]
 
 
@@ -475,6 +477,7 @@ class FixChecks:
             test_waiver_needed=bool(sources.files)
             and not tests.files
             and not all(_needs_no_test(path) for path in sources.paths),
+            per_test=self._baseline.per_test,
             notes=notes,
         )
         self.results[sha] = result
