@@ -369,27 +369,27 @@ def _github_header(
         f"/approve {review.fingerprint[:12]}",
         "```",
         "",
-        f"The approval binds fingerprint {_code(review.fingerprint)}: the patch, the pull "
+        f"The approval binds fingerprint {code_span(review.fingerprint)}: the patch, the pull "
         "request text, the commit, and where it is published. Anything that changes them "
         f"changes the fingerprint. An approval lasts {approval_expires_hours} hours.",
         "",
         "| Field | Value |",
         "| --- | --- |",
-        f"| Run | {_code(run.run_id, table=True)} |",
-        f"| Upstream issue | {_code(issue, table=True)} |",
-        f"| Issue link | {_code(run.candidate.html_url, table=True)} |",
-        f"| Base | {_code(approval.base_branch, table=True)} at "
-        f"{_code(approval.base_sha, table=True)} |",
-        f"| Head repository | {_code(_head_repository_line(approval), table=True)} |",
+        f"| Run | {code_span(run.run_id, table=True)} |",
+        f"| Upstream issue | {code_span(issue, table=True)} |",
+        f"| Issue link | {code_span(run.candidate.html_url, table=True)} |",
+        f"| Base | {code_span(approval.base_branch, table=True)} at "
+        f"{code_span(approval.base_sha, table=True)} |",
+        f"| Head repository | {code_span(_head_repository_line(approval), table=True)} |",
         f"| Opens as | {opens_as} |",
-        f"| Publishing account | {_code(approval.publishing_login, table=True)} |",
+        f"| Publishing account | {code_span(approval.publishing_login, table=True)} |",
         f"| Patch | {len(review.patch):,} bytes, {patch_lines:,} lines, SHA-256 "
-        f"{_code(approval.diff_sha256, table=True)} |",
-        f"| validation.json SHA-256 | {_code(validation_sha256, table=True)} |",
+        f"{code_span(approval.diff_sha256, table=True)} |",
+        f"| validation.json SHA-256 | {code_span(validation_sha256, table=True)} |",
         "",
         "Upstream issue title:",
         "",
-        _fenced(run.candidate.title, "text"),
+        fenced_block(run.candidate.title, "text"),
         "",
     ]
 
@@ -398,26 +398,26 @@ def _github_publication_text(approval: ApprovalManifest) -> list[str]:
     author = f"{approval.commit_author_name} <{approval.commit_author_email}>"
     committer = f"{approval.commit_committer_name} <{approval.commit_committer_email}>"
     identity = (
-        f"Author and committer: {_code(author)}"
+        f"Author and committer: {code_span(author)}"
         if author == committer
-        else f"Author: {_code(author)}; committer: {_code(committer)}"
+        else f"Author: {code_span(author)}; committer: {code_span(committer)}"
     )
     return [
         "### Pull request title",
         "",
-        _fenced(approval.pull_request_title, "text"),
+        fenced_block(approval.pull_request_title, "text"),
         "",
         "### Pull request body",
         "",
         "The Markdown source of the body, exactly as it will be posted:",
         "",
-        _fenced(approval.pull_request_body, "markdown"),
+        fenced_block(approval.pull_request_body, "markdown"),
         "",
         "### Commit",
         "",
         identity,
         "",
-        _fenced(approval.commit_message, "text"),
+        fenced_block(approval.commit_message, "text"),
         "",
     ]
 
@@ -533,7 +533,7 @@ def _github_validation(
         for index, result in enumerate(run.patched_validation, start=1)
     )
     reference = (
-        f"validation.json (SHA-256 {_code(artifact_sha256)}) in the run evidence has every "
+        f"validation.json (SHA-256 {code_span(artifact_sha256)}) in the run evidence has every "
         "command's full output."
     )
     for tail in _OUTPUT_TAILS if budget else ():
@@ -544,7 +544,7 @@ def _github_validation(
                 [
                     f"#### {heading}",
                     "",
-                    f"Command {_code(result.command)}: exit code {result.exit_code}, "
+                    f"Command {code_span(result.command)}: exit code {result.exit_code}, "
                     f"{result.duration_seconds:.2f} seconds, timed out: "
                     f"{'yes' if result.timed_out else 'no'}.",
                     "",
@@ -564,7 +564,7 @@ def _github_validation(
                         if len(shown) < len(output)
                         else f"{stream}:"
                     )
-                    lines.extend([label, "", _fenced(shown, "text"), ""])
+                    lines.extend([label, "", fenced_block(shown, "text"), ""])
         if not results:
             lines.extend(["No validation command was recorded.", ""])
         if cut:
@@ -599,7 +599,7 @@ def _github_critic(run: RunManifest, *, budget: int) -> tuple[str, str | None]:
         f"{critic.verdict}.\n\n"
     )
     full = "\n".join(evidence)
-    text = heading + _fenced(full, "text") + "\n\n"
+    text = heading + fenced_block(full, "text") + "\n\n"
     if len(text) <= budget:
         return text, None
     room = budget - len(heading) - 300
@@ -608,7 +608,7 @@ def _github_critic(run: RunManifest, *, budget: int) -> tuple[str, str | None]:
         return heading + note, "critic"
     shortened = (
         heading
-        + _fenced(full[:room], "text")
+        + fenced_block(full[:room], "text")
         + f"\n\nShortened to fit: the first {room:,} of {len(full):,} characters; "
         "manifest.json has the rest.\n\n"
     )
@@ -633,10 +633,10 @@ def _github_ai_policy(run: RunManifest, *, budget: int) -> tuple[str, str | None
             raise TypeError("AI policy evidence has unexpected types")
     except (ValueError, KeyError, TypeError, AttributeError):
         return heading + "The recorded AI-policy evidence could not be read.\n\n", None
-    text = heading + f"Stance: {_code(stance)}.\n\n"
+    text = heading + f"Stance: {code_span(stance)}.\n\n"
     shown = 0
     for source, quote in quotes:
-        entry = f"From {_code(source)}:\n\n{_fenced(quote, 'text')}\n\n"
+        entry = f"From {code_span(source)}:\n\n{fenced_block(quote, 'text')}\n\n"
         if len(text) + len(entry) > budget - 200:
             break
         text += entry
@@ -661,7 +661,9 @@ def _fence(value: str, *, minimum: int) -> str:
     return "`" * max(minimum, longest + 1)
 
 
-def _fenced(value: str, info: str) -> str:
+def fenced_block(value: str, info: str) -> str:
+    """A fenced block that no backtick run in ``value`` can close; GitHub renders nothing in it."""
+
     shown = _github_visible(value)
     fence = _fence(shown, minimum=3)
     return f"{fence}{info}\n{shown.removesuffix(chr(10))}\n{fence}"
@@ -672,7 +674,7 @@ def _fenced_lines(lines: list[_PatchLine], info: str, fence: str) -> str:
     return f"{fence}{info}\n{content.removesuffix(chr(10))}\n{fence}"
 
 
-def _code(value: str, *, table: bool = False) -> str:
+def code_span(value: str, *, table: bool = False) -> str:
     """An inline code span that no backtick, newline or table pipe in ``value`` can end."""
 
     shown = _github_visible(value).replace("\n", " ")
@@ -762,6 +764,8 @@ __all__ = [
     "GITHUB_TEXT_LIMIT",
     "MAX_PATCH_PARTS",
     "GitHubReview",
+    "code_span",
+    "fenced_block",
     "render_approval_review",
     "render_github_review",
     "render_run_report",
