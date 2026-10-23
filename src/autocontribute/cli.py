@@ -7,6 +7,7 @@ import json
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, NoReturn
 from urllib.parse import quote
@@ -45,6 +46,7 @@ from autocontribute.exceptions import (
     PolicyError,
     PublicationLimitError,
     PublicationResumeRequired,
+    ReviewTooLargeError,
     StateError,
 )
 from autocontribute.github import GitHubClient
@@ -52,7 +54,11 @@ from autocontribute.github_origin import web_origin_for_api
 from autocontribute.lifecycle import LifecycleSyncResult, sync_open_pull_requests
 from autocontribute.orchestrator import Orchestrator, RunInvocationMode
 from autocontribute.publication import Publisher, approve_run, build_approval_review
-from autocontribute.reporting import render_approval_review, render_run_report
+from autocontribute.reporting import (
+    render_approval_review,
+    render_github_review,
+    render_run_report,
+)
 from autocontribute.state_archive import export_state, import_state
 from autocontribute.store import CandidateRetryAuthorization, RunStore
 
@@ -542,6 +548,89 @@ def show_run(
             _show_report(manifest)
     except AutocontributeError as exc:
         _fail(str(exc))
+
+
+class ReviewFormat(StrEnum):
+    GITHUB = "github"
+
+
+@runs_app.command(name="review")
+def review_run(
+    run_id: Annotated[str, typer.Argument(help="Run identifier waiting for approval.")],
+    review_format: Annotated[
+        ReviewFormat,
+        typer.Option(
+            "--format",
+            help="github: an issue body of at most 60,000 characters plus patch parts.",
+        ),
+    ],
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="New or empty directory for body.md and part-K.md."),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the written files as JSON."),
+    ] = False,
+) -> None:
+    """Write the approval review of a ready run as files to post on GitHub.
+
+    Exit codes: 0 written, 4 the review cannot fit in the body and five parts, 1 anything else.
+    """
+
+    context: dict[str, object] = {"run_id": run_id}
+    target = output_dir.expanduser().resolve()
+    if target.exists() and (not target.is_dir() or any(target.iterdir())):
+        _fail(
+            f"{target} must be a new or empty directory", json_output=json_output, context=context
+        )
+    settings = _config(config, json_output=json_output)
+    store = RunStore(settings.storage.path)
+    try:
+        with _github_client(settings, store) as github:
+            review = build_approval_review(settings, store, run_id, github=github)
+        rendered = render_github_review(
+            review,
+            approval_expires_hours=settings.publishing.approval_expires_hours,
+        )
+    except ReviewTooLargeError as exc:
+        _fail(
+            str(exc),
+            exit_code=4,
+            json_output=json_output,
+            outcome="too_large",
+            context=context,
+        )
+    except AutocontributeError as exc:
+        _fail(str(exc), json_output=json_output, context=context)
+    target.mkdir(parents=True, exist_ok=True)
+    files = [("body.md", rendered.body)] + [
+        (f"part-{index}.md", part) for index, part in enumerate(rendered.parts, start=1)
+    ]
+    for name, text in files:
+        (target / name).write_text(text, encoding="utf-8")
+    if json_output:
+        _emit_json(
+            {
+                "run_id": run_id,
+                "fingerprint": review.fingerprint,
+                "approval_command": f"/approve {review.fingerprint[:12]}",
+                "body": str(target / "body.md"),
+                "body_characters": len(rendered.body),
+                "parts": [
+                    {"path": str(target / name), "characters": len(text)}
+                    for name, text in files[1:]
+                ],
+                "shortened": list(rendered.shortened),
+            }
+        )
+        return
+    console.print(
+        f"Wrote body.md and {len(rendered.parts)} part file(s) to {target}. "
+        f"Approve with: /approve {review.fingerprint[:12]}",
+        markup=False,
+    )
 
 
 @runs_app.command(name="check")

@@ -160,6 +160,10 @@ class PublicationLimitError(PolicyError):
     """A publication limit refuses the pull request for now; the approval stays usable."""
 
 
+class ReviewTooLargeError(PolicyError):
+    """A review cannot fit GitHub's size limits without cutting text the approval binds."""
+
+
 class SandboxError(AutocontributeError):
     """An isolated validation command could not be executed."""
 
