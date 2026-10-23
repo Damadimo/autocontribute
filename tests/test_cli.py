@@ -2006,6 +2006,10 @@ def test_publish_failures_have_typed_outcomes_and_exit_codes(
                 store.trip_circuit_breaker(
                     source="operator:a", reason="stop", trigger_hash="c" * 64
                 )
+            if outcome == "resume_required":
+                stranded = store.get(run_id)
+                stranded.status = RunStatus.SUBMITTING
+                store.save(stranded, event="test.intent", details={})
             raise error
 
     monkeypatch.setattr(cli, "GitHubClient", _ContextGitHub)
@@ -2018,13 +2022,31 @@ def test_publish_failures_have_typed_outcomes_and_exit_codes(
     assert as_json.exit_code == exit_code, as_json.output
     assert json.loads(as_json.output) == {
         "run_id": run_id,
-        "status": "approved",
+        "status": "submitting" if outcome == "resume_required" else "approved",
         "pull_request_url": None,
         "outcome": outcome,
         "message": str(error),
     }
     assert as_text.exit_code == exit_code
     assert str(error) in " ".join(as_text.output.split())
+
+
+def test_publish_reports_another_runs_stuck_publication_as_an_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, run_id = _approved_state(tmp_path)
+
+    def other_run_is_stuck(*_: object, **__: object) -> None:
+        raise PublicationResumeRequired("Run 0123456789abcdef requires publication resumption")
+
+    monkeypatch.setattr(cli, "GitHubClient", _ContextGitHub)
+    monkeypatch.setattr(cli, "_sync_lifecycle", other_run_is_stuck)
+
+    result = runner.invoke(app, ["publish", run_id, "--yes", "--json", "--config", str(config)])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output)["outcome"] == "error"
 
 
 def test_publish_json_reports_an_unknown_run(tmp_path: Path) -> None:
