@@ -694,6 +694,87 @@ def test_discover_explain_lists_every_issue_skip_and_error(
             assert reason in " ".join(output.split())
 
 
+_RUN_SUMMARY_KEYS = {
+    "run_id",
+    "status",
+    "repository",
+    "issue_number",
+    "issue_url",
+    "created_at",
+    "updated_at",
+    "approval_expires_at",
+    "pull_request_url",
+    "skip_reason",
+    "error",
+}
+
+
+def test_runs_list_selects_statuses_as_json_oldest_first(tmp_path: Path) -> None:
+    config_path, store, ready_id = _ready_review_run(tmp_path)
+    queued = store.create_run()
+    failed = store.create_run()
+    store.transition(failed, RunStatus.FAILED, reason="fixture")
+
+    result = runner.invoke(
+        app,
+        [
+            "runs",
+            "list",
+            "--status",
+            "ready_for_approval, queued",
+            "--json",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    listed = json.loads(result.output)
+    assert [item["run_id"] for item in listed] == [ready_id, queued.run_id]
+    assert all(set(item) == _RUN_SUMMARY_KEYS for item in listed)
+    ready = listed[0]
+    assert ready["status"] == "ready_for_approval"
+    assert ready["repository"] == "example/project"
+    assert ready["issue_number"] == 42
+    assert ready["issue_url"] == "https://github.com/example/project/issues/42"
+    assert ready["approval_expires_at"] is None
+    assert listed[1]["repository"] is None
+
+
+def test_runs_list_refuses_to_truncate_a_status_selection(tmp_path: Path) -> None:
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+    store = RunStore(state)
+    for _ in range(3):
+        store.transition(store.create_run(), RunStatus.FAILED, reason="fixture")
+
+    truncated = runner.invoke(
+        app,
+        ["runs", "list", "--status", "failed", "--limit", "2", "--json", "--config", str(config)],
+    )
+    unknown = runner.invoke(
+        app,
+        ["runs", "list", "--status", "failed,finished", "--json", "--config", str(config)],
+    )
+    unfiltered = runner.invoke(
+        app,
+        ["runs", "list", "--limit", "2", "--json", "--config", str(config)],
+    )
+
+    assert truncated.exit_code == 1
+    assert json.loads(truncated.output) == {
+        "outcome": "error",
+        "message": "Selected run set exceeds the configured safety bound",
+    }
+    assert unknown.exit_code == 1
+    refusal = json.loads(unknown.output)
+    assert refusal["outcome"] == "error"
+    assert "--status takes comma-separated statuses from: queued" in refusal["message"]
+    assert unfiltered.exit_code == 0, unfiltered.output
+    assert len(json.loads(unfiltered.output)) == 2
+
+
 def test_init_does_not_overwrite_without_force(tmp_path: Path) -> None:
     config = tmp_path / "autocontribute.yml"
     config.write_text("sentinel", encoding="utf-8")
@@ -1405,6 +1486,54 @@ def test_run_expires_runs_left_unapproved_past_approval_lifetime_plus_seven_days
         RunStatus.CANCELLED if expired else RunStatus.READY_FOR_APPROVAL
     )
     assert _SkippingOrchestrator.calls == ["run"]
+
+
+def test_scheduled_run_prints_its_outcome_as_json(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+
+    class FakeOrchestrator:
+        def __init__(self, _: object, *, store: RunStore, github: object) -> None:
+            self.store = store
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def run(self, **_: object):  # type: ignore[no-untyped-def]
+            manifest = self.store.create_run()
+            manifest.status = RunStatus.FAILED
+            manifest.error = "sandbox image is unavailable"
+            self.store.save(manifest, event="test.failed", details={})
+            return manifest
+
+    monkeypatch.setattr(cli, "GitHubClient", _ClosableGitHub)
+    monkeypatch.setattr(cli, "Orchestrator", FakeOrchestrator)
+    monkeypatch.setattr(
+        cli,
+        "_sync_lifecycle",
+        lambda *_, **__: LifecycleSyncResult(observations=()),
+    )
+
+    result = runner.invoke(app, ["run", "--scheduled", "--json", "--config", str(config)])
+    refused = runner.invoke(
+        app,
+        ["run", "--scheduled", "--issue", "example/project#1", "--json", "--config", str(config)],
+    )
+
+    assert result.exit_code == 1
+    summary = json.loads(result.output)
+    assert set(summary) == _RUN_SUMMARY_KEYS
+    assert summary["status"] == "failed"
+    assert summary["error"] == "sandbox image is unavailable"
+    assert refused.exit_code == 1
+    assert json.loads(refused.output) == {
+        "outcome": "error",
+        "message": "--scheduled cannot be combined with --issue; pinned retries must be manual",
+    }
 
 
 @pytest.mark.parametrize("already_active", [False, True])

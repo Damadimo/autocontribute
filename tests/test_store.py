@@ -2715,6 +2715,35 @@ def test_open_pull_request_enumeration_never_silently_truncates(tmp_path: Path) 
     assert [run.run_id for run in store.list_submitting_runs()] == [submitting.run_id]
 
 
+def test_status_selection_lists_every_match_oldest_first_and_validates_rows(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    ready = store.create_run()
+    approved = store.create_run()
+    failed = store.create_run()
+    _set_status(store, ready, RunStatus.READY_FOR_APPROVAL)
+    _set_status(store, approved, RunStatus.APPROVED)
+    _set_status(store, failed, RunStatus.FAILED)
+
+    selected = store.list_with_statuses(
+        [RunStatus.APPROVED, RunStatus.READY_FOR_APPROVAL],
+        limit=2,
+    )
+
+    assert [run.run_id for run in selected] == [ready.run_id, approved.run_id]
+    with pytest.raises(StateError, match="Selected run set exceeds"):
+        store.list_with_statuses(
+            {RunStatus.FAILED, RunStatus.APPROVED}, limit=1, resource="selected"
+        )
+    with pytest.raises(ValueError, match="at least one run status"):
+        store.list_with_statuses((), limit=1)
+    with closing(sqlite3.connect(store.database_path)) as connection, connection:
+        connection.execute("UPDATE runs SET status = 'approved' WHERE run_id = ?", (failed.run_id,))
+    with pytest.raises(StateError, match="disagrees with its state row"):
+        store.list_with_statuses({RunStatus.APPROVED}, limit=10)
+
+
 def test_deleted_event_tail_cannot_be_replaced_with_a_new_event(
     tmp_path: Path,
 ) -> None:

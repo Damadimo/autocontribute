@@ -8,7 +8,7 @@ import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, NoReturn
 from urllib.parse import quote
 
 import typer
@@ -203,19 +203,32 @@ def run_once(
             help="Make one unattended attempt: run lifecycle sync, pick the issue, never publish."
         ),
     ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the run outcome as JSON."),
+    ] = False,
 ) -> None:
     """Prepare one candidate, or skip safely when evidence is insufficient."""
 
     if scheduled and retry_unchanged:
-        _fail("--retry-unchanged cannot be used by a scheduled invocation")
+        _fail("--retry-unchanged cannot be used by a scheduled invocation", json_output=json_output)
     if scheduled and issue is not None:
-        _fail("--scheduled cannot be combined with --issue; pinned retries must be manual")
+        _fail(
+            "--scheduled cannot be combined with --issue; pinned retries must be manual",
+            json_output=json_output,
+        )
     if retry_unchanged and issue is None:
-        _fail("--retry-unchanged requires --issue owner/repository#number")
+        _fail("--retry-unchanged requires --issue owner/repository#number", json_output=json_output)
     if retry_unchanged and (retry_actor is None or retry_reason is None):
-        _fail("--retry-unchanged requires both --retry-actor and --retry-reason")
+        _fail(
+            "--retry-unchanged requires both --retry-actor and --retry-reason",
+            json_output=json_output,
+        )
     if not retry_unchanged and (retry_actor is not None or retry_reason is not None):
-        _fail("--retry-actor and --retry-reason require --retry-unchanged")
+        _fail(
+            "--retry-actor and --retry-reason require --retry-unchanged",
+            json_output=json_output,
+        )
     try:
         retry_authorization = (
             CandidateRetryAuthorization(actor=retry_actor, reason=retry_reason)
@@ -223,8 +236,8 @@ def run_once(
             else None
         )
     except (TypeError, ValueError) as exc:
-        _fail(str(exc))
-    settings = _actionable_config(config)
+        _fail(str(exc), json_output=json_output)
+    settings = _actionable_config(config, json_output=json_output)
     store = RunStore(settings.storage.path)
     github: GitHubClient | None = None
     try:
@@ -242,18 +255,24 @@ def run_once(
                 retry_authorization=retry_authorization,
             )
     except (AutocontributeError, ValueError) as exc:
-        _fail(str(exc))
+        _fail(str(exc), json_output=json_output)
     finally:
         if github is not None:
             github.close()
-            if store.record_run_rate_limits(
-                ended_on_secondary_limit=github.secondary_limit_exhausted
+            if (
+                store.record_run_rate_limits(
+                    ended_on_secondary_limit=github.secondary_limit_exhausted
+                )
+                and not json_output
             ):
                 console.print(
                     "[red]Three runs in a row ended on a GitHub secondary rate limit; the safety "
                     "stop is now active.[/red]"
                 )
-    _print_outcome(manifest, store)
+    if json_output:
+        _emit_json(_run_summary(manifest))
+    else:
+        _print_outcome(manifest, store)
     if manifest.status == RunStatus.FAILED:
         raise typer.Exit(1)
 
@@ -336,12 +355,42 @@ def publish(
 @runs_app.command(name="list")
 def list_runs(
     config: ConfigOption = DEFAULT_CONFIG,
-    limit: Annotated[int, typer.Option(min=1, max=200)] = 20,
+    limit: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            max=200,
+            help="Most runs to list. With --status, more matches fail instead of truncating.",
+        ),
+    ] = 20,
+    status: Annotated[
+        str | None,
+        typer.Option(
+            "--status",
+            help="List every run in these comma-separated statuses, oldest first.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the runs as a JSON array."),
+    ] = False,
 ) -> None:
     """List recent runs and terminal outcomes."""
 
-    settings = _config(config)
-    manifests = RunStore(settings.storage.path).list(limit=limit)
+    statuses = None if status is None else _parse_statuses(status, json_output=json_output)
+    settings = _config(config, json_output=json_output)
+    try:
+        store = RunStore(settings.storage.path)
+        manifests = (
+            store.list(limit=limit)
+            if statuses is None
+            else store.list_with_statuses(statuses, limit=limit, resource="selected")
+        )
+    except AutocontributeError as exc:
+        _fail(str(exc), json_output=json_output)
+    if json_output:
+        _emit_json([_run_summary(manifest) for manifest in manifests])
+        return
     table = Table("Run", "Status", "Issue", "Updated")
     for manifest in manifests:
         table.add_row(
@@ -881,22 +930,23 @@ def _immutable_policy_urls(
     return [f"  - {web_origin}/{repository}/blob/{ref}/{quote(path, safe='/')}" for path in paths]
 
 
-def _config(path: Path):  # type: ignore[no-untyped-def]
+def _config(path: Path, *, json_output: bool = False) -> AutocontributeConfig:
     try:
         return load_config(path)
     except ConfigurationError as exc:
-        _fail(str(exc))
+        _fail(str(exc), json_output=json_output)
 
 
-def _actionable_config(path: Path) -> AutocontributeConfig:
+def _actionable_config(path: Path, *, json_output: bool = False) -> AutocontributeConfig:
     """Load a configuration that commands may act on: no starter placeholder may remain."""
 
-    settings: AutocontributeConfig = _config(path)
+    settings = _config(path, json_output=json_output)
     placeholders = starter_placeholders(settings)
     if placeholders:
         _fail(
             f"{path} still contains starter placeholders. Replace each one, then run the "
-            "command again:\n" + "\n".join(f"  - {placeholder}" for placeholder in placeholders)
+            "command again:\n" + "\n".join(f"  - {placeholder}" for placeholder in placeholders),
+            json_output=json_output,
         )
     return settings
 
@@ -1052,9 +1102,54 @@ def _refresh_report(store: RunStore, manifest: RunManifest) -> None:
     )
 
 
-def _fail(message: str) -> None:
-    console.print(f"[red]Error:[/red] {message}")
-    raise typer.Exit(1)
+def _parse_statuses(value: str, *, json_output: bool) -> frozenset[RunStatus]:
+    try:
+        return frozenset(RunStatus(name.strip()) for name in value.split(","))
+    except ValueError:
+        _fail(
+            "--status takes comma-separated statuses from: "
+            + ", ".join(status.value for status in RunStatus),
+            json_output=json_output,
+        )
+
+
+def _run_summary(manifest: RunManifest) -> dict[str, object]:
+    candidate = manifest.candidate
+    return {
+        "run_id": manifest.run_id,
+        "status": manifest.status.value,
+        "repository": candidate.repository if candidate else None,
+        "issue_number": candidate.number if candidate else None,
+        "issue_url": candidate.html_url if candidate else None,
+        "created_at": manifest.created_at.isoformat(),
+        "updated_at": manifest.updated_at.isoformat(),
+        "approval_expires_at": (
+            manifest.approval.expires_at.isoformat() if manifest.approval else None
+        ),
+        "pull_request_url": manifest.pull_request_url,
+        "skip_reason": manifest.skip_reason,
+        "error": manifest.error,
+    }
+
+
+def _emit_json(value: object) -> None:
+    # Rich wraps long lines at the console width, which would corrupt machine-read output.
+    typer.echo(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _fail(
+    message: str,
+    *,
+    exit_code: int = 1,
+    json_output: bool = False,
+    outcome: str = "error",
+    context: dict[str, object] | None = None,
+) -> NoReturn:
+    if json_output:
+        _emit_json({**(context or {}), "outcome": outcome, "message": message})
+    else:
+        console.print(f"[red]Error:[/red] {message}")
+    raise typer.Exit(exit_code)
 
 
 if __name__ == "__main__":  # pragma: no cover
