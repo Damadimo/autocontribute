@@ -851,7 +851,7 @@ def _github_client(
 
     return GitHubClient(
         settings.github,
-        safety_trigger_handler=store.trip_circuit_breaker_trigger,
+        safety_trigger_handler=store.record_stop,
     )
 
 

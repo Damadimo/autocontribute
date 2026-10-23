@@ -34,11 +34,13 @@ from autocontribute.domain import (
     RunStatus,
 )
 from autocontribute.exceptions import (
+    CircuitBreakerTrigger,
     GitHubError,
     GitHubRequestNotSentError,
     PolicyError,
     PublicationResumeRequired,
     StateError,
+    StopScope,
 )
 from autocontribute.github import (
     CheckRunDetails,
@@ -1171,6 +1173,29 @@ def test_base_drift_stops_before_any_github_mutation(tmp_path: Path) -> None:
 
     assert not github.mutated
     assert all(event["event_type"] != "publication.reserved" for event in store.events(run_id))
+
+
+def test_held_repository_stops_before_any_github_mutation(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    assert manifest.repository is not None
+    store.record_stop(
+        CircuitBreakerTrigger(
+            source="github_lifecycle:example/project#7:automation_stop",
+            reason="A maintainer turned away automated contributions",
+            trigger_hash="c" * 64,
+            scope=StopScope.REPOSITORY,
+            scope_key=manifest.repository.full_name,
+            maintainer_stop=True,
+        )
+    )
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+
+    with pytest.raises(PolicyError, match="Publication is held"):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert not github.mutated
+    assert not store.circuit_breaker_status().is_tripped
 
 
 def test_base_movement_during_policy_fetch_stops_before_remote_mutation(

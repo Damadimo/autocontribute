@@ -13,7 +13,7 @@ import pytest
 from autocontribute.ai_policy import RepositoryAiPolicy
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.domain import IssueCandidate, RunManifest, RunStatus
-from autocontribute.exceptions import StateError
+from autocontribute.exceptions import CircuitBreakerTrigger, PolicyError, StateError, StopScope
 from autocontribute.issue_revision import compute_issue_revision
 from autocontribute.store import (
     CURRENT_SCHEMA_VERSION,
@@ -563,6 +563,7 @@ def test_fresh_database_has_current_version_and_all_tables(tmp_path: Path) -> No
         "manifest_artifact_sync",
         "candidate_retry_authorizations",
         "repository_policies",
+        "holds",
     }
 
 
@@ -2780,6 +2781,181 @@ def test_concurrent_new_trip_cannot_be_lost_by_resume(tmp_path: Path) -> None:
     assert status.is_tripped
     assert status.source == "second"
     assert status.trigger_hash == "signal-b"
+
+
+def _hold(
+    scope: StopScope,
+    key: str,
+    trigger_hash: str,
+    *,
+    reason: str = "maintainer asked to stop",
+    expires_at: datetime | None = None,
+    maintainer_stop: bool = False,
+) -> CircuitBreakerTrigger:
+    return CircuitBreakerTrigger(
+        source=f"fixture:{key}",
+        reason=reason,
+        trigger_hash=trigger_hash,
+        scope=scope,
+        scope_key=key,
+        expires_at=expires_at,
+        maintainer_stop=maintainer_stop,
+    )
+
+
+def test_scoped_stops_become_holds_and_leave_the_breaker_untouched(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = RunStore(root)
+    now = datetime.now(UTC)
+
+    assert store.record_stop(_hold(StopScope.REPOSITORY, "example/project", "hold-a"))
+    assert store.record_stop(
+        _hold(
+            StopScope.PULL_REQUEST,
+            "https://github.com/example/project/pull/7",
+            "hold-b",
+            expires_at=now + timedelta(days=30),
+        )
+    )
+    assert store.record_stop(
+        _hold(StopScope.ISSUE, "example/project#42", "hold-c", expires_at=now - timedelta(days=1))
+    )
+    assert not store.record_stop(_hold(StopScope.REPOSITORY, "example/project", "hold-a"))
+    with pytest.raises(StateError, match="reused"):
+        store.record_stop(
+            _hold(StopScope.REPOSITORY, "example/project", "hold-a", reason="different")
+        )
+
+    reopened = RunStore(root)
+    assert not reopened.circuit_breaker_status().is_tripped
+    assert [hold.trigger_hash for hold in reopened.active_holds()] == ["hold-a", "hold-b"]
+    assert [
+        hold.trigger_hash for hold in reopened.active_holds(StopScope.REPOSITORY, "Example/Project")
+    ] == ["hold-a"]
+    assert reopened.active_holds(StopScope.ISSUE) == []
+    assert [
+        hold.trigger_hash
+        for hold in reopened.active_holds(StopScope.ISSUE, now=now - timedelta(days=2))
+    ] == ["hold-c"]
+    assert reopened.active_holds(now=now + timedelta(days=31))[0].trigger_hash == "hold-a"
+    assert len(reopened.active_holds(now=now + timedelta(days=31))) == 1
+
+
+def test_global_stop_trips_the_breaker_and_rejects_hold_fields(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+
+    assert store.record_stop(
+        CircuitBreakerTrigger(source="github_api:suspended", reason="suspended", trigger_hash="g")
+    )
+    assert not store.record_stop(
+        CircuitBreakerTrigger(source="github_api:suspended", reason="suspended", trigger_hash="g")
+    )
+    with pytest.raises(ValueError, match="global stop"):
+        store.record_stop(
+            CircuitBreakerTrigger(
+                source="fixture", reason="fixture", trigger_hash="h", scope_key="example/project"
+            )
+        )
+
+    assert store.circuit_breaker_status().source == "github_api:suspended"
+    assert store.active_holds() == []
+
+
+@pytest.mark.parametrize(
+    ("scope", "key"),
+    [
+        (StopScope.REPOSITORY, "example"),
+        (StopScope.REPOSITORY, " example/project"),
+        (StopScope.ISSUE, "example/project"),
+        (StopScope.PULL_REQUEST, "example/project#7"),
+        (StopScope.PUBLICATION, "api.github.com"),
+        (StopScope.RUN, ""),
+    ],
+)
+def test_holds_require_a_canonical_key_for_their_scope(
+    tmp_path: Path, scope: StopScope, key: str
+) -> None:
+    store = RunStore(tmp_path / "state")
+
+    with pytest.raises(ValueError):
+        store.record_stop(_hold(scope, key, "hold"))
+
+    assert store.active_holds() == []
+
+
+def test_released_hold_does_not_return_for_the_same_evidence(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    store.record_stop(_hold(StopScope.REPOSITORY, "example/project", "hold-a"))
+    hold = store.active_holds()[0]
+
+    assert store.release_hold(hold.hold_id, actor="operator", reason="reviewed the comment")
+    assert not store.release_hold(hold.hold_id, actor="operator", reason="again")
+    with pytest.raises(StateError, match="Unknown hold"):
+        store.release_hold(hold.hold_id + 1, actor="operator", reason="missing")
+    with pytest.raises(ValueError, match="release reason"):
+        store.release_hold(hold.hold_id, actor="operator", reason=" ")
+
+    assert not store.record_stop(_hold(StopScope.REPOSITORY, "example/project", "hold-a"))
+    assert store.active_holds() == []
+    assert store.record_stop(_hold(StopScope.REPOSITORY, "example/project", "hold-edited"))
+
+
+def test_maintainer_stops_in_a_second_repository_escalate_to_a_global_stop(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    assert store.record_stop(
+        _hold(StopScope.REPOSITORY, "example/released", "released", maintainer_stop=True)
+    )
+    assert store.release_hold(
+        store.active_holds(StopScope.REPOSITORY, "example/released")[0].hold_id,
+        actor="operator",
+        reason="the comment was about a different bot",
+    )
+    store.record_stop(_hold(StopScope.REPOSITORY, "example/first", "first-a", maintainer_stop=True))
+    store.record_stop(_hold(StopScope.REPOSITORY, "example/first", "first-b", maintainer_stop=True))
+    store.record_stop(_hold(StopScope.REPOSITORY, "example/closed", "cooldown"))
+    assert not store.circuit_breaker_status().is_tripped
+
+    store.record_stop(_hold(StopScope.REPOSITORY, "example/second", "second", maintainer_stop=True))
+
+    status = store.circuit_breaker_status()
+    assert status.is_tripped
+    assert status.source == "escalation:maintainer_stops"
+    assert status.reason == (
+        "Maintainers of 2 repositories turned away automated contributions within 30 days, "
+        "most recently example/second"
+    )
+    assert len(store.active_holds(StopScope.REPOSITORY)) == 4
+
+
+def test_publication_refuses_held_repositories_pull_requests_and_publication(
+    tmp_path: Path,
+) -> None:
+    store = RunStore(tmp_path / "state")
+    pull_request_url = "https://github.com/example/project/pull/7"
+    store.record_stop(_hold(StopScope.REPOSITORY, "example/held", "repository"))
+    store.record_stop(_hold(StopScope.PULL_REQUEST, pull_request_url, "pull-request"))
+    store.record_stop(_hold(StopScope.ISSUE, "example/project#42", "issue"))
+    store.record_stop(
+        _hold(
+            StopScope.REPOSITORY,
+            "example/cooled",
+            "expired",
+            expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        )
+    )
+
+    store.assert_publication_not_held("example/project")
+    store.assert_publication_not_held("example/cooled")
+    with pytest.raises(PolicyError, match="Publication is held by fixture:example/held"):
+        store.assert_publication_not_held("Example/Held")
+    with pytest.raises(PolicyError, match="safety release 2"):
+        store.assert_publication_not_held("example/project", pull_request_url=pull_request_url)
+
+    store.record_stop(_hold(StopScope.PUBLICATION, "https://api.github.com", "publication"))
+    with pytest.raises(PolicyError, match=r"fixture:https://api\.github\.com"):
+        store.assert_publication_not_held("example/project")
 
 
 def test_pr_open_manifest_write_failure_keeps_committed_state_and_repairs_on_reopen(
