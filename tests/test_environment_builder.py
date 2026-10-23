@@ -10,11 +10,11 @@ from typing import Any, ClassVar
 import pytest
 
 import autocontribute.environment_builder as environment_builder
-from autocontribute.config import EnvironmentOverride, SandboxConfig
+from autocontribute.config import SandboxConfig
 from autocontribute.environment_builder import EnvironmentBuilder, FailedAttempt
 from autocontribute.environment_setup import EnvironmentImage
 from autocontribute.environment_signals import RepositorySignals
-from autocontribute.environments import EnvironmentBaseline, EnvironmentRecipe
+from autocontribute.environments import EnvironmentBaseline, EnvironmentOverride, EnvironmentRecipe
 from autocontribute.exceptions import (
     EnvironmentRecipeError,
     EnvironmentSetupError,

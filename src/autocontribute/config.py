@@ -32,11 +32,6 @@ _CANONICAL_UTC_TIMESTAMP = re.compile(
 )
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 _IMAGE_DIGEST = re.compile(r"@sha256:[0-9a-fA-F]{64}$")
-# A DNS name with a letter-led top-level label, so IP literals cannot be allowlisted.
-_HOST_NAME = re.compile(
-    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
-)
-_MAX_COMMAND_CHARACTERS = 20_000
 _DEFAULT_SANDBOX_IMAGE = (
     "python:3.12-bookworm@sha256:9bed8554e926c07c6f908841d5ee88c33e8df9236b191526bbce81a9062ab43a"
 )
@@ -66,30 +61,6 @@ def validate_model_identifier(value: object) -> str:
     if not isinstance(value, str) or not _MODEL_ID.fullmatch(value):
         raise ValueError("model identifiers must be canonical provider IDs")
     return value
-
-
-def validate_image_reference(value: str) -> str:
-    """Return one Docker image reference that cannot be read as an option or a second word."""
-
-    if (
-        not value
-        or value.startswith("-")
-        or "\0" in value
-        or any(character.isspace() for character in value)
-    ):
-        raise ValueError("image must be one Docker image reference")
-    return value
-
-
-def validate_environment_command(value: str) -> str:
-    """Return one stripped shell command for a repository's environment, or reject it."""
-
-    command = value.strip()
-    if not command or "\0" in command:
-        raise ValueError("environment commands must be non-empty and NUL-free")
-    if len(command) > _MAX_COMMAND_CHARACTERS:
-        raise ValueError(f"environment command exceeds {_MAX_COMMAND_CHARACTERS:,} characters")
-    return command
 
 
 class StrictModel(BaseModel):
@@ -367,45 +338,6 @@ class ModelsConfig(StrictModel):
                 normalized["reasoning_mode"] = mode
                 result[role] = normalized
         return result
-
-
-class EnvironmentOverride(StrictModel):
-    """Operator-chosen environment fields for one repository; detection fills the rest."""
-
-    # Base image for setup, by tag; setup records the digest it resolves to.
-    image: str | None = None
-    # Run with network through the setup proxy; an empty list means nothing to install.
-    setup: list[str] | None = None
-    # Runs offline; a recognised test runner gets a structured reporter added.
-    test: str | None = None
-    # Hosts the setup proxy allows on top of the package registries.
-    allow_hosts: list[str] = Field(default_factory=list)
-
-    @field_validator("image")
-    @classmethod
-    def image_is_a_single_reference(cls, value: str | None) -> str | None:
-        return None if value is None else validate_image_reference(value)
-
-    @field_validator("setup")
-    @classmethod
-    def setup_commands_are_safe(cls, values: list[str] | None) -> list[str] | None:
-        return None if values is None else [validate_environment_command(value) for value in values]
-
-    @field_validator("test")
-    @classmethod
-    def test_command_is_safe(cls, value: str | None) -> str | None:
-        return None if value is None else validate_environment_command(value)
-
-    @field_validator("allow_hosts")
-    @classmethod
-    def allow_hosts_are_host_names(cls, values: list[str]) -> list[str]:
-        normalized = [value.strip().casefold() for value in values]
-        invalid = [value for value in normalized if not _HOST_NAME.fullmatch(value)]
-        if invalid:
-            raise ValueError(
-                f"allow_hosts must be DNS host names, not URLs or addresses: {invalid}"
-            )
-        return list(dict.fromkeys(normalized))
 
 
 class SandboxConfig(StrictModel):
@@ -754,7 +686,6 @@ class AutocontributeConfig(StrictModel):
     identity: IdentityConfig = Field(default_factory=IdentityConfig)
     github: GitHubConfig = Field(default_factory=GitHubConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
-    environments: dict[str, EnvironmentOverride] = Field(default_factory=dict)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
@@ -762,23 +693,6 @@ class AutocontributeConfig(StrictModel):
     publishing: PublishingConfig = Field(default_factory=PublishingConfig)
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
-
-    @field_validator("environments")
-    @classmethod
-    def environments_are_repository_scoped(
-        cls, values: dict[str, EnvironmentOverride]
-    ) -> dict[str, EnvironmentOverride]:
-        normalized: dict[str, EnvironmentOverride] = {}
-        for repository, override in values.items():
-            if not _REPOSITORY.fullmatch(repository):
-                raise ValueError("environments keys must use owner/name syntax")
-            key = repository.casefold()
-            if key in normalized:
-                raise ValueError(
-                    f"duplicate environments repository after case-folding: {repository}"
-                )
-            normalized[key] = override
-        return normalized
 
     @model_validator(mode="after")
     def trusted_validation_is_complete(self) -> AutocontributeConfig:
@@ -831,11 +745,6 @@ class AutocontributeConfig(StrictModel):
                 + ", ".join(missing_pricing)
             )
         return self
-
-    def environment_for(self, repository: str) -> EnvironmentOverride | None:
-        """Return the operator's environment override for one repository, if any."""
-
-        return self.environments.get(repository.casefold())
 
     def model_for(self, role: Literal["scout", "builder", "critic"]) -> ModelProfile:
         if role == "scout":
@@ -1011,7 +920,6 @@ __all__ = [
     "AutocontributeConfig",
     "CLAAuthorization",
     "DCOAuthorization",
-    "EnvironmentOverride",
     "GitHubConfig",
     "LegalAttestation",
     "ModelPricing",
@@ -1021,7 +929,5 @@ __all__ = [
     "example_config",
     "load_config",
     "starter_placeholders",
-    "validate_environment_command",
-    "validate_image_reference",
     "validate_model_identifier",
 ]

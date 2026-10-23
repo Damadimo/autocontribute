@@ -15,12 +15,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from autocontribute.config import EnvironmentOverride, SandboxConfig
+from autocontribute.config import SandboxConfig
 from autocontribute.environment_detection import detect_recipe
 from autocontribute.environment_setup import EnvironmentImage, EnvironmentSetup, python_distribution
 from autocontribute.environment_signals import RepositorySignals, read_signals
 from autocontribute.environments import (
     EnvironmentBaseline,
+    EnvironmentOverride,
     EnvironmentRecipe,
     dependency_digest,
     environment_cache_key,
