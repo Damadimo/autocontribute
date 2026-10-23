@@ -29,6 +29,7 @@ from autocontribute.exceptions import (
     EnvironmentRecipeError,
     EnvironmentSetupError,
     EnvironmentUnavailable,
+    RepositoryError,
     SandboxError,
 )
 from autocontribute.repository import RepositoryWorkspace
@@ -196,8 +197,13 @@ class EnvironmentBuilder:
     ) -> PreparedEnvironment:
         if fresh:
             # A replay starts from the clone as it was, without an earlier attempt's output.
-            workspace.restore_base()
-            workspace.remove_ignored()
+            try:
+                workspace.restore_base()
+                workspace.remove_ignored()
+            except RepositoryError as exc:
+                raise EnvironmentSetupError(
+                    f"An earlier attempt left changes that cannot be undone: {exc}"
+                ) from exc
         base = self._base_image(recipe)
         key = cache_key or environment_cache_key(
             language=recipe.language,
@@ -223,17 +229,24 @@ class EnvironmentBuilder:
                 + ", ".join(recipe.setup_dirty_paths[:10])
             )
         snapshot = workspace.path.with_name(f"{workspace.path.name}.snapshot")
-        remove_workspace_copy(snapshot)
-        copy_workspace(workspace.path, snapshot)
-        baseline, runs = run_baseline(
-            self.config,
-            image_id=image.image_id,
-            recipe=recipe,
-            snapshot=snapshot,
-            base_sha=workspace.base_sha,
-            run_id=self.run_id,
-            store_root=self.store.root,
-        )
+        try:
+            remove_workspace_copy(snapshot)
+            copy_workspace(workspace.path, snapshot)
+            baseline, runs = run_baseline(
+                self.config,
+                image_id=image.image_id,
+                recipe=recipe,
+                snapshot=snapshot,
+                base_sha=workspace.base_sha,
+                run_id=self.run_id,
+                store_root=self.store.root,
+            )
+        except RepositoryError as exc:
+            # Setup decides what the workspace holds, so a tree that cannot be copied is
+            # the recipe's failure.
+            raise EnvironmentSetupError(
+                f"The post-setup workspace cannot be copied: {exc}"
+            ) from exc
         rejection = acceptance_failure(baseline, runs)
         if rejection is not None:
             raise EnvironmentSetupError(
