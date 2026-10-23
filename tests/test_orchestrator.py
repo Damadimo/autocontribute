@@ -43,6 +43,7 @@ from autocontribute.exceptions import (
     StateError,
     StopScope,
 )
+from autocontribute.fix_checks import FixCheckResult
 from autocontribute.github import DirectoryEntry
 from autocontribute.orchestrator import Orchestrator, RunInvocationMode
 from autocontribute.preparation import (
@@ -311,7 +312,16 @@ class FakeChecks:
     def __init__(self, workspace: RepositoryWorkspace) -> None:
         self.workspace = workspace
         self.results: dict[str, Any] = {}
+        self.latest: FixCheckResult | None = None
         self.validated = workspace.path.with_name("repository.validation")
+
+    def check(self, source: str) -> str:
+        """Write ``source`` to app.py and record a passing check, as FixChecks.check does."""
+
+        (self.workspace.path / "app.py").write_text(source, encoding="utf-8")
+        sha = hashlib.sha256(self.workspace.patch_bytes()).hexdigest()
+        self.results[sha] = self.latest = _check(diff_sha256=sha)
+        return sha
 
 
 class FakeSolver:
@@ -361,9 +371,7 @@ def fixes(source: str = "def value():\n    return 2\n", **submission: object) ->
     """The agent writes ``source`` to app.py and submits a fix that passed its checks."""
 
     def act(checks: FakeChecks) -> SolverOutcome:
-        (checks.workspace.path / "app.py").write_text(source, encoding="utf-8")
-        sha = hashlib.sha256(checks.workspace.patch_bytes()).hexdigest()
-        checks.results[sha] = _check(diff_sha256=sha)
+        sha = checks.check(source)
         return SubmittedFix(
             submission=_submission(**submission),
             check=CheckReport(passed=True, diff_sha256=sha, text="Checks passed."),
@@ -635,6 +643,30 @@ def test_an_agent_that_does_not_finish_rejects_the_run(
     assert manifest.reject_reason == (
         "agent did not finish: The transcript reached its turn cap of 100"
     )
+
+
+def test_the_evidence_of_an_unfinished_agent_holds_its_latest_check(
+    tmp_path: Path, pipeline: Pipeline, source: tuple[Path, str]
+) -> None:
+    _, sha = source
+    checked: list[str] = []
+
+    def back_to_the_first_diff(checks: FakeChecks) -> SolverOutcome:
+        for value in (2, 3, 2):
+            checked.append(checks.check(f"def value():\n    return {value}\n"))
+        return DidNotFinish("turns", "The transcript reached its turn cap of 100")
+
+    pipeline.agent = [back_to_the_first_diff]
+
+    manifest, store = _run(tmp_path, pipeline, sha)
+
+    assert manifest.status == RunStatus.REJECTED
+    assert checked[0] == checked[2] != checked[1]
+    evidence = read_validation_evidence(
+        (store.artifact_dir(manifest.run_id) / "validation.json").read_bytes()
+    )
+    assert evidence.check is not None
+    assert evidence.check.diff_sha256 == checked[2]
 
 
 @pytest.mark.parametrize(

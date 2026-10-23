@@ -206,6 +206,8 @@ class FixChecks:
         self._host_values = host_values
         self._base_paths: frozenset[str] | None = None
         self.results: dict[str, FixCheckResult] = {}
+        # The most recent check. A diff checked again keeps its old place in ``results``.
+        self.latest: FixCheckResult | None = None
         # V of the latest check, present only when its gates passed; the critic reviews a
         # copy of it.
         self.validated = workspace.path.with_name(f"{workspace.path.name}.validation")
@@ -468,6 +470,7 @@ class FixChecks:
             notes=notes,
         )
         self.results[sha] = result
+        self.latest = result
         return result
 
     def _report(self, result: FixCheckResult, diff: str) -> CheckReport:
