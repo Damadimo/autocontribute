@@ -32,7 +32,7 @@ _SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 _SESSION_SHELL: Final = "/bin/sh"
 _SESSION_TMP_SIZE: Final = "1g"
 _SESSION_MAIN_UID: Final = 65_534
-SESSION_OUTPUT_DIRECTORY: Final = "/tmp/ac-out"
+_SESSION_OUTPUT_DIRECTORY: Final = "/tmp/ac-out"
 _SESSION_ENVIRONMENT: Final = (
     ("HOME", "/tmp/home"),
     ("TMPDIR", "/tmp"),
@@ -432,7 +432,7 @@ class SessionContainer:
 
         if number < 1:
             raise SandboxError("Output log numbers start at 1")
-        path = f"{SESSION_OUTPUT_DIRECTORY}/{number}.log"
+        path = f"{_SESSION_OUTPUT_DIRECTORY}/{number}.log"
         written = _docker_control(
             self.docker_binary,
             [
@@ -445,7 +445,7 @@ class SessionContainer:
                 "PATH=/usr/bin:/bin",
                 _SESSION_SHELL,
                 "-c",
-                f"mkdir -p {SESSION_OUTPUT_DIRECTORY} && cat > {path}",
+                f"mkdir -p {_SESSION_OUTPUT_DIRECTORY} && cat > {path}",
             ],
             self._docker_environment,
             input_text=text,
@@ -926,7 +926,6 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 __all__ = [
-    "SESSION_OUTPUT_DIRECTORY",
     "DockerDaemonMode",
     "DockerSandbox",
     "SandboxRunner",
