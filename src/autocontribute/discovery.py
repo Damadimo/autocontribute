@@ -147,6 +147,15 @@ _NEGATED_OR_CONDITIONAL = re.compile(
     r"\b(?:not|no|never|nobody|none|no\s+one|if|unless|whether)\b|n't\b", re.I
 )
 _CLAIM_WINDOW = timedelta(days=30)
+# A maintainer's reply to a claim ("Thanks! Feel free to open a PR.") accepts it. Only an
+# invitation that offers the work to anyone, or one that comes after the claimant has gone quiet
+# for this long, reopens it.
+_CLAIM_QUIET_PERIOD = timedelta(days=7)
+_OPEN_TO_ANYONE = re.compile(
+    r"\b(?:anyone|anybody|someone\s+else|somebody\s+else|up\s+for\s+grabs"
+    r"|still\s+(?:open|available|unclaimed))\b",
+    re.I,
+)
 # Repositories name the same invitation in many ways; these are searched whenever a repository
 # defines them, unless github.labels sets the repository's include list.
 _INVITATION_SYNONYMS = (
@@ -2019,10 +2028,11 @@ def _active_claimants(
     *,
     now: datetime,
 ) -> list[str]:
-    """Name everyone with a recent, unanswered claim on the issue.
+    """Name everyone with a recent claim on the issue that no maintainer has since reopened.
 
-    A claim lapses after 30 days, and a later maintainer invitation that does not address the
-    claimant reopens the work to everyone.
+    A claim lapses after 30 days. A later maintainer invitation that does not address the
+    claimant reopens the work when it offers it to anyone, or when the claimant had been quiet
+    for a week before it.
     """
 
     invitations = [
@@ -2035,9 +2045,19 @@ def _active_claimants(
             or _stated(_ASSIGNMENT_REQUEST, comment.body, questions_count=True)
         ):
             continue
+        last_active = max(
+            other.created_at
+            for other in discussion
+            if other.author.casefold() == comment.author.casefold()
+        )
         mention = re.compile(rf"@{re.escape(comment.author)}(?![\w-])", re.I)
         if any(
-            invitation.created_at > comment.created_at and not mention.search(invitation.body)
+            invitation.created_at > comment.created_at
+            and not mention.search(invitation.body)
+            and (
+                _OPEN_TO_ANYONE.search(invitation.body) is not None
+                or invitation.created_at - last_active >= _CLAIM_QUIET_PERIOD
+            )
             for invitation in invitations
         ):
             continue
