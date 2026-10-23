@@ -381,6 +381,38 @@ def test_state_branch_commits_only_changes_and_pushes_without_force(tmp_path: Pa
     assert _remote_file(origin, "README.md") == b"notes\n"
 
 
+@pytest.mark.parametrize("failed_pushes", [2, 3])
+def test_state_branch_tries_a_failed_push_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_pushes: int
+) -> None:
+    origin = _state_remote(tmp_path)
+    branch = StateBranch(_checkout(origin, tmp_path / "checkout"), token=None)
+    archive = tmp_path / "state.tar.gz"
+    archive.write_bytes(b"state with an open pull request")
+    original_git = StateBranch._git
+    pushes: list[str] = []
+    pauses: list[float] = []
+
+    def flaky_git(self: StateBranch, *arguments: str) -> None:
+        if arguments[0] == "push":
+            pushes.append(arguments[0])
+            if len(pushes) <= failed_pushes:
+                raise StateError("git push failed: Could not resolve host: github.com")
+        original_git(self, *arguments)
+
+    monkeypatch.setattr(StateBranch, "_git", flaky_git)
+    monkeypatch.setattr(runner_module.time, "sleep", pauses.append)
+
+    if failed_pushes < 3:
+        assert branch.save(archive, message="Save the state") is True
+        assert _remote_file(origin, STATE_ARCHIVE) == b"state with an open pull request"
+    else:
+        with pytest.raises(StateError, match="Could not resolve host"):
+            branch.save(archive, message="Save the state")
+    assert len(pushes) == 3
+    assert pauses == [5, 5]
+
+
 def test_state_branch_refuses_to_overwrite_state_saved_by_another_job(tmp_path: Path) -> None:
     origin = _state_remote(tmp_path)
     branch = StateBranch(_checkout(origin, tmp_path / "checkout"), token=None)
@@ -697,9 +729,9 @@ def test_issue_sync_opens_locked_issues_labelled_last_and_closes_finished_runs(
     assert github.issues[opened]["locked"] is True
     assert github.issues[opened]["labels"] == [AWAITING_LABEL]
     assert github.issue_comments(opened) == ["Part 2 of 2"]
-    assert github.requests.index(("POST", f"/issues/{opened}/labels")) > github.requests.index(
-        ("PUT", f"/issues/{opened}/lock")
-    )
+    locked = github.requests.index(("PUT", f"/issues/{opened}/lock"))
+    assert locked < github.requests.index(("POST", f"/issues/{opened}/comments"))
+    assert locked < github.requests.index(("POST", f"/issues/{opened}/labels"))
     assert github.issues[stale_issue]["state_reason"] == "not_planned"
     assert github.issues[stale_issue]["labels"] == []
     assert "cancelled" in github.issue_comments(stale_issue)[0]
@@ -787,7 +819,7 @@ def test_approval_report_announces_the_pull_request_or_explains_the_refusal(
 
     with github.repository(context, "runner-token") as repository:
         for number, run_id, outcome, message, save_error in (
-            (published_issue, "cccccccccccccccc", "pr_open", "", None),
+            (published_issue, "cccccccccccccccc", "pr_open", "", "connection reset"),
             (waiting_issue, "aaaaaaaaaaaaaaaa", "limit", "At most 1 per day", "push rejected"),
             (failed_issue, "bbbbbbbbbbbbbbbb", "error", "GitHub refused the pull request", None),
             (missing_issue, "dddddddddddddddd", "error", "Unknown run", None),
@@ -806,6 +838,10 @@ def test_approval_report_announces_the_pull_request_or_explains_the_refusal(
 
     assert github.issues[published_issue]["labels"] == [PUBLISHED_LABEL]
     assert github.issues[published_issue]["state"] == "closed"
+    opened, untracked = github.issue_comments(published_issue)
+    assert f"`{url}`" in opened
+    assert "will not watch the pull request" in untracked
+    assert "re-run" not in untracked
     assert github.issues[waiting_issue]["state"] == "open"
     assert github.issues[waiting_issue]["labels"] == [AWAITING_LABEL]
     limit_reply, unsaved = github.issue_comments(waiting_issue)
