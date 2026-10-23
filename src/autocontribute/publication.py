@@ -45,6 +45,7 @@ from autocontribute.domain import (
     Approval,
     EligibilityResult,
     IssueCandidate,
+    RepositoryInfo,
     RunManifest,
     RunStatus,
     publication_head,
@@ -73,7 +74,7 @@ from autocontribute.preparation import (
     validate_preparation_fingerprint,
     validate_validation_artifact,
 )
-from autocontribute.quality import workflow_paths
+from autocontribute.quality import patch_paths, workflow_paths
 from autocontribute.redaction import (
     contains_credential_material,
     contains_high_confidence_token,
@@ -459,6 +460,38 @@ def _refuse_workflow_changes(patch: bytes) -> None:
         )
 
 
+def _issue_for_evaluation(issue: IssueCandidate, login: str) -> IssueCandidate:
+    """The publishing account's own assignment and comments are not competing work."""
+
+    return issue.model_copy(
+        update={
+            "assignees": [name for name in issue.assignees if name.casefold() != login],
+            "discussion": [
+                comment for comment in issue.discussion if comment.author.casefold() != login
+            ],
+        }
+    )
+
+
+def _issue_drift_blockers(
+    recorded: IssueCandidate,
+    current: IssueCandidate,
+    login: str,
+) -> list[str]:
+    blockers: list[str] = []
+    if current.locked:
+        blockers.append("issue is locked")
+    recorded_assignees = {name.casefold() for name in recorded.assignees}
+    new_assignees = sorted(
+        name
+        for name in current.assignees
+        if name.casefold() not in recorded_assignees and name.casefold() != login
+    )
+    if new_assignees:
+        blockers.append("issue is now assigned to " + ", ".join(new_assignees))
+    return blockers
+
+
 def _required_publication_draft(manifest: RunManifest) -> bool:
     if manifest.publication_draft is None:
         raise PolicyError("Run is missing its durable pull-request draft intent")
@@ -610,6 +643,7 @@ class Publisher:
         self.config = config
         self.store = store
         self.github = github
+        self._safe_bases: dict[tuple[str, str], bool] = {}
 
     def _assert_constructive_mutation_authorized(
         self,
@@ -1468,7 +1502,7 @@ class Publisher:
             manifest.candidate.repository,
             manifest.repository.default_branch,
         )
-        if current_base_sha.casefold() != manifest.base_sha.casefold():
+        if not self._base_drift_is_safe(manifest, current_base_sha):
             manifest.publication_compensation_reason = "pre_pr_base_moved"
             self.store.save(
                 manifest,
@@ -1490,8 +1524,9 @@ class Publisher:
                 lease_guard=lease_guard,
             )
             raise PolicyError(
-                "The upstream base branch moved after the contribution branch was pushed; "
-                "the exact remote branch was removed and validation and approval must be rerun"
+                "The upstream base branch changed a path the patch touches after the "
+                "contribution branch was pushed; the exact remote branch was removed and "
+                "validation and approval must be rerun"
             )
 
         try:
@@ -2065,7 +2100,7 @@ class Publisher:
             "merged state": (created.merged, False),
             "draft state": (created.draft, _required_publication_draft(manifest)),
             "base branch": (created.base_ref, manifest.repository.default_branch),
-            "base commit": (created.base_sha.casefold(), manifest.base_sha.casefold()),
+            "base commit": (self._base_drift_is_safe(manifest, created.base_sha), True),
             "head branch": (created.head_ref, manifest.branch_name),
             "head label": (created.head_label.casefold(), head.casefold()),
             "head repository": (
@@ -3345,7 +3380,7 @@ class Publisher:
 
         expected: dict[str, tuple[object, object]] = {
             "base branch": (details.base_ref, manifest.repository.default_branch),
-            "base commit": (details.base_sha.casefold(), manifest.base_sha.casefold()),
+            "base commit": (self._base_drift_is_safe(manifest, details.base_sha), True),
             "title": (details.title, manifest.proposal.pull_request_title),
             "body": (details.body, manifest.proposal.pull_request_body),
         }
@@ -3529,31 +3564,22 @@ class Publisher:
             repository.full_name,
             repository.default_branch,
         )
-        if current_base_sha.casefold() != manifest.base_sha.casefold():
-            raise PolicyError("The upstream base branch moved at the publication mutation boundary")
+        if not self._base_drift_is_safe(manifest, current_base_sha):
+            raise PolicyError(
+                "The upstream base branch changed a path the patch touches at the publication "
+                "mutation boundary"
+            )
 
         issue = self.github.get_issue(
             manifest.candidate.repository,
             manifest.candidate.number,
         )
-        eligibility = DiscoveryService(self.config, self.github, self.store).evaluate(
+        self._assert_issue_drift_allowed(
+            manifest,
             issue,
             repository,
-            check_remote_policy=False,
-            check_competing_pull_requests=False,
+            stage="at the publication mutation boundary",
         )
-        if not eligibility.eligible:
-            reasons = "; ".join(eligibility.blockers)
-            raise PolicyError(
-                "Candidate no longer passes mutation-boundary eligibility: " + reasons
-            )
-        changed_issue_evidence = self._changed_issue_evidence(manifest.candidate, issue)
-        if changed_issue_evidence:
-            raise PolicyError(
-                "Issue evidence changed at the publication mutation boundary ("
-                + ", ".join(changed_issue_evidence)
-                + "); approval is stale"
-            )
 
     def _check_freshness(self, manifest: RunManifest) -> None:
         assert manifest.candidate and manifest.repository and manifest.base_sha
@@ -3561,6 +3587,7 @@ class Publisher:
             manifest.repository.full_name,
             pull_request_url=manifest.pull_request_url,
         )
+        assert manifest.publishing_login is not None
         issue = self.github.get_issue(manifest.candidate.repository, manifest.candidate.number)
         repository = self.github.get_repository(manifest.repository.full_name)
         if repository.full_name.casefold() != manifest.repository.full_name.casefold():
@@ -3572,22 +3599,23 @@ class Publisher:
             repository.full_name,
             repository.default_branch,
         )
-        if current_sha.casefold() != manifest.base_sha.casefold():
-            raise PolicyError("The upstream base branch moved; rerun validation and approval")
+        if not self._base_drift_is_safe(manifest, current_sha):
+            raise PolicyError(
+                "The upstream base branch changed a path the patch touches; rerun validation "
+                "and approval"
+            )
+        # Policy evidence is pinned to the prepared base; drift safety above already proved
+        # that no policy file changed since then.
         eligibility = DiscoveryService(self.config, self.github, self.store).evaluate(
-            issue,
+            _issue_for_evaluation(issue, manifest.publishing_login),
             repository,
-            repository_ref=current_sha,
+            repository_ref=manifest.base_sha,
+            check_competing_pull_requests=False,
         )
         self._assert_current_eligibility_evidence(manifest, eligibility)
-
-        changed_issue_evidence = self._changed_issue_evidence(manifest.candidate, issue)
-        if changed_issue_evidence:
-            raise PolicyError(
-                "Issue evidence changed after preparation ("
-                + ", ".join(changed_issue_evidence)
-                + "); approval is stale"
-            )
+        drift = _issue_drift_blockers(manifest.candidate, issue, manifest.publishing_login)
+        if drift:
+            raise PolicyError("Issue changed after preparation: " + "; ".join(drift))
 
         closing_repository = self.github.get_repository(manifest.repository.full_name)
         if (
@@ -3598,30 +3626,16 @@ class Publisher:
                 "The upstream repository identity or default branch changed during freshness "
                 "verification"
             )
-        closing_issue = self.github.get_issue(
-            manifest.candidate.repository,
-            manifest.candidate.number,
-        )
-        closing_eligibility = DiscoveryService(self.config, self.github, self.store).evaluate(
-            closing_issue,
+        # Duplicates are the most common reason maintainers close drive-by PRs, so the
+        # linked-PR search runs here, right before the intent; the final round re-reads the
+        # issue to catch changes made while it ran.
+        self._assert_issue_drift_allowed(
+            manifest,
+            self.github.get_issue(manifest.candidate.repository, manifest.candidate.number),
             closing_repository,
-            check_remote_policy=False,
+            stage="during publication freshness verification",
+            check_competing_pull_requests=True,
         )
-        if not closing_eligibility.eligible:
-            reasons = "; ".join(closing_eligibility.blockers)
-            raise PolicyError(
-                "Candidate changed during publication freshness verification: " + reasons
-            )
-        closing_issue_changes = self._changed_issue_evidence(
-            manifest.candidate,
-            closing_issue,
-        )
-        if closing_issue_changes:
-            raise PolicyError(
-                "Issue evidence changed during publication freshness verification ("
-                + ", ".join(closing_issue_changes)
-                + "); approval is stale"
-            )
 
         owner_policy_repository = f"{repository.full_name.split('/', 1)[0]}/.github"
         final_organization_ref = self.github.default_branch_sha_if_exists(
@@ -3647,31 +3661,12 @@ class Publisher:
                 "The upstream repository identity or default branch changed during final "
                 "freshness verification"
             )
-        final_issue = self.github.get_issue(
-            manifest.candidate.repository,
-            manifest.candidate.number,
-        )
-        final_eligibility = DiscoveryService(self.config, self.github, self.store).evaluate(
-            final_issue,
+        self._assert_issue_drift_allowed(
+            manifest,
+            self.github.get_issue(manifest.candidate.repository, manifest.candidate.number),
             final_repository,
-            check_remote_policy=False,
-            check_competing_pull_requests=False,
+            stage="during final publication freshness verification",
         )
-        if not final_eligibility.eligible:
-            reasons = "; ".join(final_eligibility.blockers)
-            raise PolicyError(
-                "Candidate changed during final publication freshness verification: " + reasons
-            )
-        final_issue_changes = self._changed_issue_evidence(
-            manifest.candidate,
-            final_issue,
-        )
-        if final_issue_changes:
-            raise PolicyError(
-                "Issue evidence changed during final publication freshness verification ("
-                + ", ".join(final_issue_changes)
-                + "); approval is stale"
-            )
 
         final_sha = self.github.default_branch_sha(
             final_repository.full_name,
@@ -3702,31 +3697,75 @@ class Publisher:
                 "A trusted maintainer stop was observed in the final issue discussion"
             ) from exc
 
-    @staticmethod
-    def _changed_issue_evidence(
-        recorded: IssueCandidate,
-        current: IssueCandidate,
-    ) -> list[str]:
-        changed: list[str] = []
-        if current.state.casefold() != recorded.state.casefold():
-            changed.append("state")
-        if current.title != recorded.title:
-            changed.append("title")
-        if current.body != recorded.body:
-            changed.append("body")
-        if {label.casefold() for label in current.labels} != {
-            label.casefold() for label in recorded.labels
-        }:
-            changed.append("labels")
-        if current.comments != recorded.comments or current.discussion != recorded.discussion:
-            changed.append("discussion")
-        if {assignee.casefold() for assignee in current.assignees} != {
-            assignee.casefold() for assignee in recorded.assignees
-        }:
-            changed.append("assignment")
-        if current.updated_at != recorded.updated_at:
-            changed.append("updated timestamp")
-        return changed
+    def _assert_issue_drift_allowed(
+        self,
+        manifest: RunManifest,
+        issue: IssueCandidate,
+        repository: RepositoryInfo,
+        *,
+        stage: str,
+        check_competing_pull_requests: bool = False,
+    ) -> None:
+        """Allow issue edits and comments unless they close, claim, stop, or lock the issue."""
+
+        assert manifest.candidate is not None and manifest.publishing_login is not None
+        eligibility = DiscoveryService(self.config, self.github, self.store).evaluate(
+            _issue_for_evaluation(issue, manifest.publishing_login),
+            repository,
+            check_remote_policy=False,
+            check_competing_pull_requests=check_competing_pull_requests,
+        )
+        blockers = [
+            *eligibility.blockers,
+            *_issue_drift_blockers(manifest.candidate, issue, manifest.publishing_login),
+        ]
+        if blockers:
+            raise PolicyError(f"Issue changed {stage}: " + "; ".join(blockers))
+
+    def _base_drift_is_safe(self, manifest: RunManifest, observed_base_sha: str) -> bool:
+        """Accept a newer base only when it changed no path the patch or the policy covers.
+
+        The contribution commit stays a child of the prepared base, so GitHub merges it into
+        the newer base without conflict and the reviewed diff is exactly what lands. Policy
+        files at either commit count as touched, so policy evidence read at the prepared base
+        still describes the newer one.
+        """
+
+        assert manifest.candidate is not None and manifest.base_sha is not None
+        assert manifest.repository is not None
+        observed = observed_base_sha.casefold()
+        if observed == manifest.base_sha.casefold():
+            return True
+        key = (manifest.run_id, observed)
+        if key not in self._safe_bases:
+            try:
+                patch = _read_approval_artifact(
+                    self.store,
+                    manifest.run_id,
+                    "contribution.patch",
+                    description="Contribution patch",
+                )
+                validate_preparation_fingerprint(manifest, diff=patch)
+                touched = set(patch_paths(patch.decode("utf-8")))
+            except (PolicyError, UnicodeDecodeError, ValueError):
+                return False
+            for ref in (manifest.base_sha, observed):
+                snapshot = DiscoveryService(self.config, self.github, self.store).policy_snapshot(
+                    manifest.repository,
+                    repository_ref=ref,
+                )
+                touched.update(snapshot.repository_paths)
+            comparison = self.github.compare_commits(
+                manifest.candidate.repository,
+                manifest.base_sha,
+                observed,
+            )
+            self._safe_bases[key] = (
+                comparison.status == "ahead"
+                and comparison.complete
+                and touched.isdisjoint(comparison.changed_paths)
+            )
+        return self._safe_bases[key]
 
     @staticmethod
     def _assert_current_eligibility_evidence(

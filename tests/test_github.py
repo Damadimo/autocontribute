@@ -1128,6 +1128,39 @@ def _access_payload(
     return payload
 
 
+def test_compare_commits_reports_status_and_old_and_new_paths() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/repos/upstream/project/compare/{'a' * 40}...{'b' * 40}"
+        return httpx.Response(
+            200,
+            json={
+                "status": "ahead",
+                "files": [
+                    {"filename": "docs/new.md"},
+                    {"filename": "src/renamed.py", "previous_filename": "src/old.py"},
+                ],
+            },
+        )
+
+    with _client(handler) as github:
+        comparison = github.compare_commits("upstream/project", "a" * 40, "b" * 40)
+
+    assert comparison.status == "ahead"
+    assert comparison.changed_paths == {"docs/new.md", "src/renamed.py", "src/old.py"}
+    assert comparison.complete
+
+
+def test_compare_commits_marks_a_full_file_list_incomplete() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        files = [{"filename": f"file{index}.txt"} for index in range(300)]
+        return httpx.Response(200, json={"status": "ahead", "files": files})
+
+    with _client(handler) as github:
+        comparison = github.compare_commits("upstream/project", "a" * 40, "b" * 40)
+
+    assert not comparison.complete
+
+
 def test_repository_access_reports_owner_push_and_pull_request_policy() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/repos/upstream/project":

@@ -142,8 +142,11 @@ the target repository and base commit, the publishing account, and a fingerprint
   `publishing` settings match those the run was prepared with;
 - the PR body still shows the current `policy.ai_disclosure`, which preparation appends;
 - your account is within the [publication limits](configuration.md#publishing);
-- the base commit, policy files, CLA/DCO evidence, and issue (state, title, body, labels, comments,
-  assignees, update time) are unchanged, and the issue still passes every rule with no linked PR.
+- the policy files and CLA/DCO evidence are unchanged, and the default branch has not changed any
+  file the patch touches or any policy file since the prepared base commit (the PR commit stays on
+  that base);
+- the issue still passes every rule with no linked PR: edits, label changes, and comments are fine
+  unless they close or lock it, assign it to someone else, or add a claim or a stop request.
 
 A failed recheck pushes nothing and leaves the run `approved`: retry `publish` after a limit clears,
 or run `autocontribute runs cancel RUN_ID --reason "TEXT"` and [retry the issue](#run-states) (also

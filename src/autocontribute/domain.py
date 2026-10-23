@@ -131,6 +131,7 @@ class IssueCandidate(DomainModel):
     body: str
     html_url: str
     state: str
+    locked: bool = False
     author: str
     labels: list[str]
     assignees: list[str]
