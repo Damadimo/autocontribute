@@ -808,7 +808,10 @@ class _TemporaryIndex:
         if not real_index.is_file() or real_index.is_symlink():
             self._directory.cleanup()
             raise RepositoryError("Workspace Git index is missing or unsafe")
-        shutil.copyfile(real_index, index)
+        # copy2 keeps the index's mtime, which Git compares with each entry's to catch files
+        # changed in the same second they were checked out ("racily clean" entries). A fresh
+        # mtime made Git trust stale stat data and miss such edits.
+        shutil.copy2(real_index, index)
         environment = _git_environment()
         environment["GIT_INDEX_FILE"] = str(index)
         try:

@@ -729,3 +729,27 @@ def test_apply_patch_checks_the_whole_patch_before_changing_anything(
     assert not (target.path / "delete.txt").exists()
     with pytest.raises(RepositoryError, match="empty patch"):
         target.apply_patch("")
+
+
+def test_temporary_index_keeps_the_index_mtime_so_racy_edits_are_seen(
+    tmp_path: Path, source_repository: tuple[Path, str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Git rehashes an entry whose mtime is not older than the index file's. A copy with a
+    # fresh mtime made it trust stat data instead, and a same-size edit made in the second
+    # of the checkout vanished from the patch.
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+    index_mtime = (workspace.path / ".git" / "index").stat().st_mtime_ns
+    seen: list[int] = []
+    real_run = subprocess.run
+
+    def recording_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        environment = kwargs.get("env")
+        if isinstance(environment, dict) and "GIT_INDEX_FILE" in environment:
+            seen.append(os.stat(environment["GIT_INDEX_FILE"]).st_mtime_ns)
+        return real_run(*args, **kwargs)  # type: ignore[call-overload,no-any-return]
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    workspace.patch_bytes()
+
+    assert seen and seen[0] == index_mtime
