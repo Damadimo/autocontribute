@@ -337,6 +337,30 @@ def test_editor_reports_invalid_calls(
     assert message in result.output
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        # json.loads turns a "\\ud800" escape in tool input into a lone surrogate.
+        {"command": "create", "path": "s.py", "file_text": "x = '\ud800'\n"},
+        {"command": "create", "path": "s\ud800.py", "file_text": "x = 1\n"},
+        {"command": "str_replace", "path": "src/calc.py", "old_str": "sub", "new_str": "\udc80"},
+        {"command": "insert", "path": "src/calc.py", "insert_line": 0, "insert_text": "\udc80"},
+        {"command": "view", "path": "\udc80"},
+    ],
+)
+def test_editor_reports_lone_surrogates_instead_of_raising(
+    files: WorkspaceFiles, workspace: Path, arguments: dict[str, object]
+) -> None:
+    before = _read(workspace, "src/calc.py")
+
+    result = run_text_editor(files, arguments)
+
+    assert result.status == "failed"
+    assert "lone surrogate" in result.output
+    assert _read(workspace, "src/calc.py") == before
+    assert sorted(path.name for path in workspace.iterdir()) == ["src"]
+
+
 def test_editor_refuses_planted_directory_symlinks(
     files: WorkspaceFiles, workspace: Path, tmp_path: Path
 ) -> None:

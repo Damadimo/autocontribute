@@ -45,6 +45,8 @@ class WorkspaceFiles:
 
         if not isinstance(path, str) or "\0" in path:
             raise RepositoryError("Path must be a string without NUL bytes")
+        if not _is_unicode_text(path):
+            raise RepositoryError("Path must be Unicode text without lone surrogates")
         candidate = PurePosixPath(path)
         if candidate.is_absolute():
             try:
@@ -108,6 +110,9 @@ class WorkspaceFiles:
         A replaced file keeps its permission bits.
         """
 
+        if not _is_unicode_text(text):
+            # JSON tool arguments can carry a lone surrogate escape such as \ud800.
+            raise RepositoryError(f"New content is not UTF-8 text: it has a lone surrogate: {path}")
         data = text.encode("utf-8")
         if len(data) > MAX_EDIT_BYTES:
             raise RepositoryError(f"New content is larger than {MAX_EDIT_BYTES} bytes: {path}")
@@ -190,6 +195,14 @@ class WorkspaceFiles:
             yield descriptor
         finally:
             os.close(descriptor)
+
+
+def _is_unicode_text(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
 
 
 def _entry(directory: int, name: str, *, path: str) -> os.stat_result | None:
