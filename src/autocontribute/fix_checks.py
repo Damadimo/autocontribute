@@ -38,8 +38,14 @@ from autocontribute.exceptions import (
     RepositoryError,
     StateError,
 )
-from autocontribute.patches import FilePatch, Patch, PatchSplit, extract_patch, is_test_path
-from autocontribute.patches import split_patch as split_by_tests
+from autocontribute.patches import (
+    FilePatch,
+    Patch,
+    PatchSplit,
+    extract_patch,
+    is_test_path,
+    split_patch,
+)
 from autocontribute.redaction import redact_text, scrub_for_model
 from autocontribute.repository import RepositoryWorkspace
 from autocontribute.store import RunStore
@@ -64,7 +70,7 @@ _TAIL_CHARACTERS: Final = 3_000
 _DIFF_CHARACTERS: Final = 60_000
 _LISTED_TESTS: Final = 10
 _TITLE_CHARACTERS: Final = 200
-# Room under GitHub's 65,536-character body for the testing note and the disclosure.
+# Leaves room for the testing note and the disclosure under publication's 50,000 characters.
 _BODY_CHARACTERS: Final = 45_000
 _DOCS_SUFFIXES: Final = frozenset({".md", ".rst", ".txt", ".adoc", ".asciidoc", ".markdown"})
 _DOCS_DIRECTORIES: Final = frozenset({"doc", "docs", "documentation"})
@@ -96,7 +102,6 @@ _CHECKLIST: Final = (
     "- scratch, generated or stray files;",
     "- changes to tests that already existed, unless the issue is about them.",
 )
-
 _OUT_OF_TIME: Final = "the run is out of time"
 
 SuiteRunKind = Literal["red", "green", "related", "full_suite", "rerun"]
@@ -255,7 +260,7 @@ class FixChecks:
 
     def _split(self, patch: Patch) -> PatchSplit:
         try:
-            return split_by_tests(patch, WorkspaceFiles(self._workspace.path))
+            return split_patch(patch, WorkspaceFiles(self._workspace.path))
         except RepositoryError:
             # A Rust source the host cannot read safely, which the gates refuse anyway.
             tests = tuple(file for file in patch.files if is_test_path(file.path))
