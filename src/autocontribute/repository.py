@@ -109,7 +109,6 @@ class TreeEntry:
     """One file or submodule in the tree of the base commit."""
 
     path: str
-    mode: str
     object_id: str
     # None for a submodule, whose object is a commit of another repository.
     size: int | None
@@ -697,12 +696,10 @@ class RepositoryWorkspace:
                 path = raw_path.decode("utf-8")
             except UnicodeDecodeError:
                 continue
-            mode, kind, object_id, size = (field.decode("ascii") for field in fields)
+            _, kind, object_id, size = (field.decode("ascii") for field in fields)
             if kind not in {"blob", "commit"}:
                 continue
-            entries.append(
-                TreeEntry(path, mode, object_id, None if kind == "commit" else int(size))
-            )
+            entries.append(TreeEntry(path, object_id, None if kind == "commit" else int(size)))
         return entries
 
     def read_blob(self, object_id: str, *, max_bytes: int) -> bytes:

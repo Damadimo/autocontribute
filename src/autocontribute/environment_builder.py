@@ -79,20 +79,11 @@ class EnvironmentBuilder:
         store: RunStore,
         *,
         run_id: str,
-        docker_binary: str = "docker",
-        allow_local_source: bool = False,
     ) -> None:
         self.config = config
         self.store = store
         self.run_id = run_id
-        self.docker_binary = docker_binary
-        self._setup = EnvironmentSetup(
-            config,
-            run_id=run_id,
-            store_root=store.root,
-            docker_binary=docker_binary,
-            allow_local_source=allow_local_source,
-        )
+        self._setup = EnvironmentSetup(config, run_id=run_id, store_root=store.root)
         # Base images resolved during one prepare, so a tag is pulled once.
         self._bases: dict[str, ImageIdentity] = {}
 
@@ -116,7 +107,7 @@ class EnvironmentBuilder:
             )
         # Fails before any attempt when Docker is unusable, so that is never blamed on the
         # repository.
-        detect_docker_daemon_mode(self.docker_binary)
+        detect_docker_daemon_mode()
         self._bases = {}
         signals = read_signals(workspace)
         allow_hosts = () if override is None else tuple(override.allow_hosts)
@@ -205,12 +196,7 @@ class EnvironmentBuilder:
                     f"An earlier attempt left changes that cannot be undone: {exc}"
                 ) from exc
         base = self._base_image(recipe)
-        key = cache_key or environment_cache_key(
-            language=recipe.language,
-            arch=base.platform,
-            base_image_digest=base.digest,
-            dependency_digest=recipe.dependency_digest,
-        )
+        key = cache_key or self._cache_key(recipe)
         image = None
         if recipe.source != "agent":
             image = self._setup.reuse(workspace, recipe, base=base, cache_key=key)
@@ -267,7 +253,7 @@ class EnvironmentBuilder:
     def _base_image(self, recipe: EnvironmentRecipe) -> ImageIdentity:
         if recipe.base_image not in self._bases:
             try:
-                base = pull_image(recipe.base_image, docker_binary=self.docker_binary)
+                base = pull_image(recipe.base_image)
             except SandboxError as exc:
                 # Docker answered moments ago, so the image reference is what failed.
                 raise EnvironmentSetupError(str(exc)) from exc

@@ -126,14 +126,10 @@ class EnvironmentSetup:
         *,
         run_id: str,
         store_root: Path,
-        docker_binary: str = "docker",
-        allow_local_source: bool = False,
     ) -> None:
         self.config = config
         self.run_id = run_id
         self.store_root = store_root
-        self.docker_binary = docker_binary
-        self.allow_local_source = allow_local_source
         # Installs run more processes than tests do: compilers, package managers, builds.
         self._setup_config = config.model_copy(
             update={"pids_limit": max(config.pids_limit, _SETUP_PIDS_LIMIT)}
@@ -155,7 +151,7 @@ class EnvironmentSetup:
         """
 
         tag = image_tag(recipe.repository, cache_key)
-        found = inspect_image(tag, docker_binary=self.docker_binary)
+        found = inspect_image(tag)
         if found is None or found.labels.get(IMAGE_LABEL) != self._label(recipe, cache_key):
             return None
         self._fetch_git_metadata(workspace, recipe)
@@ -165,7 +161,6 @@ class EnvironmentSetup:
             workspace=workspace.path,
             run_id=self.run_id,
             store_root=self.store_root,
-            docker_binary=self.docker_binary,
         ) as container:
             extracted = container.exec(
                 f"if [ -f {_WORKSPACE_ARCHIVE} ]; then "
@@ -207,7 +202,6 @@ class EnvironmentSetup:
             allowed_hosts=DEFAULT_ALLOWED_HOSTS | set(allow_hosts),
             run_id=self.run_id,
             store_root=self.store_root,
-            docker_binary=self.docker_binary,
         ) as network:
             online = proxy_variables(network.proxy_url)
             bootstrapped = self._bootstrap(workspace, recipe, base, network, online)
@@ -219,7 +213,6 @@ class EnvironmentSetup:
                     workspace=workspace.path,
                     run_id=self.run_id,
                     store_root=self.store_root,
-                    docker_binary=self.docker_binary,
                     network=network.network,
                     writable_root=True,
                 ) as container:
@@ -241,10 +234,10 @@ class EnvironmentSetup:
             except BaseException:
                 # A committed environment image keeps the bootstrap image as its parent;
                 # without one, the bootstrap image is only waste.
-                remove_image(bootstrapped, docker_binary=self.docker_binary)
+                remove_image(bootstrapped)
                 raise
         tag = image_tag(recipe.repository, cache_key)
-        tag_image(image_id, tag, docker_binary=self.docker_binary)
+        tag_image(image_id, tag)
         image = EnvironmentImage(
             image_id, tag, recipe.base_image, base.digest, cache_key, reused=False
         )
@@ -271,7 +264,6 @@ class EnvironmentSetup:
             workspace=workspace.path,
             run_id=self.run_id,
             store_root=self.store_root,
-            docker_binary=self.docker_binary,
             network=network.network,
             writable_root=True,
             capabilities=capabilities,
@@ -342,14 +334,14 @@ class EnvironmentSetup:
     ) -> None:
         try:
             if recipe.fetch_tags:
-                workspace.fetch_tags(allow_local_source=self.allow_local_source)
+                workspace.fetch_tags()
             if recipe.fetch_submodules:
-                workspace.fetch_submodules(allow_local_source=self.allow_local_source)
+                workspace.fetch_submodules()
         except RepositoryError as exc:
             raise EnvironmentSetupError(f"Fetching Git tags or submodules failed: {exc}") from exc
 
     def _label(self, recipe: EnvironmentRecipe, cache_key: str) -> str:
-        mode = detect_docker_daemon_mode(self.docker_binary)
+        mode = detect_docker_daemon_mode()
         uid, gid = docker_container_identity(mode)
         return environment_label(recipe, cache_key=cache_key, command_user=f"{uid}:{gid}")
 

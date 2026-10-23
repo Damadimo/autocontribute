@@ -28,26 +28,28 @@ from autocontribute.environment_ci import (
     checkout_input,
     ci_jobs,
     expand_command,
+    job_test_run,
     nox_sessions,
     package_json,
     single_invocation,
-    test_run,
 )
 from autocontribute.environment_signals import RepositorySignals
 from autocontribute.environments import (
+    DEBIAN_PACKAGE,
+    TOOL_ROOT,
     EnvironmentRecipe,
     Language,
     TestFramework,
     dependency_digest,
 )
 from autocontribute.exceptions import EnvironmentRecipeError
+from autocontribute.sandbox import SAFE_CONTAINER_PATH
 from autocontribute.workspace_files import CONTAINER_WORKSPACE
 
-_SYSTEM_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-# Setup runs as the command uid with HOME under /opt/ac (DESIGN §5.2); later containers mount
-# a tmpfs on /tmp, so nothing an offline command needs may live there.
-_TOOLS: Final = "/opt/ac/tools"
-_VENV: Final = "/opt/ac/venv"
+# Setup runs as the command uid with HOME under the tool root (DESIGN §5.2); later containers
+# mount a tmpfs on /tmp, so nothing an offline command needs may live there.
+_TOOLS: Final = f"{TOOL_ROOT}/tools"
+_VENV: Final = f"{TOOL_ROOT}/venv"
 _UV_VERSION: Final = "0.12.24"
 _BASE_SYSTEM_PACKAGES: Final = ("ca-certificates", "git", "less", "locales")
 _JUNIT_REPORT: Final = "/tmp/ac-report.xml"
@@ -76,7 +78,6 @@ _CI_ONLY_VARIABLE: Final = re.compile(
 _SECRET_VARIABLE: Final = re.compile(
     r"TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|PRIVATE|AUTH", re.IGNORECASE
 )
-_DEBIAN_PACKAGE: Final = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
 _PYTHON_VERSION: Final = re.compile(r"^(?:cpython-?)?3(?:\.(\d+|x))?(?:\.\d+)?$")
 _VERSION_CLAUSE: Final = re.compile(r"^(~=|===|==|!=|<=|>=|<|>)\s*(\d+(?:\.\d+)*)(\.\*)?$")
 _GO_VERSION: Final = re.compile(r"^[~^>=v]*(\d+)\.(\d+)")
@@ -188,7 +189,7 @@ def detect_recipe(
             override.image,
             override.setup,
             _verbatim(override.test),
-            env={"PATH": _SYSTEM_PATH, "LANG": "C.UTF-8"},
+            env={"PATH": SAFE_CONTAINER_PATH, "LANG": "C.UTF-8"},
             offline_env={},
             job=None,
         )
@@ -289,7 +290,7 @@ def _find_test_run(
     """The first CI job whose tests run in the given language, and that job."""
 
     for job in ci_jobs(sources.signals):
-        run = test_run(sources, job, python_minor=python_minor(job))
+        run = job_test_run(sources, job, python_minor=python_minor(job))
         if run is not None and _language_of(run.tests[0]) == language:
             return run, job
     return None, None
@@ -361,7 +362,7 @@ def _python_recipe(repository: str, sources: CiSources) -> EnvironmentRecipe:
         setup,
         test_command,
         env={
-            "PATH": f"{_VENV}/bin:{_TOOLS}/bin:{_SYSTEM_PATH}",
+            "PATH": f"{_VENV}/bin:{_TOOLS}/bin:{SAFE_CONTAINER_PATH}",
             "VIRTUAL_ENV": _VENV,
             "UV_PROJECT_ENVIRONMENT": _VENV,
             "UV_PYTHON_DOWNLOADS": "never",
@@ -385,7 +386,7 @@ def _python_install_commands(
     requirements: Sequence[str],
     minor: int,
 ) -> list[str]:
-    """The first install route of §B4 that applies, into the virtualenv at /opt/ac/venv."""
+    """The first install route of §B4 that applies, into the virtualenv under the tool root."""
 
     signals = sources.signals
     project = _table(pyproject.get("project"))
@@ -437,9 +438,10 @@ def _python_install_commands(
         return [
             shlex.join([*tool_install, "tox", "tox-current-env", *sources.tox.requires]),
             shlex.join(["tox", "-e", environment.name])
-            + " --print-deps-to /opt/ac/tox-deps.txt --print-extras-to /opt/ac/tox-extras.txt",
-            "extras=$(paste -sd, /opt/ac/tox-extras.txt) && "
-            'uv pip install -r /opt/ac/tox-deps.txt -e ".${extras:+[$extras]}"'
+            + f" --print-deps-to {TOOL_ROOT}/tox-deps.txt"
+            + f" --print-extras-to {TOOL_ROOT}/tox-extras.txt",
+            f"extras=$(paste -sd, {TOOL_ROOT}/tox-extras.txt) && "
+            f'uv pip install -r {TOOL_ROOT}/tox-deps.txt -e ".${{extras:+[$extras]}}"'
             + "".join(f" --group {shlex.quote(name)}" for name in environment.dependency_groups),
         ]
     if test is not None and test.nox_session is not None:
@@ -665,8 +667,8 @@ def _javascript_recipe(repository: str, sources: CiSources) -> EnvironmentRecipe
     setup: list[str] = []
     if manager != "npm":
         if major >= 25:
-            setup.append("npm install --global --prefix /opt/ac corepack")
-        setup.append("corepack enable --install-directory /opt/ac/bin")
+            setup.append(f"npm install --global --prefix {TOOL_ROOT} corepack")
+        setup.append(f"corepack enable --install-directory {TOOL_ROOT}/bin")
     setup.append(install)
     test = _javascript_test_command(sources, run, manager)
     build = [] if run is None else _javascript_build_commands(run.setup_steps, manager)
@@ -681,8 +683,14 @@ def _javascript_recipe(repository: str, sources: CiSources) -> EnvironmentRecipe
         setup,
         test,
         env={
-            "PATH": f"{CONTAINER_WORKSPACE}/node_modules/.bin:/opt/ac/bin:{_SYSTEM_PATH}",
-            "COREPACK_HOME": "/opt/ac/corepack",
+            "PATH": ":".join(
+                (
+                    f"{CONTAINER_WORKSPACE}/node_modules/.bin",
+                    f"{TOOL_ROOT}/bin",
+                    SAFE_CONTAINER_PATH,
+                )
+            ),
+            "COREPACK_HOME": f"{TOOL_ROOT}/corepack",
             "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
             "PUPPETEER_SKIP_DOWNLOAD": "1",
             "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1",
@@ -892,10 +900,10 @@ def _go_recipe(repository: str, sources: CiSources) -> EnvironmentRecipe:
         setup,
         _go_test_command(run.tests[0] if run is not None else None),
         env={
-            "PATH": f"/opt/ac/go/bin:/usr/local/go/bin:{_SYSTEM_PATH}",
-            "GOPATH": "/opt/ac/go",
-            "GOMODCACHE": "/opt/ac/go/pkg/mod",
-            "GOCACHE": "/opt/ac/go/cache",
+            "PATH": f"{TOOL_ROOT}/go/bin:/usr/local/go/bin:{SAFE_CONTAINER_PATH}",
+            "GOPATH": f"{TOOL_ROOT}/go",
+            "GOMODCACHE": f"{TOOL_ROOT}/go/pkg/mod",
+            "GOCACHE": f"{TOOL_ROOT}/go/cache",
             "GOTOOLCHAIN": "local",
             "GOFLAGS": "-buildvcs=false",
             "LANG": "C.UTF-8",
@@ -941,9 +949,9 @@ def _rust_recipe(repository: str, sources: CiSources) -> EnvironmentRecipe:
         setup,
         _cargo_test_command(flags),
         env={
-            "PATH": f"/usr/local/cargo/bin:{_SYSTEM_PATH}",
+            "PATH": f"/usr/local/cargo/bin:{SAFE_CONTAINER_PATH}",
             "RUSTUP_HOME": "/usr/local/rustup",
-            "CARGO_HOME": "/opt/ac/cargo",
+            "CARGO_HOME": f"{TOOL_ROOT}/cargo",
             "LANG": "C.UTF-8",
         },
         offline_env={"CARGO_NET_OFFLINE": "true"},
@@ -1108,7 +1116,7 @@ def _apt_packages(invocations: Iterable[Invocation]) -> set[str]:
             packages.update(
                 word
                 for word in words[words.index("install") + 1 :]
-                if not word.startswith("-") and _DEBIAN_PACKAGE.fullmatch(word) and word != "sudo"
+                if not word.startswith("-") and DEBIAN_PACKAGE.fullmatch(word) and word != "sudo"
             )
     return packages
 

@@ -356,7 +356,7 @@ def checkout_input(job: CiJob, name: str) -> str | None:
     return values[0] if values else None
 
 
-def test_run(sources: CiSources, job: CiJob, *, python_minor: int | None) -> CiTestRun | None:
+def job_test_run(sources: CiSources, job: CiJob, *, python_minor: int | None) -> CiTestRun | None:
     """Expand a job's steps and return its test run, or None when it runs no tests."""
 
     expander = _Expander(sources, python_minor)
@@ -1082,6 +1082,7 @@ __all__ = [
     "checkout_input",
     "ci_jobs",
     "expand_command",
+    "job_test_run",
     "load_strings_yaml",
     "matrix_values",
     "nox_sessions",
@@ -1089,5 +1090,4 @@ __all__ = [
     "shell_commands",
     "single_invocation",
     "substitute_expressions",
-    "test_run",
 ]
