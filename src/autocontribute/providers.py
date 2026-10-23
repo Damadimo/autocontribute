@@ -15,9 +15,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Final, Generic, Literal, NoReturn, Protocol, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError
@@ -32,7 +33,7 @@ from autocontribute.exceptions import (
 )
 from autocontribute.model_retry import PROVIDER_ERROR_CODES
 from autocontribute.pricing import API_KEY_ENVS, Effort, ModelSpec, ModelUsage
-from autocontribute.redaction import redact_model_input
+from autocontribute.redaction import contains_host_secret, redact_model_input
 from autocontribute.transcript import (
     Transcript,
     TranscriptKind,
@@ -53,6 +54,10 @@ MAX_TOOL_ARGUMENT_BYTES: Final = 256 * 1024
 MAX_TURN_SECONDS: Final = 600.0
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _REQUEST_ERROR_DETAIL_KEYS = frozenset({"http_status", "provider_code", "retry_after_seconds"})
+# Provider-opaque fields by output item type: replayed as received and never scanned (§3.6).
+_OPAQUE_FIELDS: Final[Mapping[str, str]] = MappingProxyType(
+    {"reasoning": "encrypted_content", "thinking": "signature", "redacted_thinking": "data"}
+)
 _WORKER_TERM_GRACE_SECONDS = 0.25
 _WORKER_POLL_SECONDS = 0.05
 _WORKER_ENV_ALLOWLIST = (
@@ -546,7 +551,13 @@ def _worker_result(
     return ModelResult(output=output, response_id=response_id, model=model, usage=usage)
 
 
-def _turn_result(payload: bytes, *, spec: ModelSpec, kind: TranscriptKind) -> Turn:
+def _turn_result(
+    payload: bytes,
+    *,
+    spec: ModelSpec,
+    kind: TranscriptKind,
+    host_values: frozenset[str],
+) -> Turn:
     envelope = _success_envelope(
         payload,
         protocol=_MODEL_TURN_PROTOCOL,
@@ -569,7 +580,7 @@ def _turn_result(payload: bytes, *, spec: ModelSpec, kind: TranscriptKind) -> Tu
         if len(_canonical_json_bytes(call.get("arguments"))) > MAX_TOOL_ARGUMENT_BYTES:
             raise ModelError("Model tool call arguments exceeded the size limit")
     try:
-        return Turn.model_validate(
+        turn = Turn.model_validate(
             {
                 "stop": envelope.get("stop"),
                 "output_items": envelope.get("output_items"),
@@ -581,6 +592,26 @@ def _turn_result(payload: bytes, *, spec: ModelSpec, kind: TranscriptKind) -> Tu
         )
     except ValidationError as exc:
         raise ModelError("Model worker returned an invalid turn") from exc
+    _reject_host_values(turn, host_values)
+    return turn
+
+
+def _reject_host_values(turn: Turn, host_values: frozenset[str]) -> None:
+    """Fail a turn whose output holds an exact host secret value, without echoing it.
+
+    The worker never holds the GitHub token, so only the parent can look for it. Parsed call
+    arguments are checked too: a JSON escape can hide a value in the raw argument string.
+    """
+
+    visible: list[dict[str, JsonValue]] = []
+    for item in turn.output_items:
+        item_type = item.get("type")
+        opaque = _OPAQUE_FIELDS.get(item_type) if isinstance(item_type, str) else None
+        visible.append({key: value for key, value in item.items() if key != opaque})
+    arguments = [call.arguments for call in turn.tool_calls]
+    for text in _model_output_strings([visible, arguments]):
+        if contains_host_secret(text, host_values):
+            raise ModelError("Model output contained a host secret value")
 
 
 def _run_worker(
@@ -757,13 +788,16 @@ class SubprocessTurnProvider:
 
     The worker gets only this provider's key, so third-party SDK code never runs beside the
     GitHub token. Transcript text is sent as appended; it was scrubbed once, when appended.
+    ``host_values`` are the host secret values (``host_secret_values`` over
+    ``github.token_env`` and the model key names); a turn whose output holds one fails.
     """
 
-    def __init__(self, spec: ModelSpec) -> None:
+    def __init__(self, spec: ModelSpec, host_values: frozenset[str]) -> None:
         if os.name != "posix":  # pragma: no cover - supported hosts are POSIX
             raise ModelError("Hard model deadlines require a POSIX process-group runtime")
         _require_api_key(API_KEY_ENVS[spec.provider])
         self.spec = spec
+        self.host_values = host_values
 
     def step(
         self,
@@ -800,7 +834,9 @@ class SubprocessTurnProvider:
             environment=_worker_environment(api_key_env, _require_api_key(api_key_env)),
             timeout_seconds=request_timeout,
             started=started,
-            parse=lambda payload: _turn_result(payload, spec=self.spec, kind=transcript.kind),
+            parse=lambda payload: _turn_result(
+                payload, spec=self.spec, kind=transcript.kind, host_values=self.host_values
+            ),
         )
 
 
