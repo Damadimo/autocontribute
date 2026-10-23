@@ -48,3 +48,6 @@ collaborators to either kind: anyone with write access can read the secrets.
 
 - The autocontribute version is set in `.github/actions/install-autocontribute/action.yml`.
 - The `autocontribute-state` branch holds the runner's state. Do not edit it.
+- A repository whose tests cannot be set up is skipped for 7 days.
+  [Test environments](https://github.com/Damadimo/autocontribute/blob/main/docs/environments.md)
+  says how to set them in `autocontribute.yml`.

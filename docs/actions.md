@@ -30,7 +30,7 @@ that changes a target's CI files.
 | Workflow | When | What it does |
 | --- | --- | --- |
 | `setup.yml` | Every push to `main`, or by hand | Checks the secrets, the token's owner and scope, the configuration and Docker. Creates the labels and the `autocontribute-state` branch. Turns `prepare.yml` on only when every check passes; otherwise it keeps a "Finish setup" issue with the checklist. |
-| `prepare.yml` | Daily at 06:37 UTC, or by hand | Job `prepare` restores the state and makes one attempt (`run --scheduled`). Job `record` checks the result, saves the state and opens one issue per prepared fix. |
+| `prepare.yml` | Daily at 06:37 UTC, or by hand | Job `prepare` restores the state, reads the open pull requests, makes one attempt as `run --scheduled` does, and keeps the run's evidence as the `evidence` artifact for 30 days. Job `record` checks the result, saves the state and opens one issue per prepared fix. |
 | `approve.yml` | A new comment on an issue | Starts only for the owner's `/approve` comment on an open approval issue. Approves, publishes, comments the pull request link and closes the issue. |
 
 Each workflow installs the version of Autocontribute set in
@@ -85,10 +85,11 @@ Run only the commands you need: `safety status` and `safety resume` end a safety
 
 ## Public or private
 
-A private runner uses Actions minutes: GitHub Free includes 2,000 a month, and one preparation a
-day fits. A public runner gets free minutes and larger machines, but anyone can read its issues,
-diffs and state, and GitHub turns scheduled workflows off after 60 days without activity in the
-repository. Never add collaborators: anyone with write access can read the secrets.
+A private runner uses Actions minutes: GitHub Free includes 2,000 a month, about an hour a day, and
+runs stop when they run out. A public runner gets free minutes and larger machines, but anyone can
+read its issues, diffs and state, and GitHub turns scheduled workflows off after 60 days without
+activity in the repository. Never add collaborators: anyone with write access can read the
+secrets.
 
 GitHub's terms limit hosted runners to work on the repository's own software, and a runner that
 prepares fixes for other projects is a borderline case. Keep the volume low; the default limits

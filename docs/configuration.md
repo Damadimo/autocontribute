@@ -1,6 +1,6 @@
 # Configuration
 
-Autocontribute reads one YAML file: `autocontribute.yml` in the current directory, or the file you pass with `--config`. `autocontribute init` writes a starter file, and the [README](../README.md#minimal-configuration) shows a minimal one. A key you leave out keeps the default listed here; an unknown key is an error. `autocontribute config validate` checks the file, and `autocontribute config show` prints it with every default filled in.
+Autocontribute reads one YAML file: `autocontribute.yml` in the current directory, or the file you pass with `--config`. `autocontribute init` writes a short starter file, and [`autocontribute.example.yml`](../autocontribute.example.yml) shows every section. A key you leave out keeps the default listed here; an unknown key is an error. `autocontribute config validate` checks the file, and `autocontribute config show` prints it with every default filled in.
 
 Secrets never go in this file. Model API keys come from `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`, and the GitHub token from the variable `github.token_env` names, or from `gh`. The file loads without any key; `run` and `doctor` need one.
 
@@ -77,7 +77,7 @@ environments:
 | --- | --- | --- |
 | `image` | detected | Base image. Setup records the digest the tag resolved to. |
 | `setup` | detected | Commands that install the project and its test dependencies. `[]` installs nothing. |
-| `test` | detected | Command that runs the test suite without network. A pytest, unittest, jest, vitest, mocha, `go test` or `cargo test` command gets a report option added, so results count per test. |
+| `test` | detected | Command that runs the test suite without network. A pytest, jest, vitest, mocha, `go test` or `cargo test` command gets a report option added, so results count per test; any other command, unittest included, counts as one test. |
 | `allow_hosts` | `[]` | Host names, not URLs or addresses. |
 
 ## sandbox
