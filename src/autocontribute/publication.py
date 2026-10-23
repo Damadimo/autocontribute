@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, NoReturn, cast
 
+from autocontribute.ai_policy import AI_COMMIT_TRAILER
 from autocontribute.approval import (
     FINGERPRINT_PREFIX,
     ApprovalReview,
@@ -91,6 +92,7 @@ _SAFE_SLUG = re.compile(r"[^a-z0-9-]+")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SIGNOFF = r"Signed-off-by: [^<>\n]{1,200} <[^<>\n]{3,320}>"
 _APPROVAL_SOURCE = re.compile(r"^https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[\x21-\x7e]{0,1900}$")
 _FORK_READY_BACKOFF_SECONDS = (1, 2, 4, 8, 16, 32)
 # Each compensation reason is proven by exactly one marker event written before cleanup starts.
@@ -162,12 +164,14 @@ def validate_publication_text(
     if "\r" in proposal.commit_message:
         raise PolicyError("commit message contains a carriage return")
     if "\n" in proposal.commit_message:
+        trailer = AI_COMMIT_TRAILER.pattern
         if not re.fullmatch(
-            r"[^\n]{1,200}\n\nSigned-off-by: [^<>\n]{1,200} <[^<>\n]{3,320}>",
+            rf"[^\n]{{1,200}}\n\n(?:{trailer}|{trailer}\n{_SIGNOFF}|{_SIGNOFF})",
             proposal.commit_message,
         ):
             raise PolicyError(
-                "multiline commit message must be one subject and one exact DCO signoff trailer"
+                "multiline commit message must be one subject, then an AI trailer, an exact DCO "
+                "signoff trailer, or both in that order"
             )
     elif len(proposal.commit_message) > 200:
         raise PolicyError("commit message subject exceeds the 200-character limit")

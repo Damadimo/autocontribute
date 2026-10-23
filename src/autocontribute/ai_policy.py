@@ -19,6 +19,9 @@ AiPolicyStance = Literal["ban", "conditional", "permissive", "none", "unclear"]
 AGENT_INSTRUCTION_FILES = frozenset(
     {"agents.md", "claude.md", "gemini.md", "copilot-instructions.md"}
 )
+# The commit trailer a repository's AI policy can ask for, as ``pr_text`` writes it: the key as
+# the policy spells it, then the tool and model. It goes between the subject and any DCO signoff.
+AI_COMMIT_TRAILER = re.compile(r"(?i:assisted-by|generated-by): [^\r\n]{1,200}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,6 +274,7 @@ def _collapsed(text: str) -> str:
 
 __all__ = [
     "AGENT_INSTRUCTION_FILES",
+    "AI_COMMIT_TRAILER",
     "AiPolicyQuote",
     "AiPolicyStance",
     "PolicyFile",

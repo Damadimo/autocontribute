@@ -17,6 +17,7 @@ from urllib.parse import unquote, urlparse
 
 from autocontribute.ai_policy import (
     AGENT_INSTRUCTION_FILES,
+    AI_COMMIT_TRAILER,
     AiPolicyQuote,
     PolicyFile,
     RepositoryAiPolicy,
@@ -1780,13 +1781,16 @@ def validate_legal_publication(
     if "dco" in requirements:
         if attestation.dco is None:
             raise PolicyError("Run lacks its named DCO signoff authorization")
-        parts = commit_message.split("\n\n")
+        subject, _, trailers = commit_message.partition("\n\n")
+        # The signoff is the last trailer; an AI trailer may come before it.
+        *ai_trailers, signoff = trailers.split("\n")
         if (
-            len(parts) != 2
-            or not parts[0]
+            not subject
             or "\r" in commit_message
-            or "\n" in parts[0]
-            or parts[1] != attestation.dco.trailer
+            or "\n" in subject
+            or signoff != attestation.dco.trailer
+            or len(ai_trailers) > 1
+            or not all(AI_COMMIT_TRAILER.fullmatch(line) for line in ai_trailers)
         ):
             raise PolicyError("Commit does not contain the exact authorized DCO signoff trailer")
     elif re.search(r"signed-off-by\s*:", commit_message, re.I):

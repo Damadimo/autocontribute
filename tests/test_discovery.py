@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Literal
 
 import pytest
@@ -2766,6 +2767,69 @@ def test_dco_authorization_produces_and_revalidates_exact_signoff(tmp_path) -> N
             publishing_login="different-user",
             commit_message=message,
         )
+
+
+@pytest.mark.parametrize(
+    ("trailers", "accepted"),
+    [
+        ("Assisted-by: autocontribute 0.1.0, gpt-5.6-sol\n{signoff}", True),
+        ("generated-by: autocontribute 0.1.0, claude-opus-5-5\n{signoff}", True),
+        ("{signoff}\nAssisted-by: autocontribute 0.1.0, gpt-5.6-sol", False),
+        ("Co-authored-by: Model <model@example.invalid>\n{signoff}", False),
+        ("Assisted-by: one\nAssisted-by: two\n{signoff}", False),
+    ],
+)
+def test_dco_revalidation_accepts_only_an_ai_trailer_before_the_signoff(
+    tmp_path: Path, trailers: str, accepted: bool
+) -> None:
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "All commits must include a Signed-off-by line under the Developer Certificate "
+                "of Origin."
+            )
+        }
+    )
+    snapshot = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path / "preview")
+    ).policy_snapshot(_repository(), repository_ref=REPOSITORY_REF)
+    config = _legal_config(snapshot)
+    result = DiscoveryService(config, github, RunStore(tmp_path / "run")).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref=REPOSITORY_REF
+    )
+    signoff = "Signed-off-by: Example Signer <signer@example.invalid>"
+    message = "Fix documented parser boundary\n\n" + trailers.format(signoff=signoff)
+
+    def revalidate() -> None:
+        validate_legal_publication(
+            config,
+            result,
+            repository="example/project",
+            publishing_login="octocat",
+            commit_message=message,
+        )
+
+    if accepted:
+        revalidate()
+    else:
+        with pytest.raises(PolicyError, match="exact authorized DCO signoff"):
+            revalidate()
+
+
+def test_an_ai_trailer_needs_no_legal_requirement(tmp_path: Path) -> None:
+    github = PolicyGitHub({("example/project", "CONTRIBUTING.md"): "Contribution guidelines"})
+    config = AutocontributeConfig()
+    result = DiscoveryService(config, github, RunStore(tmp_path)).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository(), repository_ref=REPOSITORY_REF
+    )
+
+    validate_legal_publication(
+        config,
+        result,
+        repository="example/project",
+        publishing_login="octocat",
+        commit_message="Fix parser\n\nAssisted-by: autocontribute 0.1.0, gpt-5.6-sol",
+    )
 
 
 def test_dco_authorization_rejects_model_supplied_legal_trailer(tmp_path) -> None:
