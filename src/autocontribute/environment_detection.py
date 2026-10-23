@@ -1069,6 +1069,17 @@ def _narrows_cargo_suite(arguments: Sequence[str]) -> bool:
 # Shared helpers
 
 
+def reported_test_command(command: str) -> tuple[str, TestFramework, str | None]:
+    """Return a test command with a structured reporter when it is one runner call.
+
+    Also returns its framework and the path of the report it writes, or ``None`` when it writes
+    none, as for an operator's ``environments.<repo>.test``.
+    """
+
+    test = _operator_test_command(command)
+    return test.command, test.framework, test.report
+
+
 def _operator_test_command(command: str) -> _TestCommand:
     """An operator's test command, with a structured reporter when it is one runner call."""
 
@@ -1187,4 +1198,4 @@ def _unique(values: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
-__all__ = ["detect_recipe"]
+__all__ = ["detect_recipe", "reported_test_command"]
