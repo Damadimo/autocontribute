@@ -371,8 +371,10 @@ class RunManifest(DomainModel):
     ) = None
     pull_request_url: str | None = None
     pull_request_node_id: str | None = Field(default=None, min_length=1, max_length=256)
-    # Set by lifecycle sync; sync stops observing a pull request once it is merged or closed.
+    # Set by lifecycle sync. Sync stops observing a closed pull request, and watches a merged one
+    # only for a revert, for 30 days after it merged.
     pull_request_state: Literal["open", "merged", "closed"] | None = None
+    pull_request_merged_at: datetime | None = None
     pull_request_attention: list[PullRequestAttention] = Field(default_factory=list)
     skip_reason: str | None = None
     error: str | None = None

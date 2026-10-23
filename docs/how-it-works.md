@@ -182,9 +182,9 @@ autocontribute run --issue owner/repo#123 --retry-unchanged --retry-actor NAME -
 
 `autocontribute lifecycle sync` reads every open PR this tool opened and re-checks runs left in
 `submitting`. It runs first in every `run --scheduled` ([Scheduling](../README.md#scheduling)) and
-`publish`, and exits with code 2 while the safety stop is active. Once a PR is merged or closed,
-sync stops reading it. A PR that GitHub cannot serve gets an `observation_failed` note, and sync
-goes on to the next one.
+`publish`, and exits with code 2 while the safety stop is active. Once a PR is closed, sync stops
+reading it. For 30 days after a PR is merged, sync reads only whether another merged PR reverts it.
+A PR that GitHub cannot serve gets an `observation_failed` note, and sync goes on to the next one.
 
 Routine events stop nothing. Each one is noted once on its run (`pull_request_attention` in
 `manifest.json`) for you to handle:

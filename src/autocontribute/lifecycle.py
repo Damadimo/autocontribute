@@ -69,6 +69,8 @@ _COMMIT_SHA: Final = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
 _REQUEST_ID: Final = re.compile(r"\s*\(request [^)]*\)")
 MAX_LIFECYCLE_RUNS: Final = 1_000
 REPOSITORY_COOLDOWN: Final = timedelta(days=30)
+# A merged pull request is watched this long for a merged revert.
+REVERT_WATCH: Final = timedelta(days=30)
 
 
 class LifecycleStore(Protocol):
@@ -82,6 +84,10 @@ class LifecycleRunStore(LifecycleStore, Protocol):
 
     def list_open_pull_request_runs(
         self, *, limit: int = MAX_LIFECYCLE_RUNS
+    ) -> list[RunManifest]: ...
+
+    def list_merged_pull_request_runs(
+        self, *, merged_since: datetime, limit: int = MAX_LIFECYCLE_RUNS
     ) -> list[RunManifest]: ...
 
     def save(self, manifest: RunManifest, *, event: str, details: dict[str, str]) -> None: ...
@@ -272,6 +278,15 @@ class LifecycleObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class RevertWatch:
+    """A merged pull request read only for a revert merged after it."""
+
+    pull_request: PullRequestDetails
+    signals: tuple[LifecycleSignal, ...]
+    newly_recorded: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LifecycleFailure:
     """A pull request whose observation failed; the others were still observed."""
 
@@ -284,18 +299,23 @@ class LifecycleFailure:
 class LifecycleSyncResult:
     observations: tuple[LifecycleObservation, ...]
     failures: tuple[LifecycleFailure, ...] = ()
+    revert_watches: tuple[RevertWatch, ...] = ()
 
     @property
     def runs_checked(self) -> int:
-        return len(self.observations) + len(self.failures)
+        return len(self.observations) + len(self.revert_watches) + len(self.failures)
 
     @property
     def signals_detected(self) -> int:
-        return sum(len(item.signals) for item in self.observations)
+        return sum(len(item.signals) for item in self.observations) + sum(
+            len(item.signals) for item in self.revert_watches
+        )
 
     @property
     def newly_recorded(self) -> int:
-        return sum(len(item.newly_recorded) for item in self.observations)
+        return sum(len(item.newly_recorded) for item in self.observations) + sum(
+            len(item.newly_recorded) for item in self.revert_watches
+        )
 
 
 class LifecycleObserver:
@@ -400,22 +420,47 @@ class LifecycleObserver:
         )
         signals = classify_lifecycle(snapshot)
         observed_at = utc_now()
-        attention: list[PullRequestAttention] = []
+        attention = tuple(
+            item for item in (signal.attention(observed_at) for signal in signals) if item
+        )
+        return LifecycleObservation(
+            snapshot=snapshot,
+            signals=signals,
+            attention=attention,
+            newly_recorded=self._record_stops(signals, observed_at=observed_at),
+        )
+
+    def watch_for_revert(self, *, repository: str, number: int) -> RevertWatch:
+        """Read a merged pull request's references only, for a revert merged after it."""
+
+        normalized_repository = _identity(repository, field="repository")
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            raise ValueError("pull request number must be a positive integer")
+        pull_request = self.github.get_pull_request(normalized_repository, number)
+        _require_identity(pull_request, normalized_repository, number)
+        references = self.github.list_pull_request_references(normalized_repository, number)
+        if self.github.get_pull_request(normalized_repository, number) != pull_request:
+            raise GitHubError(
+                "Pull request changed while lifecycle evidence was fetched; retry observation"
+            )
+        self._assert_lease_owned()
+        signals = _ordered(_revert_signals(pull_request, references))
+        return RevertWatch(
+            pull_request=pull_request,
+            signals=signals,
+            newly_recorded=self._record_stops(signals, observed_at=utc_now()),
+        )
+
+    def _record_stops(
+        self, signals: Sequence[LifecycleSignal], *, observed_at: datetime
+    ) -> tuple[str, ...]:
         newly_recorded: list[str] = []
         for signal in signals:
-            item = signal.attention(observed_at)
-            if item is not None:
-                attention.append(item)
             for trigger in signal.stops(api_origin=self.github.api_origin, observed_at=observed_at):
                 self._assert_lease_owned()
                 if self.store.record_stop(trigger):
                     newly_recorded.append(trigger.trigger_hash)
-        return LifecycleObservation(
-            snapshot=snapshot,
-            signals=signals,
-            attention=tuple(attention),
-            newly_recorded=tuple(newly_recorded),
-        )
+        return tuple(newly_recorded)
 
     def _assert_lease_owned(self) -> None:
         if self._assert_owned is not None:
@@ -460,7 +505,10 @@ def sync_open_pull_requests(
     max_runs: int = MAX_LIFECYCLE_RUNS,
     assert_owned: Callable[[], object] | None = None,
 ) -> LifecycleSyncResult:
-    """Observe every durable open PR after validating the complete local target set."""
+    """Observe every open PR, and watch each PR merged in the last 30 days for a revert.
+
+    The complete local target set is validated before any GitHub read.
+    """
 
     reported_api_origin = github.api_origin
     try:
@@ -469,7 +517,76 @@ def sync_open_pull_requests(
         raise StateError("Lifecycle GitHub client has an invalid API origin") from exc
     if reported_api_origin != current_api_origin:
         raise StateError("Lifecycle GitHub client returned a non-canonical API origin")
-    manifests = store.list_open_pull_request_runs(limit=max_runs)
+    open_targets = _sync_targets(
+        store.list_open_pull_request_runs(limit=max_runs), api_origin=current_api_origin
+    )
+    merged_targets = _sync_targets(
+        store.list_merged_pull_request_runs(merged_since=utc_now() - REVERT_WATCH, limit=max_runs),
+        api_origin=current_api_origin,
+    )
+
+    observer = LifecycleObserver(github, store, assert_owned=assert_owned)
+    observations: list[LifecycleObservation] = []
+    revert_watches: list[RevertWatch] = []
+    failures: list[LifecycleFailure] = []
+    for manifest, pull_request_url, repository, number, commit_sha in open_targets:
+        if assert_owned is not None:
+            assert_owned()
+        try:
+            observation = observer.observe(
+                repository=repository,
+                number=number,
+                expected_head_sha=commit_sha,
+                publishing_login=manifest.publishing_login,
+            )
+        except (GitHubSafetyError, GitHubRateLimitError):
+            raise
+        except GitHubError as exc:
+            # One unreadable pull request must not hide the others or stop preparation.
+            failures.append(LifecycleFailure(manifest.run_id, pull_request_url, str(exc)))
+            state = manifest.pull_request_state
+            merged_at = manifest.pull_request_merged_at
+            attention: tuple[PullRequestAttention, ...] = (
+                _observation_failure(pull_request_url, exc),
+            )
+        else:
+            observations.append(observation)
+            state = observation.snapshot.pull_request_state
+            merged_at = observation.snapshot.pull_request.merged_at if state == "merged" else None
+            attention = observation.attention
+        if assert_owned is not None:
+            assert_owned()
+        _record_on_run(store, manifest, state=state, merged_at=merged_at, attention=attention)
+    for manifest, pull_request_url, repository, number, _ in merged_targets:
+        if assert_owned is not None:
+            assert_owned()
+        try:
+            revert_watches.append(observer.watch_for_revert(repository=repository, number=number))
+        except (GitHubSafetyError, GitHubRateLimitError):
+            raise
+        except GitHubError as exc:
+            failures.append(LifecycleFailure(manifest.run_id, pull_request_url, str(exc)))
+            if assert_owned is not None:
+                assert_owned()
+            _record_on_run(
+                store,
+                manifest,
+                state=manifest.pull_request_state,
+                merged_at=manifest.pull_request_merged_at,
+                attention=(_observation_failure(pull_request_url, exc),),
+            )
+    return LifecycleSyncResult(
+        observations=tuple(observations),
+        failures=tuple(failures),
+        revert_watches=tuple(revert_watches),
+    )
+
+
+def _sync_targets(
+    manifests: Sequence[RunManifest], *, api_origin: str
+) -> list[tuple[RunManifest, str, str, int, str]]:
+    """Validate published runs and name the pull request each one observes."""
+
     targets: list[tuple[RunManifest, str, str, int, str]] = []
     seen: set[tuple[str, int]] = set()
     for manifest in manifests:
@@ -493,7 +610,7 @@ def sync_open_pull_requests(
             raise StateError(
                 f"Published run {manifest.run_id} has a non-canonical publishing API origin"
             )
-        if durable_api_origin != current_api_origin:
+        if durable_api_origin != api_origin:
             raise StateError(
                 f"Published run {manifest.run_id} belongs to a different GitHub API origin"
             )
@@ -517,40 +634,10 @@ def sync_open_pull_requests(
             )
         identity = (repository.casefold(), number)
         if identity in seen:
-            raise StateError("Multiple durable runs refer to the same open pull request")
+            raise StateError("Multiple durable runs refer to the same pull request")
         seen.add(identity)
         targets.append((manifest, manifest.pull_request_url, repository, number, commit_sha))
-
-    observer = LifecycleObserver(github, store, assert_owned=assert_owned)
-    observations: list[LifecycleObservation] = []
-    failures: list[LifecycleFailure] = []
-    for manifest, pull_request_url, repository, number, commit_sha in targets:
-        if assert_owned is not None:
-            assert_owned()
-        try:
-            observation = observer.observe(
-                repository=repository,
-                number=number,
-                expected_head_sha=commit_sha,
-                publishing_login=manifest.publishing_login,
-            )
-        except (GitHubSafetyError, GitHubRateLimitError):
-            raise
-        except GitHubError as exc:
-            # One unreadable pull request must not hide the others or stop preparation.
-            failures.append(LifecycleFailure(manifest.run_id, pull_request_url, str(exc)))
-            state = manifest.pull_request_state
-            attention: tuple[PullRequestAttention, ...] = (
-                _observation_failure(pull_request_url, exc),
-            )
-        else:
-            observations.append(observation)
-            state = observation.snapshot.pull_request_state
-            attention = observation.attention
-        if assert_owned is not None:
-            assert_owned()
-        _record_on_run(store, manifest, state=state, attention=attention)
-    return LifecycleSyncResult(observations=tuple(observations), failures=tuple(failures))
+    return targets
 
 
 def _observation_failure(pull_request_url: str, error: GitHubError) -> PullRequestAttention:
@@ -571,15 +658,21 @@ def _record_on_run(
     manifest: RunManifest,
     *,
     state: Literal["open", "merged", "closed"] | None,
+    merged_at: datetime | None,
     attention: tuple[PullRequestAttention, ...],
 ) -> None:
     """Save the observed state and each attention entry the run does not have yet."""
 
     known = {item.evidence_hash for item in manifest.pull_request_attention}
     new = [item for item in attention if item.evidence_hash not in known]
-    if state == manifest.pull_request_state and not new:
+    if (
+        state == manifest.pull_request_state
+        and merged_at == manifest.pull_request_merged_at
+        and not new
+    ):
         return
     manifest.pull_request_state = state
+    manifest.pull_request_merged_at = merged_at
     manifest.pull_request_attention.extend(new)
     store.save(
         manifest,
@@ -721,7 +814,26 @@ def classify_lifecycle(
             )
         )
 
-    for reference in snapshot.references:
+    signals.extend(_revert_signals(pull_request, snapshot.references))
+
+    return _ordered(signals)
+
+
+def _ordered(signals: Sequence[LifecycleSignal]) -> tuple[LifecycleSignal, ...]:
+    # API ordering must never influence breaker trigger order or hashes.
+    return tuple(
+        sorted(
+            signals,
+            key=lambda signal: (signal.kind.value, signal.evidence_key, signal.source_url),
+        )
+    )
+
+
+def _revert_signals(
+    pull_request: PullRequestDetails, references: Sequence[PullRequestReference]
+) -> list[LifecycleSignal]:
+    signals: list[LifecycleSignal] = []
+    for reference in references:
         if (
             not pull_request.merged
             or pull_request.merged_at is None
@@ -745,14 +857,7 @@ def classify_lifecycle(
                     source_url=reference.source_url,
                 )
             )
-
-    # API ordering must never influence breaker trigger order or hashes.
-    return tuple(
-        sorted(
-            signals,
-            key=lambda signal: (signal.kind.value, signal.evidence_key, signal.source_url),
-        )
-    )
+    return signals
 
 
 def _signal(
@@ -964,6 +1069,7 @@ def _hash_payload(value: object) -> str:
 __all__ = [
     "MAX_LIFECYCLE_RUNS",
     "REPOSITORY_COOLDOWN",
+    "REVERT_WATCH",
     "LifecycleFailure",
     "LifecycleGitHub",
     "LifecycleObservation",
@@ -974,6 +1080,7 @@ __all__ = [
     "LifecycleStore",
     "LifecycleSyncResult",
     "PullRequestLifecycleSnapshot",
+    "RevertWatch",
     "classify_lifecycle",
     "parse_pull_request_url",
     "sync_open_pull_requests",
