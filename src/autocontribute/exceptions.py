@@ -156,6 +156,10 @@ class ApprovalMismatchError(PolicyError):
     """The fingerprint a person approved is not the run's current approval fingerprint."""
 
 
+class PublicationLimitError(PolicyError):
+    """A publication limit refuses the pull request for now; the approval stays usable."""
+
+
 class SandboxError(AutocontributeError):
     """An isolated validation command could not be executed."""
 

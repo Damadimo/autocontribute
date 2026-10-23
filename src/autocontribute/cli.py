@@ -16,6 +16,7 @@ import yaml
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 
 from autocontribute import __version__
 from autocontribute.approval import FINGERPRINT_PREFIX, fingerprint_matches
@@ -42,6 +43,7 @@ from autocontribute.exceptions import (
     AutocontributeError,
     ConfigurationError,
     PolicyError,
+    PublicationLimitError,
     PublicationResumeRequired,
     StateError,
 )
@@ -406,13 +408,28 @@ def publish(
         bool,
         typer.Option("--yes", help="Perform the authorized GitHub write without another prompt."),
     ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the outcome as JSON; requires --yes."),
+    ] = False,
 ) -> None:
-    """Push one branch to the reviewed head repository and open one pull request."""
+    """Push one branch to the reviewed head repository and open one pull request.
 
-    settings = _config(config)
+    Exit codes: 0 the pull request is open, 3 a limit or stale evidence refused it (wait, or
+    prepare the issue again), 4 an interrupted publication needs `publish` again after review,
+    5 a safety stop is active, 1 anything else.
+    """
+
+    if json_output and not yes:
+        _fail("--json cannot prompt; pass --yes", json_output=True, context={"run_id": run_id})
+    settings = _config(config, json_output=json_output)
     store = RunStore(settings.storage.path)
-    manifest = store.get(run_id)
-    _show_report(manifest)
+    try:
+        manifest = store.get(run_id)
+    except AutocontributeError as exc:
+        _fail(str(exc), json_output=json_output, context={"run_id": run_id})
+    if not json_output:
+        _show_report(manifest)
     if not yes and not typer.confirm("Publish this exact approved artifact to GitHub"):
         raise typer.Abort()
     try:
@@ -429,9 +446,25 @@ def publish(
             if manifest.status != RunStatus.PR_OPEN:
                 manifest = Publisher(settings, store, github).publish(run_id)
     except AutocontributeError as exc:
-        _fail(str(exc))
+        outcome, exit_code = _publication_failure(store, exc)
+        _fail(
+            str(exc),
+            exit_code=exit_code,
+            json_output=json_output,
+            outcome=outcome,
+            context=_publication_state(store, run_id),
+        )
     _refresh_report(store, manifest)
-    console.print(f"[bold green]Pull request opened:[/bold green] {manifest.pull_request_url}")
+    if json_output:
+        _emit_json(
+            {
+                **_publication_state(store, run_id),
+                "outcome": "pr_open",
+                "message": "Pull request opened",
+            }
+        )
+    else:
+        console.print(f"[bold green]Pull request opened:[/bold green] {manifest.pull_request_url}")
 
 
 @runs_app.command(name="list")
@@ -1184,6 +1217,32 @@ def _refresh_report(store: RunStore, manifest: RunManifest) -> None:
     )
 
 
+def _publication_failure(store: RunStore, error: AutocontributeError) -> tuple[str, int]:
+    """Name a failed publication and its exit code, so a runner knows whether to wait."""
+
+    if store.circuit_breaker_status().is_tripped:
+        return "safety_stop", 5
+    if isinstance(error, PublicationResumeRequired):
+        return "resume_required", 4
+    if isinstance(error, PublicationLimitError):
+        return "limit", 3
+    if isinstance(error, PolicyError):
+        return "stale", 3
+    return "error", 1
+
+
+def _publication_state(store: RunStore, run_id: str) -> dict[str, object]:
+    try:
+        manifest = store.get(run_id)
+    except AutocontributeError:
+        return {"run_id": run_id, "status": None, "pull_request_url": None}
+    return {
+        "run_id": run_id,
+        "status": manifest.status.value,
+        "pull_request_url": manifest.pull_request_url,
+    }
+
+
 def _already_approved(manifest: RunManifest, fingerprint: str) -> bool:
     """Whether a repeated approval names the approval this run already recorded."""
 
@@ -1248,7 +1307,8 @@ def _fail(
     if json_output:
         _emit_json({**(context or {}), "outcome": outcome, "message": message})
     else:
-        console.print(f"[red]Error:[/red] {message}")
+        # Text is never parsed, so brackets and :name: in a message print as written.
+        console.print(Text.assemble(("Error:", "red"), f" {message}"))
     raise typer.Exit(exit_code)
 
 

@@ -58,6 +58,7 @@ from autocontribute.exceptions import (
     GitHubRequestNotSentError,
     GitHubSafetyError,
     PolicyError,
+    PublicationLimitError,
     PublicationResumeRequired,
     RepositoryError,
     StateError,
@@ -3853,14 +3854,18 @@ class Publisher:
             for run in in_flight
         )
         if open_count >= publishing.max_open_pull_requests:
-            raise PolicyError("Maximum number of open autocontribute pull requests reached")
+            raise PublicationLimitError(
+                "Maximum number of open autocontribute pull requests reached"
+            )
         if any(
             pull_request.repository.casefold() == repository for pull_request in open_pull_requests
         ) or any(
             run.candidate is not None and run.candidate.repository.casefold() == repository
             for run in in_flight
         ):
-            raise PolicyError("An autocontribute pull request is already open in this repository")
+            raise PublicationLimitError(
+                "An autocontribute pull request is already open in this repository"
+            )
 
         now = datetime.now(UTC)
         day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -3878,13 +3883,13 @@ class Publisher:
             sum(pull_request.created_at >= day_start for pull_request in recent)
             >= publishing.max_new_pull_requests_per_day
         ):
-            raise PolicyError("Daily new pull-request limit reached")
+            raise PublicationLimitError("Daily new pull-request limit reached")
         if publishing.repository_cooldown_days and any(
             pull_request.repository.casefold() == repository
             and pull_request.updated_at >= cooldown_start
             for pull_request in recent
         ):
-            raise PolicyError("Repository cooldown is active for this account")
+            raise PublicationLimitError("Repository cooldown is active for this account")
 
     def _publication_intent_time(self, run_id: str) -> datetime:
         """Commit dates come from the durable intent, so a rebuilt commit has the same SHA."""
