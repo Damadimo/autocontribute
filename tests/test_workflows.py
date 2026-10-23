@@ -504,7 +504,8 @@ def test_e2e_workflow_prepares_with_read_only_tokens_and_keeps_the_evidence() ->
     evidence = next(step for step in steps if step["name"] == "Keep the run evidence")
 
     assert set(triggers) == {"workflow_dispatch", "push"}
-    assert triggers["workflow_dispatch"]["inputs"]["issue"]["required"] is True
+    # One of the two inputs names the target: an issue, or repositories for discovery.
+    assert set(triggers["workflow_dispatch"]["inputs"]) == {"issue", "repositories"}
     assert triggers["push"] == {"branches": ["e2e/**"]}
     assert document["permissions"] == {"contents": "read"}
     assert "permissions" not in job

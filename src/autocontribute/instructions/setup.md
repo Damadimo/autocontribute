@@ -7,9 +7,10 @@ What you get
   runners, manifests, version pins), and the commands of the attempt that failed with the last
   lines of its log.
 - A shell in a container built from that image, with the repository at /workspace. Network
-  access goes through a proxy that allows package registries and GitHub only. Each command starts
-  in a fresh shell in /workspace; `cd` and variables do not persist. Your home is /opt/ac/home;
-  keep tool homes and caches under /opt/ac.
+  access goes through a proxy that allows only the hosts the first message lists: package
+  registries, operating system package mirrors, toolchain downloads and GitHub. Each command
+  starts in a fresh shell in /workspace; `cd` and variables do not persist. Your home is
+  /opt/ac/home; keep tool homes and caches under /opt/ac.
 
 How to work
 1. Read the failed attempt's log and find why it failed.
