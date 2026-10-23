@@ -437,7 +437,12 @@ def _openai_user_message(text: str) -> dict[str, JsonValue]:
 
 def _openai_result(call: ToolCall, result: ToolResult) -> dict[str, JsonValue]:
     if call.name == NATIVE_CALL_NAMES["openai"]["shell"]:
-        if isinstance(result.output, str) or not result.output:
+        commands = call.arguments.get("commands")
+        if (
+            isinstance(result.output, str)
+            or not isinstance(commands, list)
+            or len(result.output) != len(commands)
+        ):
             raise ValueError("an OpenAI shell result needs one output chunk per command")
         item: dict[str, JsonValue] = {
             "type": "shell_call_output",

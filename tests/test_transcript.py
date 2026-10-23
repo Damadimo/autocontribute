@@ -477,6 +477,18 @@ def test_results_need_pending_calls() -> None:
         ("gpt-5.6-sol", _OPENAI_SHELL_CALL, (), "one output chunk per command"),
         (
             "gpt-5.6-sol",
+            _OPENAI_SHELL_CALL,
+            (ShellChunk(stdout="", stderr="", exit_code=0),),
+            "one output chunk per command",
+        ),
+        (
+            "gpt-5.6-sol",
+            _OPENAI_SHELL_CALL,
+            (ShellChunk(stdout="", stderr="", exit_code=0),) * 3,
+            "one output chunk per command",
+        ),
+        (
+            "gpt-5.6-sol",
             _OPENAI_PATCH_CALL,
             (ShellChunk(stdout="", stderr="", exit_code=0),),
             "only OpenAI shell results",
@@ -488,7 +500,14 @@ def test_results_need_pending_calls() -> None:
             "only OpenAI shell results",
         ),
     ],
-    ids=["openai-shell-text", "openai-shell-empty", "openai-patch-chunks", "anthropic-chunks"],
+    ids=[
+        "openai-shell-text",
+        "openai-shell-empty",
+        "openai-shell-too-few",
+        "openai-shell-too-many",
+        "openai-patch-chunks",
+        "anthropic-chunks",
+    ],
 )
 def test_result_output_must_fit_the_call(
     model: str,
