@@ -542,6 +542,7 @@ def test_approval_event_is_checked_again_in_python(tmp_path: Path) -> None:
     refusals = (
         ("action", "edited"),
         ("repository.full_name", "someone-else/runner"),
+        ("repository.owner", {"id": 1, "login": OWNER}),
         ("issue.pull_request", {"url": "https://api.github.com/x"}),
         ("issue.state", "closed"),
         ("issue.user", {"login": OWNER, "type": "User"}),

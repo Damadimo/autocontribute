@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+import autocontribute.state_archive as state_archive
 from autocontribute.cli import app
 from autocontribute.domain import RunStatus
 from autocontribute.exceptions import StateError
@@ -187,6 +188,31 @@ def test_import_rejects_unexpected_archives_without_touching_the_target(
 
     assert not target.exists()
     assert sorted(path.name for path in tmp_path.iterdir()) == ["database-source", "state.tar.gz"]
+
+
+@pytest.mark.parametrize(
+    ("bound", "value", "message"),
+    [("_MAX_ENTRIES", 2, "too many entries"), ("_MAX_BYTES", 1_024, "larger than 1 GiB")],
+)
+def test_import_stops_at_its_bounds_without_touching_the_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    bound: str,
+    value: int,
+    message: str,
+) -> None:
+    store, _, _ = _state(tmp_path / "source")
+    archive = tmp_path / "state.tar.gz"
+    export_state(store, archive)
+    target = tmp_path / "target"
+    existing = RunStore(target).create_run()
+    monkeypatch.setattr(state_archive, bound, value)
+
+    with pytest.raises(StateError, match=message):
+        import_state(archive, target, force=True)
+
+    assert RunStore(target).get(existing.run_id).run_id == existing.run_id
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["source", "state.tar.gz", "target"]
 
 
 def test_import_rejects_a_file_that_is_not_an_archive(tmp_path: Path) -> None:
