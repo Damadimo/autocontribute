@@ -1,11 +1,15 @@
 import os
+import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+TEMPLATE = ROOT / "template"
+_PINNED_ACTION = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
 
 
 def _security_workflow() -> dict[str, object]:
@@ -126,6 +130,7 @@ def test_ci_audits_workflows_shell_and_complete_history_for_secrets() -> None:
     assert "shellcheck" in install["run"]
     assert "actionlint" in workflow_audit["run"]
     assert "-shellcheck" in workflow_audit["run"]
+    assert "template/.github/workflows/*.yml" in workflow_audit["run"]
     assert secret_scan["run"] == '"$(go env GOPATH)/bin/gitleaks" git --redact --verbose .'
 
 
@@ -251,6 +256,7 @@ def test_security_workflow_changes_are_assigned_to_a_trusted_code_owner() -> Non
     }
 
     assert "/.github/workflows/ @Damadimo" in rules
+    assert "/template/.github/ @Damadimo" in rules
     assert "/.github/CODEOWNERS @Damadimo" in rules
 
 
@@ -477,3 +483,128 @@ def test_security_integration_runs_live_rootful_docker_isolation() -> None:
     assert rootful["run"] == (
         "uv run pytest -q tests/test_sandbox_live.py tests/test_environments_live.py"
     )
+
+
+def _template_workflow(name: str) -> dict[str, object]:
+    return yaml.safe_load((TEMPLATE / ".github" / "workflows" / name).read_text())
+
+
+def _steps(document: dict[str, object]) -> list[dict[str, object]]:
+    jobs = document.get("jobs")
+    if isinstance(jobs, dict):
+        return [step for job in jobs.values() for step in job["steps"]]
+    return list(document["runs"]["steps"])  # type: ignore[index]
+
+
+def test_template_workflows_are_hardened_and_never_run_in_a_template_repository() -> None:
+    names = sorted(path.name for path in (TEMPLATE / ".github" / "workflows").iterdir())
+    assert names == ["approve.yml", "prepare.yml", "setup.yml"]
+    for name in names:
+        document = _template_workflow(name)
+        assert document["permissions"] == {}
+        for job in document["jobs"].values():
+            assert job["runs-on"] == "ubuntu-24.04"
+            assert isinstance(job["timeout-minutes"], int)
+            assert job["permissions"]
+            assert "!github.event.repository.is_template" in job["if"]
+        for step in _steps(document):
+            uses = str(step.get("uses", ""))
+            if uses:
+                assert uses == "./.github/actions/install-autocontribute" or (
+                    _PINNED_ACTION.fullmatch(uses)
+                )
+            if uses.startswith("actions/checkout@"):
+                assert step["with"]["persist-credentials"] is False
+            # Event text and secrets reach commands only through env, never through the script.
+            assert "${{" not in str(step.get("run", ""))
+
+
+def test_template_reuses_this_repositorys_action_pins() -> None:
+    pins: dict[str, set[str]] = {}
+    for path in (ROOT / ".github" / "workflows").glob("*.yml"):
+        for step in _steps(yaml.safe_load(path.read_text())):
+            action, _, ref = str(step.get("uses", "")).partition("@")
+            if ref:
+                pins.setdefault(action, set()).add(ref)
+    install = yaml.safe_load(
+        (TEMPLATE / ".github" / "actions" / "install-autocontribute" / "action.yml").read_text()
+    )
+    template_steps = _steps(install) + [
+        step
+        for name in ("approve.yml", "prepare.yml", "setup.yml")
+        for step in _steps(_template_workflow(name))
+    ]
+    for step in template_steps:
+        action, _, ref = str(step.get("uses", "")).partition("@")
+        if action in pins:
+            assert {ref} == pins[action], action
+
+
+def test_template_pins_autocontribute_once_at_the_project_version() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    references = [
+        (path.relative_to(TEMPLATE).as_posix(), match)
+        for path in TEMPLATE.rglob("*")
+        if path.is_file()
+        for match in re.findall(r"Damadimo/autocontribute@([^\"\s]+)", path.read_text())
+    ]
+
+    assert references == [
+        (".github/actions/install-autocontribute/action.yml", f"v{project['project']['version']}")
+    ]
+
+
+def test_template_separates_untrusted_preparation_from_state_and_publishing_writes() -> None:
+    prepare = _template_workflow("prepare.yml")
+    triggers = prepare.get("on", prepare.get(True))
+    assert set(triggers) == {"schedule", "workflow_dispatch"}
+    (schedule,) = triggers["schedule"]
+    minute = schedule["cron"].split()[0]
+    assert minute.isdigit() and minute not in {"0", "30"}
+
+    preparing = prepare["jobs"]["prepare"]
+    assert preparing["permissions"] == {"contents": "read"}
+    assert preparing["concurrency"] == {"group": "autocontribute-prepare"}
+    preparing_env = {
+        key: value for step in preparing["steps"] for key, value in step.get("env", {}).items()
+    }
+    assert preparing_env["AUTOCONTRIBUTE_GITHUB_TOKEN"] == "${{ github.token }}"
+    assert "GH_TOKEN" not in preparing_env
+
+    record = prepare["jobs"]["record"]
+    assert record["needs"] == "prepare"
+    assert record["permissions"] == {"contents": "write", "issues": "write"}
+    approve = _template_workflow("approve.yml")["jobs"]["approve"]
+    setup = _template_workflow("setup.yml")["jobs"]["setup"]
+    for job in (record, approve, setup):
+        assert job["concurrency"] == {"group": "autocontribute-state", "queue": "max"}
+    assert setup["permissions"] == {"actions": "write", "contents": "write", "issues": "write"}
+
+    publishing_jobs = {
+        name
+        for name, workflow in (("approve", approve), ("setup", setup), ("record", record))
+        for step in workflow["steps"]
+        if "secrets.AUTOCONTRIBUTE_GITHUB_TOKEN" in str(step.get("env", {}))
+    }
+    assert publishing_jobs == {"approve", "setup"}
+
+
+def test_template_approval_job_starts_only_for_the_owners_approve_comment() -> None:
+    approve = _template_workflow("approve.yml")
+    triggers = approve.get("on", approve.get(True))
+    assert triggers == {"issue_comment": {"types": ["created"]}}
+    condition = approve["jobs"]["approve"]["if"]
+    for required in (
+        "!github.event.issue.pull_request",
+        "github.event.issue.state == 'open'",
+        "github.event.issue.user.login == 'github-actions[bot]'",
+        "contains(github.event.issue.labels.*.name, 'autocontribute:awaiting-approval')",
+        "github.event.comment.user.id == github.repository_owner_id",
+        "github.event.comment.author_association == 'OWNER'",
+        "startsWith(github.event.comment.body, '/approve ')",
+    ):
+        assert required in condition
+    (command,) = [step for step in approve["jobs"]["approve"]["steps"] if "run" in step]
+    assert command["env"]["ISSUE_NUMBER"] == "${{ github.event.issue.number }}"
+    assert command["env"]["COMMENT_ID"] == "${{ github.event.comment.id }}"
+    assert "body" not in str(command["env"])

@@ -1,0 +1,8 @@
+# Settings for this runner. Every push to main checks them again.
+# All keys and their defaults:
+# https://github.com/Damadimo/autocontribute/blob/main/docs/configuration.md
+github:
+  auth: token          # the workflows pass the tokens; keep this
+  repositories: []     # the public repositories to contribute to, such as [psf/requests]
+publishing:
+  login: ""            # empty: the owner of this repository, who must own the token

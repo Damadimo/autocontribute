@@ -37,6 +37,11 @@ jobs:
         run: |
           shellcheck --version
           "$(go env GOPATH)/bin/actionlint" -shellcheck "$(command -v shellcheck)"
+          # The runner template's workflows run in the repositories made from it. actionlint
+          # does not know the concurrency queue key yet, which GitHub added in May 2026.
+          "$(go env GOPATH)/bin/actionlint" -shellcheck "$(command -v shellcheck)" \
+            -ignore 'unexpected key "queue" for "concurrency" section' \
+            template/.github/workflows/*.yml
       - name: Scan complete history for secrets
         run: '"$(go env GOPATH)/bin/gitleaks" git --redact --verbose .'
 

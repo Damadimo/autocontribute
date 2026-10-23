@@ -68,7 +68,9 @@ from autocontribute.reporting import (
 )
 from autocontribute.runner import (
     APPROVAL_SYNTAX_REPLY,
+    DEFAULT_RUNNER_NAME,
     STATE_ARCHIVE,
+    TOKEN_URL,
     AttentionItem,
     PreparedState,
     RunnerContext,
@@ -78,6 +80,7 @@ from autocontribute.runner import (
     attention_items,
     check_runner,
     confirm_comment_unchanged,
+    create_runner_repository,
     load_runner_config,
     read_approval_event,
     read_prepared,
@@ -154,9 +157,34 @@ def init(
         typer.Option("--path", "-p", help="Configuration file to create."),
     ] = DEFAULT_CONFIG,
     force: Annotated[bool, typer.Option(help="Replace an existing file.")] = False,
+    actions: Annotated[
+        bool,
+        typer.Option(
+            "--actions",
+            help="Instead of a file, create a GitHub repository that runs autocontribute in "
+            "Actions; needs an authenticated `gh`.",
+        ),
+    ] = False,
+    repo: Annotated[
+        str,
+        typer.Option("--repo", help="Name of the repository that --actions creates."),
+    ] = DEFAULT_RUNNER_NAME,
+    public: Annotated[
+        bool,
+        typer.Option(
+            "--public",
+            help="Make that repository public: free Actions minutes, but anyone can read its "
+            "issues and state.",
+        ),
+    ] = False,
 ) -> None:
-    """Create a safe starter configuration with no credentials."""
+    """Create a safe starter configuration with no credentials, or a runner repository."""
 
+    if actions:
+        _init_runner_repository(repo, public=public)
+        return
+    if public or repo != DEFAULT_RUNNER_NAME:
+        _fail("--repo and --public apply only with --actions")
     target = path.expanduser().resolve()
     if target.exists() and not force:
         _fail(f"{target} already exists; pass --force to replace it")
@@ -1699,6 +1727,30 @@ def _print_checks(checks: list[DoctorCheck]) -> None:
             result = "[red]FAIL[/red]"
         table.add_row(check.name, result, check.detail)
     console.print(table)
+
+
+def _init_runner_repository(name: str, *, public: bool) -> None:
+    try:
+        repository = create_runner_repository(name, public=public)
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    visibility = "public" if public else "private"
+    # Plain output: Rich would wrap the link and the commands that the user copies.
+    typer.echo(
+        "\n".join(
+            [
+                f"Created the {visibility} repository {repository}. To finish:",
+                "  1. Create a classic token with only the public_repo scope:",
+                f"     {TOKEN_URL}",
+                "  2. Save it, and a model API key (or use ANTHROPIC_API_KEY):",
+                f"     gh secret set AUTOCONTRIBUTE_GITHUB_TOKEN --repo {repository}",
+                f"     gh secret set OPENAI_API_KEY --repo {repository}",
+                "  3. List the repositories to contribute to in its autocontribute.yml and push.",
+                "     Each push to main checks the setup; its Finish setup issue lists what is",
+                "     missing.",
+            ]
+        )
+    )
 
 
 def _retire_unpublishable(

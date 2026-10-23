@@ -60,6 +60,10 @@ default = true
 [tool.hatch.build.targets.wheel]
 packages = ["src/autocontribute"]
 
+# `init --actions` creates a runner repository from the template inside the installed package.
+[tool.hatch.build.targets.wheel.force-include]
+"template" = "autocontribute/template"
+
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers --strict-config"
 testpaths = ["tests"]
