@@ -157,8 +157,10 @@ otherwise your fork `<login>/<repository>`, which `publish` creates or reuses; s
 `publishing.head_strategy: fork` to always use the fork. A branch in the repository itself may not
 change CI configuration, because its push workflows run with the repository's secrets. `publish`
 commits as `identity.name` and `identity.email` (if empty, your login and
-`<account ID>+<login>@users.noreply.github.com`), and pushes the new branch
-`<publishing.branch_prefix>/issue-<number>-<run ID prefix>`, never overwriting an existing one. If
+`<account ID>+<login>@users.noreply.github.com`) with the time publishing started as the commit
+date, so a later `publish` rebuilds the identical commit if the checkout is gone, and pushes the new
+branch `<publishing.branch_prefix>/issue-<number>-<run ID prefix>`, never overwriting an existing
+one. If
 the base, issue, or policy files changed meanwhile, it deletes the branch and the run ends `failed`;
 otherwise it opens a PR against the default branch. With `publishing.draft: true` it opens a draft
 and then marks it ready for review if `publishing.ready_for_review` is true.

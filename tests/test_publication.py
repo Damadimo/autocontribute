@@ -1006,7 +1006,12 @@ def test_workspace_reconstruction_rejects_stored_cross_origin_clone_before_git(
     patch = (store.artifact_dir(run_id) / "contribution.patch").read_bytes()
 
     with pytest.raises(PolicyError, match="outside the configured GitHub origin"):
-        publisher._prepare_workspace(manifest, workspace_path, patch)
+        publisher._prepare_workspace(
+            manifest,
+            workspace_path,
+            patch,
+            committed_at=datetime.now(UTC),
+        )
 
     assert not clone_called
 
@@ -3745,8 +3750,21 @@ def test_retry_rejects_recovered_commit_with_different_author_or_committer(
     assert "create_pull_request" not in github.calls
 
 
-def test_retry_with_stored_commit_and_no_remote_state_finalizes_compensation(
+def _clone_from_fixture_source(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Rebuild workspaces from the local fixture repository instead of GitHub."""
+
+    clone = RepositoryWorkspace.clone
+
+    def local_clone(url: str, sha: str, path: Path) -> RepositoryWorkspace:
+        assert url == "https://github.com/example/project.git"
+        return clone(str(tmp_path / "source"), sha, path, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", local_clone)
+
+
+def test_retry_with_unreproducible_stored_commit_and_no_remote_state_finalizes_compensation(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
     manifest = _begin_review_publication(config, store, store.get(run_id))
@@ -3754,6 +3772,7 @@ def test_retry_with_stored_commit_and_no_remote_state_finalizes_compensation(
     store.save(manifest, event="fixture.commit_stored", details={})
     workspace = store.workspace_dir(run_id) / "repository"
     shutil.rmtree(workspace)
+    _clone_from_fixture_source(monkeypatch, tmp_path)
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
 
     finalized = Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
@@ -3783,7 +3802,7 @@ def test_retry_with_stored_commit_and_no_remote_state_finalizes_compensation(
         "commit_sha": "c" * 40,
         "reason": (
             "verified absent remote publication state after the approved workspace became "
-            "unavailable"
+            "unavailable and could not be rebuilt exactly"
         ),
     }
 
@@ -4792,6 +4811,7 @@ def test_absent_pre_post_state_records_unbound_fork_before_any_commit(
 
 def test_absent_pre_post_state_rejects_commit_without_bound_fork(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
     manifest = _begin_review_publication(
@@ -4803,6 +4823,7 @@ def test_absent_pre_post_state_rejects_commit_without_bound_fork(
     manifest.commit_sha = "c" * 40
     store.save(manifest, event="fixture.legacy_unbound_commit", details={})
     shutil.rmtree(store.workspace_dir(run_id) / "repository")
+    _clone_from_fixture_source(monkeypatch, tmp_path)
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
 
     with pytest.raises(StateError, match="commit without immutable fork identity"):
@@ -6306,3 +6327,78 @@ def test_account_limits_count_local_runs_still_submitting(tmp_path: Path) -> Non
         Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
 
     assert not github.mutated
+
+
+def test_commit_dates_come_from_the_publication_intent_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    dates: list[str] = []
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        before_mutation()
+        dates.append(_git(workspace, "show", "--no-patch", "--format=%at %ct", commit_sha))
+        github.branch_sha = commit_sha
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", push)
+
+    publisher.publish(run_id)
+
+    intent = next(
+        event for event in store.events(run_id) if event["event_type"] == "publication.intent.begun"
+    )
+    timestamp = str(int(datetime.fromisoformat(intent["occurred_at"]).timestamp()))
+    assert dates == [f"{timestamp} {timestamp}"]
+
+
+def test_lost_workspace_before_push_is_rebuilt_to_the_same_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    pushes: list[str] = []
+
+    def crash_before_push(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated job loss before the push")
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", crash_before_push)
+    with pytest.raises(RuntimeError, match="job loss before the push"):
+        publisher.publish(run_id)
+    stored_commit = store.get(run_id).commit_sha
+    assert stored_commit is not None
+    shutil.rmtree(store.workspace_dir(run_id) / "repository")
+    _clone_from_fixture_source(monkeypatch, tmp_path)
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        before_mutation()
+        pushes.append(_git(workspace, "rev-parse", "HEAD"))
+        github.branch_sha = commit_sha
+
+    monkeypatch.setattr(publisher, "_push", push)
+
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert published.commit_sha == stored_commit
+    assert pushes == [stored_commit]
