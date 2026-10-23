@@ -275,21 +275,14 @@ class Transcript(DomainModel):
 
 
 def append_user_text(transcript: Transcript, text: str) -> None:
-    """Append a user message: the task, a nudge, a reminder or the critic's blockers.
-
-    On Anthropic this is a message of its own even right after tool results; the API merges
-    consecutive user messages into one turn.
-    """
+    """Append a user message: the task, a nudge after a turn without tool calls, or the critic's
+    blockers. Per-turn reminders go with the tool results (``append_tool_results``)."""
 
     if transcript.pending_calls:
         raise ValueError("tool calls are waiting for their results")
     item: dict[str, JsonValue]
     if transcript.provider == "openai":
-        item = {
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": text}],
-        }
+        item = _openai_user_message(text)
     else:
         item = {"role": "user", "content": [{"type": "text", "text": text}]}
     _append(transcript, [item], counted_items=1)
@@ -315,8 +308,18 @@ def append_turn(transcript: Transcript, turn: Turn) -> None:
     transcript.appended_items = 0
 
 
-def append_tool_results(transcript: Transcript, results: Sequence[ToolResult]) -> None:
-    """Append one result for each pending tool call, in call order."""
+def append_tool_results(
+    transcript: Transcript,
+    results: Sequence[ToolResult],
+    *,
+    reminder: str | None = None,
+) -> None:
+    """Append one result for each pending tool call, in call order.
+
+    ``reminder`` is per-turn guidance such as the turns left. It follows the results: on
+    Anthropic as a text block in their user message, on OpenAI as a user message of its own.
+    Like everything else it stays in the transcript; a later turn adds a new one.
+    """
 
     calls = transcript.pending_calls
     if not calls:
@@ -327,13 +330,17 @@ def append_tool_results(transcript: Transcript, results: Sequence[ToolResult]) -
     items: list[dict[str, JsonValue]]
     if transcript.provider == "openai":
         items = [_openai_result(call, result) for call, result in pairs]
+        if reminder is not None:
+            items.append(_openai_user_message(reminder))
     else:
         # All results of one turn go back in one user message.
-        items = [
-            {"role": "user", "content": [_anthropic_result(call, result) for call, result in pairs]}
-        ]
+        content: list[JsonValue] = [_anthropic_result(call, result) for call, result in pairs]
+        if reminder is not None:
+            content.append({"type": "text", "text": reminder})
+        items = [{"role": "user", "content": content}]
     transcript.pending_calls = []
-    _append(transcript, items, counted_items=len(results))
+    counted_items = len(results) if reminder is None else len(results) + 1
+    _append(transcript, items, counted_items=counted_items)
 
 
 def next_input_reservation(transcript: Transcript) -> int:
@@ -370,6 +377,10 @@ def _text(result: ToolResult) -> str:
     if not isinstance(result.output, str):
         raise ValueError("only OpenAI shell results are output chunks")
     return result.output
+
+
+def _openai_user_message(text: str) -> dict[str, JsonValue]:
+    return {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
 
 
 def _openai_result(call: ToolCall, result: ToolResult) -> dict[str, JsonValue]:
