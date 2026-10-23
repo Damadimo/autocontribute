@@ -239,9 +239,8 @@ class EnvironmentBuilder:
             raise EnvironmentSetupError(
                 f"The baseline was not accepted: {rejection}", log_tail=runs[-1].output_tail
             )
-        accepted = recipe.model_copy(update={"targeted": baseline.timed_out})
-        self.store.save_environment(accepted, cache_key=key, baseline=baseline)
-        return PreparedEnvironment(image, accepted, baseline, snapshot)
+        self.store.save_environment(recipe, cache_key=key, baseline=baseline)
+        return PreparedEnvironment(image, recipe, baseline, snapshot)
 
     def _cache_key(self, recipe: EnvironmentRecipe) -> str:
         base = self._base_image(recipe)
@@ -264,7 +263,7 @@ class EnvironmentBuilder:
 
 
 def _same_setup(recipe: EnvironmentRecipe, other: EnvironmentRecipe) -> bool:
-    fields = {"source", "dependency_digest", "setup_dirty_paths", "targeted"}
+    fields = {"source", "dependency_digest", "setup_dirty_paths"}
     return recipe.model_dump(exclude=fields) == other.model_dump(exclude=fields)
 
 

@@ -64,6 +64,9 @@ class CaseResult:
     duration_seconds: float | None
     # The start of the failure or skip message; empty for a pass.
     message: str
+    # The result stands for a whole file, module or package, which test_id names, rather than
+    # one test: its tests could not be collected, imported or built, or it failed outside them.
+    collection_error: bool = False
 
 
 def parse_report(framework: TestFramework, data: bytes) -> dict[str, CaseResult]:
@@ -97,7 +100,12 @@ def parse_report(framework: TestFramework, data: bytes) -> dict[str, CaseResult]
 
 
 def _result(
-    test_id: str, status: CaseStatus, duration_seconds: float | None, message: str
+    test_id: str,
+    status: CaseStatus,
+    duration_seconds: float | None,
+    message: str,
+    *,
+    collection_error: bool = False,
 ) -> CaseResult:
     identifier = "".join(c if c.isprintable() else " " for c in test_id).strip()
     if not identifier:
@@ -110,6 +118,7 @@ def _result(
         status,
         duration_seconds if valid_duration else None,
         "" if status == "passed" else message.strip()[:_MAX_MESSAGE_CHARACTERS],
+        collection_error,
     )
 
 
@@ -147,12 +156,16 @@ class _JUnitReader:
         if name == "testcase" and self._test is not None:
             classname = self._test.get("classname", "")
             test_name = self._test.get("name", "")
+            status = self._status or "passed"
             self.results.append(
                 _result(
                     f"{classname}::{test_name}" if classname else test_name,
-                    self._status or "passed",
+                    status,
                     _seconds(self._test.get("time")),
                     self._message,
+                    # pytest reports a module it could not collect as an error case without
+                    # a class name, named by the module's dotted path.
+                    collection_error=not classname and status == "error",
                 )
             )
             self._test = None
@@ -195,7 +208,9 @@ def _jest_results(data: bytes) -> list[CaseResult]:
         assertions = _objects(suite.get("assertionResults"))
         if not assertions and suite.get("status") == "failed":
             # The file failed before any test ran: a syntax or import error.
-            results.append(_result(path, "error", None, _text(suite.get("message"))))
+            results.append(
+                _result(path, "error", None, _text(suite.get("message")), collection_error=True)
+            )
         for assertion in assertions:
             titles = [*_strings(assertion.get("ancestorTitles")), _text(assertion.get("title"))]
             full_name = _text(assertion.get("fullName")) or " ".join(t for t in titles if t)
@@ -286,7 +301,7 @@ def _go_results(data: bytes) -> list[CaseResult]:
         if package not in failing:
             # A build failure, a panic outside any test, or a failing TestMain.
             message = "".join(output.get((package, ""), [])) or "the package failed"
-            results.append(_result(package, "error", seconds, message))
+            results.append(_result(package, "error", seconds, message, collection_error=True))
     return results
 
 

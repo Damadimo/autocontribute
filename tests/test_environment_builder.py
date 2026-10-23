@@ -64,6 +64,10 @@ def _suite(passed: int, failed: int = 0, *, output: str = "") -> SuiteRun:
     return SuiteRun(1 if failed else 0, False, 2.0, results, True, None, output)
 
 
+def _timed_out() -> SuiteRun:
+    return SuiteRun(124, True, 900.0, {}, True, None, "watching for file changes")
+
+
 class _FakeSetup:
     """Scripted environment setup that records what it was asked to do."""
 
@@ -162,7 +166,6 @@ def test_a_detected_recipe_is_built_baselined_and_cached(
     assert prepared.snapshot == workspace.path.with_name("W.snapshot")
     assert harness["baselines"] == [(prepared.snapshot, ["detected.txt"])]
     assert prepared.baseline.pass_stable == [f"t{n}" for n in range(10)]
-    assert not prepared.recipe.targeted
     stored = store.environment("acme/demo")
     assert stored is not None and stored.status == "ok" and stored.recipe == prepared.recipe
     assert stored.cache_key is not None and stored.baseline == prepared.baseline
@@ -310,3 +313,20 @@ def test_a_repository_without_a_supported_project_is_recorded_as_failed(
         builder.prepare("acme/plain", plain, None, _Agent(None))
 
     assert store.environment_block("acme/plain") is not None
+
+
+def test_a_test_command_that_never_finishes_is_not_cached(
+    tmp_path: Path, workspace: RepositoryWorkspace, harness: dict[str, list[Any]]
+) -> None:
+    # A watch-mode runner or a server the tests start looks like a slow suite: it collects
+    # nothing, so the recipe must not be replayed as a working one.
+    builder, store = _builder(tmp_path)
+    harness["suites"] = [[_timed_out()]]
+    agent = _Agent(None)
+
+    with pytest.raises(EnvironmentUnavailable, match="did not finish within 900 s"):
+        builder.prepare("acme/demo", workspace, None, agent)
+
+    assert agent.calls[0][1].log_tail == "watching for file changes"
+    stored = store.environment("acme/demo")
+    assert stored is not None and stored.status == "failed" and stored.baseline is None

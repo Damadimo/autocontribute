@@ -41,10 +41,8 @@ _NOT_REPRODUCED_SIGNATURES: Final = (
     "ModuleNotFoundError",
     "SyntaxError",
     "IndentationError",
-    "collection failure",
     "Cannot find module",
     "error[E0",
-    "the test did not finish",
 )
 
 
@@ -72,6 +70,10 @@ class Reproduction:
     targets: tuple[str, ...]
     # The targets that fail with an assertion, not an import, syntax or collection error.
     reproduced: tuple[str, ...]
+    # Files, modules or packages that failed as a whole on the unpatched source, usually
+    # because the code their new tests call does not exist yet. Their tests reproduce
+    # nothing, and the green step checks every test it finds in them.
+    uncollected: tuple[str, ...]
 
 
 def run_suite(
@@ -110,7 +112,7 @@ def run_suite(
                     )
                     return SuiteRun(
                         built.result.exit_code,
-                        # Only a test command over the limit makes validation targeted.
+                        # The failure says the build timed out; timed_out is the test command's.
                         timed_out=False,
                         duration_seconds=built.result.duration_seconds,
                         results={},
@@ -167,7 +169,7 @@ def run_baseline(
         )
 
     runs = [run_once()]
-    # A suite over the limit is not run again, and a broken run would fail the gate anyway.
+    # A run over the limit or a broken one fails the gate, so the suite is not run again.
     if not runs[0].timed_out and runs[0].failure is None:
         runs.append(run_once())
         if _statuses(runs[0]) != _statuses(runs[1]):
@@ -216,15 +218,15 @@ def summarize_baseline(runs: Sequence[SuiteRun], *, base_sha: str) -> Environmen
 def acceptance_failure(baseline: EnvironmentBaseline, runs: Sequence[SuiteRun]) -> str | None:
     """Say why the environment is not good enough to validate patches against, or ``None``.
 
-    A suite that exceeds the time limit is accepted for targeted validation (§5.3): only
-    the setup checks and the related tests a patch touches can then speak for it.
+    A suite over the time limit is refused: a hung or mis-detected test command looks the
+    same, and without a finished run nothing shows that the environment runs any test.
     """
 
-    if baseline.timed_out:
-        return None
     for run in runs:
         if run.failure is not None:
             return run.failure
+        if run.timed_out:
+            return f"the test command did not finish within {run.duration_seconds:.0f} s"
     if baseline.collected == 0:
         return "the test command ran no tests"
     considered = baseline.collected - len(baseline.skip)
@@ -254,31 +256,36 @@ def reproduction(baseline: EnvironmentBaseline, red: SuiteRun) -> Reproduction:
 
     ``red`` ran on the snapshot with only the test part of the patch applied. A target that
     fails for an import, syntax or collection error, or a run that timed out, reproduces
-    nothing: the test may only be failing because the code it calls does not exist yet.
+    nothing: the test may only be failing because the code it calls does not exist yet. A
+    file, module or package that fails as a whole is reported in ``uncollected`` instead.
     """
 
     if red.failure is not None or red.timed_out or not red.per_test:
-        return Reproduction((), ())
+        return Reproduction((), (), ())
     known = {*baseline.pass_stable, *baseline.fail_before, *baseline.flaky, *baseline.skip}
     stable = set(baseline.pass_stable)
-    targets = sorted(
-        test_id
-        for test_id, result in red.results.items()
+    new = [
+        (test_id, result)
+        for test_id, result in sorted(red.results.items())
         if test_id not in known or (test_id in stable and result.status in _FAILING)
-    )
+    ]
+    targets = [test_id for test_id, result in new if not result.collection_error]
     reproduced = [
         test_id
         for test_id in targets
         if red.results[test_id].status == "failed"
         and not any(text in red.results[test_id].message for text in _NOT_REPRODUCED_SIGNATURES)
     ]
-    return Reproduction(tuple(targets), tuple(reproduced))
+    uncollected = [test_id for test_id, result in new if result.collection_error]
+    return Reproduction(tuple(targets), tuple(reproduced), tuple(uncollected))
 
 
 def green_failure(found: Reproduction, green: Sequence[SuiteRun]) -> str | None:
     """Say why the full patch does not make every target pass in every run, or ``None``.
 
-    The design asks for three passing runs in a row on the patched copy.
+    The design asks for three passing runs in a row on the patched copy. A file, module or
+    package that could not be collected on the unpatched source must now collect, run at
+    least one passing test, and fail none.
     """
 
     if not green:
@@ -293,6 +300,11 @@ def green_failure(found: Reproduction, green: Sequence[SuiteRun]) -> str | None:
             for test_id in found.targets
             if (result := run.results.get(test_id)) is None or result.status != "passed"
         ]
+        for scope in found.uncollected:
+            inside = [result for test_id, result in run.results.items() if _within(test_id, scope)]
+            if scope in run.results or not any(r.status == "passed" for r in inside):
+                failing.append(scope)
+            failing += [result.test_id for result in inside if result.status in _FAILING]
         if failing:
             return f"run {number} did not pass {len(failing)} patched tests: " + ", ".join(
                 failing[:5]
@@ -309,9 +321,10 @@ def new_failures(
 ) -> list[str]:
     """Return tests that passed in every baseline run and now fail, error or disappear.
 
-    Tests the patch deleted or renamed are left out, and so is every test missing from a
-    targeted ``run`` (``full_suite=False``), which never ran them. Failing-before and flaky
-    tests are ignored. Re-run the result through :func:`still_failing` twice before counting.
+    Tests the patch deleted or renamed are left out, and so is every test missing from a run
+    of related tests only (``full_suite=False``), which never ran them. Failing-before and
+    flaky tests are ignored. Re-run the result through :func:`still_failing` twice before
+    counting.
     """
 
     if run.failure is not None or run.timed_out:
@@ -357,6 +370,12 @@ def _read_results(
         return parse_report(recipe.test_framework, report), None
     except SuiteReportError as exc:
         return {}, str(exc)
+
+
+def _within(test_id: str, scope: str) -> bool:
+    # Tests carry their file, module or package as a prefix: `tests.test_x::test_y` or
+    # `tests.test_x.TestZ::test_y` for pytest, `src/x.test.js::...`, `example.com/m/pkg::Test`.
+    return test_id.startswith((f"{scope}::", f"{scope}."))
 
 
 def _statuses(run: SuiteRun) -> dict[str, CaseStatus]:
