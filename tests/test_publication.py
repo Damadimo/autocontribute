@@ -6450,6 +6450,34 @@ def test_legacy_submitting_run_without_a_bound_head_resumes_from_its_fork(
     assert github.last_head == f"octocat:{published.branch_name}"
 
 
+def test_legacy_submitting_run_in_an_owned_repository_is_abandoned_not_resumed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def legacy_review(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(publication_module, "_review_head_repository", legacy_review)
+    config, store, run_id, issue = _ready_run(tmp_path, actor="example")
+    monkeypatch.undo()
+    manifest = _begin_review_publication(config, store, store.get(run_id), bind_fork_identity=False)
+    assert manifest.head_repository is None
+    github = FakePublishingGitHub(issue, manifest.base_sha or "", login="example")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        publisher, "_push", lambda *args, **kwargs: pytest.fail("nothing may be pushed")
+    )
+
+    with pytest.raises(PolicyError, match=f"runs abandon {run_id}"):
+        publisher.publish(run_id)
+
+    assert store.get(run_id).status == RunStatus.SUBMITTING
+    assert not github.mutated
+    abandoned = publisher.abandon(run_id, reason="Stuck before same-repository publishing")
+    assert abandoned.status == RunStatus.FAILED
+    assert "ensure_fork" not in github.calls
+
+
 def _authored(
     repository: str,
     head_ref: str,

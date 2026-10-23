@@ -1402,6 +1402,12 @@ class Publisher:
                 or not manifest.branch_name
             ):
                 raise StateError(f"Submitting run {run_id} lacks durable publication evidence")
+            if manifest.head_repository is None and publication_head(manifest).same_repository:
+                # Its approval predates head binding, so nobody approved a branch in the upstream.
+                raise PolicyError(
+                    f"Run {run_id} was approved before branches could go to a repository the "
+                    f"account owns; end it with `autocontribute runs abandon {run_id}`"
+                )
             context = _durable_publication_context(
                 self.config,
                 manifest,
