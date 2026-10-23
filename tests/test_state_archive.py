@@ -12,9 +12,10 @@ import pytest
 from typer.testing import CliRunner
 
 import autocontribute.state_archive as state_archive
+from autocontribute.ai_policy import RepositoryAiPolicy
 from autocontribute.cli import app
 from autocontribute.domain import RunStatus
-from autocontribute.exceptions import StateError
+from autocontribute.exceptions import CircuitBreakerTrigger, StateError, StopScope
 from autocontribute.state_archive import export_state, import_state
 from autocontribute.store import RunStore
 
@@ -263,8 +264,23 @@ def _saved_run(store: RunStore, status: RunStatus, **fields: object) -> str:
     return manifest.run_id
 
 
+def _repository_hold(trigger_hash: str) -> CircuitBreakerTrigger:
+    return CircuitBreakerTrigger(
+        source="maintainer",
+        reason="asked automation to stop",
+        trigger_hash=trigger_hash,
+        scope=StopScope.REPOSITORY,
+        scope_key="example/project",
+    )
+
+
 def _trusted_state(root: Path) -> tuple[RunStore, dict[RunStatus, str]]:
     store = RunStore(root)
+    store.record_repository_ai_policy(
+        "example/project", "a" * 64, RepositoryAiPolicy(stance="none")
+    )
+    store.mark_environment_failed("example/project", reason="no supported project")
+    store.record_stop(_repository_hold("b" * 64))
     runs = {
         status: _saved_run(store, status)
         for status in (
@@ -298,6 +314,13 @@ def test_append_only_import_takes_what_a_preparation_may_add(tmp_path: Path) -> 
     prepared.save(published, event="lifecycle.observed", details={})
     added = _saved_run(prepared, RunStatus.READY_FOR_APPROVAL)
     prepared.trip_circuit_breaker(source="maintainer", reason="stop", trigger_hash="d" * 64)
+    # Discovery refreshes the policy and environment caches and counts rate-limited runs.
+    prepared.record_repository_ai_policy(
+        "example/project", "e" * 64, RepositoryAiPolicy(stance="none")
+    )
+    prepared.mark_environment_failed("example/project", reason="the base image is gone")
+    prepared.record_run_rate_limits(ended_on_secondary_limit=True)
+    prepared.record_stop(_repository_hold("f" * 64))
     archive = tmp_path / "prepared.tar.gz"
     export_state(prepared, archive)
 
@@ -308,6 +331,8 @@ def test_append_only_import_takes_what_a_preparation_may_add(tmp_path: Path) -> 
     assert saved.get(runs[RunStatus.APPROVED]).status is RunStatus.CANCELLED
     assert saved.get(runs[RunStatus.SUBMITTING]).status is RunStatus.SUBMITTING
     assert saved.circuit_breaker_status().is_tripped
+    assert len(saved.active_holds()) == 2
+    assert saved.environment_block("example/project") == "the base image is gone"
 
 
 def _forge(prepared: RunStore, runs: dict[RunStatus, str], change: str) -> None:
@@ -331,6 +356,9 @@ def _forge(prepared: RunStore, runs: dict[RunStatus, str], change: str) -> None:
             reason="forged",
             expected_trigger_hash=prepared.circuit_breaker_status().active_revision or "",
         )
+    elif change == "release_hold":
+        (hold,) = prepared.active_holds()
+        prepared.release_hold(hold.hold_id, actor="forger", reason="forged")
     elif change == "rewrite_status_column":
         with closing(sqlite3.connect(prepared.database_path)) as connection, connection:
             connection.execute(
@@ -347,6 +375,7 @@ def _forge(prepared: RunStore, runs: dict[RunStatus, str], change: str) -> None:
         ("forget_pull_request", r"rewrites run .* \(pr_open to pr_open\)"),
         ("add_published", "adds run"),
         ("end_stop", "ends a safety stop"),
+        ("release_hold", "rewrites 1 saved holds row"),
         ("rewrite_status_column", "disagrees with its state row"),
     ],
 )

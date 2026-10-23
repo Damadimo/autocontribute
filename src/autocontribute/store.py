@@ -41,6 +41,25 @@ from autocontribute.issue_revision import compute_issue_revision
 from autocontribute.lifecycle import parse_pull_request_url
 
 CURRENT_SCHEMA_VERSION: Final = 11
+# Every table of the current schema; SQL that must name a table checks it against this set.
+STATE_TABLES: Final = frozenset(
+    {
+        "schema_metadata",
+        "runs",
+        "events",
+        "leases",
+        "lease_generations",
+        "circuit_breaker",
+        "circuit_breaker_events",
+        "publication_reservations",
+        "manifest_artifact_sync",
+        "candidate_retry_authorizations",
+        "repository_policies",
+        "holds",
+        "secondary_rate_limit_streak",
+        "environment_recipes",
+    }
+)
 _MAX_GENERATION: Final = 2**63 - 1
 _MAX_ACTIVE_CIRCUIT_BREAKER_TRIGGERS: Final = 10_000
 _MAX_RUN_CORPUS: Final = 10_000
@@ -995,22 +1014,7 @@ class RunStore:
 
     @staticmethod
     def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
-        if table not in {
-            "schema_metadata",
-            "runs",
-            "events",
-            "leases",
-            "lease_generations",
-            "circuit_breaker",
-            "circuit_breaker_events",
-            "publication_reservations",
-            "manifest_artifact_sync",
-            "candidate_retry_authorizations",
-            "repository_policies",
-            "holds",
-            "secondary_rate_limit_streak",
-            "environment_recipes",
-        }:
+        if table not in STATE_TABLES:
             raise StateError(f"Refusing to inspect unexpected state table: {table}")
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
         return {str(row["name"]) for row in rows}
