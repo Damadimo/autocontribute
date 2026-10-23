@@ -212,6 +212,13 @@ _INFRASTRUCTURE_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
 )
+# Tests run offline by design, so these alone do not mean the environment is broken.
+_NETWORK_FAILURE_REASONS = frozenset(
+    {
+        "network name resolution failed",
+        "the validation command failed because the network was unavailable",
+    }
+)
 _ACTIONABLE_VALIDATION_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "an assertion failed",
@@ -551,6 +558,19 @@ def infrastructure_failure_reason(result: CommandResult) -> str | None:
     return None
 
 
+def environment_failure_signature(output: str) -> str | None:
+    """Name the broken-environment pattern in one failing test's output, if any.
+
+    Network failures are left out: the tests that need the network fail on the unmodified
+    base too and are ignored like any other failing-before test.
+    """
+
+    for reason, pattern in _INFRASTRUCTURE_FAILURE_PATTERNS:
+        if reason not in _NETWORK_FAILURE_REASONS and pattern.search(output):
+            return reason
+    return None
+
+
 def actionable_validation_failure_reason(result: CommandResult) -> str | None:
     """Return a bounded positive reason for offering one repository-code repair."""
 
@@ -753,6 +773,7 @@ def _path_evidence(kind: str, paths: Sequence[str]) -> str:
 __all__ = [
     "QualityEvaluator",
     "actionable_validation_failure_reason",
+    "environment_failure_signature",
     "infrastructure_failure_reason",
     "secret_findings",
 ]

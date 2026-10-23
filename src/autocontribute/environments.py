@@ -14,6 +14,9 @@ from pydantic import Field, field_validator
 from autocontribute.config import validate_environment_command, validate_image_reference
 from autocontribute.domain import DomainModel
 
+# Setup installs tools, homes and caches here: an image path that later containers keep, unlike
+# /tmp, which they mount a tmpfs over. Test and agent containers get it as a writable volume.
+TOOL_ROOT: Final = "/opt/ac"
 RECIPE_SCHEMA_VERSION: Final = 1
 # Bump when detection or setup would build a different environment from the same signals, so
 # cached recipes and environment images made by the old logic stop matching.
@@ -28,6 +31,7 @@ _DEBIAN_PACKAGE: Final = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
 _SHA256_HEX: Final = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_DIGEST: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ARCHITECTURE: Final = re.compile(r"^[a-z0-9][a-z0-9_./-]{0,63}$")
+_GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
 class EnvironmentRecipe(DomainModel):
@@ -120,6 +124,35 @@ class EnvironmentRecipe(DomainModel):
         return value
 
 
+class EnvironmentBaseline(DomainModel):
+    """The unmodified base's tests, run offline two or three times (DESIGN §5.3)."""
+
+    base_sha: str
+    exit_codes: list[int]
+    durations_seconds: list[float]
+    # False when the test command writes no per-test report, so the suite counts as one test.
+    per_test: bool
+    # The first run exceeded the time limit, so the suite was not run again.
+    timed_out: bool
+    collected: int
+    # Passed in every run.
+    pass_stable: list[str]
+    # Failed or errored in every run; validation ignores them.
+    fail_before: list[str]
+    # Different results across runs, including missing from some; validation ignores them.
+    flaky: list[str]
+    skip: list[str]
+    # The longest duration seen per test, for choosing what fits a time limit.
+    test_durations: dict[str, float]
+
+    @field_validator("base_sha")
+    @classmethod
+    def base_sha_is_a_commit(cls, value: str) -> str:
+        if not _GIT_SHA.fullmatch(value):
+            raise ValueError("base_sha must be a full lowercase commit SHA")
+        return value
+
+
 def dependency_digest(dependency_files: Sequence[tuple[str, str]]) -> str:
     """Hash the (path, object ID) list of the files an environment depends on."""
 
@@ -161,6 +194,8 @@ def environment_cache_key(
 __all__ = [
     "RECIPE_SCHEMA_VERSION",
     "SETUP_LOGIC_VERSION",
+    "TOOL_ROOT",
+    "EnvironmentBaseline",
     "EnvironmentRecipe",
     "Language",
     "TestFramework",
