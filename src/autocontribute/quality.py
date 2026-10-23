@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 
 from autocontribute.config import AutocontributeConfig
 from autocontribute.domain import CommandResult, CriticReview, GateResult, QualityReport
+from autocontribute.redaction import high_confidence_token_labels
 
 _DEPENDENCY_FILES = {
     "build.sbt",
@@ -68,31 +69,6 @@ _WORKFLOW_FILES = {
     "jenkinsfile",
 }
 
-_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "private key",
-        re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----"),
-    ),
-    (
-        "GitHub token",
-        re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{40,255})\b"),
-    ),
-    (
-        "OpenAI API key",
-        re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b"),
-    ),
-    ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
-    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
-    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
-    ("Stripe live key", re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b")),
-)
-_GENERIC_SECRET = re.compile(
-    r"(?i)\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|client[_-]?secret)"
-    r"\s*[:=]\s*[\"']?([A-Za-z0-9_./+=-]{16,})"
-)
-_OBVIOUS_PLACEHOLDER = re.compile(
-    r"(?i)(?:example|dummy|placeholder|change[-_]?me|test|fake|your[-_]?|x{4,})"
-)
 # Tests run offline by design, so these alone do not mean the environment is broken.
 _NETWORK_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
@@ -741,16 +717,16 @@ def _is_workflow_path(path: str) -> bool:
 
 
 def _secret_findings(files: Sequence[_DiffFile]) -> list[str]:
-    findings: set[str] = set()
-    for item in files:
-        for added_line in item.added_lines:
-            for label, pattern in _SECRET_PATTERNS:
-                if pattern.search(added_line):
-                    findings.add(f"{label} in {item.path}")
-            generic = _GENERIC_SECRET.search(added_line)
-            if generic and not _OBVIOUS_PLACEHOLDER.search(generic.group(1)):
-                findings.add(f"credential assignment in {item.path}")
-    return sorted(findings)
+    # The high-confidence token patterns only: password-style assignments are mostly test
+    # fixtures, and a hit here stops every run (G6).
+    return sorted(
+        {
+            f"{label} in {item.path}"
+            for item in files
+            for added_line in item.added_lines
+            for label in high_confidence_token_labels(added_line)
+        }
+    )
 
 
 def patch_paths(diff: str) -> list[str]:

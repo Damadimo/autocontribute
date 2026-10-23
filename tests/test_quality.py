@@ -10,6 +10,7 @@ from autocontribute.quality import (
     QualityEvaluator,
     actionable_validation_failure_reason,
     infrastructure_failure_reason,
+    secret_findings,
 )
 
 
@@ -580,3 +581,20 @@ index 1111111..2222222 100644
 
     assert report.ready
     assert report.changed_lines == 2
+
+
+def test_secret_scan_names_token_kinds_and_ignores_fixture_assignments() -> None:
+    # Assembled at runtime so the repository's own secret scan does not report this file.
+    token = "ghp_" + "Q7" * 18
+    diff = (
+        "diff --git a/tests/test_client.py b/tests/test_client.py\n"
+        "--- a/tests/test_client.py\n+++ b/tests/test_client.py\n"
+        "@@ -1 +1,3 @@\n x = 1\n"
+        '+api_key = "' + "abcd1234" + 'efgh5678ijkl"\n'
+        f'+TOKEN = "{token}"\n'
+    )
+
+    findings = secret_findings(diff)
+
+    assert findings == ["GitHub token in tests/test_client.py"]
+    assert token not in "".join(findings)

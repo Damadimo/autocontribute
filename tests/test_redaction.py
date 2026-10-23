@@ -10,6 +10,7 @@ from autocontribute.redaction import (
     SENSITIVE_FILE_REDACTION,
     contains_high_confidence_token,
     contains_host_secret,
+    high_confidence_token_labels,
     host_secret_values,
     redact_model_input,
     redact_text,
@@ -178,6 +179,15 @@ def test_a_private_key_header_without_key_material_is_left_alone(line: str) -> N
     _assert_secret_free_model_output("OPENAI_API_KEY", "openai-key-placeholder", line)
     # Publication text has no reason to quote a header, so the check still flags it.
     assert contains_high_confidence_token(line)
+
+
+def test_token_labels_name_each_kind_found_without_its_value() -> None:
+    text = f"{_TOKENS['GitHub token']} {_TOKENS['npm token']}\n{_PEM_HEADER}\n"
+
+    labels = high_confidence_token_labels(text)
+
+    assert labels == ["GitHub token", "npm token", "private key"]
+    assert high_confidence_token_labels("password = 'hunter2-fixture-value'") == []
 
 
 def test_a_cut_off_private_key_loses_its_body_but_not_the_following_line() -> None:
