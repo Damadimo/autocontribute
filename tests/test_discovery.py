@@ -286,6 +286,7 @@ def test_clear_maintainer_signaled_issue_passes(tmp_path) -> None:
         "freshness": "10/15: created within 2 years, updated within 90 days",
         "testability": "15/15: reproduction, tests named",
     }
+    assert result.evidence["adjustments"] == "none"
 
 
 SCORE_PARTS = ("invitation", "specificity", "smallness", "freshness", "testability")
@@ -306,7 +307,7 @@ SCORE_PARTS = ("invitation", "specificity", "smallness", "freshness", "testabili
                     "test would help."
                 ),
             },
-            75,
+            80,
         ),
         (
             {
@@ -314,7 +315,7 @@ SCORE_PARTS = ("invitation", "specificity", "smallness", "freshness", "testabili
                 "labels": ["help wanted", "documentation"],
                 "body": "The README says 'teh' where it means 'the'.",
             },
-            80,
+            90,
         ),
         (
             {
@@ -947,6 +948,7 @@ def test_search_uses_the_repository_spelling_of_invitation_labels_and_synonyms(t
             "enhancement",
             "good-first-issue",
             "Security",
+            "Needs Decision",
         ],
     )
     service = DiscoveryService(  # type: ignore[arg-type]
@@ -959,7 +961,7 @@ def test_search_uses_the_repository_spelling_of_invitation_labels_and_synonyms(t
     assert github.searches == [
         {
             "include": ["Help-Wanted", "Status: Help Wanted", "sprintable", "E-easy"],
-            "exclude": ["good-first-issue", "Security"],
+            "exclude": ["good-first-issue", "Security", "Needs Decision"],
             "unassigned": True,
             "page": 1,
         }
@@ -1038,6 +1040,13 @@ def test_search_reads_a_bounded_number_of_pages(tmp_path) -> None:  # type: igno
         (["HELP WANTED"], None),
         (["sprintable"], None),
         (["help wanted", "Good-First-Issue"], "issue has excluded labels: Good-First-Issue"),
+        (["help wanted", "Needs Triage"], "issue has excluded labels: Needs Triage"),
+        (["help wanted", "needs-decision"], "issue has excluded labels: needs-decision"),
+        (["help wanted", "RFC"], "issue has excluded labels: RFC"),
+        (["help wanted", "question"], "issue has excluded labels: question"),
+        (["help wanted", "beginner"], "issue has excluded labels: beginner"),
+        (["help wanted", "wontfix", "Duplicate"], "issue has excluded labels: Duplicate, wontfix"),
+        (["help wanted", "needsdocs"], None),
         (
             ["enhancement"],
             "issue has no invitation label and no maintainer comment inviting a pull request",
@@ -1290,6 +1299,63 @@ def _comment(
         created_at=created,
         updated_at=created,
     )
+
+
+@pytest.mark.parametrize(
+    ("updates", "score", "adjustments"),
+    [
+        (
+            {"title": "Fix the CI job that runs mypy", "labels": ["help wanted", "bug"]},
+            85,
+            "+10 docs, CI, build, test or typing work",
+        ),
+        (
+            {"title": "Speed up the parser on large inputs", "labels": ["help wanted"]},
+            60,
+            "-15 performance, feature, UI, platform or concurrency work without a "
+            "maintainer-stated expected behaviour",
+        ),
+        (
+            {"labels": ["help wanted", "type: enhancement"]},
+            60,
+            "-15 performance, feature, UI, platform or concurrency work without a "
+            "maintainer-stated expected behaviour",
+        ),
+        (
+            {"title": "Parser output is wrong on Windows", "labels": ["help wanted", "bug"]},
+            60,
+            "-15 performance, feature, UI, platform or concurrency work without a "
+            "maintainer-stated expected behaviour",
+        ),
+        (
+            {
+                "title": "Parser output is wrong on Windows",
+                "comments": 1,
+                "discussion": [
+                    _comment(
+                        body="It should return the documented node on every platform.",
+                        author="maintainer",
+                        association="MEMBER",
+                    )
+                ],
+            },
+            80,
+            "none",
+        ),
+    ],
+)
+def test_kind_of_work_moves_the_score(
+    tmp_path,
+    updates: dict[str, object],
+    score: int,
+    adjustments: str,
+) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+
+    result = service.evaluate(_issue(**updates), _repository())
+
+    assert result.score == score
+    assert result.evidence["adjustments"] == adjustments
 
 
 @pytest.mark.parametrize(

@@ -198,6 +198,22 @@ _SMALL_LABEL = re.compile(
     r"|e easy|typo"
 )
 _TYPO_TITLE = re.compile(r"\b(?:typos?|spelling)\b", re.I)
+# Agents fix these kinds of work most reliably, and maintainers merge them most often.
+_ROUTINE_WORK = re.compile(
+    r"\b(?:docs?|documentation|typos?|ci|continuous integration|build|packaging|tests?|testing"
+    r"|typing|type (?:hints?|annotations?|stubs?)|mypy|pyright)\b",
+    re.I,
+)
+# These need judgement or hardware that a sandboxed agent lacks, unless a maintainer has said
+# what the result should be.
+_JUDGEMENT_WORK = re.compile(
+    r"\b(?:perf(?:ormance)?|slow(?:ness)?|speed\s?up|memory (?:usage|leak)|optimi[sz]\w*"
+    r"|features?(?: requests?)?|enhancements?|ui|ux|gui|visual|css"
+    r"|windows|macos|osx|ios|android|gpu|cuda|rocm|arm64|aarch64|platform(?:[- ]specific)?"
+    r"|concurren\w*|thread(?:s|ing|[- ]safe\w*)?|race(?: conditions?)?|deadlocks?"
+    r"|flak(?:y|iness))\b",
+    re.I,
+)
 _STOP_TARGET = (
     r"(?:(?:(?:ai|llm)[ -]generated|ai[ -]assisted|automated|bot[ -]authored|"
     r"community|external|outside|unsolicited)\s+)?"
@@ -789,14 +805,16 @@ class DiscoveryService:
     def _search_labels(self, repository: str) -> tuple[list[str], list[str]]:
         """Name the repository's own labels that discovery searches for and leaves out."""
 
-        include_keys, exclude_keys = self._label_keys(repository)
+        include, exclude = self._label_rules(repository)
         names = self.github.list_labels(repository)
         return (
-            [name for name in names if _label_key(name) in include_keys],
-            [name for name in names if _label_key(name) in exclude_keys],
+            [name for name in names if include.fullmatch(_label_key(name))],
+            [name for name in names if exclude.fullmatch(_label_key(name))],
         )
 
-    def _label_keys(self, repository: str) -> tuple[frozenset[str], frozenset[str]]:
+    def _label_rules(self, repository: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
+        """Match label keys to the include and exclude lists that apply to the repository."""
+
         override = self.config.github.labels.get(repository.casefold())
         include: Sequence[str] = (*self.config.github.include_labels, *_INVITATION_SYNONYMS)
         exclude: Sequence[str] = self.config.github.exclude_labels
@@ -804,7 +822,7 @@ class DiscoveryService:
             include = override.include
         if override is not None and override.exclude is not None:
             exclude = override.exclude
-        return frozenset(map(_label_key, include)), frozenset(map(_label_key, exclude))
+        return _label_matcher(include), _label_matcher(exclude)
 
     def _search(
         self,
@@ -891,10 +909,10 @@ class DiscoveryService:
         repository_ref: str | None = None,
     ) -> IssueEvaluation:
         blockers: list[tuple[str, str]] = []
-        include_keys, exclude_keys = self._label_keys(repository.full_name)
+        include, exclude = self._label_rules(repository.full_name)
         labels = {_label_key(label): label for label in issue.labels}
-        invitation_labels = sorted(labels[key] for key in labels.keys() & include_keys)
-        excluded = sorted(labels[key] for key in labels.keys() & exclude_keys)
+        invitation_labels = sorted(label for key, label in labels.items() if include.fullmatch(key))
+        excluded = sorted(label for key, label in labels.items() if exclude.fullmatch(key))
         maintainer_comments = [
             comment for comment in issue.discussion if _is_trusted_maintainer(comment)
         ]
@@ -1782,7 +1800,9 @@ def _suitability(
 ) -> tuple[int, dict[str, str]]:
     """Score, out of 100, how well an agent can fix the issue, with evidence for each part.
 
-    Parts: invitation 25, specificity 25, smallness 20, freshness 15, testability 15.
+    Parts: invitation 25, specificity 25, smallness 20, freshness 15, testability 15. The kind
+    of work then moves the score: up for routine work and pinpointed bugs, down for work that
+    needs judgement nobody has supplied.
     """
 
     text = f"{issue.title}\n{issue.body}"
@@ -1833,6 +1853,24 @@ def _suitability(
         "tests named": (5, bool(_TEST_MENTION.search(text))),
     }
 
+    kinds = (issue.title, *label_keys)
+    stated = any(_EXPECTED_BEHAVIOR.search(comment.body) for comment in maintainer_comments)
+    adjustments = {
+        "docs, CI, build, test or typing work": (
+            10,
+            any(_ROUTINE_WORK.search(kind) for kind in kinds),
+        ),
+        "reproduction and a named file or function": (
+            5,
+            (code_block or reproduction or error_output) and reference,
+        ),
+        "performance, feature, UI, platform or concurrency work without a maintainer-stated "
+        "expected behaviour": (
+            -15,
+            not stated and any(_JUDGEMENT_WORK.search(kind) for kind in kinds),
+        ),
+    }
+
     evidence = {
         "invitation": (
             f"{invitation}/25: labels={invitation_labels}, "
@@ -1854,7 +1892,9 @@ def _suitability(
         met = [signal for signal, (_, present) in signals.items() if present]
         evidence[name] = f"{points}/{maximum}: {', '.join(met) or 'none'}"
         score += points
-    return score, evidence
+    applied = [(points, name) for name, (points, present) in adjustments.items() if present]
+    evidence["adjustments"] = ", ".join(f"{points:+d} {name}" for points, name in applied) or "none"
+    return max(0, min(100, score + sum(points for points, _ in applied))), evidence
 
 
 def _with_triage(evaluation: IssueEvaluation, verdict: TriageVerdict) -> IssueEvaluation:
@@ -1887,6 +1927,16 @@ def _label_key(name: str) -> str:
     """Compare labels as people spell them, ignoring case, hyphens, and underscores."""
 
     return " ".join(re.split(r"[\s_-]+", name.casefold())).strip()
+
+
+def _label_matcher(names: Sequence[str]) -> re.Pattern[str]:
+    """Match label keys to label names, where * in a name stands for any text."""
+
+    alternatives = [
+        "".join(".*" if part == "*" else re.escape(part) for part in re.split(r"(\*)", key))
+        for key in map(_label_key, names)
+    ]
+    return re.compile("|".join(alternatives) or "(?!)")
 
 
 def _is_trusted_maintainer(comment: IssueComment) -> bool:
