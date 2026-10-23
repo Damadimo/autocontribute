@@ -18,9 +18,10 @@ import json
 import re
 import shlex
 import tomllib
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from configparser import ConfigParser
 from configparser import Error as ConfigParserError
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -242,6 +243,45 @@ class EnvironmentSetup:
             image_id, tag, recipe.base_image, base.digest, cache_key, reused=False
         )
         return image, recipe.model_copy(update={"setup_dirty_paths": dirty})
+
+    @contextmanager
+    def session(
+        self,
+        workspace: RepositoryWorkspace,
+        recipe: EnvironmentRecipe,
+        *,
+        base: ImageIdentity,
+        allow_hosts: Collection[str],
+    ) -> Iterator[tuple[SessionContainer, dict[str, str]]]:
+        """Open a setup container on ``workspace`` for the setup agent, and remove it after.
+
+        The container is the one :meth:`build` runs the recipe in: the root bootstrap with the
+        recipe's system packages done, network through the egress proxy only. Yields it with
+        the variables its commands run with. Nothing is committed. Raises
+        :class:`EnvironmentSetupError` when Git metadata or the bootstrap fails.
+        """
+
+        self._fetch_git_metadata(workspace, recipe)
+        with EgressNetwork(
+            allowed_hosts=DEFAULT_ALLOWED_HOSTS | set(allow_hosts),
+            run_id=self.run_id,
+            store_root=self.store_root,
+        ) as network:
+            online = proxy_variables(network.proxy_url)
+            bootstrapped = self._bootstrap(workspace, recipe, base, network, online)
+            try:
+                with SessionContainer(
+                    self._setup_config,
+                    image=bootstrapped,
+                    workspace=workspace.path,
+                    run_id=self.run_id,
+                    store_root=self.store_root,
+                    network=network.network,
+                    writable_root=True,
+                ) as container:
+                    yield container, {**recipe.env, "HOME": _SETUP_HOME, **online}
+            finally:
+                remove_image(bootstrapped)
 
     def _bootstrap(
         self,

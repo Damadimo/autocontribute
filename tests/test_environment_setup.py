@@ -263,6 +263,30 @@ def test_setup_runs_behind_the_proxy_undoes_tracked_changes_and_commits(
     )
 
 
+def test_the_setup_agent_session_is_the_build_container_without_a_commit(
+    tmp_path: Path, workspace: RepositoryWorkspace, docker: dict[str, list[Any]]
+) -> None:
+    with _setup(tmp_path).session(
+        workspace, _recipe(), base=_BASE, allow_hosts=["npm.example.org"]
+    ) as (container, environment):
+        bootstrap, opened = _FakeContainer.instances
+        assert container is opened and not opened.removed
+        assert opened.options["image"] == _BOOTSTRAPPED
+        assert opened.options["network"] == "ac-run1-net-1"
+        assert opened.options["writable_root"] is True
+        assert environment == {
+            **_recipe().env,
+            "HOME": "/opt/ac/home",
+            **proxy_variables("http://ac-run1-proxy-1:3128"),
+        }
+
+    network = _FakeNetwork.instances[0]
+    assert network.allowed_hosts == DEFAULT_ALLOWED_HOSTS | {"npm.example.org"}
+    assert network.removed and bootstrap.removed and opened.removed
+    assert opened.execs == [] and opened.labels is None
+    assert docker["removed"] == [_BOOTSTRAPPED] and docker["tag"] == []
+
+
 def test_python_setup_checks_where_the_project_imports_from(
     tmp_path: Path, workspace: RepositoryWorkspace, docker: dict[str, list[Any]]
 ) -> None:
