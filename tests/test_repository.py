@@ -753,3 +753,69 @@ def test_temporary_index_keeps_the_index_mtime_so_racy_edits_are_seen(
     workspace.patch_bytes()
 
     assert seen and seen[0] == index_mtime
+
+
+def test_fetching_tags_gives_version_tools_the_history_they_describe(
+    source_repository: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    source, first_sha, second_sha = source_repository
+    _git(source, "tag", "v1.2.0", first_sha)
+    workspace = _clone(source, second_sha, tmp_path / "workspace")
+    assert _git(workspace.path, "tag") == ""
+
+    with pytest.raises(RepositoryError, match="Git operation failed"):
+        workspace.fetch_tags()
+    workspace.fetch_tags(allow_local_source=True)
+
+    assert _git(workspace.path, "describe", "--tags") == "v1.2.0-1-g" + second_sha[:7]
+    assert _git(workspace.path, "rev-parse", "--is-shallow-repository") == "false"
+    assert _git(workspace.path, "rev-parse", "HEAD") == second_sha
+
+
+def test_fetching_submodules_checks_out_the_recorded_commit(
+    source_repository: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    source, _, _ = source_repository
+    library = tmp_path / "library"
+    library.mkdir()
+    _git(library, "init", "--quiet")
+    (library / "lib.txt").write_text("vendored\n", encoding="utf-8")
+    _git(library, "add", "lib.txt")
+    _git(library, "-c", "user.name=F", "-c", "user.email=f@example.invalid", "commit", "-qm", "l")
+    _git(source, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(library), "lib")
+    _git(source, "commit", "--quiet", "-m", "add submodule")
+    workspace = _clone(source, _git(source, "rev-parse", "HEAD"), tmp_path / "workspace")
+
+    with pytest.raises(RepositoryError):
+        workspace.fetch_submodules()
+    workspace.fetch_submodules(allow_local_source=True)
+
+    assert (workspace.path / "lib" / "lib.txt").read_text(encoding="utf-8") == "vendored\n"
+    assert workspace.changed_paths() == []
+
+
+def test_restoring_the_base_undoes_tracked_and_new_files_but_keeps_ignored_ones(
+    source_repository: tuple[Path, str, str], tmp_path: Path
+) -> None:
+    source, _, second_sha = source_repository
+    workspace = _clone(source, second_sha, tmp_path / "workspace")
+    (workspace.path / ".git" / "info" / "exclude").write_text("build/\n*.log\n", encoding="utf-8")
+    (workspace.path / "README.md").write_text("rewritten by setup\n", encoding="utf-8")
+    (workspace.path / "delete.txt").unlink()
+    (workspace.path / "src" / "_version.py").write_text("version = '0.1'\n", encoding="utf-8")
+    (workspace.path / "*.md").write_text("glob-named\n", encoding="utf-8")
+    (workspace.path / "linked").symlink_to(workspace.path / "README.md")
+    (workspace.path / "build").mkdir()
+    (workspace.path / "build" / "out.o").write_bytes(b"\x7fELF")
+    (workspace.path / "setup.log").write_text("log\n", encoding="utf-8")
+
+    restored = workspace.restore_base()
+
+    assert restored == ["*.md", "README.md", "delete.txt", "linked", "src/_version.py"]
+    assert workspace.changed_paths() == []
+    assert (workspace.path / "README.md").read_text(encoding="utf-8") == "second\n"
+    assert (workspace.path / "delete.txt").read_text(encoding="utf-8") == "remove me\n"
+    assert (workspace.path / "CONTRIBUTING.md").read_text(encoding="utf-8") == "Run tests.\n"
+    assert not os.path.lexists(workspace.path / "linked")
+    assert (workspace.path / "build" / "out.o").is_file()
+    assert workspace.ignored_paths() == ["build/", "setup.log"]
