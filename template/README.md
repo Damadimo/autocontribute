@@ -36,7 +36,7 @@ off and lists what is missing in a "Finish setup" issue.
 
 | | Private (default) | Public |
 | --- | --- | --- |
-| Actions minutes | 2,000 a month on GitHub Free; one run a day fits | Free |
+| Actions minutes | 2,000 a month on GitHub Free, about an hour a day; runs stop when they run out | Free |
 | Runner | 2 CPUs, 8 GB memory | 4 CPUs, 16 GB memory |
 | Issues, diffs and state | Only you can read them | Anyone can read them |
 | Scheduled runs | Keep running | GitHub turns them off after 60 days without activity |
