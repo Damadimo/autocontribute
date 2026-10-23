@@ -9,7 +9,7 @@ Secrets never go in this file. It holds only the names of the environment variab
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `name` | empty | Git author and committer name. Empty uses your GitHub login. |
-| `email` | empty | Git author and committer email. Empty uses `<your-login>@users.noreply.github.com`. |
+| `email` | empty | Git author and committer email. Empty uses your GitHub noreply address, `<account ID>+<login>@users.noreply.github.com`. |
 
 A DCO attestation needs both keys set, because the `Signed-off-by` trailer must match them.
 
@@ -110,6 +110,7 @@ There is no network setting: the `docker` backend always runs checks with no net
 
 | Key | Default | Meaning |
 | --- | --- | --- |
+| `login` | empty | GitHub account that publishes. Empty uses the account that owns the GitHub token. When set, preparing and showing a review does not need that account's token, and `approve` and `publish` refuse a token that belongs to a different account. |
 | `approval_expires_hours` | `72` | Hours an approval stays valid (1–168). |
 | `branch_prefix` | `autocontribute` | Branches are named `<prefix>/issue-<number>-<first 8 characters of the run ID>`. |
 | `draft` | `false` | Open PRs as drafts. |

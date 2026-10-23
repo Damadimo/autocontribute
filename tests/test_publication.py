@@ -49,6 +49,7 @@ from autocontribute.github import (
     CommitStatusDetails,
     DirectoryEntry,
     ForkIdentity,
+    GitHubAccount,
     GitHubComment,
     LinkedPullRequest,
     PullRequestDetails,
@@ -137,6 +138,22 @@ class _FixtureEligibilityGitHub:
     ) -> list[DirectoryEntry] | None:
         del repository, ref
         return None if path else [DirectoryEntry(path="CONTRIBUTING.md", kind="file")]
+
+
+_ACCOUNT_ID = 583231
+
+
+class _AccountGitHub:
+    """Account reads only: what building a review needs without the publishing token."""
+
+    def __init__(self, login: str = "octocat") -> None:
+        self.login = login
+
+    def authenticated_user(self) -> GitHubAccount:
+        return GitHubAccount(login=self.login, database_id=_ACCOUNT_ID)
+
+    def get_user(self, login: str) -> GitHubAccount:
+        return GitHubAccount(login=login, database_id=_ACCOUNT_ID)
 
 
 def _ready_run(
@@ -327,12 +344,18 @@ def _ready_run(
     run.status = RunStatus.READY_FOR_APPROVAL
     store.save(run, event="fixture.ready", details={})
     if approved:
-        approval_review = build_approval_review(config, store, run.run_id, actor=actor)
+        account_github = _AccountGitHub(actor)
+        approval_review = build_approval_review(
+            config,
+            store,
+            run.run_id,
+            github=account_github,  # type: ignore[arg-type]
+        )
         approve_run(
             config,
             store,
             run.run_id,
-            actor=actor,
+            github=account_github,  # type: ignore[arg-type]
             attestation="I reviewed the exact contribution.",
             reviewed_fingerprint=approval_review.fingerprint,
         )
@@ -453,6 +476,14 @@ class FakePublishingGitHub:
     def authenticated_login(self) -> str:
         self.calls.append("authenticated_login")
         return self.login
+
+    def authenticated_user(self) -> GitHubAccount:
+        self.calls.append("authenticated_user")
+        return GitHubAccount(login=self.login, database_id=_ACCOUNT_ID)
+
+    def get_user(self, login: str) -> GitHubAccount:
+        self.calls.append("get_user")
+        return GitHubAccount(login=login, database_id=_ACCOUNT_ID)
 
     def find_pull_request(self, repository: str, *, head: str) -> str | None:
         self.calls.append("find_pull_request")
@@ -2563,6 +2594,100 @@ def test_workspace_change_after_preflight_cannot_be_committed_or_pushed(
     assert "create_pull_request" not in github.calls
 
 
+class _TokenlessGitHub(_AccountGitHub):
+    """The Actions prepare job: public reads work, but no token belongs to the publisher."""
+
+    def authenticated_user(self) -> GitHubAccount:
+        raise AssertionError("a review with publishing.login must not need the publishing token")
+
+
+def _unapproved_run_with_login(
+    tmp_path: Path, login: str
+) -> tuple[AutocontributeConfig, RunStore, str, IssueCandidate]:
+    config, store, run_id, issue = _ready_run(tmp_path, approved=False)
+    config.publishing.login = login
+    manifest = store.get(run_id)
+    manifest.preparation_config_fingerprint = compute_preparation_config_fingerprint(
+        config,
+        repository=issue.repository,
+    )
+    patch = (store.artifact_dir(run_id) / "contribution.patch").read_bytes()
+    manifest.preparation_fingerprint = compute_preparation_fingerprint(manifest, diff=patch)
+    store.save(manifest, event="fixture.publishing_login", details={})
+    return config, store, run_id, issue
+
+
+def test_review_with_publishing_login_binds_it_without_the_token(tmp_path: Path) -> None:
+    config, store, run_id, _issue = _unapproved_run_with_login(tmp_path, "OctoCat")
+
+    review = build_approval_review(
+        config,
+        store,
+        run_id,
+        github=_TokenlessGitHub("OctoCat"),  # type: ignore[arg-type]
+    )
+
+    assert review.manifest.publishing_login == "octocat"
+    assert review.manifest.commit_author_name == "octocat"
+    assert review.manifest.commit_author_email == f"{_ACCOUNT_ID}+octocat@users.noreply.github.com"
+    assert store.get(run_id).publishing_login is None
+
+
+def test_approval_requires_the_token_of_the_publishing_login(tmp_path: Path) -> None:
+    config, store, run_id, _issue = _unapproved_run_with_login(tmp_path, "octocat")
+    review = build_approval_review(
+        config,
+        store,
+        run_id,
+        github=_TokenlessGitHub("octocat"),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(PolicyError, match=r"token belongs to someone-else, not publishing\.login"):
+        approve_run(
+            config,
+            store,
+            run_id,
+            github=_AccountGitHub("someone-else"),  # type: ignore[arg-type]
+            attestation="I reviewed the exact contribution.",
+            reviewed_fingerprint=review.fingerprint,
+        )
+    assert store.get(run_id).status == RunStatus.READY_FOR_APPROVAL
+
+    approved = approve_run(
+        config,
+        store,
+        run_id,
+        github=_AccountGitHub("OctoCat"),  # type: ignore[arg-type]
+        attestation="I reviewed the exact contribution.",
+        reviewed_fingerprint=review.fingerprint,
+    )
+
+    assert approved.status == RunStatus.APPROVED
+    assert approved.approval is not None
+    assert approved.approval.actor == "OctoCat"
+
+
+def test_publication_refuses_a_token_that_is_not_the_publishing_login(tmp_path: Path) -> None:
+    config, store, run_id, issue = _unapproved_run_with_login(tmp_path, "octocat")
+    account = _AccountGitHub("octocat")
+    review = build_approval_review(config, store, run_id, github=account)  # type: ignore[arg-type]
+    approve_run(
+        config,
+        store,
+        run_id,
+        github=account,  # type: ignore[arg-type]
+        attestation="I reviewed the exact contribution.",
+        reviewed_fingerprint=review.fingerprint,
+    )
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "", login="someone-else")
+
+    with pytest.raises(PolicyError, match=r"not publishing\.login octocat"):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert not github.mutated
+    assert store.get(run_id).status == RunStatus.APPROVED
+
+
 @pytest.mark.parametrize("field", ["name", "email"])
 def test_configured_git_identity_rejects_credential_material_without_echoing_it(
     tmp_path: Path,
@@ -2579,7 +2704,7 @@ def test_configured_git_identity_rejects_credential_material_without_echoing_it(
     setattr(config.identity, field, value)
 
     with pytest.raises(PolicyError, match="appears to contain a credential") as error:
-        build_approval_review(config, store, run_id, actor="octocat")
+        build_approval_review(config, store, run_id, github=_AccountGitHub())  # type: ignore[arg-type]
 
     assert credential not in str(error.value)
     stored = store.get(run_id)
@@ -2835,7 +2960,8 @@ def test_approval_event_and_transition_commit_in_one_transaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config, store, run_id, _issue = _ready_run(tmp_path, approved=False)
-    review = build_approval_review(config, store, run_id, actor="octocat")
+    github = _AccountGitHub()
+    review = build_approval_review(config, store, run_id, github=github)  # type: ignore[arg-type]
     append_event = store._append_event
 
     def fail_transition_event(connection, run, event_type, details, **kwargs):  # type: ignore[no-untyped-def]
@@ -2849,7 +2975,7 @@ def test_approval_event_and_transition_commit_in_one_transaction(
             config,
             store,
             run_id,
-            actor="octocat",
+            github=github,  # type: ignore[arg-type]
             attestation="I reviewed the exact contribution.",
             reviewed_fingerprint=review.fingerprint,
         )
@@ -2864,7 +2990,7 @@ def test_approval_event_and_transition_commit_in_one_transaction(
         config,
         store,
         run_id,
-        actor="octocat",
+        github=github,  # type: ignore[arg-type]
         attestation="I reviewed the exact contribution.",
         reviewed_fingerprint=review.fingerprint,
     )

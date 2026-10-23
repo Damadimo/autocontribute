@@ -194,6 +194,19 @@ def test_publishing_mode_is_not_a_setting() -> None:
         AutocontributeConfig.model_validate({"publishing": {"mode": "review_required"}})
 
 
+@pytest.mark.parametrize("login", ["octocat", "Octo-Cat", ""])
+def test_publishing_login_accepts_github_logins(login: str) -> None:
+    config = AutocontributeConfig.model_validate({"publishing": {"login": login}})
+
+    assert config.publishing.login == login
+
+
+@pytest.mark.parametrize("login", ["octo cat", "-octocat", "octo/cat", "ghp_" + "a" * 40])
+def test_publishing_login_rejects_values_that_are_not_logins(login: str) -> None:
+    with pytest.raises(ValueError, match=r"publishing\.login must be a GitHub login"):
+        AutocontributeConfig.model_validate({"publishing": {"login": login}})
+
+
 def test_publishing_defaults_open_ready_pull_requests() -> None:
     publishing = AutocontributeConfig().publishing
 

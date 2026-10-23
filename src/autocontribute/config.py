@@ -646,6 +646,9 @@ class QualityConfig(StrictModel):
 
 
 class PublishingConfig(StrictModel):
+    # Empty means the token owner. Setting it lets a job without the publishing token prepare
+    # and render reviews; approve and publish still require the token to belong to this login.
+    login: str = ""
     approval_expires_hours: int = Field(default=72, ge=1, le=168)
     branch_prefix: str = "autocontribute"
     draft: bool = False
@@ -654,6 +657,13 @@ class PublishingConfig(StrictModel):
     max_new_pull_requests_per_day: int = Field(default=1, ge=1, le=5)
     max_open_pull_requests: int = Field(default=3, ge=1, le=20)
     repository_cooldown_days: int = Field(default=7, ge=0, le=365)
+
+    @field_validator("login")
+    @classmethod
+    def login_is_a_github_account(cls, value: str) -> str:
+        if value and not _GITHUB_LOGIN.fullmatch(value):
+            raise ValueError("publishing.login must be a GitHub login or empty")
+        return value
 
 
 class BudgetConfig(StrictModel):
@@ -887,6 +897,7 @@ quality:
   require_regression_evidence_for_bugfix: true
 
 publishing:
+  login: ""                        # empty = the GitHub token's account
   approval_expires_hours: 72
   draft: false
   ready_for_review: true           # applies only when draft is true
