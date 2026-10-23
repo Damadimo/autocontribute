@@ -97,7 +97,9 @@ app = typer.Typer(
     help="Prepare issue-backed open-source contributions behind hard quality gates.",
     no_args_is_help=True,
 )
-runs_app = typer.Typer(help="List, show, or cancel contribution runs.", no_args_is_help=True)
+runs_app = typer.Typer(
+    help="List, show, review, check, cancel, or abandon contribution runs.", no_args_is_help=True
+)
 config_app = typer.Typer(help="Inspect configuration safely.", no_args_is_help=True)
 lifecycle_app = typer.Typer(
     help="Observe published pull requests and persist maintainer/CI safety signals.",

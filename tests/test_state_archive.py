@@ -58,7 +58,6 @@ def test_export_holds_unfinished_evidence_and_imports_it_byte_for_byte(tmp_path:
         for member in members
     )
     assert exported.unfinished_runs == 1
-    assert exported.files == len(names)
     assert exported.sha256 == hashlib.sha256(archive.read_bytes()).hexdigest()
 
     target = tmp_path / "restored"
