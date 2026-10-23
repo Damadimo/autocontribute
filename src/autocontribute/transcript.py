@@ -1,11 +1,11 @@
 """Provider-native transcripts for multi-turn tool calling.
 
 A transcript is bound to one model and effort, one tool set and one set of instructions, and it
-only grows.
-Every request replays all of its items byte for byte: that keeps the provider's prompt cache warm
-and keeps earlier Anthropic thinking blocks valid, and editing an earlier item breaks both.
-Callers truncate text before they append it. The append functions scrub it with the host secret
-values (``scrub_for_model``), and nothing rewrites it later; model output is replayed as received.
+only grows. Every request replays all of its items byte for byte: that keeps the provider's prompt
+cache warm and keeps earlier Anthropic thinking blocks valid, and editing an earlier item breaks
+both. Callers truncate text before they append it. The append functions scrub it with the host
+secret values (``scrub_for_model``), and nothing rewrites it later; model output is replayed as
+received.
 
 A conversation runs in this order:
 
