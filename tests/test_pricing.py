@@ -18,8 +18,9 @@ from autocontribute.pricing import (
     ModelSpec,
     ModelUsage,
     Rates,
-    Role,
+    TierRole,
     cost,
+    resolve_critic,
     resolve_model,
     upper_bound_cost,
 )
@@ -110,15 +111,9 @@ def test_model_table_is_pinned_to_its_date() -> None:
 
 def test_role_defaults_efforts_caps_and_key_names_are_pinned() -> None:
     assert {provider: dict(models) for provider, models in ROLE_MODELS.items()} == {
-        "openai": {
-            "agent": "gpt-5.6-sol",
-            "critic": "gpt-5.6-sol",
-            "setup": "gpt-5.6-terra",
-            "triage": "gpt-5.6-luna",
-        },
+        "openai": {"agent": "gpt-5.6-sol", "setup": "gpt-5.6-terra", "triage": "gpt-5.6-luna"},
         "anthropic": {
             "agent": "claude-opus-5-5",
-            "critic": "claude-opus-5-5",
             "setup": "claude-sonnet-5-5",
             "triage": "claude-haiku-5-5",
         },
@@ -161,11 +156,11 @@ def test_model_table_cannot_be_modified() -> None:
         ({"ANTHROPIC_API_KEY": "", "OPENAI_API_KEY": "openai-key"}, "openai"),
     ],
 )
-@pytest.mark.parametrize("role", ["agent", "critic", "setup", "triage"])
+@pytest.mark.parametrize("role", ["agent", "setup", "triage"])
 def test_auto_prefers_anthropic_then_openai_and_uses_the_role_default(
     environ: dict[str, str],
     expected: str,
-    role: Role,
+    role: TierRole,
 ) -> None:
     spec = resolve_model("auto", role, environ)
 
@@ -176,10 +171,10 @@ def test_auto_prefers_anthropic_then_openai_and_uses_the_role_default(
 @pytest.mark.parametrize("environ", [{}, {"ANTHROPIC_API_KEY": "", "OPENAI_API_KEY": ""}])
 def test_auto_without_a_model_key_names_both_variables(environ: dict[str, str]) -> None:
     with pytest.raises(ConfigurationError) as raised:
-        resolve_model("auto", "critic", environ)
+        resolve_model("auto", "triage", environ)
 
     message = str(raised.value)
-    assert "models.critic" in message
+    assert "models.triage" in message
     assert "ANTHROPIC_API_KEY" in message
     assert "OPENAI_API_KEY" in message
 
@@ -187,6 +182,56 @@ def test_auto_without_a_model_key_names_both_variables(environ: dict[str, str]) 
 def test_explicit_model_resolves_without_consulting_keys() -> None:
     assert resolve_model("gpt-5.6-terra", "setup", {}) is MODELS["gpt-5.6-terra"]
     assert resolve_model("claude-haiku-5-5", "agent", {}) is MODELS["claude-haiku-5-5"]
+
+
+@pytest.mark.parametrize(
+    ("agent", "environ", "expected"),
+    [
+        ("auto", {"ANTHROPIC_API_KEY": "anthropic-key"}, "claude-opus-5-5"),
+        ("auto", {"OPENAI_API_KEY": "openai-key"}, "gpt-5.6-sol"),
+        ("gpt-5.6-terra", {"OPENAI_API_KEY": "openai-key"}, "gpt-5.6-terra"),
+        (
+            "auto",
+            {"ANTHROPIC_API_KEY": "anthropic-key", "OPENAI_API_KEY": "openai-key"},
+            "gpt-5.6-sol",
+        ),
+        (
+            "gpt-5.6-terra",
+            {"ANTHROPIC_API_KEY": "anthropic-key", "OPENAI_API_KEY": "openai-key"},
+            "claude-opus-5-5",
+        ),
+        (
+            "claude-haiku-5-5",
+            {"ANTHROPIC_API_KEY": "anthropic-key", "OPENAI_API_KEY": ""},
+            "claude-haiku-5-5",
+        ),
+    ],
+    ids=[
+        "anthropic-only",
+        "openai-only",
+        "explicit-agent",
+        "both-keys",
+        "both-keys-explicit-agent",
+        "empty-other-key",
+    ],
+)
+def test_auto_critic_is_the_agent_model_or_the_other_providers_with_both_keys(
+    agent: str,
+    environ: dict[str, str],
+    expected: str,
+) -> None:
+    agent_spec = resolve_model(agent, "agent", environ)
+
+    assert resolve_critic("auto", agent_spec, environ) is MODELS[expected]
+
+
+def test_explicit_critic_ignores_the_agent_and_rejects_unknown_ids() -> None:
+    environ = {"ANTHROPIC_API_KEY": "anthropic-key", "OPENAI_API_KEY": "openai-key"}
+    opus = MODELS["claude-opus-5-5"]
+
+    assert resolve_critic("claude-sonnet-5-5", opus, environ) is MODELS["claude-sonnet-5-5"]
+    with pytest.raises(ConfigurationError, match=r"^models\.critic is not a known model"):
+        resolve_critic("gpt-5.6", opus, environ)
 
 
 @pytest.mark.parametrize("name", ["gpt-5.6", "claude-opus-5", "Claude Opus 5.5"])
