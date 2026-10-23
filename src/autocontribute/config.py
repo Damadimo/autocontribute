@@ -569,6 +569,9 @@ class PolicyConfig(StrictModel):
     allow_dependency_changes: bool = False
     allow_workflow_changes: bool = False
     legal_attestations: dict[str, LegalAttestation] = Field(default_factory=dict)
+    # Repositories whose AI policy asks for human-written PR text, where the user still wants
+    # to contribute and will write that text.
+    allow_conditional_ai_policy: list[str] = Field(default_factory=list)
     ai_disclosure: str = (
         "This contribution was prepared autonomously by an AI agent. Its validation evidence "
         "comes from Autocontribute's configured automated checks; no human review is implied."
@@ -593,6 +596,19 @@ class PolicyConfig(StrictModel):
                     "legal-attestation mapping key must exactly match its repository field"
                 )
             normalized[key] = attestation
+        return normalized
+
+    @field_validator("allow_conditional_ai_policy")
+    @classmethod
+    def conditional_ai_policy_entries_are_repositories(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            if not _REPOSITORY.fullmatch(value):
+                raise ValueError(
+                    "policy.allow_conditional_ai_policy entries must use owner/name syntax"
+                )
+            if value.casefold() not in normalized:
+                normalized.append(value.casefold())
         return normalized
 
     def legal_attestation_for(self, repository: str) -> LegalAttestation | None:

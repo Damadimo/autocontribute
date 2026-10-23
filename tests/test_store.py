@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from autocontribute.ai_policy import RepositoryAiPolicy
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.domain import IssueCandidate, RunManifest, RunStatus
 from autocontribute.exceptions import StateError
@@ -561,6 +562,7 @@ def test_fresh_database_has_current_version_and_all_tables(tmp_path: Path) -> No
         "publication_reservations",
         "manifest_artifact_sync",
         "candidate_retry_authorizations",
+        "repository_policies",
     }
 
 
@@ -3099,3 +3101,33 @@ def test_incomplete_publication_evidence_fails_closed_without_reconstruction(
         assert connection.execute(
             "SELECT count(*) FROM publication_reservations WHERE run_id = ?", (run.run_id,)
         ).fetchone() == (0,)
+
+
+def test_repository_ai_policy_cache_matches_repository_and_policy_digest(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    first = RepositoryAiPolicy(stance="conditional", requires_disclosure=True)
+    second = RepositoryAiPolicy(stance="none")
+
+    store.record_repository_ai_policy("example/project", "a" * 64, first)
+
+    assert store.repository_ai_policy("Example/Project", "a" * 64) == first
+    assert store.repository_ai_policy("example/project", "b" * 64) is None
+    assert store.repository_ai_policy("example/other", "a" * 64) is None
+
+    store.record_repository_ai_policy("example/project", "b" * 64, second)
+
+    assert store.repository_ai_policy("example/project", "a" * 64) is None
+    assert store.repository_ai_policy("example/project", "b" * 64) == second
+
+
+@pytest.mark.parametrize(
+    ("repository", "digest"),
+    [("not a repository", "a" * 64), ("example/project", "A" * 64), ("example/project", "a")],
+)
+def test_repository_ai_policy_cache_rejects_malformed_keys(
+    tmp_path: Path, repository: str, digest: str
+) -> None:
+    store = RunStore(tmp_path / "state")
+
+    with pytest.raises(StateError, match="cache keys"):
+        store.record_repository_ai_policy(repository, digest, RepositoryAiPolicy(stance="none"))

@@ -15,6 +15,15 @@ from pathlib import PurePosixPath
 from typing import Literal, Protocol
 from urllib.parse import unquote, urlparse
 
+from autocontribute.ai_policy import (
+    AiPolicyQuote,
+    PolicyFile,
+    RepositoryAiPolicy,
+    ai_policy_digest,
+    ai_policy_files,
+    checked_ai_policy,
+    deterministic_ai_policy,
+)
 from autocontribute.config import AutocontributeConfig, LegalAttestation
 from autocontribute.domain import (
     DomainModel,
@@ -70,26 +79,6 @@ _DANGEROUS_LABEL = re.compile(
     r"(?:^|[\s/:_-])(?:security|sec|vuln(?:erabilit(?:y|ies))?|CVE|CWE(?:-\d+)?)"
     r"(?:$|[\s/:_-])",
     re.I,
-)
-_AI_PROHIBITION = re.compile(
-    r"(?:\b(?:no|do not|don't|must not|prohibit(?:ed)?|forbid(?:den)?|"
-    r"reject(?:ed|ing)?|decline(?:d|ing)?|not accept(?:ed|ing)?|not allowed)\b"
-    r".{0,120}\b(?:AI(?:[- ](?:generated|assisted))?|LLM(?:[- ]generated)?|"
-    r"artificial intelligence|generated code|AI assistance)\b|"
-    r"\b(?:AI(?:[- ](?:generated|assisted))?|LLM(?:[- ]generated)?|"
-    r"artificial intelligence|generated code|AI assistance)\b.{0,120}"
-    r"\b(?:prohibit(?:ed)?|forbid(?:den)?|reject(?:ed|ing)?|decline(?:d|ing)?|"
-    r"not accept(?:ed|ing)?|not allowed|will be closed)\b)",
-    re.I | re.S,
-)
-_AUTOMATION_PROHIBITION = re.compile(
-    r"(?:\b(?:no|do not|don't|must not|prohibit(?:ed)?|forbid(?:den)?|"
-    r"reject(?:ed|ing)?|decline(?:d|ing)?|not accept(?:ed|ing)?|not allowed)\b"
-    r".{0,120}\b(?:bots?|bot[- ]authored|automated|automation)\b|"
-    r"\b(?:bots?|bot[- ]authored|automated|automation)\b.{0,120}"
-    r"\b(?:prohibit(?:ed)?|forbid(?:den)?|reject(?:ed|ing)?|decline(?:d|ing)?|"
-    r"not accept(?:ed|ing)?|not allowed|will be closed)\b)",
-    re.I | re.S,
 )
 _CLA_TERM = r"(?:contributor(?:['\u2019]s)? license agreement|\bCLA\b)"
 _DCO_TERM = r"(?:signed[- ]off[- ]by|developer(?:['\u2019]s)? certificate of origin|\bDCO\b)"
@@ -378,6 +367,7 @@ _UNLINKED_DOCUMENT = re.compile(
 )
 
 POLICY_SOURCES_EVIDENCE_KEY = "policy_sources_sha256"
+AI_POLICY_EVIDENCE_KEY = "ai_policy"
 POLICY_REPOSITORY_REF_EVIDENCE_KEY = "policy_repository_ref"
 POLICY_ORGANIZATION_REF_EVIDENCE_KEY = "policy_organization_ref"
 LEGAL_REQUIREMENTS_EVIDENCE_KEY = "legal_requirements"
@@ -385,15 +375,6 @@ LEGAL_ATTESTATION_EVIDENCE_KEY = "legal_attestation_sha256"
 LEGAL_POLICY_EVIDENCE_KEY = "legal_policy_sha256"
 _LEGAL_ATTESTATION_FINGERPRINT_DOMAIN = b"autocontribute.legal-attestation.v1\x00"
 _LEGAL_POLICY_FINGERPRINT_DOMAIN = b"autocontribute.legal-policy-surface.v1\x00"
-
-
-@dataclass(frozen=True, slots=True)
-class PolicyFile:
-    """One policy file read at a pinned ref, as raw text with any HTML comments."""
-
-    repository: str
-    path: str
-    text: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,6 +460,18 @@ class IssueTriage(Protocol):
     """Judges whether an agent can fix an issue that passed every deterministic gate."""
 
     def triage(self, issue: IssueCandidate, repository: RepositoryInfo) -> TriageVerdict: ...
+
+
+class PolicyClassifier(Protocol):
+    """Reads a repository's AI-contribution policy from its policy files that concern AI.
+
+    Every quote in the result must appear verbatim in the file it names, or the result is
+    replaced (see ``checked_ai_policy``).
+    """
+
+    def classify(
+        self, repository: RepositoryInfo, files: Sequence[PolicyFile]
+    ) -> RepositoryAiPolicy: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -596,11 +589,13 @@ class DiscoveryService:
         store: RunStore,
         *,
         triage: IssueTriage | None = None,
+        policy_classifier: PolicyClassifier | None = None,
     ) -> None:
         self.config = config
         self.github = github
         self.store = store
         self.triage = triage
+        self.policy_classifier = policy_classifier
         self._policy_sources: dict[tuple[str, str], _PolicySource] = {}
         self._policy_snapshots: dict[tuple[str, str], PolicySnapshot] = {}
         self._repository_reviews: dict[tuple[str, str], _RepositoryReview] = {}
@@ -1085,20 +1080,12 @@ class DiscoveryService:
                     "no repository or organization contribution guidelines were found",
                 )
             )
-        if any(_AI_PROHIBITION.search(file.text) for file in snapshot.files):
-            blockers.append(
-                (
-                    "AI policy",
-                    "repository policy appears to prohibit AI-assisted contributions",
-                )
-            )
-        elif any(_AUTOMATION_PROHIBITION.search(file.text) for file in snapshot.files):
-            blockers.append(
-                (
-                    "automation policy",
-                    "repository policy appears to prohibit automated contributions",
-                )
-            )
+        ai_policy = self._ai_policy(repository, snapshot)
+        # The approval review shows the policy, conditions and quotes included.
+        evidence[AI_POLICY_EVIDENCE_KEY] = ai_policy.model_dump_json()
+        ai_policy_reason = self._ai_policy_blocker(repository.full_name, ai_policy)
+        if ai_policy_reason is not None:
+            blockers.append(("AI policy", ai_policy_reason))
         if snapshot.legal_requirements:
             evidence[LEGAL_REQUIREMENTS_EVIDENCE_KEY] = ",".join(snapshot.legal_requirements)
             attestation = self.config.policy.legal_attestation_for(repository.full_name)
@@ -1121,6 +1108,50 @@ class DiscoveryService:
         result = _RepositoryReview(blockers=tuple(blockers), evidence=tuple(evidence.items()))
         self._repository_reviews[key] = result
         return result
+
+    def _ai_policy(
+        self, repository: RepositoryInfo, snapshot: PolicySnapshot
+    ) -> RepositoryAiPolicy:
+        """Read the AI policy, preferring a verified classifier reading cached by file digest."""
+
+        deterministic = deterministic_ai_policy(snapshot.files)
+        files = ai_policy_files(snapshot.files)
+        # A repository with unread policy files is skipped anyway; its partial text is not
+        # worth a classifier call or a cache entry.
+        if not files or snapshot.problems:
+            return deterministic
+        digest = ai_policy_digest(files)
+        cached = self.store.repository_ai_policy(repository.full_name, digest)
+        if cached is not None:
+            return cached
+        if self.policy_classifier is None:
+            return deterministic
+        policy = checked_ai_policy(
+            self.policy_classifier.classify(repository, files),
+            files,
+            fallback=deterministic,
+        )
+        self.store.record_repository_ai_policy(repository.full_name, digest, policy)
+        return policy
+
+    def _ai_policy_blocker(self, repository: str, policy: RepositoryAiPolicy) -> str | None:
+        quotes = _quoted(policy.quotes)
+        if policy.stance == "ban":
+            return f"the repository's AI policy bans agent-made contributions: {quotes}"
+        if policy.stance == "unclear":
+            return "the repository's AI policy could not be verified: " + (
+                quotes or "no quoted passage appears in its policy files"
+            )
+        if (
+            policy.stance == "conditional"
+            and policy.requires_human_written_text
+            and repository.casefold() not in self.config.policy.allow_conditional_ai_policy
+        ):
+            return (
+                "the repository's AI policy asks for human-written pull request text; list it in "
+                f"policy.allow_conditional_ai_policy to contribute there: {quotes}"
+            )
+        return None
 
     def _repository_baseline(self, repository: RepositoryInfo) -> bool:
         pushed_at = repository.pushed_at
@@ -1648,6 +1679,13 @@ def _immutable_ref(value: object, *, field: str) -> str:
     return value.casefold()
 
 
+def _quoted(quotes: Sequence[AiPolicyQuote]) -> str:
+    return "; ".join(
+        f'"{" ".join(quote.text.split())}" ({quote.repository}/{quote.path})'
+        for quote in quotes[:3]
+    )
+
+
 def _pull_request_restriction(repository: RepositoryInfo) -> str | None:
     if not repository.has_pull_requests:
         return "the repository has pull requests turned off"
@@ -1928,6 +1966,7 @@ def _counted_reason(count: int, *, singular: str, plural: str) -> str:
 
 
 __all__ = [
+    "AI_POLICY_EVIDENCE_KEY",
     "LEGAL_ATTESTATION_EVIDENCE_KEY",
     "LEGAL_POLICY_EVIDENCE_KEY",
     "LEGAL_REQUIREMENTS_EVIDENCE_KEY",
@@ -1942,7 +1981,7 @@ __all__ = [
     "DiscoveryService",
     "IssueEvaluation",
     "IssueTriage",
-    "PolicyFile",
+    "PolicyClassifier",
     "PolicySnapshot",
     "TriageVerdict",
     "apply_legal_commit_message",

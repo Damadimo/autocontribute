@@ -523,3 +523,15 @@ def test_model_base_url_cannot_expose_credentials(base_url: str) -> None:
                 }
             }
         )
+
+
+def test_conditional_ai_policy_opt_ins_are_case_folded_repository_names() -> None:
+    config = AutocontributeConfig.model_validate(
+        {"policy": {"allow_conditional_ai_policy": ["NumPy/numpy", "numpy/NumPy"]}}
+    )
+
+    assert config.policy.allow_conditional_ai_policy == ["numpy/numpy"]
+    with pytest.raises(ValueError, match="owner/name"):
+        AutocontributeConfig.model_validate(
+            {"policy": {"allow_conditional_ai_policy": ["https://github.com/numpy/numpy"]}}
+        )
