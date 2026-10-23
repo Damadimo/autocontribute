@@ -252,8 +252,8 @@ def test_live_tool_loop_through_the_model_worker(provider: Provider) -> None:
     # The setup role's model has the agent's tools at a lower price.
     spec = MODELS[ROLE_MODELS[provider]["setup"]]
     output_cap = TURN_OUTPUT_CAPS[provider]["setup"]
-    model = SubprocessTurnProvider(spec)
     host_values = host_secret_values((), os.environ)
+    model = SubprocessTurnProvider(spec, host_values)
     transcript = start_transcript(
         model=spec.id,
         effort="low",
