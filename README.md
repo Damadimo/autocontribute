@@ -104,7 +104,7 @@ cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod
 
 | Command | What it does |
 | --- | --- |
-| `init` | Write a starter `autocontribute.yml` (`--path`, `--force`). |
+| `init` | Write a starter `autocontribute.yml` (`--path`, `--force`); `--actions` creates a GitHub Actions runner repository instead. |
 | `doctor` | Check config, credentials, GitHub access, Git, Docker, and the sandbox image, and warn about configured repositories whose AI policy rules this tool out; sends small paid model probes. |
 | `discover` | Show the best current candidate issue without cloning, model calls, or GitHub writes. |
 | `run` | Prepare one contribution or skip; `--issue owner/repo#N` pins an issue, `--scheduled` makes an [unattended attempt](#scheduling), `--json` prints the outcome. |
@@ -132,6 +132,7 @@ cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod
 ## Documentation
 
 - [How it works](docs/how-it-works.md): the pipeline, hard gates, and run states.
+- [GitHub Actions](docs/actions.md): run it daily in a repository of your own and approve fixes with an issue comment.
 - [Configuration](docs/configuration.md): every config key and its default.
 - [Sandbox image](docs/sandbox-image.md): build and pin the image your checks run in.
 - [Security policy](SECURITY.md): reporting vulnerabilities and safe use.
