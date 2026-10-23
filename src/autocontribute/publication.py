@@ -1225,8 +1225,9 @@ class Publisher:
         """Fail a submitting run after proving its publication left nothing on GitHub.
 
         This releases a publication that can never finish, such as one stuck before
-        same-repository publishing existed. A run whose pull request may exist, or whose
-        cleanup already started, has to be resumed with ``publish`` instead.
+        same-repository publishing existed, or one whose pull-request request went unanswered
+        and created nothing; that run's branch is deleted first. A run whose pull request
+        exists, or whose cleanup already started, has to be resumed with ``publish`` instead.
         """
 
         normalized = reason.strip()
@@ -1249,10 +1250,73 @@ class Publisher:
                 raise PublicationResumeRequired(
                     f"Run {run_id} already started cleaning up its publication"
                 )
+            if manifest.pull_request_creation_started and manifest.pull_request_url is None:
+                self._withdraw_unanswered_pull_request_creation(manifest, lease_guard=lease_guard)
             return self._finalize_absent_pre_post_publication(
                 manifest,
                 reason=f"abandoned by the operator: {normalized}",
                 lease_guard=lease_guard,
+            )
+
+    def _withdraw_unanswered_pull_request_creation(
+        self,
+        manifest: RunManifest,
+        *,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> None:
+        """Delete the head of a POST that GitHub never answered, then release its marker.
+
+        A POST that GitHub has not processed yet fails without its head branch, so once the
+        branch is gone and no pull request exists, none can appear for this run.
+        """
+
+        if (
+            manifest.candidate is None
+            or not manifest.branch_name
+            or not manifest.commit_sha
+            or manifest.fork_repository_id is None
+            or manifest.fork_repository_node_id is None
+        ):
+            raise StateError("An unanswered pull-request creation lacks durable branch evidence")
+        _durable_publication_context(
+            self.config,
+            manifest,
+            login=self.github.authenticated_login(),
+            api_origin=self.github.api_origin,
+        )
+        repository = manifest.candidate.repository
+        head = publication_head(manifest)
+
+        def assert_no_pull_request() -> None:
+            lease_guard.assert_owned()
+            existing = self.github.find_pull_request(repository, head=head.label)
+            lease_guard.assert_owned()
+            if existing is not None:
+                raise PublicationResumeRequired(
+                    f"GitHub opened the pull request {existing} for run {manifest.run_id}"
+                )
+
+        assert_no_pull_request()
+        self._compensate_branch_only(
+            manifest,
+            fork=head.repository,
+            branch=manifest.branch_name,
+            commit_sha=manifest.commit_sha,
+            lease_guard=lease_guard,
+            before_mutation=assert_no_pull_request,
+        )
+        assert_no_pull_request()
+        if not self._release_pull_request_creation(
+            manifest,
+            event="pull_request.creation.withdrawn",
+            details={
+                "repository": repository,
+                "head": head.label,
+                "head_sha": manifest.commit_sha,
+            },
+        ):
+            raise PublicationResumeRequired(
+                "The unanswered pull-request creation could not be released"
             )
 
     def publish(self, run_id: str) -> RunManifest:

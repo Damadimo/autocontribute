@@ -786,10 +786,11 @@ def abandon_run(
         typer.Option("--yes", help="Abandon without asking for confirmation."),
     ] = False,
 ) -> None:
-    """Fail a submitting run whose publication left no branch or pull request on GitHub.
+    """Fail a submitting run whose publication left no pull request on GitHub.
 
-    Exit codes: 0 abandoned, 4 GitHub has the branch or pull request, so resume it with
-    `publish`, 1 anything else.
+    A run whose pull-request request went unanswered loses its branch first; any other run must
+    have no branch. Exit codes: 0 abandoned, 4 GitHub has the pull request or that branch, so
+    resume it with `publish`, 1 anything else.
     """
 
     normalized_reason = reason.strip()

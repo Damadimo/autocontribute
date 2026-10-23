@@ -98,6 +98,12 @@ _APPROVAL_FAILURES = {
     "safety_stop": "a safety stop is active, so nothing was published.",
     "error": "publishing failed.",
 }
+_UNANSWERED_REPLY = (
+    "GitHub never answered the request that opens the pull request, and the runner does not send "
+    "it twice. If the pull request appears, comment the same approval again to record it. "
+    "Otherwise end the run by hand: "
+    "https://github.com/Damadimo/autocontribute/blob/main/docs/actions.md#fix-a-run-by-hand"
+)
 
 _Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 _RunId = Annotated[str, Field(pattern=r"^[0-9a-f]{16}$")]
@@ -700,6 +706,17 @@ def report_approval(
         _mark_published(repository, number, manifest.pull_request_url)
     else:
         explanation = _APPROVAL_FAILURES.get(outcome, _APPROVAL_FAILURES["error"])
+        # A run left submitting is this approval's own interrupted publication, whatever error
+        # stopped it, so only another approval comment can carry it on.
+        if (
+            outcome != "safety_stop"
+            and manifest is not None
+            and manifest.status == RunStatus.SUBMITTING
+        ):
+            unanswered = (
+                manifest.pull_request_creation_started and manifest.pull_request_url is None
+            )
+            explanation = _UNANSWERED_REPLY if unanswered else _APPROVAL_FAILURES["resume_required"]
         repository.comment(
             number, f"Not published: {explanation}\n\n{fenced_block(message, 'text')}"
         )

@@ -4279,6 +4279,86 @@ def test_ambiguous_pull_request_post_is_never_sent_twice(
     assert store.get(run_id).status == RunStatus.SUBMITTING
 
 
+def _unanswered_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[RunStore, str, FakePublishingGitHub, Publisher, list[tuple[str, str, str]]]:
+    """A run whose pull-request POST got no answer and created nothing GitHub shows."""
+
+    store, run_id, github, publisher, deleted = _refusing_publisher(
+        tmp_path,
+        monkeypatch,
+        GitHubHTTPError(
+            "GitHub returned 502",
+            status_code=502,
+            request_id="ABCD:1234",
+            github_message="Bad Gateway",
+        ),
+    )
+    with pytest.raises(PublicationResumeRequired, match="will not send a second POST"):
+        publisher.publish(run_id)
+    assert store.get(run_id).pull_request_creation_started
+    github.calls.clear()
+    return store, run_id, github, publisher, deleted
+
+
+def test_abandon_deletes_the_branch_of_an_unanswered_post_before_failing_the_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, run_id, github, publisher, deleted = _unanswered_publication(tmp_path, monkeypatch)
+    stranded = store.get(run_id)
+    assert stranded.candidate is not None
+
+    with pytest.raises(PublicationResumeRequired, match="second POST is forbidden"):
+        publisher.publish(run_id)
+    abandoned = publisher.abandon(run_id, reason="GitHub never answered")
+
+    assert abandoned.status == RunStatus.FAILED
+    assert abandoned.pull_request_creation_started is False
+    assert deleted == [("octocat/project", stranded.branch_name, stranded.commit_sha)]
+    assert "create_pull_request" not in github.calls
+    event_types = [event["event_type"] for event in store.events(run_id)]
+    assert event_types.index("branch.compensated") < event_types.index(
+        "pull_request.creation.withdrawn"
+    )
+    assert event_types[-3:] == [
+        "publication.absence.verified",
+        "publication.compensation.verified",
+        "run.transitioned",
+    ]
+    released = store.candidate_attempt_disposition(stranded.candidate)
+    assert released.state is CandidateAttemptState.AVAILABLE
+
+
+@pytest.mark.parametrize("appears", ["before_the_delete", "after_the_delete"])
+def test_abandon_keeps_an_unanswered_post_whose_pull_request_appears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    appears: str,
+) -> None:
+    store, run_id, github, publisher, deleted = _unanswered_publication(tmp_path, monkeypatch)
+    url = "https://github.com/example/project/pull/7"
+    if appears == "before_the_delete":
+        github.existing_pr = url
+    else:
+        original_delete = publisher._delete_remote_branch
+
+        def delete_then_appear(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            original_delete(*args, **kwargs)
+            github.existing_pr = url
+
+        monkeypatch.setattr(publisher, "_delete_remote_branch", delete_then_appear)
+
+    with pytest.raises(PublicationResumeRequired, match="opened the pull request"):
+        publisher.abandon(run_id, reason="GitHub never answered")
+
+    durable = store.get(run_id)
+    assert durable.status == RunStatus.SUBMITTING
+    assert durable.pull_request_creation_started
+    assert len(deleted) == (0 if appears == "before_the_delete" else 1)
+
+
 def test_unsent_pull_request_post_releases_intent_for_clean_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -187,13 +187,16 @@ and then marks it ready for review if `publishing.ready_for_review` is true.
 
 If GitHub refuses the PR (for example, the repository accepts PRs only from collaborators or caps
 open PRs), `publish` deletes the branch and the run ends `failed` with GitHub's message. If GitHub's
-answer is lost, that run stays `submitting` and never sends a second request; other runs are not
-affected.
+answer is lost, that run stays `submitting` and never sends a second request. Other runs still
+publish; the stuck run counts toward the limits until `publish` finds its PR or
+`runs abandon` ends it.
 
-A `submitting` run that can never finish, such as one stuck in an older version, ends with
-`runs abandon RUN_ID --reason TEXT`: it checks that GitHub has neither the run's branch nor a PR
-from it, then ends the run `failed` and releases its issue. If either exists, it exits 4 and
-changes nothing; resume the run with `publish` instead.
+A `submitting` run that can never finish ends with `runs abandon RUN_ID --reason TEXT`, which
+then releases its issue. For a run whose PR request went unanswered, it deletes the run's branch,
+so a request GitHub has not processed yet cannot open a PR, checks that no PR exists, and ends the
+run `failed`. Any other run, such as one stuck in an older version, must have neither its branch
+nor a PR on GitHub. If GitHub has the PR, or that branch, `runs abandon` exits 4; resume the run
+with `publish` instead.
 
 `publish RUN_ID --yes --json` prints the outcome as JSON, and the exit code tells a script what to
 do next: 0 the PR is open, 3 a limit (`limit`) or a failed recheck (`stale`) refused it, so wait
