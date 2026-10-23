@@ -6,16 +6,14 @@ The parent process holds the GitHub token, so third-party SDK code runs in the w
 from __future__ import annotations
 
 import json
-import re
-from collections.abc import Iterator
 from typing import Final, cast
 
 from openai import APIStatusError, OpenAI
 from openai.types.responses import Response, ResponseError, ResponseInputParam, ToolParam
 from openai.types.shared_params import Reasoning
-from pydantic import BaseModel, JsonValue, ValidationError
+from pydantic import JsonValue, ValidationError
 
-from autocontribute.config import ModelProfile, validate_model_identifier
+from autocontribute.config import ModelProfile
 from autocontribute.exceptions import ModelError, ModelRequestError
 from autocontribute.model_retry import PROVIDER_ERROR_CODES, retry_after_seconds
 from autocontribute.pricing import API_KEY_ENVS, ModelUsage
@@ -24,14 +22,17 @@ from autocontribute.providers import (
     ModelResult,
     OutputT,
     TurnRequest,
+    _assert_secret_free_model_output,
     _effective_output_tokens,
     _effective_timeout,
     _require_api_key,
     _require_expected_response_model,
+    _response_identity,
+    _safe_request_id,
     _scrub_request_text,
+    _token_count,
     _validate_usage,
 )
-from autocontribute.redaction import redact_model_input
 from autocontribute.transcript import (
     SUBMIT_TOOLS,
     ToolCall,
@@ -45,7 +46,6 @@ from autocontribute.transcript import (
 # retries selected failures internally, outside Autocontribute's hard limits.
 _SDK_MAX_RETRIES = 0
 _SAFE_INCOMPLETE_REASONS: frozenset[str] = frozenset({"content_filter", "max_output_tokens"})
-_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 # Codes of failed responses that another attempt can fix.
 _RETRIABLE_FAILURE_CODES: Final = frozenset({"server_error", "rate_limit_exceeded"})
 # Codes of failed responses that end the run and may be named in its error; other codes are not
@@ -59,23 +59,6 @@ _NAMED_FAILURE_CODES: Final = frozenset(
         "potentially_unintended_destructive_activity",
     }
 )
-
-
-def _token_count(container: object | None, field: str, *, required: bool = False) -> int:
-    """Read a non-negative SDK token count without silently accepting bad data."""
-
-    if container is None:
-        if required:
-            raise ModelError(f"Model provider omitted required usage field: {field}")
-        return 0
-    value = getattr(container, field, None)
-    if value is None:
-        if required:
-            raise ModelError(f"Model provider omitted required usage field: {field}")
-        return 0
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ModelError(f"Model provider returned invalid usage field: {field}")
-    return int(value)
 
 
 def _responses_usage(raw_usage: object | None) -> ModelUsage:
@@ -138,14 +121,11 @@ def _request_error(
                 break
         retry_after = retry_after_seconds(exc.response.headers)
 
-    request_id = getattr(exc, "request_id", None)
-    if isinstance(request_id, str) and _SAFE_REQUEST_ID.fullmatch(request_id):
-        try:
-            _assert_secret_free_model_output(api_key_env, api_key, request_id)
-        except ModelError:
-            pass
-        else:
-            details.append(f"request ID: {request_id}")
+    request_id = _safe_request_id(
+        getattr(exc, "request_id", None), api_key_env=api_key_env, api_key=api_key
+    )
+    if request_id is not None:
+        details.append(f"request ID: {request_id}")
     detail_suffix = f" ({'; '.join(details)})" if details else ""
     return ModelRequestError(
         f"{provider} request failed{detail_suffix}",
@@ -153,50 +133,6 @@ def _request_error(
         provider_code=provider_code,
         retry_after_seconds=retry_after,
     )
-
-
-def _model_output_strings(value: object) -> Iterator[str]:
-    """Yield every model-authored string from JSON-like structured output."""
-
-    if isinstance(value, str):
-        yield value
-        return
-    if isinstance(value, BaseModel):
-        yield from _model_output_strings(value.model_dump(mode="json"))
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            yield from _model_output_strings(key)
-            yield from _model_output_strings(item)
-        return
-    if isinstance(value, (list, tuple, set, frozenset)):
-        for item in value:
-            yield from _model_output_strings(item)
-
-
-def _assert_secret_free_model_output(
-    api_key_env: str,
-    api_key: str,
-    *values: object,
-) -> None:
-    """Reject credential reflection without returning or logging the reflected value."""
-
-    for value in values:
-        for text in _model_output_strings(value):
-            if api_key in text or redact_model_input(text, secret_env_names=(api_key_env,)) != text:
-                raise ModelError("Model provider response contained credential material")
-
-
-def _response_identity(response: object) -> tuple[str, str]:
-    response_id = getattr(response, "id", None)
-    model = getattr(response, "model", None)
-    if not isinstance(response_id, str) or not response_id:
-        raise ModelError("Model provider returned no response identifier")
-    try:
-        resolved_model = validate_model_identifier(model)
-    except ValueError as exc:
-        raise ModelError("Model provider returned an invalid model identifier") from exc
-    return response_id, resolved_model
 
 
 class OpenAIResponsesProvider:

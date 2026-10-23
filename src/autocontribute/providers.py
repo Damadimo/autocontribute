@@ -8,13 +8,14 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import selectors
 import signal
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Final, Generic, Literal, NoReturn, Protocol, TypeVar, cast
@@ -50,6 +51,7 @@ _MAX_MODEL_REQUEST_BYTES = 32 * 1024 * 1024
 _MAX_MODEL_RESULT_BYTES = 32 * 1024 * 1024
 MAX_TOOL_ARGUMENT_BYTES: Final = 256 * 1024
 MAX_TURN_SECONDS: Final = 600.0
+_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _REQUEST_ERROR_DETAIL_KEYS = frozenset({"http_status", "provider_code", "retry_after_seconds"})
 _WORKER_TERM_GRACE_SECONDS = 0.25
 _WORKER_POLL_SECONDS = 0.05
@@ -140,6 +142,79 @@ def _validate_usage(usage: ModelUsage) -> ModelUsage:
     if usage.total_tokens != usage.input_tokens + usage.output_tokens:
         raise ModelError("Model provider returned inconsistent total_tokens")
     return usage
+
+
+def _token_count(container: object | None, field: str, *, required: bool = False) -> int:
+    """Read a non-negative SDK token count without silently accepting bad data."""
+
+    if container is None:
+        if required:
+            raise ModelError(f"Model provider omitted required usage field: {field}")
+        return 0
+    value = getattr(container, field, None)
+    if value is None:
+        if required:
+            raise ModelError(f"Model provider omitted required usage field: {field}")
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ModelError(f"Model provider returned invalid usage field: {field}")
+    return int(value)
+
+
+def _model_output_strings(value: object) -> Iterator[str]:
+    """Yield every model-authored string from JSON-like structured output."""
+
+    if isinstance(value, str):
+        yield value
+        return
+    if isinstance(value, BaseModel):
+        yield from _model_output_strings(value.model_dump(mode="json"))
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _model_output_strings(key)
+            yield from _model_output_strings(item)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            yield from _model_output_strings(item)
+
+
+def _assert_secret_free_model_output(
+    api_key_env: str,
+    api_key: str,
+    *values: object,
+) -> None:
+    """Reject credential reflection without returning or logging the reflected value."""
+
+    for value in values:
+        for text in _model_output_strings(value):
+            if api_key in text or redact_model_input(text, secret_env_names=(api_key_env,)) != text:
+                raise ModelError("Model provider response contained credential material")
+
+
+def _safe_request_id(request_id: object, *, api_key_env: str, api_key: str) -> str | None:
+    """Return a provider request ID that is safe to put in an error message, else None."""
+
+    if not isinstance(request_id, str) or not _SAFE_REQUEST_ID.fullmatch(request_id):
+        return None
+    try:
+        _assert_secret_free_model_output(api_key_env, api_key, request_id)
+    except ModelError:
+        return None
+    return request_id
+
+
+def _response_identity(response: object) -> tuple[str, str]:
+    response_id = getattr(response, "id", None)
+    model = getattr(response, "model", None)
+    if not isinstance(response_id, str) or not response_id:
+        raise ModelError("Model provider returned no response identifier")
+    try:
+        resolved_model = validate_model_identifier(model)
+    except ValueError as exc:
+        raise ModelError("Model provider returned an invalid model identifier") from exc
+    return response_id, resolved_model
 
 
 def _effective_output_tokens(configured: int, requested: int | None) -> int:
