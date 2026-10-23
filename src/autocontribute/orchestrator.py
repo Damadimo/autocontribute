@@ -244,6 +244,7 @@ class Orchestrator:
             setup=models.setup.id,
             triage=models.triage.id,
         )
+        manifest.autocontribute_version = __version__
         self._assert_operational()
         self.store.transition(manifest, RunStatus.DISCOVERING, reason="starting candidate search")
         budget_config = self.config.budget
@@ -687,19 +688,20 @@ class Orchestrator:
         """Assemble the pull request text, seal the evidence and wait for approval."""
 
         eligibility, models = manifest.eligibility, manifest.models
-        assert eligibility is not None and models is not None
+        version = manifest.autocontribute_version
+        assert eligibility is not None and models is not None and version is not None
         patch = workspace.patch_bytes()
         if hashlib.sha256(patch).hexdigest() != fix.check.diff_sha256:
             raise StateError("The workspace changed after its fix was checked")
         submission = fix.submission
-        assistant = f"autocontribute {__version__}, {models.agent}"
+        assistant = f"autocontribute {version}, {models.agent}"
         try:
             text = assemble_pull_request(
                 submission,
                 issue_number=facts.issue.number,
                 check=check,
                 disclosure=fill_disclosure(
-                    self.config.policy.ai_disclosure, version=__version__, model=models.agent
+                    self.config.policy.ai_disclosure, version=version, model=models.agent
                 ),
                 commit_message=apply_legal_commit_message(
                     self.config,
@@ -719,7 +721,7 @@ class Orchestrator:
                 test_command=submission.test_command,
                 disclosure=text.disclosure,
             )
-            validate_publication_text(manifest, check_disclosure=True)
+            validate_publication_text(manifest, ai_disclosure=self.config.policy.ai_disclosure)
         except PolicyError as exc:
             return self._end(
                 manifest, RunStatus.REJECTED, f"the pull request text cannot be published: {exc}"

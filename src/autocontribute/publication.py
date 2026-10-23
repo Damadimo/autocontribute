@@ -74,6 +74,7 @@ from autocontribute.github_origin import canonical_api_origin, git_push_url
 from autocontribute.host_environment import proxy_environment
 from autocontribute.lifecycle import LifecycleObserver, parse_pull_request_url
 from autocontribute.pr_template import visible_markdown
+from autocontribute.pr_text import fill_disclosure
 from autocontribute.preparation import (
     validate_preparation_config_fingerprint,
     validate_preparation_fingerprint,
@@ -141,13 +142,14 @@ def has_visible_disclosure(body: str, disclosure: str) -> bool:
 def validate_publication_text(
     manifest: RunManifest,
     *,
-    check_disclosure: bool = False,
+    ai_disclosure: str | None = None,
 ) -> None:
     """Check the commit message and pull request text a run would publish.
 
-    ``check_disclosure`` also requires the body to show the run's filled AI disclosure outside
-    comments and code blocks; the configuration fingerprint shows it comes from the current
-    ``policy.ai_disclosure``.
+    ``ai_disclosure`` is the configured ``policy.ai_disclosure``. When given, the run's
+    disclosure must be exactly that text filled with the version and agent model the run
+    recorded, and the body must show it outside comments and code blocks. The preparation
+    state comes from a job that ran repository code, so its own disclosure proves nothing.
     """
 
     proposal = manifest.proposal
@@ -182,13 +184,21 @@ def validate_publication_text(
             )
     elif len(proposal.commit_message) > 200:
         raise PolicyError("commit message subject exceeds the 200-character limit")
-    if check_disclosure:
-        if not proposal.disclosure.strip():
-            raise PolicyError("The run's AI disclosure cannot be blank")
-        if not has_visible_disclosure(proposal.pull_request_body, proposal.disclosure):
-            raise PolicyError(
-                "Pull request body does not visibly contain the run's exact AI disclosure"
-            )
+    if ai_disclosure is None:
+        return
+    if manifest.autocontribute_version is None or manifest.models is None:
+        raise PolicyError("Run does not record the version and model its AI disclosure names")
+    expected = fill_disclosure(
+        ai_disclosure, version=manifest.autocontribute_version, model=manifest.models.agent
+    )
+    if proposal.disclosure != expected:
+        raise PolicyError(
+            "The run's AI disclosure is not policy.ai_disclosure filled with its version and model"
+        )
+    if not has_visible_disclosure(proposal.pull_request_body, expected):
+        raise PolicyError(
+            "Pull request body does not visibly contain the run's exact AI disclosure"
+        )
 
 
 def _validate_command_evidence(store: RunStore, manifest: RunManifest) -> None:
@@ -556,7 +566,7 @@ def _build_approval_review(
     _validate_current_config(config)
     if manifest.quality is None or not manifest.quality.ready:
         raise PolicyError("Run has not passed every quality gate")
-    validate_publication_text(manifest, check_disclosure=True)
+    validate_publication_text(manifest, ai_disclosure=config.policy.ai_disclosure)
     patch = _read_approval_artifact(
         store,
         run_id,
@@ -1492,7 +1502,9 @@ class Publisher:
         assert manifest.candidate is not None
         assert manifest.repository is not None
         assert manifest.base_sha is not None
-        validate_publication_text(manifest, check_disclosure=not recovering)
+        validate_publication_text(
+            manifest, ai_disclosure=None if recovering else self.config.policy.ai_disclosure
+        )
         try:
             patch_path = self.store.artifact_dir(run_id) / "contribution.patch"
             if not patch_path.is_file() or patch_path.is_symlink():

@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from test_evidence import MODELS, seal_evidence
+from test_evidence import MODELS, VERSION, seal_evidence
 from test_evidence import proposal as ready_proposal
 
 import autocontribute.publication as publication_module
@@ -58,6 +58,7 @@ from autocontribute.github import (
     RepositoryAccess,
     RepositoryIdentity,
 )
+from autocontribute.pr_text import fill_disclosure
 from autocontribute.preparation import (
     compute_preparation_config_fingerprint,
     compute_preparation_fingerprint,
@@ -1229,18 +1230,18 @@ def test_preparation_configuration_drift_stops_before_github_work(
 
 
 def test_ai_disclosure_hidden_in_html_comment_is_rejected(tmp_path: Path) -> None:
-    _config, store, run_id, _ = _ready_run(tmp_path)
+    config, store, run_id, _ = _ready_run(tmp_path)
     manifest = store.get(run_id)
     assert manifest.proposal is not None
     manifest.proposal.pull_request_body = f"Fixes #42.\n\n<!-- {manifest.proposal.disclosure} -->"
 
     with pytest.raises(PolicyError, match="visibly contain"):
-        validate_publication_text(manifest, check_disclosure=True)
+        validate_publication_text(manifest, ai_disclosure=config.policy.ai_disclosure)
 
 
 @pytest.mark.parametrize("fence", ["```", "~~~~"])
 def test_ai_disclosure_inside_fenced_code_is_rejected(tmp_path: Path, fence: str) -> None:
-    _config, store, run_id, _ = _ready_run(tmp_path)
+    config, store, run_id, _ = _ready_run(tmp_path)
     manifest = store.get(run_id)
     assert manifest.proposal is not None
     manifest.proposal.pull_request_body = (
@@ -1248,7 +1249,75 @@ def test_ai_disclosure_inside_fenced_code_is_rejected(tmp_path: Path, fence: str
     )
 
     with pytest.raises(PolicyError, match="visibly contain"):
-        validate_publication_text(manifest, check_disclosure=True)
+        validate_publication_text(manifest, ai_disclosure=config.policy.ai_disclosure)
+
+
+def _forge_disclosure(store: RunStore, run_id: str, disclosure: str) -> None:
+    """Rewrite the run's disclosure as a prepare job could in the state it exports.
+
+    The preparation fingerprint is an unkeyed hash, so the forger can recompute it.
+    """
+
+    manifest = store.get(run_id)
+    assert manifest.proposal is not None
+    manifest.proposal.disclosure = disclosure
+    manifest.proposal.pull_request_body = f"Fixes #42.\n\n{disclosure}"
+    patch = (store.artifact_dir(run_id) / "contribution.patch").read_bytes()
+    manifest.preparation_fingerprint = compute_preparation_fingerprint(manifest, diff=patch)
+    store.save(manifest, event="fixture.forged", details={})
+
+
+@pytest.mark.parametrize(
+    "disclosure",
+    [
+        "Written by hand.",
+        # The configured text naming another model than the one the run recorded.
+        fill_disclosure(
+            AutocontributeConfig().policy.ai_disclosure, version=VERSION, model="claude-opus-5-5"
+        ),
+    ],
+    ids=["hand-written", "another-model"],
+)
+def test_approval_review_requires_the_configured_disclosure(
+    tmp_path: Path, disclosure: str
+) -> None:
+    config, store, run_id, _ = _ready_run(tmp_path, approved=False)
+    _forge_disclosure(store, run_id, disclosure)
+
+    with pytest.raises(PolicyError, match=r"not policy\.ai_disclosure filled"):
+        build_approval_review(
+            config,
+            store,
+            run_id,
+            github=_AccountGitHub("octocat"),  # type: ignore[arg-type]
+        )
+
+
+def test_publication_requires_the_configured_disclosure(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    _forge_disclosure(store, run_id, "Written by hand.")
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+
+    with pytest.raises(PolicyError, match=r"not policy\.ai_disclosure filled"):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert github.calls == []
+    assert not github.mutated
+
+
+def test_approval_review_requires_the_recorded_version(tmp_path: Path) -> None:
+    config, store, run_id, _ = _ready_run(tmp_path, approved=False)
+    manifest = store.get(run_id)
+    manifest.autocontribute_version = None
+    store.save(manifest, event="fixture.unversioned", details={})
+
+    with pytest.raises(PolicyError, match="does not record the version"):
+        build_approval_review(
+            config,
+            store,
+            run_id,
+            github=_AccountGitHub("octocat"),  # type: ignore[arg-type]
+        )
 
 
 def test_publication_text_rejects_tokens_from_the_shared_credential_patterns(
