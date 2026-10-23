@@ -6,6 +6,7 @@ import hashlib
 import json
 
 import pytest
+from pydantic import ValidationError
 from test_task_messages import _check, _facts
 
 from autocontribute.config import AutocontributeConfig
@@ -31,6 +32,8 @@ from autocontribute.submissions import ReviewSubmission
 MODELS = RunModels(
     agent="gpt-5.6-sol", critic="gpt-5.6-sol", setup="gpt-5.6-terra", triage="gpt-5.6-luna"
 )
+# The autocontribute version the fixture runs record as the one that prepared them.
+VERSION = "0.1.0"
 ENVIRONMENT = RunEnvironment(
     recipe_source="detected",
     image_id="sha256:" + "e" * 64,
@@ -62,7 +65,7 @@ def validation_evidence() -> ValidationEvidence:
 
 
 def disclosure(config: AutocontributeConfig) -> str:
-    return fill_disclosure(config.policy.ai_disclosure, version="0.1.0", model=MODELS.agent)
+    return fill_disclosure(config.policy.ai_disclosure, version=VERSION, model=MODELS.agent)
 
 
 def proposal(config: AutocontributeConfig, **changes: object) -> PatchProposal:
@@ -96,6 +99,7 @@ def seal_evidence(store: RunStore, run: RunManifest) -> None:
     text = render_validation_evidence(validation_evidence())
     store.write_artifact(run.run_id, "validation.json", text)
     run.models = MODELS
+    run.autocontribute_version = VERSION
     run.environment = ENVIRONMENT
     run.quality = ready_quality()
     run.validation_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -115,3 +119,22 @@ def test_validation_evidence_reads_back_what_was_written() -> None:
 def test_validation_evidence_refuses_anything_else(artifact: bytes) -> None:
     with pytest.raises(PolicyError, match="not the evidence of a prepared run"):
         read_validation_evidence(artifact)
+
+
+@pytest.mark.parametrize("version", ["0.1.0) wrote this by hand (", "", "v1"])
+def test_manifest_records_only_a_version_number(version: str) -> None:
+    with pytest.raises(ValidationError):
+        RunManifest.model_validate(
+            {
+                "run_id": "0123456789abcdef",
+                "status": "discovering",
+                "created_at": "2026-10-22T12:00:00Z",
+                "updated_at": "2026-10-22T12:00:00Z",
+                "autocontribute_version": version,
+            }
+        )
+
+
+def test_run_models_come_from_the_model_table() -> None:
+    with pytest.raises(ValidationError, match="not a model in the built-in table"):
+        RunModels.model_validate({**MODELS.model_dump(), "agent": "a person"})

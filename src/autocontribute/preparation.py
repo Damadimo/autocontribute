@@ -43,6 +43,8 @@ def compute_preparation_fingerprint(
         raise PolicyError("Cannot fingerprint a preparation without a patch proposal")
     if manifest.models is None or manifest.environment is None:
         raise PolicyError("Cannot fingerprint a preparation without its models and environment")
+    if manifest.autocontribute_version is None:
+        raise PolicyError("Cannot fingerprint a preparation without the version that prepared it")
     if manifest.validation_sha256 is None:
         raise PolicyError("Cannot fingerprint a preparation without its validation evidence")
     if manifest.quality is None or not manifest.quality.ready:
@@ -58,6 +60,7 @@ def compute_preparation_fingerprint(
         "repository": manifest.repository.model_dump(mode="json"),
         "base_sha": manifest.base_sha,
         "models": manifest.models.model_dump(mode="json"),
+        "autocontribute_version": manifest.autocontribute_version,
         "environment": manifest.environment.model_dump(mode="json"),
         "proposal": manifest.proposal.model_dump(mode="json"),
         "validation_sha256": manifest.validation_sha256,

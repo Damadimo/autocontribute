@@ -11,6 +11,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from autocontribute.exceptions import StateError
+from autocontribute.pricing import MODELS
 
 
 def utc_now() -> datetime:
@@ -250,6 +251,14 @@ class RunModels(DomainModel):
     setup: str
     triage: str
 
+    @field_validator("agent", "critic", "setup", "triage")
+    @classmethod
+    def model_is_in_the_table(cls, value: str) -> str:
+        # The agent's id is part of the AI disclosure the approval binds.
+        if value not in MODELS:
+            raise ValueError(f"{value!r} is not a model in the built-in table")
+        return value
+
 
 class RunEnvironment(DomainModel):
     """The accepted test environment of a run; ``validation.json`` has its full recipe."""
@@ -273,6 +282,10 @@ class RunManifest(DomainModel):
     repository: RepositoryInfo | None = None
     base_sha: str | None = None
     models: RunModels | None = None
+    # The autocontribute version that prepared the run, which the AI disclosure names.
+    autocontribute_version: str | None = Field(
+        default=None, pattern=r"^[0-9][0-9A-Za-z.+!-]{0,63}$"
+    )
     environment: RunEnvironment | None = None
     proposal: PatchProposal | None = None
     quality: QualityReport | None = None

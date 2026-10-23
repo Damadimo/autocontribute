@@ -4,7 +4,7 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from test_evidence import ENVIRONMENT, MODELS, proposal, ready_quality
+from test_evidence import ENVIRONMENT, MODELS, VERSION, proposal, ready_quality
 
 from autocontribute.config import AutocontributeConfig
 from autocontribute.domain import (
@@ -65,6 +65,7 @@ def _ready_manifest(*, run_id: str = "a" * 32) -> RunManifest:
         ),
         base_sha="b" * 40,
         models=MODELS,
+        autocontribute_version=VERSION,
         environment=ENVIRONMENT,
         proposal=proposal(_config()),
         quality=ready_quality(),
