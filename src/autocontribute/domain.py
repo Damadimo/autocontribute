@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from autocontribute.exceptions import StateError
 
 
 def utc_now() -> datetime:
@@ -354,8 +357,13 @@ class RunManifest(DomainModel):
     # is deliberately not eligible for destructive recovery.
     upstream_repository_id: int | None = Field(default=None, gt=0)
     upstream_repository_node_id: str | None = Field(default=None, min_length=1, max_length=256)
+    # The fork_* identity names whichever repository holds the branch: the publishing
+    # account's fork, or the upstream itself in same-repository mode.
     fork_repository_id: int | None = Field(default=None, gt=0)
     fork_repository_node_id: str | None = Field(default=None, min_length=1, max_length=256)
+    # Bound by the reviewed approval. None only for runs approved before it existed, which
+    # always published from ``<publishing_login>/<name>``.
+    head_repository: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
     branch_name: str | None = None
     commit_sha: str | None = None
     pull_request_creation_started: bool = False
@@ -414,6 +422,30 @@ class RunManifest(DomainModel):
         return self
 
 
+@dataclass(frozen=True, slots=True)
+class PublicationHead:
+    """Where a run's pull-request branch lives and how GitHub's ``head`` filter names it."""
+
+    repository: str
+    label: str
+    same_repository: bool
+
+
+def publication_head(manifest: RunManifest) -> PublicationHead:
+    if manifest.candidate is None or manifest.branch_name is None:
+        raise StateError("Publication head needs the run's repository and branch")
+    repository = manifest.head_repository
+    if repository is None:
+        if manifest.publishing_login is None:
+            raise StateError("Publication head needs the run's publishing login")
+        repository = f"{manifest.publishing_login}/{manifest.candidate.repository.split('/', 1)[1]}"
+    return PublicationHead(
+        repository=repository,
+        label=f"{repository.split('/', 1)[0]}:{manifest.branch_name}",
+        same_repository=repository.casefold() == manifest.candidate.repository.casefold(),
+    )
+
+
 __all__ = [
     "ALLOWED_TRANSITIONS",
     "TERMINAL_STATUSES",
@@ -428,11 +460,13 @@ __all__ = [
     "IssueComment",
     "ModelBudgetReservation",
     "PatchProposal",
+    "PublicationHead",
     "PullRequestAttention",
     "PullRequestAttentionKind",
     "QualityReport",
     "RepositoryInfo",
     "RunManifest",
     "RunStatus",
+    "publication_head",
     "utc_now",
 ]

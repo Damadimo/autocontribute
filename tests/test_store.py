@@ -183,6 +183,7 @@ def _begin_publication(
     run: RunManifest,
     *,
     branch_name: str = "autocontribute/fix-exact-bug",
+    head_repository: str | None = "octocat/project",
     publication_draft: bool = True,
     max_per_utc_day: int = 100,
     repository_cooldown: timedelta = timedelta(0),
@@ -192,6 +193,7 @@ def _begin_publication(
         run,
         "example/project",
         branch_name=branch_name,
+        head_repository=head_repository,
         publication_draft=publication_draft,
         publishing_login="octocat",
         publishing_api_origin="https://api.github.com",
@@ -1502,6 +1504,7 @@ def test_begin_publication_atomically_persists_intent_reservation_and_status(
     ]
     intent = json.loads(store.events(run.run_id)[-1]["details"])
     assert intent["branch"] == run.branch_name
+    assert intent["head_repository"] == run.head_repository == "octocat/project"
     assert intent["draft"] == "true"
 
 
@@ -1603,6 +1606,8 @@ def test_begin_publication_matching_submitting_retry_is_exactly_idempotent(
         _begin_publication(store, retry, branch_name="autocontribute/different")
     with pytest.raises(StateError, match="differs from durable intent"):
         _begin_publication(store, retry, publication_draft=False)
+    with pytest.raises(StateError, match="differs from durable intent: head_repository"):
+        _begin_publication(store, retry, head_repository="example/project")
     assert store.events(run.run_id) == original_events
 
 
@@ -1633,13 +1638,19 @@ def test_begin_publication_recovers_complete_legacy_submitting_intent_but_reject
     store.save(legacy, event="test.legacy_publication_intent", details={})
     previous_updated_at = legacy.updated_at
 
-    _begin_publication(store, legacy)
+    _begin_publication(store, legacy, head_repository=None)
 
     assert legacy.updated_at == previous_updated_at
     event_types = [event["event_type"] for event in store.events(legacy.run_id)]
     assert event_types.count("publication.reserved") == 1
     assert event_types.count("publication.intent.begun") == 1
     assert event_types.count("run.transitioned") == 0
+    intent = next(
+        json.loads(event["details"])
+        for event in store.events(legacy.run_id)
+        if event["event_type"] == "publication.intent.begun"
+    )
+    assert "head_repository" not in intent
 
 
 def test_begin_publication_rejects_stale_or_capacity_blocked_manifest_atomically(

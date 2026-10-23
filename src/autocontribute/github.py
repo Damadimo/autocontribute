@@ -154,6 +154,19 @@ class RepositoryIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class RepositoryAccess:
+    """Ownership, this token's push permission, and who may open pull requests."""
+
+    identity: RepositoryIdentity
+    owner: str
+    fork_parent: RepositoryIdentity | None
+    # None when GitHub reported no permissions for this token, as for an unrelated app token.
+    can_push: bool | None
+    has_pull_requests: bool
+    pull_requests_from_collaborators_only: bool
+
+
+@dataclass(frozen=True, slots=True)
 class GitHubAccount:
     """A user account by its current login and immutable database ID."""
 
@@ -675,6 +688,48 @@ class GitHubClient:
             resource="repository identity",
         )
         return _parse_repository_identity(data, resource="repository identity")
+
+    def get_repository_access(self, full_name: str) -> RepositoryAccess | None:
+        """Read one repository's access facts, or None when it does not exist."""
+
+        data = self._request(
+            "GET",
+            f"/repos/{quote(full_name, safe='/')}",
+            allow_not_found=True,
+        )
+        if data is None:
+            return None
+        payload = _mapping(data, resource="repository access")
+        fork = payload.get("fork")
+        if not isinstance(fork, bool):
+            raise GitHubError("GitHub returned malformed repository fork state")
+        permissions = payload.get("permissions")
+        can_push: bool | None = None
+        if permissions is not None:
+            push = _mapping(permissions, resource="repository permissions").get("push")
+            if not isinstance(push, bool):
+                raise GitHubError("GitHub returned malformed repository push permission")
+            can_push = push
+        # Servers that predate these 2026 settings omit them; PRs are then open to everyone.
+        has_pull_requests = payload.get("has_pull_requests", True)
+        policy = payload.get("pull_request_creation_policy", "all")
+        if not isinstance(has_pull_requests, bool) or policy not in {"all", "collaborators_only"}:
+            raise GitHubError("GitHub returned an unsupported pull-request creation setting")
+        return RepositoryAccess(
+            identity=_parse_repository_identity(payload, resource="repository access"),
+            owner=_user_login(payload.get("owner"), resource="repository owner"),
+            fork_parent=(
+                _parse_repository_identity(
+                    _mapping(payload.get("parent"), resource="fork parent"),
+                    resource="fork parent",
+                )
+                if fork
+                else None
+            ),
+            can_push=can_push,
+            has_pull_requests=has_pull_requests,
+            pull_requests_from_collaborators_only=policy == "collaborators_only",
+        )
 
     def get_fork_identity(self, full_name: str) -> ForkIdentity:
         """Resolve a fork and its parent to immutable identities in one API observation."""
@@ -1594,25 +1649,36 @@ class GitHubClient:
     def ensure_fork(
         self,
         repository: str,
-        login: str,
+        fork: str,
         *,
+        upstream_repository_id: int,
         before_mutation: Callable[[], None] | None = None,
     ) -> str:
-        name = repository.split("/", 1)[1]
-        fork_name = f"{login}/{name}"
-        existing = self._request(
-            "GET", f"/repos/{quote(fork_name, safe='/')}", allow_not_found=True
+        """Reuse or create ``fork`` and return the name GitHub reports for it.
+
+        GitHub answers a fork request with the account's existing fork of the upstream even
+        when it has another name, so callers must compare the returned name.
+        """
+
+        existing = self.get_repository_access(fork)
+        if existing is not None:
+            if (
+                existing.fork_parent is None
+                or existing.fork_parent.database_id != upstream_repository_id
+            ):
+                raise GitHubError(f"{fork} already exists but is not a fork of {repository}")
+            return existing.identity.full_name
+        if before_mutation is not None:
+            before_mutation()
+        created = _mapping(
+            self._request(
+                "POST",
+                f"/repos/{quote(repository, safe='/')}/forks",
+                json_body={"name": fork.split("/", 1)[1], "default_branch_only": True},
+            ),
+            resource="created fork",
         )
-        if existing is None:
-            if before_mutation is not None:
-                before_mutation()
-            self._request("POST", f"/repos/{quote(repository, safe='/')}/forks", json_body={})
-        else:
-            existing_data = cast("dict[str, Any]", existing)
-            parent = existing_data.get("parent") or {}
-            if not existing_data.get("fork") or str(parent.get("full_name")) != repository:
-                raise GitHubError(f"{fork_name} already exists but is not a fork of {repository}")
-        return fork_name
+        return _canonical_repository_name(created.get("full_name"))
 
     def create_pull_request(
         self,
@@ -1688,7 +1754,13 @@ class GitHubClient:
                     "head": expected_head,
                     "base": expected_base,
                     "draft": draft,
-                    "maintainer_can_modify": True,
+                    # GitHub defines this only for heads in a fork; maintainers already
+                    # control a branch in their own repository.
+                    **(
+                        {"maintainer_can_modify": True}
+                        if expected_head_repo.casefold() != repository.casefold()
+                        else {}
+                    ),
                 },
             ),
             resource="created pull request",
@@ -2610,6 +2682,7 @@ __all__ = [
     "PullRequestDetails",
     "PullRequestReference",
     "PullRequestReview",
+    "RepositoryAccess",
     "RepositoryIdentity",
     "resolve_github_token",
 ]

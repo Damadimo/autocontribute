@@ -306,7 +306,7 @@ def publish(
         typer.Option("--yes", help="Perform the authorized GitHub write without another prompt."),
     ] = False,
 ) -> None:
-    """Create/reuse a fork, push one branch, and open one pull request."""
+    """Push one branch to the reviewed head repository and open one pull request."""
 
     settings = _config(config)
     store = RunStore(settings.storage.path)

@@ -47,6 +47,7 @@ from autocontribute.domain import (
     IssueCandidate,
     RunManifest,
     RunStatus,
+    publication_head,
 )
 from autocontribute.exceptions import (
     GitHubError,
@@ -72,6 +73,7 @@ from autocontribute.preparation import (
     validate_preparation_fingerprint,
     validate_validation_artifact,
 )
+from autocontribute.quality import workflow_paths
 from autocontribute.redaction import (
     contains_credential_material,
     contains_high_confidence_token,
@@ -84,6 +86,7 @@ _SAFE_SLUG = re.compile(r"[^a-z0-9-]+")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_FORK_READY_BACKOFF_SECONDS = (1, 2, 4, 8, 16, 32)
 # Each compensation reason is proven by exactly one marker event written before cleanup starts.
 _COMPENSATION_MARKERS = {
     "pre_pr_base_moved": "publication.base_moved_before_pull_request",
@@ -412,6 +415,50 @@ def _durable_publication_context(
     )
 
 
+def _review_head_repository(
+    config: AutocontributeConfig,
+    github: GitHubClient,
+    repository: str,
+    *,
+    login: str,
+    patch: bytes,
+) -> str:
+    """Choose where the branch lives: the upstream when the login can push, else its fork."""
+
+    access = github.get_repository_access(repository)
+    if access is None:
+        raise PolicyError(f"{repository} is not visible to the publishing account")
+    if not access.has_pull_requests:
+        raise PolicyError(f"{repository} has pull requests turned off")
+    owned = access.owner.casefold() == login
+    # With publishing.login set the review may be built with a token of another identity (the
+    # Actions prepare job), so only ownership decides the same way in every job.
+    can_push = owned or (not config.publishing.login and access.can_push is True)
+    if can_push and config.publishing.head_strategy == "auto":
+        _refuse_workflow_changes(patch)
+        return repository
+    if owned:
+        raise PolicyError(
+            f"publishing.head_strategy is fork, but {login} owns {repository} and cannot fork it"
+        )
+    if access.pull_requests_from_collaborators_only and not can_push:
+        raise PolicyError(f"{repository} accepts pull requests only from collaborators")
+    return f"{login}/{repository.split('/', 1)[1]}"
+
+
+def _refuse_workflow_changes(patch: bytes) -> None:
+    """A branch pushed to the upstream runs its push workflows with the upstream's secrets."""
+
+    try:
+        paths = workflow_paths(patch.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise PolicyError("Contribution patch is not valid UTF-8") from exc
+    if paths:
+        raise PolicyError(
+            "A same-repository branch cannot change CI configuration: " + ", ".join(paths)
+        )
+
+
 def _required_publication_draft(manifest: RunManifest) -> bool:
     if manifest.publication_draft is None:
         raise PolicyError("Run is missing its durable pull-request draft intent")
@@ -438,6 +485,7 @@ def build_approval_review(
         store,
         run_id,
         account=publishing_account(config, github),
+        github=github,
     )
 
 
@@ -447,6 +495,7 @@ def _build_approval_review(
     run_id: str,
     *,
     account: GitHubAccount,
+    github: GitHubClient,
 ) -> ApprovalReview:
     manifest = store.get(run_id)
     if manifest.status != RunStatus.READY_FOR_APPROVAL:
@@ -481,6 +530,13 @@ def _build_approval_review(
     _bind_publication_context(manifest, context, allow_new=True)
     if manifest.eligibility is None or manifest.proposal is None or manifest.candidate is None:
         raise PolicyError("Run is missing durable legal-publication evidence")
+    manifest.head_repository = _review_head_repository(
+        config,
+        github,
+        manifest.candidate.repository,
+        login=context.login,
+        patch=patch,
+    )
     validate_legal_publication(
         config,
         manifest.eligibility,
@@ -515,7 +571,7 @@ def approve_run(
 ) -> RunManifest:
     account = _token_account(config, github)
     actor = account.login
-    review = _build_approval_review(config, store, run_id, account=account)
+    review = _build_approval_review(config, store, run_id, account=account, github=github)
     if not hmac.compare_digest(reviewed_fingerprint, review.fingerprint):
         raise PolicyError(
             "Approval evidence changed after review; inspect the run again before approving"
@@ -717,7 +773,11 @@ class Publisher:
     ) -> RepositoryIdentity:
         """Bind the exact fork and immutable upstream parent before any branch mutation."""
 
-        if manifest.upstream_repository_id is None or manifest.upstream_repository_node_id is None:
+        if (
+            manifest.candidate is None
+            or manifest.upstream_repository_id is None
+            or manifest.upstream_repository_node_id is None
+        ):
             raise StateError("Fork identity lacks its durable upstream identity")
         if manifest.fork_repository_id is None or manifest.fork_repository_node_id is None:
             if not allow_new:
@@ -725,6 +785,28 @@ class Publisher:
                     "Existing publication evidence predates immutable fork identity; "
                     "autonomous recovery is forbidden"
                 )
+            if fork.casefold() == manifest.candidate.repository.casefold():
+                lease_guard.assert_owned()
+                upstream = self.github.assert_repository_identity(
+                    fork,
+                    expected_database_id=manifest.upstream_repository_id,
+                    expected_node_id=manifest.upstream_repository_node_id,
+                )
+                lease_guard.assert_owned()
+                manifest.fork_repository_id = upstream.database_id
+                manifest.fork_repository_node_id = upstream.node_id
+                self.store.save(
+                    manifest,
+                    event="publication.fork_identity.bound",
+                    details={
+                        "fork": fork,
+                        "fork_repository_id": str(upstream.database_id),
+                        "fork_repository_node_id": upstream.node_id,
+                        "upstream_repository_id": str(upstream.database_id),
+                        "upstream_repository_node_id": upstream.node_id,
+                    },
+                )
+                return upstream
             lease_guard.assert_owned()
             observed = self.github.get_fork_identity(fork)
             lease_guard.assert_owned()
@@ -812,20 +894,34 @@ class Publisher:
         assert manifest.upstream_repository_node_id is not None
         assert manifest.fork_repository_id is not None
         assert manifest.fork_repository_node_id is not None
-        lease_guard.assert_owned()
-        observed_fork = self.github.get_fork_identity(fork)
-        lease_guard.assert_owned()
-        if (
-            observed_fork.repository.full_name.casefold() != fork.casefold()
-            or observed_fork.repository.database_id != manifest.fork_repository_id
-            or observed_fork.repository.node_id != manifest.fork_repository_node_id
-            or observed_fork.parent.full_name.casefold() != manifest.candidate.repository.casefold()
-            or observed_fork.parent.database_id != manifest.upstream_repository_id
-            or observed_fork.parent.node_id != manifest.upstream_repository_node_id
-        ):
-            raise GitHubError(
-                "The publication fork no longer has its durable immutable upstream parent"
-            )
+        if fork.casefold() == manifest.candidate.repository.casefold():
+            lease_guard.assert_owned()
+            access = self.github.get_repository_access(fork)
+            lease_guard.assert_owned()
+            if (
+                access is None
+                or access.identity.database_id != manifest.upstream_repository_id
+                or access.can_push is not True
+            ):
+                raise GitHubError(
+                    "The publishing account can no longer push to the upstream repository"
+                )
+        else:
+            lease_guard.assert_owned()
+            observed_fork = self.github.get_fork_identity(fork)
+            lease_guard.assert_owned()
+            if (
+                observed_fork.repository.full_name.casefold() != fork.casefold()
+                or observed_fork.repository.database_id != manifest.fork_repository_id
+                or observed_fork.repository.node_id != manifest.fork_repository_node_id
+                or observed_fork.parent.full_name.casefold()
+                != manifest.candidate.repository.casefold()
+                or observed_fork.parent.database_id != manifest.upstream_repository_id
+                or observed_fork.parent.node_id != manifest.upstream_repository_node_id
+            ):
+                raise GitHubError(
+                    "The publication fork no longer has its durable immutable upstream parent"
+                )
         self._assert_constructive_mutation_authorized(
             manifest,
             lease_guard=lease_guard,
@@ -900,6 +996,90 @@ class Publisher:
             details=expected,
         )
 
+    def _check_head_repository(self, manifest: RunManifest, patch: bytes) -> None:
+        """Prove before the intent that the bound head can take the branch and open the PR."""
+
+        assert manifest.candidate is not None
+        repository = manifest.candidate.repository
+        head_repository = manifest.head_repository
+        if head_repository is None:
+            raise PolicyError(
+                "Run was approved before its head repository was bound; cancel it and prepare "
+                "the issue again"
+            )
+        upstream = self.github.get_repository_access(repository)
+        if upstream is None:
+            raise PolicyError(f"{repository} is not visible to the publishing account")
+        if not upstream.has_pull_requests:
+            raise PolicyError(f"{repository} has pull requests turned off")
+        if head_repository.casefold() == repository.casefold():
+            if upstream.can_push is not True:
+                raise PolicyError(f"The publishing account can no longer push to {repository}")
+            _refuse_workflow_changes(patch)
+            return
+        if upstream.pull_requests_from_collaborators_only and upstream.can_push is not True:
+            raise PolicyError(f"{repository} accepts pull requests only from collaborators")
+        fork = self.github.get_repository_access(head_repository)
+        if fork is not None and (
+            fork.fork_parent is None
+            or fork.fork_parent.database_id != upstream.identity.database_id
+        ):
+            raise PolicyError(
+                f"{head_repository} exists and is not a fork of {repository}; rename or delete "
+                "it, then publish again"
+            )
+
+    def _ensure_fork(
+        self,
+        manifest: RunManifest,
+        fork: str,
+        *,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> None:
+        """Reuse or create the bound fork; a fork under another name ends the run."""
+
+        assert manifest.candidate is not None and manifest.repository is not None
+        upstream_repository = manifest.candidate.repository
+        upstream_id = manifest.upstream_repository_id
+        upstream_node_id = manifest.upstream_repository_node_id
+        if upstream_id is None or upstream_node_id is None:
+            raise StateError("Fork creation lacks immutable upstream identity")
+
+        def authorize_fork_creation() -> None:
+            self._assert_constructive_mutation_authorized(
+                manifest,
+                lease_guard=lease_guard,
+            )
+            self.github.assert_repository_identity(
+                upstream_repository,
+                expected_database_id=upstream_id,
+                expected_node_id=upstream_node_id,
+            )
+            self._assert_constructive_mutation_authorized(
+                manifest,
+                lease_guard=lease_guard,
+            )
+
+        reported = self.github.ensure_fork(
+            upstream_repository,
+            fork,
+            upstream_repository_id=upstream_id,
+            before_mutation=authorize_fork_creation,
+        )
+        if reported.casefold() != fork.casefold():
+            self._finalize_absent_pre_post_publication(
+                manifest,
+                reason=f"GitHub reported the existing fork {reported} instead of {fork}",
+                lease_guard=lease_guard,
+            )
+            raise PolicyError(
+                f"Your fork of {upstream_repository} is named {reported}; rename it to {fork} "
+                "or delete it, then prepare the issue again"
+            )
+        self.store.assert_circuit_breaker_clear()
+        lease_guard.assert_owned()
+        self._wait_for_fork(fork, manifest.repository.default_branch)
+
     def publish(self, run_id: str) -> RunManifest:
         with LeaseHeartbeatGuard(
             self.store,
@@ -931,7 +1111,6 @@ class Publisher:
         recovering = manifest.status == RunStatus.SUBMITTING
         context: _PublicationContext | None = None
         branch: str | None = None
-        head: str | None = None
         recovered_remote_sha: str | None = None
         review_recovery_authority: _ExactHumanApproval | None = None
         if recovering:
@@ -951,13 +1130,14 @@ class Publisher:
             )
             review_recovery_authority = self._require_exact_review_recovery(manifest)
             branch = manifest.branch_name
-            head = f"{context.login}:{branch}"
+            head = publication_head(manifest)
             self.store.assert_circuit_breaker_clear()
             lease_guard.assert_owned()
             manifest = self.store.begin_publication(
                 manifest,
                 manifest.candidate.repository,
                 branch_name=branch,
+                head_repository=manifest.head_repository,
                 publishing_login=context.login,
                 publishing_api_origin=context.api_origin,
                 commit_author_name=context.author_name,
@@ -986,14 +1166,12 @@ class Publisher:
             if existing_pr is None and manifest.commit_sha:
                 existing_pr = self.github.find_pull_request(
                     manifest.candidate.repository,
-                    head=head,
+                    head=head.label,
                 )
             if existing_pr is not None:
                 return self._accept_existing_pull_request(
                     manifest,
                     existing_pr,
-                    login=context.login,
-                    head=head,
                     allow_remote_mutation=True,
                     allow_new_repository_identity=False,
                     review_recovery_authority=review_recovery_authority,
@@ -1001,10 +1179,9 @@ class Publisher:
                 )
             if manifest.pull_request_creation_started:
                 self._stop_ambiguous_pull_request_creation(manifest)
-            expected_fork = f"{context.login}/{manifest.candidate.repository.split('/', 1)[1]}"
             lease_guard.assert_owned()
             recovered_remote_sha = self.github.ref_sha(
-                expected_fork,
+                head.repository,
                 f"heads/{branch}",
             )
             lease_guard.assert_owned()
@@ -1024,8 +1201,6 @@ class Publisher:
                 if recovered_remote_sha is None and not workspace_path.is_dir():
                     return self._finalize_absent_pre_post_publication(
                         manifest,
-                        login=context.login,
-                        head=head,
                         reason=(
                             "verified absent remote publication state after the approved "
                             "workspace became unavailable"
@@ -1061,11 +1236,8 @@ class Publisher:
             _validate_command_evidence(self.store, manifest)
         except (OSError, PolicyError):
             if recovering and recovered_remote_sha is None:
-                assert context is not None and head is not None
                 return self._finalize_absent_pre_post_publication(
                     manifest,
-                    login=context.login,
-                    head=head,
                     reason=(
                         "verified absent remote publication state after durable local publication "
                         "evidence became unavailable"
@@ -1108,13 +1280,12 @@ class Publisher:
             )
             validate_approval(manifest.approval, approval_manifest)
         branch = manifest.branch_name or self._branch_name(manifest)
-        head = f"{login}:{branch}"
 
         if not recovering:
+            self._check_head_repository(manifest, patch)
             self._check_account_limits(login, manifest)
             self._check_freshness(manifest)
         workspace_path = self.store.workspace_dir(run_id) / "repository"
-        expected_fork = f"{context.login}/{manifest.candidate.repository.split('/', 1)[1]}"
 
         self.store.assert_circuit_breaker_clear()
         lease_guard.assert_owned()
@@ -1123,6 +1294,7 @@ class Publisher:
                 manifest,
                 manifest.candidate.repository,
                 branch_name=branch,
+                head_repository=manifest.head_repository,
                 publishing_login=context.login,
                 publishing_api_origin=context.api_origin,
                 commit_author_name=context.author_name,
@@ -1139,6 +1311,7 @@ class Publisher:
         assert manifest.base_sha is not None
         if manifest.status != RunStatus.SUBMITTING or manifest.branch_name != branch:
             raise StateError("Publication intent was not durably established")
+        head = publication_head(manifest)
 
         self._bind_or_validate_upstream_identity(
             manifest,
@@ -1148,14 +1321,12 @@ class Publisher:
 
         existing_pr = self.github.find_pull_request(
             manifest.candidate.repository,
-            head=head,
+            head=head.label,
         )
         if existing_pr:
             return self._accept_existing_pull_request(
                 manifest,
                 existing_pr,
-                login=login,
-                head=head,
                 allow_remote_mutation=True,
                 allow_new_repository_identity=not recovering,
                 review_recovery_authority=review_recovery_authority,
@@ -1169,14 +1340,12 @@ class Publisher:
             )
             if recovered_remote_sha is None:
                 recovered_remote_sha = self.github.ref_sha(
-                    expected_fork,
+                    head.repository,
                     f"heads/{branch}",
                 )
             if recovered_remote_sha is None:
                 return self._finalize_absent_pre_post_publication(
                     manifest,
-                    login=context.login,
-                    head=head,
                     reason=(
                         "verified absent remote publication state after the approved workspace "
                         "became unavailable"
@@ -1191,38 +1360,9 @@ class Publisher:
         else:
             workspace = self._prepare_workspace(manifest, workspace_path, patch)
 
-        upstream_repository = manifest.candidate.repository
-
-        def authorize_fork_creation() -> None:
-            self._assert_constructive_mutation_authorized(
-                manifest,
-                lease_guard=lease_guard,
-            )
-            if (
-                manifest.upstream_repository_id is None
-                or manifest.upstream_repository_node_id is None
-            ):
-                raise StateError("Fork creation lacks immutable upstream identity")
-            self.github.assert_repository_identity(
-                upstream_repository,
-                expected_database_id=manifest.upstream_repository_id,
-                expected_node_id=manifest.upstream_repository_node_id,
-            )
-            self._assert_constructive_mutation_authorized(
-                manifest,
-                lease_guard=lease_guard,
-            )
-
-        fork = self.github.ensure_fork(
-            upstream_repository,
-            login,
-            before_mutation=authorize_fork_creation,
-        )
-        if fork.casefold() != expected_fork.casefold():
-            raise PolicyError("GitHub returned a fork outside the durable publishing account")
-        self.store.assert_circuit_breaker_clear()
-        lease_guard.assert_owned()
-        self._wait_for_fork(fork, manifest.repository.default_branch)
+        fork = head.repository
+        if not head.same_repository:
+            self._ensure_fork(manifest, fork, lease_guard=lease_guard)
         self.store.assert_circuit_breaker_clear()
         self._bind_or_validate_fork_identity(
             manifest,
@@ -1252,8 +1392,6 @@ class Publisher:
             if not workspace_path.is_dir() or workspace_path.is_symlink():
                 return self._finalize_absent_pre_post_publication(
                     manifest,
-                    login=login,
-                    head=head,
                     reason=(
                         "verified absent remote publication state before the required branch "
                         "push, with no safe approved workspace remaining"
@@ -1266,8 +1404,6 @@ class Publisher:
                 except PolicyError as exc:
                     self._finalize_absent_pre_post_publication(
                         manifest,
-                        login=login,
-                        head=head,
                         reason=(
                             "verified absent remote publication state after upstream freshness "
                             "invalidated safe branch resumption"
@@ -1388,7 +1524,7 @@ class Publisher:
         approved_base_sha = manifest.base_sha
         creation_details = {
             "repository": repository_name,
-            "head": head,
+            "head": head.label,
             "head_sha": commit_sha,
             "base": base_branch,
             "base_sha": approved_base_sha,
@@ -1473,7 +1609,7 @@ class Publisher:
                 repository_name,
                 title=proposal.pull_request_title,
                 body=proposal.pull_request_body,
-                head=head,
+                head=head.label,
                 expected_head_sha=commit_sha,
                 expected_head_repository=fork,
                 base=base_branch,
@@ -1520,7 +1656,7 @@ class Publisher:
                 try:
                     reconciled_pr = self.github.find_pull_request(
                         repository_name,
-                        head=head,
+                        head=head.label,
                     )
                     reconciled = True
                 except GitHubSafetyError:
@@ -1531,8 +1667,6 @@ class Publisher:
                     return self._accept_existing_pull_request(
                         manifest,
                         reconciled_pr,
-                        login=login,
-                        head=head,
                         allow_remote_mutation=True,
                         allow_new_repository_identity=False,
                         lease_guard=lease_guard,
@@ -1568,7 +1702,7 @@ class Publisher:
         mismatches = self._created_pull_request_mismatches(
             created_pull_request,
             manifest=manifest,
-            head=head,
+            head=head.label,
             fork=fork,
             commit_sha=commit_sha,
         )
@@ -1631,7 +1765,7 @@ class Publisher:
         created_pull_request = self._ensure_pull_request_ready_for_review(
             manifest,
             created_pull_request,
-            head=head,
+            head=head.label,
             fork=fork,
             allow_remote_mutation=True,
             lease_guard=lease_guard,
@@ -2194,6 +2328,14 @@ class Publisher:
     ) -> None:
         if manifest.fork_repository_id is None or manifest.fork_repository_node_id is None:
             raise StateError("Branch compensation lacks immutable fork identity")
+        assert manifest.candidate is not None and manifest.repository is not None
+        # In same-repository mode the delete runs in the upstream itself.
+        if (
+            branch != manifest.branch_name
+            or branch == manifest.repository.default_branch
+            or not branch.endswith(f"/issue-{manifest.candidate.number}-{manifest.run_id[:8]}")
+        ):
+            raise StateError("Refusing to delete a branch this run did not create")
         try:
             self._assert_compensation_remote_identities(
                 manifest,
@@ -2339,8 +2481,6 @@ class Publisher:
         self,
         manifest: RunManifest,
         *,
-        login: str,
-        head: str,
         reason: str,
         lease_guard: LeaseHeartbeatGuard,
     ) -> RunManifest:
@@ -2366,7 +2506,8 @@ class Publisher:
             raise PublicationResumeRequired(
                 "A durable pull-request URL exists, so branch-only absence cannot be finalized"
             )
-        expected_fork = f"{login}/{manifest.candidate.repository.split('/', 1)[1]}"
+        head = publication_head(manifest)
+        expected_fork = head.repository
         commit_evidence = manifest.commit_sha or "not_persisted"
         fork_identity_bound = manifest.fork_repository_id is not None
         if not fork_identity_bound and manifest.commit_sha is not None:
@@ -2386,7 +2527,7 @@ class Publisher:
             "publishing_api_origin": manifest.publishing_api_origin,
             "upstream_repository_id": str(manifest.upstream_repository_id),
             "upstream_repository_node_id": manifest.upstream_repository_node_id,
-            "head": head,
+            "head": head.label,
             "fork": expected_fork,
             "fork_identity_state": "bound" if fork_identity_bound else "not_bound",
             "branch": manifest.branch_name,
@@ -2409,7 +2550,7 @@ class Publisher:
         lease_guard.assert_owned()
         existing_pr = self.github.find_pull_request(
             manifest.candidate.repository,
-            head=head,
+            head=head.label,
         )
         lease_guard.assert_owned()
         if existing_pr is not None:
@@ -2430,7 +2571,7 @@ class Publisher:
         lease_guard.assert_owned()
         confirmed_absent_pr = self.github.find_pull_request(
             manifest.candidate.repository,
-            head=head,
+            head=head.label,
         )
         lease_guard.assert_owned()
         if confirmed_absent_pr is not None:
@@ -2674,15 +2815,15 @@ class Publisher:
         ):
             raise StateError("Started publication compensation lacks durable evidence")
         candidate_repository = manifest.candidate.repository
-        context = _durable_publication_context(
+        _durable_publication_context(
             self.config,
             manifest,
             login=self.github.authenticated_login(),
             api_origin=self.github.api_origin,
         )
-        login = context.login
-        head = f"{login}:{manifest.branch_name}"
-        expected_fork = f"{login}/{manifest.candidate.repository.split('/', 1)[1]}"
+        publication = publication_head(manifest)
+        head = publication.label
+        expected_fork = publication.repository
         self._assert_durable_compensation_marker(
             manifest,
             expected_fork=expected_fork,
@@ -2779,8 +2920,6 @@ class Publisher:
                 )
             return self._finalize_absent_pre_post_publication(
                 manifest,
-                login=login,
-                head=head,
                 reason=f"verified recovery of {reason.replace('_', '-')} compensation",
                 lease_guard=lease_guard,
             )
@@ -2997,13 +3136,13 @@ class Publisher:
             login=self.github.authenticated_login(),
             api_origin=self.github.api_origin,
         )
-        login = context.login
         self._require_exact_review_recovery(manifest)
         lease_guard.assert_owned()
         manifest = self.store.begin_publication(
             manifest,
             manifest.candidate.repository,
             branch_name=manifest.branch_name,
+            head_repository=manifest.head_repository,
             publishing_login=context.login,
             publishing_api_origin=context.api_origin,
             commit_author_name=context.author_name,
@@ -3023,12 +3162,11 @@ class Publisher:
             raise PublicationResumeRequired(
                 f"Submitting run {run_id} has no stored commit or pull request yet"
             )
-        head = f"{login}:{manifest.branch_name}"
         existing_pr = manifest.pull_request_url
         if existing_pr is None:
             existing_pr = self.github.find_pull_request(
                 manifest.candidate.repository,
-                head=head,
+                head=publication_head(manifest).label,
             )
         if not existing_pr:
             if manifest.pull_request_creation_started:
@@ -3040,8 +3178,6 @@ class Publisher:
         return self._accept_existing_pull_request(
             manifest,
             existing_pr,
-            login=login,
-            head=head,
             allow_remote_mutation=False,
             allow_new_repository_identity=False,
             lease_guard=lease_guard,
@@ -3091,8 +3227,6 @@ class Publisher:
         manifest: RunManifest,
         pull_request_url: str,
         *,
-        login: str,
-        head: str,
         allow_remote_mutation: bool,
         allow_new_repository_identity: bool,
         lease_guard: LeaseHeartbeatGuard,
@@ -3130,7 +3264,9 @@ class Publisher:
             allow_new=False,
             lease_guard=lease_guard,
         )
-        expected_fork = f"{login}/{manifest.candidate.repository.split('/', 1)[1]}"
+        publication = publication_head(manifest)
+        head = publication.label
+        expected_fork = publication.repository
         self._bind_or_validate_fork_identity(
             manifest,
             fork=expected_fork,
@@ -3982,11 +4118,15 @@ class Publisher:
             )
 
     def _wait_for_fork(self, fork: str, default_branch: str) -> None:
-        for _ in range(10):
+        # GitHub creates forks asynchronously; large repositories take tens of seconds.
+        for delay in (0, *_FORK_READY_BACKOFF_SECONDS):
+            time.sleep(delay)
             if self.github.ref_sha(fork, f"heads/{default_branch}"):
                 return
-            time.sleep(1)
-        raise GitHubError("Fork was not ready after 10 seconds; rerun publish to reconcile")
+        raise GitHubError(
+            f"Fork was not ready after {sum(_FORK_READY_BACKOFF_SECONDS)} seconds; rerun publish "
+            "to reconcile"
+        )
 
     def _branch_name(self, manifest: RunManifest) -> str:
         assert manifest.candidate

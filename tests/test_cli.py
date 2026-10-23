@@ -36,7 +36,12 @@ from autocontribute.exceptions import (
     StateError,
     StopScope,
 )
-from autocontribute.github import DirectoryEntry, GitHubAccount
+from autocontribute.github import (
+    DirectoryEntry,
+    GitHubAccount,
+    RepositoryAccess,
+    RepositoryIdentity,
+)
 from autocontribute.lifecycle import LifecycleSyncResult
 from autocontribute.orchestrator import RunInvocationMode
 from autocontribute.preparation import (
@@ -75,6 +80,16 @@ class _ReviewGitHub:
 
     def get_user(self, login: str) -> GitHubAccount:
         return GitHubAccount(login=login, database_id=583231)
+
+    def get_repository_access(self, full_name: str) -> RepositoryAccess:
+        return RepositoryAccess(
+            identity=RepositoryIdentity(full_name=full_name, database_id=1001, node_id="R_1001"),
+            owner=full_name.split("/", 1)[0],
+            fork_parent=None,
+            can_push=False,
+            has_pull_requests=True,
+            pull_requests_from_collaborators_only=False,
+        )
 
 
 class _PolicyGitHub(_ReviewGitHub):
@@ -309,6 +324,7 @@ def test_approval_review_ignores_tampered_report_and_approves_displayed_fingerpr
         "COMMIT_MESSAGE_EXACT_MARKER",
         "Review Author Exact Marker",
         "review-author@example.invalid",
+        "Head repository: octocat/project (fork)",
         durable.approval.manifest_hash,
     ]
     for result in (shown, approved):

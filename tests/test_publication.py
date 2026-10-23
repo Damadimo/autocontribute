@@ -55,6 +55,7 @@ from autocontribute.github import (
     PullRequestDetails,
     PullRequestReference,
     PullRequestReview,
+    RepositoryAccess,
     RepositoryIdentity,
 )
 from autocontribute.preparation import (
@@ -144,16 +145,38 @@ _ACCOUNT_ID = 583231
 
 
 class _AccountGitHub:
-    """Account reads only: what building a review needs without the publishing token."""
+    """Public reads only: what building a review needs without the publishing token."""
 
-    def __init__(self, login: str = "octocat") -> None:
+    def __init__(
+        self,
+        login: str = "octocat",
+        *,
+        owner: str = "example",
+        can_push: bool | None = None,
+    ) -> None:
         self.login = login
+        self.owner = owner
+        self.can_push = can_push
 
     def authenticated_user(self) -> GitHubAccount:
         return GitHubAccount(login=self.login, database_id=_ACCOUNT_ID)
 
     def get_user(self, login: str) -> GitHubAccount:
         return GitHubAccount(login=login, database_id=_ACCOUNT_ID)
+
+    def get_repository_access(self, full_name: str) -> RepositoryAccess:
+        return RepositoryAccess(
+            identity=RepositoryIdentity(
+                full_name=full_name,
+                database_id=1001,
+                node_id="R_upstream_fixture",
+            ),
+            owner=self.owner,
+            fork_parent=None,
+            can_push=self.can_push,
+            has_pull_requests=True,
+            pull_requests_from_collaborators_only=False,
+        )
 
 
 def _ready_run(
@@ -410,6 +433,7 @@ def _begin_review_publication(
         manifest,
         manifest.candidate.repository,
         branch_name=manifest.branch_name or f"autocontribute/issue-42-{manifest.run_id[:8]}",
+        head_repository=manifest.head_repository,
         publishing_login=manifest.publishing_login,
         publishing_api_origin=manifest.publishing_api_origin,
         commit_author_name=manifest.commit_author_name,
@@ -472,6 +496,10 @@ class FakePublishingGitHub:
         self.upstream_repository_node_id = "R_upstream_fixture"
         self.fork_repository_id = 2001
         self.fork_repository_node_id = "R_fork_fixture"
+        self.upstream_owner = "example"
+        self.upstream_push = False
+        self.upstream_has_pull_requests = True
+        self.upstream_collaborators_only = False
 
     def authenticated_login(self) -> str:
         self.calls.append("authenticated_login")
@@ -632,6 +660,35 @@ class FakePublishingGitHub:
             node_id=self.fork_repository_node_id,
         )
 
+    def get_repository_access(self, full_name: str) -> RepositoryAccess | None:
+        self.calls.append("get_repository_access")
+        upstream = RepositoryIdentity(
+            full_name="example/project",
+            database_id=self.upstream_repository_id,
+            node_id=self.upstream_repository_node_id,
+        )
+        if full_name.casefold() == "example/project":
+            return RepositoryAccess(
+                identity=upstream,
+                owner=self.upstream_owner,
+                fork_parent=None,
+                can_push=self.upstream_push,
+                has_pull_requests=self.upstream_has_pull_requests,
+                pull_requests_from_collaborators_only=self.upstream_collaborators_only,
+            )
+        return RepositoryAccess(
+            identity=RepositoryIdentity(
+                full_name=full_name,
+                database_id=self.fork_repository_id,
+                node_id=self.fork_repository_node_id,
+            ),
+            owner=self.login,
+            fork_parent=upstream,
+            can_push=True,
+            has_pull_requests=True,
+            pull_requests_from_collaborators_only=False,
+        )
+
     def get_fork_identity(self, full_name: str) -> ForkIdentity:
         self.calls.append("get_fork_identity")
         return ForkIdentity(
@@ -701,15 +758,17 @@ class FakePublishingGitHub:
     def ensure_fork(
         self,
         repository: str,
-        login: str,
+        fork: str,
         *,
+        upstream_repository_id: int,
         before_mutation=None,  # type: ignore[no-untyped-def]
     ) -> str:
+        assert upstream_repository_id == self.upstream_repository_id
         if before_mutation is not None:
             before_mutation()
         self.calls.append("ensure_fork")
         self.mutated = True
-        return f"{login}/project"
+        return fork
 
     def ref_sha(self, repository: str, ref: str) -> str | None:
         self.calls.append("ref_sha")
@@ -2369,13 +2428,15 @@ def test_breaker_trip_after_fork_blocks_branch_push(
 
     def ensure_fork_then_stop(
         repository: str,
-        login: str,
+        fork: str,
         *,
+        upstream_repository_id: int,
         before_mutation=None,  # type: ignore[no-untyped-def]
     ) -> str:
         fork = original_ensure_fork(
             repository,
-            login,
+            fork,
+            upstream_repository_id=upstream_repository_id,
             before_mutation=before_mutation,
         )
         store.trip_circuit_breaker(
@@ -2561,13 +2622,15 @@ def test_workspace_change_after_preflight_cannot_be_committed_or_pushed(
 
     def mutate_after_preflight(
         repository: str,
-        login: str,
+        fork: str,
         *,
+        upstream_repository_id: int,
         before_mutation=None,  # type: ignore[no-untyped-def]
     ) -> str:
         fork = original_ensure_fork(
             repository,
-            login,
+            fork,
+            upstream_repository_id=upstream_repository_id,
             before_mutation=before_mutation,
         )
         workspace = store.workspace_dir(run_id) / "repository"
@@ -4693,8 +4756,6 @@ def test_absent_pre_post_state_rejects_partial_fork_identity(
     with pytest.raises(StateError, match="partial immutable fork identity"):
         publisher._finalize_absent_pre_post_publication(
             manifest,
-            login="octocat",
-            head=f"octocat:{manifest.branch_name}",
             reason="fixture partial fork identity",
             lease_guard=UnexpectedLeaseUse(),  # type: ignore[arg-type]
         )
@@ -5636,3 +5697,349 @@ def test_created_pr_compensation_rechecks_pr_after_branch_absence(
     assert all(
         event["event_type"] != "publication.compensation.verified" for event in store.events(run_id)
     )
+
+
+def _same_repository_publisher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    login: str,
+) -> tuple[RunStore, str, FakePublishingGitHub, Publisher, list[tuple[str, str, str]]]:
+    """Approve a run whose head is example/project itself, then fake the push."""
+
+    config, store, run_id, issue = _ready_run(tmp_path, approved=False)
+    review_github = _AccountGitHub(login, can_push=True)
+    review = build_approval_review(config, store, run_id, github=review_github)  # type: ignore[arg-type]
+    assert review.manifest.head_repository == "example/project"
+    approve_run(
+        config,
+        store,
+        run_id,
+        github=review_github,  # type: ignore[arg-type]
+        attestation="I reviewed the exact contribution.",
+        reviewed_fingerprint=review.fingerprint,
+    )
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "", login=login)
+    github.upstream_push = True
+    github.pull_request_head_repository = "example/project"
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    pushes: list[tuple[str, str, str]] = []
+
+    def push(
+        workspace: Path,
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        del workspace
+        before_mutation()
+        pushes.append((fork, branch, commit_sha))
+        github.branch_sha = commit_sha
+
+    monkeypatch.setattr(publisher, "_push", push)
+    monkeypatch.setattr(
+        publisher,
+        "_wait_for_fork",
+        lambda *args: pytest.fail("same-repository publication must not wait for a fork"),
+    )
+    return store, run_id, github, publisher, pushes
+
+
+@pytest.mark.parametrize("login", ["example", "octocat"], ids=["owner", "collaborator"])
+def test_same_repository_publication_pushes_to_the_upstream_without_a_fork(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    login: str,
+) -> None:
+    store, run_id, github, publisher, pushes = _same_repository_publisher(
+        tmp_path, monkeypatch, login=login
+    )
+    created: list[dict[str, object]] = []
+    original_create = github.create_pull_request
+
+    def record_create(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
+        created.append(dict(kwargs))
+        return original_create(*args, **kwargs)
+
+    monkeypatch.setattr(github, "create_pull_request", record_create)
+
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert published.head_repository == "example/project"
+    assert pushes == [("example/project", published.branch_name, published.commit_sha)]
+    assert "ensure_fork" not in github.calls
+    assert "get_fork_identity" not in github.calls
+    assert created[0]["head"] == f"example:{published.branch_name}"
+    assert created[0]["expected_head_repository"] == "example/project"
+    assert published.fork_repository_id == published.upstream_repository_id
+    assert published.fork_repository_node_id == published.upstream_repository_node_id
+    intent = next(
+        json.loads(event["details"])
+        for event in store.events(run_id)
+        if event["event_type"] == "publication.intent.begun"
+    )
+    assert intent["head_repository"] == "example/project"
+
+
+def test_same_repository_publication_resumes_after_a_crash_after_its_push(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, run_id, github, publisher, pushes = _same_repository_publisher(
+        tmp_path, monkeypatch, login="example"
+    )
+    original_base = github.default_branch_sha
+
+    def crash_after_push(repository: str, branch: str) -> str:
+        if pushes and "create_pull_request" not in github.calls:
+            raise RuntimeError("simulated crash after the branch push")
+        return original_base(repository, branch)
+
+    monkeypatch.setattr(github, "default_branch_sha", crash_after_push)
+    with pytest.raises(RuntimeError, match="after the branch push"):
+        publisher.publish(run_id)
+    monkeypatch.setattr(github, "default_branch_sha", original_base)
+    stranded = store.get(run_id)
+    assert stranded.status == RunStatus.SUBMITTING
+    assert stranded.pull_request_url is None
+
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert len(pushes) == 1
+    assert github.calls.count("create_pull_request") == 1
+    assert "ensure_fork" not in github.calls
+
+
+def test_same_repository_compensation_deletes_only_the_exact_upstream_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, run_id, github, publisher, _pushes = _same_repository_publisher(
+        tmp_path, monkeypatch, login="example"
+    )
+    approved_base = github.sha
+    observed_bases = iter([approved_base, approved_base, "e" * 40])
+    deleted: list[tuple[str, str, str]] = []
+
+    def delete(
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        expected_repository_id: int,
+        expected_repository_node_id: str,
+        lease_guard: LeaseHeartbeatGuard,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        assert expected_repository_id == github.upstream_repository_id
+        assert expected_repository_node_id == github.upstream_repository_node_id
+        lease_guard.assert_owned()
+        before_mutation()
+        deleted.append((fork, branch, commit_sha))
+        github.branch_sha = None
+
+    monkeypatch.setattr(
+        github, "default_branch_sha", lambda repository, branch: next(observed_bases)
+    )
+    monkeypatch.setattr(publisher, "_delete_remote_branch", delete)
+
+    with pytest.raises(PolicyError, match="moved after the contribution branch was pushed"):
+        publisher.publish(run_id)
+
+    failed = store.get(run_id)
+    assert failed.status == RunStatus.FAILED
+    assert deleted == [("example/project", failed.branch_name, failed.commit_sha)]
+    assert "create_pull_request" not in github.calls
+
+
+def test_branch_compensation_refuses_a_branch_the_run_did_not_create(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = _begin_review_publication(config, store, store.get(run_id))
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+
+    for branch in ("main", f"autocontribute/issue-43-{run_id[:8]}"):
+        with pytest.raises(StateError, match="did not create"):
+            publisher._compensate_branch_only(
+                manifest,
+                fork="example/project",
+                branch=branch,
+                commit_sha="c" * 40,
+                lease_guard=None,  # type: ignore[arg-type]
+                before_mutation=lambda: pytest.fail("no deletion may start"),
+            )
+
+    assert not github.mutated
+
+
+def test_review_with_publishing_login_decides_same_repository_only_by_ownership(
+    tmp_path: Path,
+) -> None:
+    config, store, run_id, _issue = _unapproved_run_with_login(tmp_path, "octocat")
+
+    collaborator = build_approval_review(
+        config,
+        store,
+        run_id,
+        github=_TokenlessGitHub("octocat", can_push=True),  # type: ignore[arg-type]
+    )
+
+    assert collaborator.manifest.head_repository == "octocat/project"
+    assert collaborator.manifest.schema_version == 5
+
+
+def test_fork_head_strategy_never_pushes_to_the_upstream(tmp_path: Path) -> None:
+    config, store, run_id, _issue = _ready_run(tmp_path, approved=False)
+    config.publishing.head_strategy = "fork"
+
+    with pytest.raises(PolicyError, match="example owns example/project and cannot fork it"):
+        publication_module._review_head_repository(
+            config,
+            _AccountGitHub("example", can_push=True),  # type: ignore[arg-type]
+            "example/project",
+            login="example",
+            patch=b"",
+        )
+    assert (
+        publication_module._review_head_repository(
+            config,
+            _AccountGitHub("octocat", can_push=True),  # type: ignore[arg-type]
+            "example/project",
+            login="octocat",
+            patch=b"",
+        )
+        == "octocat/project"
+    )
+    assert store.get(run_id).head_repository is None
+
+
+def test_same_repository_review_refuses_ci_configuration_changes() -> None:
+    patch = (
+        b"diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        b"--- a/.github/workflows/ci.yml\n"
+        b"+++ b/.github/workflows/ci.yml\n"
+        b"@@ -1 +1 @@\n"
+        b"-name: ci\n"
+        b"+name: changed\n"
+    )
+    config = AutocontributeConfig()
+
+    with pytest.raises(PolicyError, match=r"cannot change CI configuration: \.github/workflows"):
+        publication_module._review_head_repository(
+            config,
+            _AccountGitHub("example"),  # type: ignore[arg-type]
+            "example/project",
+            login="example",
+            patch=patch,
+        )
+    assert (
+        publication_module._review_head_repository(
+            config,
+            _AccountGitHub("octocat"),  # type: ignore[arg-type]
+            "example/project",
+            login="octocat",
+            patch=patch,
+        )
+        == "octocat/project"
+    )
+
+
+@pytest.mark.parametrize("blocker", ["pull_requests_off", "collaborators_only", "unrelated_fork"])
+def test_head_repository_checks_fail_before_the_publication_intent(
+    tmp_path: Path,
+    blocker: str,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    if blocker == "pull_requests_off":
+        github.upstream_has_pull_requests = False
+        expected = "has pull requests turned off"
+    elif blocker == "collaborators_only":
+        github.upstream_collaborators_only = True
+        expected = "accepts pull requests only from collaborators"
+    else:
+        original_access = github.get_repository_access
+
+        def unrelated_fork(full_name: str) -> RepositoryAccess | None:
+            access = original_access(full_name)
+            if full_name == "octocat/project":
+                assert access is not None
+                return replace(access, fork_parent=None)
+            return access
+
+        github.get_repository_access = unrelated_fork  # type: ignore[method-assign]
+        expected = "octocat/project exists and is not a fork of example/project"
+
+    with pytest.raises(PolicyError, match=expected):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert store.get(run_id).status == RunStatus.APPROVED
+    assert not github.mutated
+    assert "publication.intent.begun" not in {event["event_type"] for event in store.events(run_id)}
+
+
+def test_existing_fork_under_another_name_fails_the_run_without_remote_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+
+    def renamed_fork(repository: str, fork: str, **kwargs: object) -> str:
+        github.calls.append("ensure_fork")
+        return "octocat/project-renamed"
+
+    monkeypatch.setattr(github, "ensure_fork", renamed_fork)
+    monkeypatch.setattr(github, "ref_sha", lambda repository, ref: None)
+
+    with pytest.raises(PolicyError, match="named octocat/project-renamed; rename it"):
+        publisher.publish(run_id)
+
+    assert store.get(run_id).status == RunStatus.FAILED
+    assert "create_pull_request" not in github.calls
+
+
+def test_legacy_submitting_run_without_a_bound_head_resumes_from_its_fork(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def legacy_review(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(publication_module, "_review_head_repository", legacy_review)
+    config, store, run_id, issue = _ready_run(tmp_path)
+    monkeypatch.undo()
+    legacy = store.get(run_id)
+    assert legacy.head_repository is None
+    manifest = _begin_review_publication(config, store, legacy, bind_fork_identity=False)
+    intent = next(
+        json.loads(event["details"])
+        for event in store.events(run_id)
+        if event["event_type"] == "publication.intent.begun"
+    )
+    assert "head_repository" not in intent
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    pushes: list[str] = []
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            pushes.append(fork),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert published.head_repository is None
+    assert pushes == ["octocat/project"]
+    assert github.last_head == f"octocat:{published.branch_name}"

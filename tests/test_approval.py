@@ -24,6 +24,7 @@ from autocontribute.domain import (
 from autocontribute.exceptions import PolicyError
 
 NOW = datetime(2026, 7, 21, 12, tzinfo=UTC)
+V4_FINGERPRINT = "23f32de39f6b9d25ef709130763e189f8cf1f2098a68910915a489494962730a"
 
 
 def _manifest() -> ApprovalManifest:
@@ -102,6 +103,24 @@ def test_every_publication_field_is_bound_by_fingerprint(field: str, replacement
     assert manifest_fingerprint(changed) != manifest_fingerprint(manifest)
     with pytest.raises(PolicyError, match="exact publication manifest"):
         validate_approval(approval, changed, now=NOW)
+
+
+def test_head_repository_is_bound_by_a_v5_fingerprint() -> None:
+    fork = _manifest().model_copy(
+        update={"schema_version": 5, "head_repository": "octocat/project"}
+    )
+    same_repository = fork.model_copy(update={"head_repository": "owner/project"})
+
+    assert manifest_fingerprint(fork) != manifest_fingerprint(same_repository)
+    with pytest.raises(ValueError, match="schema_version 5 binds head_repository"):
+        ApprovalManifest.model_validate(
+            {**_manifest().model_dump(), "head_repository": "octocat/project"}
+        )
+
+
+def test_manifest_without_head_keeps_its_v4_fingerprint() -> None:
+    # Pinned so approvals made before the head repository was bound still authorize recovery.
+    assert manifest_fingerprint(_manifest()) == V4_FINGERPRINT
 
 
 def test_diff_hash_is_byte_exact() -> None:
