@@ -148,7 +148,7 @@ jobs:
       - name: Exercise live rootful Docker isolation
         env:
           AUTOCONTRIBUTE_RUN_DOCKER_TESTS: "1"
-        run: uv run pytest -q tests/test_sandbox_live.py
+        run: uv run pytest -q tests/test_sandbox_live.py tests/test_environments_live.py
 
   security-integration-gate:
     name: Security integration gate
