@@ -23,6 +23,7 @@ from autocontribute.discovery import (
     PolicySnapshot,
     TriageVerdict,
     _is_policy_path,
+    _legal_policy_fingerprint,
     apply_legal_commit_message,
     competing_pull_requests,
     parse_issue_reference,
@@ -782,6 +783,22 @@ class IsolationGitHub(FakeGitHub):
         self._fail(f"issue:{repository}#{number}")
         return next(issue for issue in self.issues[repository] if issue.number == number)
 
+    def default_branch_sha(self, repository: str, branch: str) -> str:
+        self._fail(f"pin:{repository}")
+        return super().default_branch_sha(repository, branch)
+
+    def list_directory(
+        self, repository: str, path: str, *, ref: str
+    ) -> list[DirectoryEntry] | None:
+        self._fail(f"listing:{repository}")
+        return super().list_directory(repository, path, ref=ref)
+
+    def search_competing_pull_requests(
+        self, repository: str, issue_number: int
+    ) -> list[LinkedPullRequest]:
+        self._fail(f"linked:{repository}#{issue_number}")
+        return super().search_competing_pull_requests(repository, issue_number)
+
     def get_file(
         self,
         repository: str,
@@ -926,6 +943,45 @@ def test_safety_stops_rate_limits_and_state_errors_still_end_discovery(
         service.discover()
 
 
+@pytest.mark.parametrize(
+    "site",
+    [
+        "repository:example/project",
+        "owner:example",
+        "labels:example/project",
+        "pin:example/project",
+        "search:example/project",
+        "listing:example/project",
+        "file:example/project/CONTRIBUTING.md",
+        "issue:example/project#42",
+        "linked:example/project#42",
+        "triage",
+    ],
+)
+def test_every_isolated_failure_site_still_ends_discovery_on_a_rate_limit(
+    tmp_path,
+    site: str,
+) -> None:  # type: ignore[no-untyped-def]
+    # Rate limits are GitHub errors too; isolating one would keep discovery sending requests.
+    limited = GitHubRateLimitError("GitHub kept applying a secondary rate limit")
+    github = IsolationGitHub(
+        {"example/project": [_repository_issue("example/project", 42)]},
+        failures={site: limited},
+    )
+    config = _discovery_config("example/project")
+    if site.startswith("owner:"):
+        config.github.owners = ["example"]
+    service = DiscoveryService(  # type: ignore[arg-type]
+        config,
+        github,
+        RunStore(tmp_path),
+        triage=RecordingTriage({42: limited} if site == "triage" else {}),
+    )
+
+    with pytest.raises(GitHubRateLimitError):
+        service.discover()
+
+
 class SearchGitHub(FakeGitHub):
     def __init__(self, issues: list[IssueCandidate], labels: list[str]) -> None:
         self.issues = issues
@@ -1048,6 +1104,35 @@ def test_search_pages_past_issues_rejected_from_the_search_result(tmp_path) -> N
         "rejected from the search result; the discussion was not read",
     )
     assert outcome.selection is not None
+
+
+def test_search_result_blocked_only_by_what_its_discussion_can_change_is_read_in_full(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    # Without its discussion, this issue scores below the floor; the maintainer comment raises
+    # the invitation points and states the expected behaviour.
+    issue = _issue(
+        title="Speed up parsing of large files",
+        labels=["bug"],
+        comments=1,
+        discussion=[
+            _comment(
+                body="PRs welcome. It should parse a 10 MB file in under a second.",
+                author="maintainer",
+                association="MEMBER",
+            )
+        ],
+    )
+    github = SearchGitHub([issue], REPOSITORY_LABELS)
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project"), github, RunStore(tmp_path)
+    )
+
+    outcome = service.discover()
+
+    assert github.fetched == [42]
+    assert outcome.selection is not None
+    assert outcome.selection[0].number == 42
 
 
 def test_search_reads_a_bounded_number_of_pages(tmp_path) -> None:  # type: ignore[no-untyped-def]
@@ -2482,6 +2567,19 @@ def test_policy_edits_outside_legal_sections_keep_the_attestation(tmp_path) -> N
     assert edited.evidence[POLICY_SOURCES_EVIDENCE_KEY] != snapshot.policy_sources_sha256
     assert not legal_edit.eligible
     assert "the CLA or DCO text of the policy files changed" in " ".join(legal_edit.blockers)
+
+
+def test_rst_sections_bind_the_legal_fingerprint_to_the_dco_section_only() -> None:
+    text = (
+        "Contributing\n============\n\nRun the tests with tox.\n\n"
+        "Signing off\n-----------\n\nAdd a Signed-off-by trailer (git commit -s).\n"
+    )
+
+    def fingerprint(body: str) -> str:
+        return _legal_policy_fingerprint([PolicyFile("example/project", "CONTRIBUTING.rst", body)])
+
+    assert fingerprint(text.replace("tox", "nox")) == fingerprint(text)
+    assert fingerprint(text.replace("trailer", "line")) != fingerprint(text)
 
 
 @pytest.mark.parametrize(
