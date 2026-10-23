@@ -1225,11 +1225,14 @@ def test_image_identity_prefers_the_registry_digest_of_the_reference(
         "Id": image_id,
         "RepoDigests": [f"other@sha256:{'3' * 64}", f"python@{registry}"],
         "Config": {"Labels": {"org.autocontribute.environment": "abc"}},
+        "Os": "linux",
+        "Architecture": "arm",
+        "Variant": "v7",
     }
     docker.answers["image"] = subprocess.CompletedProcess([], 0, json.dumps(details), "")
 
     assert inspect_image("python:3.13-slim-bookworm") == ImageIdentity(
-        image_id, registry, {"org.autocontribute.environment": "abc"}
+        image_id, registry, {"org.autocontribute.environment": "abc"}, "linux/arm/v7"
     )
     unrelated = inspect_image("ghcr.io/acme/tool:1.2")
     assert unrelated is not None and unrelated.digest == image_id

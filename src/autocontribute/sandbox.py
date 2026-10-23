@@ -904,6 +904,8 @@ class ImageIdentity:
     # the image ID, which identifies a locally built or committed image.
     digest: str
     labels: Mapping[str, str]
+    # os/architecture[/variant], such as linux/arm64; environment caches are kept per platform.
+    platform: str
 
 
 def inspect_image(reference: str, *, docker_binary: str = "docker") -> ImageIdentity | None:
@@ -926,10 +928,16 @@ def inspect_image(reference: str, *, docker_binary: str = "docker") -> ImageIden
         raise SandboxError("Docker returned malformed image details")
     labels = (details.get("Config") or {}).get("Labels") or {}
     repository_digests = details.get("RepoDigests") or []
+    platform = "/".join(
+        str(part).lower()
+        for part in (details.get("Os"), details.get("Architecture"), details.get("Variant"))
+        if part
+    )
     return ImageIdentity(
         image_id,
         _registry_digest(reference, repository_digests) or image_id,
         {str(name): str(value) for name, value in labels.items()},
+        platform,
     )
 
 
