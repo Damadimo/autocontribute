@@ -143,6 +143,19 @@ class EnvironmentRecipeError(AutocontributeError):
     """No recipe for building a repository's test environment could be found."""
 
 
+class EnvironmentSetupError(AutocontributeError):
+    """A recipe did not build an accepted environment, through the repository's doing.
+
+    Sandbox failures raise :class:`SandboxError` instead, so they never count against the
+    repository.
+    """
+
+    def __init__(self, message: str, *, log_tail: str = "") -> None:
+        super().__init__(message)
+        # The end of the output that explains the failure, for the setup agent.
+        self.log_tail = log_tail
+
+
 class SuiteReportError(AutocontributeError):
     """A test runner's report is malformed, too large, or of an unsupported kind."""
 
