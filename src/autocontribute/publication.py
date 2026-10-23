@@ -1054,7 +1054,14 @@ class Publisher:
         if upstream.pull_requests_from_collaborators_only and upstream.can_push is not True:
             raise PolicyError(f"{repository} accepts pull requests only from collaborators")
         fork = self.github.get_repository_access(head_repository)
-        if fork is not None and (
+        if fork is None:
+            return
+        if fork.identity.full_name.casefold() != head_repository.casefold():
+            raise PolicyError(
+                f"{head_repository} now redirects to {fork.identity.full_name}; rename it back, "
+                "then publish again"
+            )
+        if (
             fork.fork_parent is None
             or fork.fork_parent.database_id != upstream.identity.database_id
         ):
@@ -3926,11 +3933,6 @@ class Publisher:
     ) -> RepositoryWorkspace | None:
         assert manifest.repository and manifest.base_sha
         if manifest.commit_sha:
-            if not path.is_dir():
-                raise PolicyError(
-                    "Publication workspace containing the stored commit is missing; refusing "
-                    "to reconstruct or push a different HEAD"
-                )
             if path.is_symlink():
                 raise PolicyError("Publication workspace cannot be a symlink")
             commit_sha = _validated_git_sha(manifest.commit_sha, field="stored commit SHA")
