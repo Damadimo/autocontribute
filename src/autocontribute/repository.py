@@ -24,6 +24,21 @@ _FULL_SHA: Final = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _GIT_TIMEOUT_SECONDS: Final = 120
 _MAX_ERROR_CHARACTERS: Final = 4_000
 _DEFAULT_MAX_FILE_BYTES: Final = 1_000_000
+_FILTER_COMMAND_KEY: Final = re.compile(r"^filter\..+\.(?:clean|smudge|process)$", re.DOTALL)
+_PATCH_DIFF_ARGUMENTS: Final = (
+    "diff",
+    "--cached",
+    "--binary",
+    "--full-index",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--no-renames",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+    "HEAD",
+    "--",
+)
 
 # Git runs with no repository credentials and executes no repository hooks or
 # filters. Inherit only the operator-controlled process settings needed to find
@@ -43,9 +58,17 @@ _GIT_HOST_ENVIRONMENT_ALLOWLIST: Final[frozenset[str]] = frozenset(
     }
 )
 
+# Repository containers can write the working tree, so these keep host git from running
+# anything the tree or a tampered .git/config names: hooks, an fsmonitor daemon, external
+# diff programs, and the LFS filters. Diff commands add --no-ext-diff and --no-textconv,
+# and other filter drivers are refused (see _refuse_filter_commands).
 _GIT_SAFETY_OPTIONS: Final[tuple[str, ...]] = (
     "-c",
     "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "diff.external=",
     "-c",
     "http.followRedirects=false",
     "-c",
@@ -503,7 +526,17 @@ class RepositoryWorkspace:
 
         with self._temporary_index() as environment:
             output = self._git_bytes(
-                ["diff", "--cached", "--name-only", "-z", "--no-renames", "HEAD", "--"],
+                [
+                    "diff",
+                    "--cached",
+                    "--name-only",
+                    "-z",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    "HEAD",
+                    "--",
+                ],
                 environment=environment,
             )
         paths = [_decode_git_path(item) for item in output.split(b"\0") if item]
@@ -525,23 +558,29 @@ class RepositoryWorkspace:
         # Validate changed paths first so a newly-created symlink can never be
         # serialized into a contribution patch.
         self.changed_paths()
+        return self.patch_bytes()
+
+    def patch_bytes(self) -> bytes:
+        """Return the patch of tracked changes and new non-ignored files since the base.
+
+        Unlike :meth:`diff_bytes`, symlinks, mode changes and binary files stay in the patch so
+        the diff gates can judge them.
+        """
+
         with self._temporary_index() as environment:
-            return self._git_bytes(
-                [
-                    "diff",
-                    "--cached",
-                    "--binary",
-                    "--full-index",
-                    "--no-color",
-                    "--no-ext-diff",
-                    "--no-renames",
-                    "--src-prefix=a/",
-                    "--dst-prefix=b/",
-                    "HEAD",
-                    "--",
-                ],
-                environment=environment,
-            )
+            return self._git_bytes(list(_PATCH_DIFF_ARGUMENTS), environment=environment)
+
+    def apply_patch(self, patch: str) -> None:
+        """Apply a patch to the working tree, after ``git apply --check`` accepts all of it."""
+
+        if not patch:
+            raise RepositoryError("Refusing to apply an empty patch")
+        self._assert_base_commit()
+        # git apply reads the files it patches through the clean filter.
+        self._refuse_filter_commands()
+        content = patch.encode("utf-8")
+        self._git_bytes(["apply", "--check", "--whitespace=nowarn", "-"], input_bytes=content)
+        self._git_bytes(["apply", "--whitespace=nowarn", "-"], input_bytes=content)
 
     def _tracked_paths(self) -> list[str]:
         output = self._git_bytes(["ls-files", "-z", "--cached"])
@@ -694,7 +733,25 @@ class RepositoryWorkspace:
 
     def _temporary_index(self) -> _TemporaryIndex:
         self._assert_base_commit()
+        # `git add --all` runs every file through its clean filter.
+        self._refuse_filter_commands()
         return _TemporaryIndex(self)
+
+    def _refuse_filter_commands(self) -> None:
+        """Refuse a workspace whose Git config names a filter program.
+
+        Clones configure none beyond the blanked LFS filter, and containers see .git
+        read-only, so one here means .git was tampered with; host git would run it.
+        """
+
+        entries = self._git_bytes(["config", "--null", "--list"]).split(b"\0")
+        # Later entries override earlier ones, as they do for git itself, so the blanked
+        # LFS filter of _GIT_SAFETY_OPTIONS counts as empty.
+        effective = {key: value for key, _, value in (entry.partition(b"\n") for entry in entries)}
+        for raw_key, value in effective.items():
+            key = raw_key.decode("utf-8", errors="replace")
+            if value and _FILTER_COMMAND_KEY.fullmatch(key):
+                raise RepositoryError(f"Workspace Git config defines a filter command: {key}")
 
     def _run_git(
         self,
@@ -715,6 +772,7 @@ class RepositoryWorkspace:
         arguments: list[str],
         *,
         environment: dict[str, str] | None = None,
+        input_bytes: bytes | None = None,
     ) -> bytes:
         command = ["git", *_GIT_SAFETY_OPTIONS, *arguments]
         try:
@@ -722,6 +780,7 @@ class RepositoryWorkspace:
                 command,
                 cwd=self.path,
                 env=environment or _git_environment(),
+                input=input_bytes,
                 capture_output=True,
                 check=False,
                 timeout=_GIT_TIMEOUT_SECONDS,
