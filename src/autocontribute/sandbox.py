@@ -69,8 +69,8 @@ _EGRESS_PROXY_IMAGE: Final = (
 )
 _EGRESS_PROXY_READY_SECONDS: Final = 30
 _EGRESS_PROXY_POLL_SECONDS: Final = 0.1
-# What a setup container's root bootstrap may need: CHOWN to give /opt/ac to the command
-# user, and for apt, writing and chmod-ing files it does not own and dropping to `_apt`.
+# What the root bootstrap's container may need: CHOWN to give /opt/ac to the command user,
+# and for apt, writing and chmod-ing files it does not own and dropping to `_apt`.
 SETUP_CAPABILITIES: Final = frozenset({"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"})
 _DOCKER_RUNTIME_INFO_FORMAT: Final = (
     '{"security_options":{{json .SecurityOptions}},'
@@ -346,10 +346,11 @@ class SessionContainer:
     environment. After every command the session kills whatever the command left running,
     so no process writes to the workspace while host-side tools read or edit it.
 
-    A setup container (DESIGN §5.2) is the same with a writable root filesystem, the setup
-    network instead of none, and the capabilities its root bootstrap needs. ``volumes`` get a
-    fresh volume each, filled from the image, so an environment image's tool homes and caches
-    under /opt/ac stay writable while the rest of the root is read-only.
+    A setup container (DESIGN §5.2) is the same with a writable root filesystem and the setup
+    network instead of none; the root bootstrap's own container also gets back the
+    capabilities the bootstrap needs. ``volumes`` get a fresh volume each, filled from the
+    image, so an environment image's tool homes and caches under /opt/ac stay writable while
+    the rest of the root is read-only.
     """
 
     def __init__(
@@ -665,14 +666,16 @@ class SessionContainer:
         self._docker("exec", f"--user={user}", self.name, _SESSION_SHELL, "-c", "kill -KILL -1")
 
     def _reap(self, user: str) -> bool:
-        uid = user.partition(":")[0]
         for _ in range(_REAP_ATTEMPTS):
             self._signal_processes(user)
             listed = self._docker("top", self.name, "-o", "pid,uid")
             if listed is None or listed.returncode != 0:
                 return False
             uids = {line.split()[-1] for line in listed.stdout.splitlines()[1:] if line.strip()}
-            if uid not in uids:
+            # Only the init process and the main sleep run as 65534. A process under any other
+            # uid is a leftover, even one the command user's signal cannot reach; the restart
+            # that follows a failed reap kills it.
+            if uids <= {str(_SESSION_MAIN_UID)}:
                 return True
             # Killed processes stay listed until docker-init reaps them.
             time.sleep(_REAP_SETTLE_SECONDS)
@@ -990,6 +993,14 @@ def tag_image(image_id: str, tag: str, *, docker_binary: str = "docker") -> None
         if line.strip() and line.strip() != tag:
             # Best effort, like container cleanup: an image in use stays until next time.
             _docker_control(docker_binary, ["image", "rm", line.strip()], environment)
+
+
+def remove_image(image_id: str, *, docker_binary: str = "docker") -> None:
+    """Delete an untagged image; best effort, as an image a container still uses stays."""
+
+    if not _IMAGE_ID.fullmatch(image_id):
+        raise SandboxError("Image ID must be sha256:<64 hex digits>")
+    _docker_control(docker_binary, ["image", "rm", image_id], docker_client_environment())
 
 
 def _registry_digest(reference: str, repository_digests: object) -> str | None:
@@ -1354,6 +1365,7 @@ __all__ = [
     "docker_isolation_arguments",
     "inspect_image",
     "pull_image",
+    "remove_image",
     "remove_leftover_containers",
     "tag_image",
 ]

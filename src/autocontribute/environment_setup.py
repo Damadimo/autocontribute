@@ -4,9 +4,11 @@ Setup runs the recipe's install commands, which execute repository and dependenc
 network access. So the setup container sits on an internal network whose only exit is the
 allowlisting egress proxy, gets the proxy address only in each command's ``env -i`` list, and
 mounts ``.git`` read-only. A root bootstrap installs system packages and hands /opt/ac to the
-command user; every other step runs as that user. Afterwards host Git undoes any change a patch
-would carry, the container is committed with only a label change, and everything else is
-removed. Locally, an image whose label matches the recipe and cache key is reused.
+command user in a container of its own, the only one with capabilities back; every other step
+runs as that user in a container made from the bootstrap's image. Afterwards host Git undoes
+any change a patch would carry, the container is committed with only a label change, and
+everything else is removed. Locally, an image whose label matches the recipe and cache key is
+reused.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from autocontribute.sandbox import (
     detect_docker_daemon_mode,
     docker_container_identity,
     inspect_image,
+    remove_image,
     tag_image,
 )
 from autocontribute.workspace_files import CONTAINER_WORKSPACE
@@ -194,27 +197,79 @@ class EnvironmentSetup:
         """
 
         self._fetch_git_metadata(workspace, recipe)
-        capabilities = SETUP_CAPABILITIES if recipe.system_packages else _BOOTSTRAP_CAPABILITIES
-        with (
-            EgressNetwork(
-                allowed_hosts=DEFAULT_ALLOWED_HOSTS | set(allow_hosts),
-                run_id=self.run_id,
-                store_root=self.store_root,
-                docker_binary=self.docker_binary,
-            ) as network,
-            SessionContainer(
-                self._setup_config,
-                image=base.image_id,
-                workspace=workspace.path,
-                run_id=self.run_id,
-                store_root=self.store_root,
-                docker_binary=self.docker_binary,
-                network=network.network,
-                writable_root=True,
-                capabilities=capabilities,
-            ) as container,
-        ):
+        with EgressNetwork(
+            allowed_hosts=DEFAULT_ALLOWED_HOSTS | set(allow_hosts),
+            run_id=self.run_id,
+            store_root=self.store_root,
+            docker_binary=self.docker_binary,
+        ) as network:
             online = proxy_variables(network.proxy_url)
+            bootstrapped = self._bootstrap(workspace, recipe, base, network, online)
+            try:
+                # Repository and dependency install scripts run here, with no capability back.
+                with SessionContainer(
+                    self._setup_config,
+                    image=bootstrapped,
+                    workspace=workspace.path,
+                    run_id=self.run_id,
+                    store_root=self.store_root,
+                    docker_binary=self.docker_binary,
+                    network=network.network,
+                    writable_root=True,
+                ) as container:
+                    setup_environment = {**recipe.env, "HOME": _SETUP_HOME, **online}
+                    for command in recipe.setup_commands:
+                        self._step(container, network, command, command, setup_environment)
+                    if distribution is not None:
+                        probe = shlex.join(["python", "-c", _IMPORT_PROBE, distribution])
+                        self._step(container, network, "the import check", probe, recipe.env)
+                    try:
+                        dirty = workspace.restore_base()
+                    except RepositoryError as exc:
+                        raise EnvironmentSetupError(
+                            f"Setup left changes that cannot be undone: {exc}"
+                        ) from exc
+                    archived = self._archive_ignored(container, workspace)
+                    labels = {IMAGE_LABEL: self._label(recipe, cache_key)} if archived else {}
+                    image_id = container.commit(labels)
+            except BaseException:
+                # A committed environment image keeps the bootstrap image as its parent;
+                # without one, the bootstrap image is only waste.
+                remove_image(bootstrapped, docker_binary=self.docker_binary)
+                raise
+        tag = image_tag(recipe.repository, cache_key)
+        tag_image(image_id, tag, docker_binary=self.docker_binary)
+        image = EnvironmentImage(
+            image_id, tag, recipe.base_image, base.digest, cache_key, reused=False
+        )
+        return image, recipe.model_copy(update={"setup_dirty_paths": dirty})
+
+    def _bootstrap(
+        self,
+        workspace: RepositoryWorkspace,
+        recipe: EnvironmentRecipe,
+        base: ImageIdentity,
+        network: EgressNetwork,
+        online: Mapping[str, str],
+    ) -> str:
+        """Run the root bootstrap in a container of its own and commit it as an image.
+
+        Only this container gets capabilities back, and it runs nothing from the repository:
+        the base image's own tools and Debian's packages. Returns the image ID.
+        """
+
+        capabilities = SETUP_CAPABILITIES if recipe.system_packages else _BOOTSTRAP_CAPABILITIES
+        with SessionContainer(
+            self._setup_config,
+            image=base.image_id,
+            workspace=workspace.path,
+            run_id=self.run_id,
+            store_root=self.store_root,
+            docker_binary=self.docker_binary,
+            network=network.network,
+            writable_root=True,
+            capabilities=capabilities,
+        ) as container:
             self._step(
                 container,
                 network,
@@ -223,27 +278,7 @@ class EnvironmentSetup:
                 online,
                 as_root=True,
             )
-            setup_environment = {**recipe.env, "HOME": _SETUP_HOME, **online}
-            for command in recipe.setup_commands:
-                self._step(container, network, command, command, setup_environment)
-            if distribution is not None:
-                probe = shlex.join(["python", "-c", _IMPORT_PROBE, distribution])
-                self._step(container, network, "the import check", probe, recipe.env)
-            try:
-                dirty = workspace.restore_base()
-            except RepositoryError as exc:
-                raise EnvironmentSetupError(
-                    f"Setup left changes that cannot be undone: {exc}"
-                ) from exc
-            archived = self._archive_ignored(container, workspace)
-            labels = {IMAGE_LABEL: self._label(recipe, cache_key)} if archived else {}
-            image_id = container.commit(labels)
-        tag = image_tag(recipe.repository, cache_key)
-        tag_image(image_id, tag, docker_binary=self.docker_binary)
-        image = EnvironmentImage(
-            image_id, tag, recipe.base_image, base.digest, cache_key, reused=False
-        )
-        return image, recipe.model_copy(update={"setup_dirty_paths": dirty})
+            return container.commit({})
 
     def _step(
         self,
