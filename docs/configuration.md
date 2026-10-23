@@ -111,7 +111,7 @@ There is no network setting: the `docker` backend always runs checks with no net
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `login` | empty | GitHub account that publishes. Empty uses the account that owns the GitHub token. When set, preparing and showing a review does not need that account's token, and `approve` and `publish` refuse a token that belongs to a different account. |
-| `head_strategy` | `auto` | `auto` pushes the branch to the repository itself when `login` owns it, or when `login` is empty and the token can push there; otherwise to your fork. `fork` always uses your fork. |
+| `head_strategy` | `auto` | `auto` pushes the branch to the repository itself when the publishing account owns it, and to your fork otherwise, even where the account can push. `fork` always uses your fork. |
 | `approval_expires_hours` | `72` | Hours an approval stays valid (1–168). |
 | `branch_prefix` | `autocontribute` | Branches are named `<prefix>/issue-<number>-<first 8 characters of the run ID>`. |
 | `draft` | `false` | Open PRs as drafts. |

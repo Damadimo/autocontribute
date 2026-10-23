@@ -448,25 +448,26 @@ def _review_head_repository(
     login: str,
     patch: bytes,
 ) -> str:
-    """Choose where the branch lives: the upstream when the login can push, else its fork."""
+    """Choose where the branch lives: the upstream when the login owns it, else its fork.
+
+    Push access alone never puts the branch in the upstream: many projects ask collaborators to
+    use forks too, and a branch there runs the project's push workflows with its secrets.
+    """
 
     access = github.get_repository_access(repository)
     if access is None:
         raise PolicyError(f"{repository} is not visible to the publishing account")
     if not access.has_pull_requests:
         raise PolicyError(f"{repository} has pull requests turned off")
-    owned = access.owner.casefold() == login
-    # With publishing.login set the review may be built with a token of another identity (the
-    # Actions prepare job), so only ownership decides the same way in every job.
-    can_push = owned or (not config.publishing.login and access.can_push is True)
-    if can_push and config.publishing.head_strategy == "auto":
+    if access.owner.casefold() == login:
+        if config.publishing.head_strategy == "fork":
+            raise PolicyError(
+                f"publishing.head_strategy is fork, but {login} owns {repository} and cannot "
+                "fork it"
+            )
         _refuse_workflow_changes(patch)
         return repository
-    if owned:
-        raise PolicyError(
-            f"publishing.head_strategy is fork, but {login} owns {repository} and cannot fork it"
-        )
-    if access.pull_requests_from_collaborators_only and not can_push:
+    if access.pull_requests_from_collaborators_only and access.can_push is not True:
         raise PolicyError(f"{repository} accepts pull requests only from collaborators")
     return f"{login}/{repository.split('/', 1)[1]}"
 

@@ -6089,14 +6089,12 @@ def _same_repository_publisher(
     return store, run_id, github, publisher, pushes
 
 
-@pytest.mark.parametrize("login", ["example", "octocat"], ids=["owner", "collaborator"])
 def test_same_repository_publication_pushes_to_the_upstream_without_a_fork(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    login: str,
 ) -> None:
     store, run_id, github, publisher, pushes = _same_repository_publisher(
-        tmp_path, monkeypatch, login=login
+        tmp_path, monkeypatch, login="example"
     )
     created: list[dict[str, object]] = []
     original_create = github.create_pull_request
@@ -6258,6 +6256,33 @@ def test_review_with_publishing_login_decides_same_repository_only_by_ownership(
 
     assert collaborator.manifest.head_repository == "octocat/project"
     assert collaborator.manifest.schema_version == 5
+
+
+@pytest.mark.parametrize("configured_login", ["", "octocat"])
+def test_auto_head_strategy_keeps_a_collaborator_with_push_access_on_its_fork(
+    configured_login: str,
+) -> None:
+    config = AutocontributeConfig()
+    config.publishing.login = configured_login
+
+    def head(*, can_push: bool, collaborators_only: bool = False) -> str:
+        github = _AccountGitHub("octocat", can_push=can_push)
+        access = github.get_repository_access("example/project")
+        github.get_repository_access = lambda full_name: replace(  # type: ignore[method-assign]
+            access, pull_requests_from_collaborators_only=collaborators_only
+        )
+        return publication_module._review_head_repository(
+            config,
+            github,  # type: ignore[arg-type]
+            "example/project",
+            login="octocat",
+            patch=b"",
+        )
+
+    assert head(can_push=True) == "octocat/project"
+    assert head(can_push=True, collaborators_only=True) == "octocat/project"
+    with pytest.raises(PolicyError, match="accepts pull requests only from collaborators"):
+        head(can_push=False, collaborators_only=True)
 
 
 def test_fork_head_strategy_never_pushes_to_the_upstream(tmp_path: Path) -> None:
