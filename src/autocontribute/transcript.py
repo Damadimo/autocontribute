@@ -42,6 +42,7 @@ from autocontribute.submissions import (
 SubmissionT = TypeVar("SubmissionT", bound=BaseModel)
 TranscriptKind = Literal["setup", "agent", "critic", "triage", "policy"]
 ToolKind = Literal["shell", "edit", "submit"]
+NativeTool = Literal["shell", "edit"]
 # Why the model stopped: it called tools, it ended its turn without one, or it hit the output
 # limit, in which case the turn is retried and never appended.
 TurnStop = Literal["tool_use", "end_turn", "max_output_tokens"]
@@ -102,6 +103,14 @@ TOOL_SETS: Final[Mapping[TranscriptKind, tuple[ToolKind, ...]]] = MappingProxyTy
         "policy": ("submit",),
     }
 )
+# Each provider's own shell and edit tools. Their calls keep the tool's native name (its type on
+# OpenAI, whose native tools have no name), so a call's name alone gives its argument shape.
+NATIVE_CALL_NAMES: Final[Mapping[Provider, Mapping[NativeTool, str]]] = MappingProxyType(
+    {
+        "openai": MappingProxyType({"shell": "shell", "edit": "apply_patch"}),
+        "anthropic": MappingProxyType({"shell": "bash", "edit": "str_replace_based_edit_tool"}),
+    }
+)
 _SHELL_TOOLS: Final[Mapping[Provider, dict[str, JsonValue]]] = MappingProxyType(
     {
         "openai": {"type": "shell", "environment": {"type": "local"}},
@@ -113,10 +122,6 @@ _EDIT_TOOLS: Final[Mapping[Provider, dict[str, JsonValue]]] = MappingProxyType(
         "openai": {"type": "apply_patch"},
         "anthropic": {"type": "text_editor_20250728", "name": "str_replace_based_edit_tool"},
     }
-)
-# The two edit tools take different arguments, so their calls keep distinct names.
-_EDIT_CALL_NAMES: Final[Mapping[Provider, str]] = MappingProxyType(
-    {"openai": "apply_patch", "anthropic": "edit"}
 )
 
 
@@ -147,14 +152,12 @@ def tool_definitions(provider: Provider, kind: TranscriptKind) -> list[dict[str,
 
 
 def tool_call_names(provider: Provider, kind: TranscriptKind) -> frozenset[str]:
-    """Return the normalized names that the transcript's tool calls may carry."""
+    """Return the names that the transcript's tool calls may carry."""
 
-    names = {
-        "shell": "shell",
-        "edit": _EDIT_CALL_NAMES[provider],
-        "submit": SUBMIT_TOOLS[kind].name,
-    }
-    return frozenset(names[tool] for tool in TOOL_SETS[kind])
+    return frozenset(
+        SUBMIT_TOOLS[kind].name if tool == "submit" else NATIVE_CALL_NAMES[provider][tool]
+        for tool in TOOL_SETS[kind]
+    )
 
 
 def _submit_definition(provider: Provider, tool: SubmitTool) -> dict[str, JsonValue]:
@@ -180,12 +183,13 @@ class _Value(BaseModel):
 
 
 class ToolCall(_Value):
-    """One tool call with a normalized name and the provider's own argument object.
+    """One tool call with its tool's name (``NATIVE_CALL_NAMES``) and the provider's arguments.
 
-    ``shell`` takes ``{commands, timeout_ms?, max_output_length?}`` on OpenAI and ``{command}`` or
-    ``{restart: true}`` on Anthropic. ``apply_patch`` (OpenAI) takes ``{type, path, diff?}`` and
-    ``edit`` (Anthropic) takes the text editor's ``{command, path, ...}``. A submit tool takes its
-    submission model's fields, which the caller validates with that model.
+    On OpenAI, ``shell`` takes ``{commands, timeout_ms?, max_output_length?}`` and
+    ``apply_patch`` takes ``{type, path, diff?}``. On Anthropic, ``bash`` takes ``{command}`` or
+    ``{restart: true}`` and ``str_replace_based_edit_tool`` takes the text editor's
+    ``{command, path, ...}``. A submit tool takes its submission model's fields, which the caller
+    validates with that model.
     """
 
     call_id: str = Field(pattern=_CALL_ID_PATTERN)
@@ -432,7 +436,7 @@ def _openai_user_message(text: str) -> dict[str, JsonValue]:
 
 
 def _openai_result(call: ToolCall, result: ToolResult) -> dict[str, JsonValue]:
-    if call.name == "shell":
+    if call.name == NATIVE_CALL_NAMES["openai"]["shell"]:
         if isinstance(result.output, str) or not result.output:
             raise ValueError("an OpenAI shell result needs one output chunk per command")
         item: dict[str, JsonValue] = {
@@ -445,7 +449,7 @@ def _openai_result(call: ToolCall, result: ToolResult) -> dict[str, JsonValue]:
         if max_output_length is not None:
             item["max_output_length"] = max_output_length
         return item
-    if call.name == "apply_patch":
+    if call.name == NATIVE_CALL_NAMES["openai"]["edit"]:
         return {
             "type": "apply_patch_call_output",
             "call_id": call.call_id,
@@ -476,8 +480,10 @@ def _anthropic_result(call: ToolCall, result: ToolResult) -> dict[str, JsonValue
 
 
 __all__ = [
+    "NATIVE_CALL_NAMES",
     "SUBMIT_TOOLS",
     "TOOL_SETS",
+    "NativeTool",
     "ShellChunk",
     "SubmitTool",
     "ToolCall",

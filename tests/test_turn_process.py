@@ -191,7 +191,8 @@ def test_worker_environment_holds_only_allowlisted_names_and_the_model_key(
     own_key: str,
     other_key: str,
 ) -> None:
-    provider, record = _provider(tmp_path, monkeypatch, _reply(model=model), model)
+    reply = _reply(model=model, stop="end_turn", output_items=[], tool_calls=[])
+    provider, record = _provider(tmp_path, monkeypatch, reply, model)
     sensitive = {
         "AUTOCONTRIBUTE_GITHUB_TOKEN": "github-token-placeholder",
         "GH_TOKEN": "gh-token-placeholder",
@@ -302,7 +303,11 @@ def _oversized_arguments() -> dict[str, object]:
         ),
         (
             "agent",
-            _reply(tool_calls=[{"call_id": "call_1", "name": "edit", "arguments": {}}]),
+            _reply(
+                tool_calls=[
+                    {"call_id": "call_1", "name": "str_replace_based_edit_tool", "arguments": {}}
+                ]
+            ),
             "outside its transcript's tool set",
         ),
         (
@@ -479,7 +484,7 @@ def test_worker_sends_anthropic_turns_to_the_anthropic_adapter(
     expected = Turn(
         stop="tool_use",
         output_items=(bash_call,),
-        tool_calls=(ToolCall(call_id=bash_call["id"], name="shell", arguments=bash_call["input"]),),
+        tool_calls=(ToolCall(call_id=bash_call["id"], name="bash", arguments=bash_call["input"]),),
         response_id="msg_01XFDUDYJgAACzvnptvVoYEL",
         model="claude-opus-5-5",
         usage=ModelUsage(**_USAGE),

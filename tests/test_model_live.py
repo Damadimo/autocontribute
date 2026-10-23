@@ -18,6 +18,7 @@ from autocontribute.pricing import API_KEY_ENVS, MODELS, ROLE_MODELS, TURN_OUTPU
 from autocontribute.providers import SubprocessTurnProvider
 from autocontribute.submissions import AgentSubmission
 from autocontribute.transcript import (
+    NATIVE_CALL_NAMES,
     ShellChunk,
     ToolCall,
     ToolResult,
@@ -68,14 +69,13 @@ class _Workspace:
     model writes is parsed but never executed.
     """
 
-    def __init__(self, provider: Provider) -> None:
-        self.provider = provider
+    def __init__(self) -> None:
         self.files = {"hello.py": f"print({_BEFORE!r})\n"}
 
     def run(self, call: ToolCall) -> ToolResult:
-        """Run one shell or edit call, checking that it has the provider's argument shape."""
+        """Run one shell or edit call, checking that it has its tool's argument shape."""
 
-        if call.name == "shell" and self.provider == "openai":
+        if call.name == "shell":
             commands = call.arguments["commands"]
             assert isinstance(commands, list) and commands
             chunks = []
@@ -91,7 +91,7 @@ class _Workspace:
                     )
                 )
             return ToolResult(call_id=call.call_id, output=tuple(chunks))
-        if call.name == "shell":
+        if call.name == "bash":
             if call.arguments == {"restart": True}:
                 return ToolResult(call_id=call.call_id, output="The shell was restarted.")
             command = call.arguments["command"]
@@ -101,7 +101,7 @@ class _Workspace:
         try:
             if call.name == "apply_patch":
                 output = self.apply_patch(call.arguments)
-            elif call.name == "edit":
+            elif call.name == "str_replace_based_edit_tool":
                 output = self.edit(call.arguments)
             else:
                 raise AssertionError(f"unexpected tool call {call.name}")
@@ -259,7 +259,7 @@ def test_live_tool_loop_through_the_model_worker(provider: Provider) -> None:
         instructions=_INSTRUCTIONS,
         task=_TASK,
     )
-    workspace = _Workspace(provider)
+    workspace = _Workspace()
     turns: list[Turn] = []
     calls: list[ToolCall] = []
     submission: AgentSubmission | None = None
@@ -301,7 +301,7 @@ def test_live_tool_loop_through_the_model_worker(provider: Provider) -> None:
     assert workspace.python("hello.py") == (f"{_AFTER}\n", 0)
     names = {call.name for call in calls}
     assert names <= tool_call_names(provider, "agent")
-    assert {"shell", "apply_patch" if provider == "openai" else "edit", "submit"} <= names
+    assert {*NATIVE_CALL_NAMES[provider].values(), "submit"} <= names
     # Every request after the first replayed the earlier turns, reasoning and thinking included.
     assert len(turns) >= 2
     for turn in turns:
