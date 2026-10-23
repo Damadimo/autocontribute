@@ -649,8 +649,8 @@ class PublishingConfig(StrictModel):
     # Empty means the token owner. Setting it lets a job without the publishing token prepare
     # and render reviews; approve and publish still require the token to belong to this login.
     login: str = ""
-    # auto: push the branch to the upstream itself when the login can push there (it owns the
-    # repository, or the token has push access and login is empty); otherwise use a fork.
+    # auto: push the branch to the upstream itself when the login owns the repository;
+    # otherwise use a fork, even where the login can push.
     head_strategy: Literal["auto", "fork"] = "auto"
     approval_expires_hours: int = Field(default=72, ge=1, le=168)
     branch_prefix: str = "autocontribute"
