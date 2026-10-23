@@ -140,6 +140,8 @@ class Critic:
         number = len(self.rounds) + 1
         if number > MAX_CRITIC_ROUNDS:
             raise ValueError(f"the critic reviews at most {MAX_CRITIC_ROUNDS} rounds")
+        if self._timeout() < 1:
+            return DidNotFinish("time", "The run reached its time limit before the review")
         earlier = self.rounds[-1].confirmed if self.rounds else ()
         transcript = start_transcript(
             model=self._model,
