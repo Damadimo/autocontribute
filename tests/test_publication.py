@@ -1334,6 +1334,40 @@ def test_publication_text_rejects_tokens_from_the_shared_credential_patterns(
     assert token not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    ("commit_message", "accepted"),
+    [
+        ("Fix parser\n\nAssisted-by: autocontribute 0.1.0, gpt-5.6-sol", True),
+        (
+            "Fix parser\n\nGenerated-by: autocontribute 0.1.0, gpt-5.6-sol\n"
+            "Signed-off-by: Example Signer <signer@example.invalid>",
+            True,
+        ),
+        ("Fix parser\n\nSigned-off-by: Example Signer <signer@example.invalid>", True),
+        (
+            "Fix parser\n\nSigned-off-by: Example Signer <signer@example.invalid>\n"
+            "Assisted-by: autocontribute 0.1.0, gpt-5.6-sol",
+            False,
+        ),
+        ("Fix parser\n\nCo-authored-by: Model <model@example.invalid>", False),
+        ("Fix parser\n\nAssisted-by: ", False),
+    ],
+)
+def test_publication_text_accepts_an_ai_trailer_before_any_signoff(
+    tmp_path: Path, commit_message: str, accepted: bool
+) -> None:
+    _config, store, run_id, _ = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    assert manifest.proposal is not None
+    manifest.proposal.commit_message = commit_message
+
+    if accepted:
+        validate_publication_text(manifest)
+    else:
+        with pytest.raises(PolicyError, match="multiline commit message"):
+            validate_publication_text(manifest)
+
+
 def test_publication_text_ignores_key_prefixes_inside_words(tmp_path: Path) -> None:
     _config, store, run_id, _ = _ready_run(tmp_path)
     manifest = store.get(run_id)
