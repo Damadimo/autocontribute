@@ -295,7 +295,8 @@ def test_live_tool_loop_through_the_model_worker(provider: Provider) -> None:
                 )
             else:
                 results.append(ToolResult(call_id=call.call_id, output="Submitted."))
-        append_tool_results(transcript, results, reminder=f"{_MAX_TURNS - len(turns)} turns left.")
+        append_tool_results(transcript, results)
+        append_user_text(transcript, f"{_MAX_TURNS - len(turns)} turns left.")
 
     assert submission is not None, f"no valid submission in {len(turns)} turns"
     assert submission.outcome == "fixed"

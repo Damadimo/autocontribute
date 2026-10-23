@@ -15,7 +15,8 @@ A conversation runs in this order:
    send the same transcript again with a larger cap.
 3. ``append_turn``. If the turn made no tool calls, ``append_user_text`` a nudge and go to 2.
 4. Run the calls in order; ``read_submission`` validates a call of the kind's submit tool.
-   ``append_tool_results`` adds one result per call, and any per-turn reminder. Go to 2.
+   ``append_tool_results`` adds one result per call; ``append_user_text`` adds any per-turn
+   reminder after them. Go to 2.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Final, Literal, TypeVar
+from typing import Final, Literal, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
@@ -323,17 +324,29 @@ def start_transcript(
 
 
 def append_user_text(transcript: Transcript, text: str) -> None:
-    """Append a user message: a nudge after a turn without tool calls, or the critic's blockers.
-    Per-turn reminders go with the tool results (``append_tool_results``)."""
+    """Append user text: a nudge after a turn without tool calls, a per-turn reminder after the
+    tool results, or the critic's blockers. Like everything else it stays in the transcript.
+
+    On Anthropic, text that follows other user content added since the last turn joins that
+    user message as one more block: the Messages API wants user and assistant to alternate.
+    """
 
     if transcript.pending_calls:
         raise ValueError("tool calls are waiting for their results")
-    item: dict[str, JsonValue]
     if transcript.provider == "openai":
-        item = _openai_user_message(text)
-    else:
-        item = {"role": "user", "content": [{"type": "text", "text": text}]}
-    _append(transcript, [item], counted_items=1)
+        _append(transcript, [_openai_user_message(text)], counted_items=1)
+        return
+    block: dict[str, JsonValue] = {"type": "text", "text": text}
+    if not transcript.appended_items:
+        _append(transcript, [{"role": "user", "content": [block]}], counted_items=1)
+        return
+    # The message has had no reply yet, so no thinking block or cached turn depends on it.
+    message = transcript.items[-1]
+    content = cast("list[JsonValue]", message["content"])
+    joined: dict[str, JsonValue] = {"role": "user", "content": [*content, block]}
+    transcript.items[-1] = joined
+    transcript.appended_bytes += len(canonical_json(joined)) - len(canonical_json(message))
+    transcript.appended_items += 1
 
 
 def append_turn(transcript: Transcript, turn: Turn) -> None:
@@ -356,18 +369,8 @@ def append_turn(transcript: Transcript, turn: Turn) -> None:
     transcript.appended_items = 0
 
 
-def append_tool_results(
-    transcript: Transcript,
-    results: Sequence[ToolResult],
-    *,
-    reminder: str | None = None,
-) -> None:
-    """Append one result for each pending tool call, in call order.
-
-    ``reminder`` is per-turn guidance such as the turns left. It follows the results: on
-    Anthropic as a text block in their user message, on OpenAI as a user message of its own.
-    Like everything else it stays in the transcript; a later turn adds a new one.
-    """
+def append_tool_results(transcript: Transcript, results: Sequence[ToolResult]) -> None:
+    """Append one result for each pending tool call, in call order."""
 
     calls = transcript.pending_calls
     if not calls:
@@ -378,17 +381,12 @@ def append_tool_results(
     items: list[dict[str, JsonValue]]
     if transcript.provider == "openai":
         items = [_openai_result(call, result) for call, result in pairs]
-        if reminder is not None:
-            items.append(_openai_user_message(reminder))
     else:
         # All results of one turn go back in one user message.
         content: list[JsonValue] = [_anthropic_result(call, result) for call, result in pairs]
-        if reminder is not None:
-            content.append({"type": "text", "text": reminder})
         items = [{"role": "user", "content": content}]
     transcript.pending_calls = []
-    counted_items = len(results) if reminder is None else len(results) + 1
-    _append(transcript, items, counted_items=counted_items)
+    _append(transcript, items, counted_items=len(results))
 
 
 def read_submission(call: ToolCall, submission: type[SubmissionT]) -> SubmissionT:
