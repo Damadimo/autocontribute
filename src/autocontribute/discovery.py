@@ -913,7 +913,9 @@ class DiscoveryService:
         """Assess one issue outside a search, as `run --issue` and publication do.
 
         Discovery skips held repositories before searching them; these callers learn of a hold,
-        including one this assessment just recorded, as a blocker.
+        including one this assessment just recorded, as a blocker. The rank floor only chooses
+        among searched issues: the score's freshness part falls with time alone, and a prepared
+        run must not become unpublishable while it waits for approval.
         """
 
         eligibility = self._assess(
@@ -922,6 +924,7 @@ class DiscoveryService:
             check_remote_policy=check_remote_policy,
             check_competing_pull_requests=check_competing_pull_requests,
             repository_ref=repository_ref,
+            apply_rank_floor=False,
         ).eligibility
         held = [
             f"the repository is held (hold {hold.hold_id}): {hold.reason}"
@@ -943,6 +946,7 @@ class DiscoveryService:
         check_remote_policy: bool = True,
         check_competing_pull_requests: bool = True,
         repository_ref: str | None = None,
+        apply_rank_floor: bool = True,
     ) -> IssueEvaluation:
         blockers: list[tuple[str, str]] = []
         include, exclude = self._label_rules(repository.full_name)
@@ -1042,7 +1046,7 @@ class DiscoveryService:
             now=now,
         )
         evidence.update(score_evidence)
-        if score < _MIN_CANDIDATE_SCORE:
+        if apply_rank_floor and score < _MIN_CANDIDATE_SCORE:
             blockers.append(
                 (
                     "low score",
