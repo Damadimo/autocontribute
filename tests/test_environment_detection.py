@@ -393,7 +393,16 @@ def test_a_job_with_per_test_results_wins_over_an_earlier_test_script(tmp_path: 
         {
             "setup.py": "from setuptools import setup\nsetup()\n",
             "scripts/release_tests.py": "print('ok')\n",
-            "tox.ini": "[testenv]\ncommands =\n    pytest tests --run-optional no_jupyter\n",
+            "pyproject.toml": "[dependency-groups]\ncov-tests = ['pytest']\n",
+            "tox.ini": """[testenv]
+skip_install = True
+dependency_groups = cov-tests
+commands =
+    pip install -e .[d]
+    pytest tests --run-optional no_jupyter
+    pip install -e .[jupyter]
+    pytest tests --run-optional jupyter -m jupyter
+""",
             ".github/workflows/release_tests.yml": """
 on: pull_request
 jobs:
@@ -422,6 +431,10 @@ jobs:
     assert recipe.test_command == (
         f"python -m pytest tests --run-optional no_jupyter {_PYTEST_REPORT}"
     )
+    # The extra installed before the first tests joins tox's; the later one stays out.
+    install = recipe.setup_commands[-1]
+    assert "printf '%s\\n' d;" in install and "jupyter" not in install
+    assert install.endswith("--group cov-tests")
 
 
 def test_nox_sessions_install_with_nox_and_rerun_without_installing(tmp_path: Path) -> None:

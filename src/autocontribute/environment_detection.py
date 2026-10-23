@@ -446,13 +446,21 @@ def _python_install_commands(
         return [shlex.join(["uv", "pip", "install", *arguments])]
     if sources.tox is not None and (tox is not None or run is None):
         environment = tox or sources.tox.environment(sources.tox.choose(None, minor))
+        printed = f"{TOOL_ROOT}/tox-extras.txt"
+        # Extras the environment's commands install themselves join the ones tox prints.
+        listed = (
+            f"{{ cat {printed}; echo; printf '%s\\n' {shlex.join(extras)}; }}"
+            " | sed '/^$/d' | sort -u | paste -sd, -"
+            if extras
+            else f"paste -sd, {printed}"
+        )
         # tox-current-env prints what the environment would install without building it.
         return [
             shlex.join([*tool_install, "tox", "tox-current-env", *sources.tox.requires]),
             shlex.join(["tox", "-e", environment.name])
             + f" --print-deps-to {TOOL_ROOT}/tox-deps.txt"
-            + f" --print-extras-to {TOOL_ROOT}/tox-extras.txt",
-            f"extras=$(paste -sd, {TOOL_ROOT}/tox-extras.txt) && "
+            + f" --print-extras-to {printed}",
+            f"extras=$({listed}) && "
             f'uv pip install -r {TOOL_ROOT}/tox-deps.txt -e ".${{extras:+[$extras]}}"'
             + "".join(f" --group {shlex.quote(name)}" for name in environment.dependency_groups),
         ]
@@ -542,10 +550,18 @@ def _python_selection(
     """Dependency groups and extras for the tests: the tox environment's, CI's, or defaults."""
 
     if tox is not None and (tox.dependency_groups or tox.extras):
-        return list(tox.dependency_groups), list(tox.extras)
+        # A tox environment with skip_install often installs extras in its commands, before
+        # the tests that need them.
+        installed: list[str] = []
+        for words in tox.commands:
+            invocation = single_invocation(shlex.join(words))
+            if invocation is None or invocation.runner:
+                break
+            installed += _pip_extras(invocation)
+        return list(tox.dependency_groups), _unique([*tox.extras, *installed])
     named_groups: list[str] = []
-    named_extras: list[str] = []
     invocations = [*(run.installs if run is not None else ()), *([test] if test else [])]
+    named_extras: list[str] = []
     for invocation in invocations:
         words = invocation.words
         if invocation is test and invocation.tox_environment is None:
@@ -563,16 +579,31 @@ def _python_selection(
             "install",
         ):
             named_groups += _option_values(words, {"--group"})
-            for word in words:
-                match = re.fullmatch(r"\.\[([\w,.-]+)\]", word)
-                if match is not None:
-                    named_extras += match.group(1).split(",")
+            named_extras += _pip_extras(invocation)
     if named_groups or named_extras:
         return _unique(named_groups), _unique(named_extras)
     default_group = next((name for name in _PYTHON_TEST_GROUPS if name in groups), None)
     if default_group is not None:
         return [default_group], []
     return [], [name for name in _PYTHON_TEST_GROUPS if name in extras][:1]
+
+
+def _pip_extras(invocation: Invocation) -> list[str]:
+    """Extras of the project itself that a pip install names, as in `pip install -e .[d]`."""
+
+    words = invocation.words
+    if words[:2] not in {("pip", "install"), ("pip3", "install")} and words[:3] != (
+        "uv",
+        "pip",
+        "install",
+    ):
+        return []
+    return [
+        extra
+        for word in words
+        if (match := re.fullmatch(r"\.\[([\w,.-]+)\]", word)) is not None
+        for extra in match.group(1).split(",")
+    ]
 
 
 def _referenced_requirements(signals: RepositorySignals, text: str) -> list[str]:
