@@ -524,9 +524,15 @@ class GitHubClient:
         remaining = response.headers.get("X-RateLimit-Remaining")
         request_id = response.headers.get("X-GitHub-Request-Id")
         template = _path_template(path)
-        # Without per-request detail, a recurrence of a stop an operator already reviewed is the
-        # same evidence and does not stop work again.
-        evidence = {"method": method, "path": template, "source": source}
+        # Repeats within one incident share this hash, whatever their request IDs, and are
+        # recorded once. The UTC day separates incidents, so a block that returns after an
+        # operator released the last one stops work again.
+        evidence = {
+            "method": method,
+            "path": template,
+            "source": source,
+            "incident_day": datetime.now(UTC).date().isoformat(),
+        }
         trigger = CircuitBreakerTrigger(
             source=source,
             reason=f"{summary} ({method} {template}).",

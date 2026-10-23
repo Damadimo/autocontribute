@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import base64
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
 
 import httpx
 import pytest
 
 from autocontribute.config import GitHubConfig
 from autocontribute.exceptions import (
+    CircuitBreakerTrigger,
     GitHubError,
     GitHubRateLimitError,
     GitHubRequestNotSentError,
@@ -856,6 +857,44 @@ def test_suspension_trigger_hash_ignores_request_ids_and_names(tmp_path) -> None
         "GitHub reports this account is suspended (GET /repos/{owner}/{repo})."
     )
     assert len(store.circuit_breaker_status().active_triggers) == 1
+
+
+def test_a_released_block_holds_again_on_a_later_day(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    message = (
+        "You have exceeded a secondary rate limit and have been temporarily blocked from "
+        "content creation. Please retry your request again later."
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(403, json={"message": message})
+
+    def block() -> CircuitBreakerTrigger:
+        with (
+            _client(handler, safety_trigger_handler=store.record_stop) as github,
+            pytest.raises(GitHubSafetyError) as raised,
+        ):
+            github.ensure_fork("upstream/project", "octocat")
+        return raised.value.trigger
+
+    first = block()
+    (hold,) = store.active_holds()
+    assert store.release_hold(hold.hold_id, actor="operator", reason="the block expired")
+    same_day = block()
+
+    class NextDay(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:  # type: ignore[override]
+            return datetime.now(tz) + timedelta(days=1)
+
+    monkeypatch.setattr("autocontribute.github.datetime", NextDay)
+    next_day = block()
+
+    assert same_day.trigger_hash == first.trigger_hash
+    assert next_day.trigger_hash != first.trigger_hash
+    assert [item.trigger_hash for item in store.active_holds()] == [next_day.trigger_hash]
 
 
 @pytest.mark.parametrize(
