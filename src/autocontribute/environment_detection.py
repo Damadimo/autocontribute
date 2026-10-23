@@ -9,6 +9,7 @@ detected fields (§5.2, step 1). Nothing here runs repository code.
 
 from __future__ import annotations
 
+import itertools
 import re
 import shlex
 import tomllib
@@ -635,7 +636,9 @@ def _python_test_command(test: Invocation | None, randomly: bool) -> _TestComman
         return _TestCommand(shlex.join(_resolved(test.words)), "other", None)
     arguments = _pytest_arguments(test.words[1:] if test is not None else ())
     return _TestCommand(
-        shlex.join(["python", "-m", "pytest", *arguments, *_pytest_report_options(randomly)]),
+        shlex.join(
+            ["python", "-m", "pytest", *arguments, *_pytest_report_options(arguments, randomly)]
+        ),
         "pytest",
         _JUNIT_REPORT,
     )
@@ -648,16 +651,23 @@ def _nox_test_command(
     command = ["nox", "--session", session, "--force-python", f"3.{minor}", "-R"]
     if re.search(r"""session\.run\(\s*["']pytest["'][^)]*\*session\.posargs""", source):
         return _TestCommand(
-            shlex.join([*command, "--", *_pytest_report_options(randomly)]),
+            shlex.join([*command, "--", *_pytest_report_options((), randomly)]),
             "pytest",
             _JUNIT_REPORT,
         )
     return _TestCommand(shlex.join(command), "other", None)
 
 
-def _pytest_report_options(randomly: bool) -> list[str]:
-    plugins = ["-p", "no:cacheprovider", *(["-p", "no:randomly"] if randomly else [])]
-    return [*plugins, f"--junitxml={_JUNIT_REPORT}"]
+def _pytest_report_options(arguments: Sequence[str], randomly: bool) -> list[str]:
+    """The JUnit report and the plugins to turn off that ``arguments`` do not turn off yet."""
+
+    present = {value for flag, value in itertools.pairwise(arguments) if flag == "-p"}
+    plugins = [
+        plugin
+        for plugin in ("no:cacheprovider", *(("no:randomly",) if randomly else ()))
+        if plugin not in present
+    ]
+    return [*(word for plugin in plugins for word in ("-p", plugin)), f"--junitxml={_JUNIT_REPORT}"]
 
 
 def _pytest_arguments(words: Sequence[str]) -> list[str]:
