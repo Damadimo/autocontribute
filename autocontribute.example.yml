@@ -86,12 +86,13 @@ quality:
   require_regression_evidence_for_bugfix: true
 
 publishing:
-  approval_expires_hours: 24
-  draft: true
+  approval_expires_hours: 72
+  draft: false
+  ready_for_review: true           # applies only when draft is true
   # Daily/cooldown capacity is durably reserved in the SQLite store before GitHub mutation.
   # Never delete or roll back state to reclaim a failed or ambiguous attempt's reservation.
   max_new_pull_requests_per_day: 1
-  max_open_pull_requests: 2
+  max_open_pull_requests: 3
   repository_cooldown_days: 7
 
 budget:

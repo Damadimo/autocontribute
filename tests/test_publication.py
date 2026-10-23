@@ -149,11 +149,10 @@ def _ready_run(
         {
             "github": {"repositories": ["example/project"]},
             "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
+            "publishing": {"draft": True, "ready_for_review": ready_for_review},
             "storage": {"path": tmp_path / "state"},
         }
     )
-    if ready_for_review:
-        config.publishing.ready_for_review = True
     store = RunStore(config.storage.path)
     source = tmp_path / "source"
     source.mkdir()

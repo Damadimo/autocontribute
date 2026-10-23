@@ -646,21 +646,14 @@ class QualityConfig(StrictModel):
 
 
 class PublishingConfig(StrictModel):
-    approval_expires_hours: int = Field(default=24, ge=1, le=168)
+    approval_expires_hours: int = Field(default=72, ge=1, le=168)
     branch_prefix: str = "autocontribute"
-    draft: bool = True
-    ready_for_review: bool = False
+    draft: bool = False
+    # Only a draft can be marked ready, so this applies when ``draft`` is true.
+    ready_for_review: bool = True
     max_new_pull_requests_per_day: int = Field(default=1, ge=1, le=5)
-    max_open_pull_requests: int = Field(default=2, ge=1, le=20)
+    max_open_pull_requests: int = Field(default=3, ge=1, le=20)
     repository_cooldown_days: int = Field(default=7, ge=0, le=365)
-
-    @model_validator(mode="after")
-    def ready_transition_starts_from_a_draft(self) -> PublishingConfig:
-        if self.ready_for_review and not self.draft:
-            raise ValueError(
-                "publishing.draft must be true when publishing.ready_for_review is enabled"
-            )
-        return self
 
 
 class BudgetConfig(StrictModel):
@@ -894,11 +887,11 @@ quality:
   require_regression_evidence_for_bugfix: true
 
 publishing:
-  approval_expires_hours: 24
-  draft: true
-  ready_for_review: false
+  approval_expires_hours: 72
+  draft: false
+  ready_for_review: true           # applies only when draft is true
   max_new_pull_requests_per_day: 1
-  max_open_pull_requests: 2
+  max_open_pull_requests: 3
   repository_cooldown_days: 7
 
 budget:

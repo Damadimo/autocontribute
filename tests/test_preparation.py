@@ -221,7 +221,7 @@ def test_preparation_config_fingerprint_rejects_gate_and_allowlist_drift() -> No
         ("sandbox", "command_timeout_seconds", 901),
         ("sandbox", "max_commands", 9),
         ("publishing", "branch_prefix", "different-prefix"),
-        ("publishing", "draft", False),
+        ("publishing", "draft", True),
     ],
 )
 def test_preparation_config_fingerprint_rejects_execution_and_publication_drift(
