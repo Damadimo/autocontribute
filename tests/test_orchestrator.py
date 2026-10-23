@@ -23,10 +23,12 @@ from autocontribute.domain import (
     RunStatus,
 )
 from autocontribute.exceptions import (
+    CircuitBreakerTrigger,
     ModelRequestError,
     ModelTimeoutError,
     PolicyError,
     StateError,
+    StopScope,
 )
 from autocontribute.github import DirectoryEntry
 from autocontribute.orchestrator import Orchestrator, RunInvocationMode
@@ -2366,6 +2368,43 @@ def test_ineligible_explicit_issue_skips_without_spending_model_tokens(tmp_path:
 
     assert manifest.status == RunStatus.SKIPPED
     assert "already assigned" in (manifest.skip_reason or "")
+    assert all(provider.calls == 0 for provider in providers.values())
+
+
+def test_explicit_issue_in_a_held_repository_skips(tmp_path: Path) -> None:
+    sha = "a" * 40
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    store.record_stop(
+        CircuitBreakerTrigger(
+            source="github_issue_discussion:example/project#40",
+            reason="a maintainer comment turns away automated or AI contributions",
+            trigger_hash="d" * 64,
+            scope=StopScope.REPOSITORY,
+            scope_key="example/project",
+        )
+    )
+    providers = _providers()
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
+
+    assert manifest.status == RunStatus.SKIPPED
+    assert "the repository is held" in (manifest.skip_reason or "")
     assert all(provider.calls == 0 for provider in providers.values())
 
 

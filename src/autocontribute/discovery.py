@@ -504,7 +504,10 @@ class PolicyClassifier(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class IssueEvaluation:
-    """One assessed issue; each blocker has a short kind that discovery summaries count."""
+    """One assessed issue; each blocker has a short kind that discovery summaries count.
+
+    ``repository_hold`` is the hold this assessment newly recorded on the whole repository.
+    """
 
     issue: IssueCandidate
     repository: RepositoryInfo
@@ -758,10 +761,7 @@ class DiscoveryService:
                     issue_errors.append((snapshot.reference, str(exc)))
                     continue
                 evaluations.append(evaluation)
-                # Recorded evidence that an operator released no longer skips the repository.
-                if evaluation.repository_hold is not None and self.store.record_stop(
-                    evaluation.repository_hold
-                ):
+                if evaluation.repository_hold is not None:
                     skipped_repositories.append(
                         (repository.full_name, evaluation.repository_hold.reason)
                     )
@@ -910,13 +910,30 @@ class DiscoveryService:
         check_competing_pull_requests: bool = True,
         repository_ref: str | None = None,
     ) -> EligibilityResult:
-        return self._assess(
+        """Assess one issue outside a search, as `run --issue` and publication do.
+
+        Discovery skips held repositories before searching them; these callers learn of a hold,
+        including one this assessment just recorded, as a blocker.
+        """
+
+        eligibility = self._assess(
             issue,
             repository,
             check_remote_policy=check_remote_policy,
             check_competing_pull_requests=check_competing_pull_requests,
             repository_ref=repository_ref,
         ).eligibility
+        held = [
+            f"the repository is held (hold {hold.hold_id}): {hold.reason}"
+            for hold in self.store.active_holds()
+            if hold.scope is StopScope.REPOSITORY
+            and hold.scope_key.casefold() == repository.full_name.casefold()
+        ]
+        if not held:
+            return eligibility
+        return eligibility.model_copy(
+            update={"eligible": False, "blockers": [*eligibility.blockers, *held]}
+        )
 
     def _assess(
         self,
@@ -1006,7 +1023,10 @@ class DiscoveryService:
             )
             hold = next((comment for comment in stops if _targets_automation(comment.body)), None)
             if hold is not None:
-                repository_hold = _automation_stop_hold(issue, repository, hold)
+                trigger = _automation_stop_hold(issue, repository, hold)
+                # Evidence that an operator released does not hold the repository again.
+                if self.store.record_stop(trigger):
+                    repository_hold = trigger
 
         evidence: dict[str, str] = {}
         evidence["discussion"] = (

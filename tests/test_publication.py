@@ -1198,6 +1198,32 @@ def test_held_repository_stops_before_any_github_mutation(tmp_path: Path) -> Non
     assert not store.circuit_breaker_status().is_tripped
 
 
+def test_automation_stop_on_the_issue_holds_the_repository_before_any_github_mutation(
+    tmp_path: Path,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    now = datetime.now(UTC)
+    comment = IssueComment(
+        author="maintainer",
+        author_association="MEMBER",
+        body="We do not accept AI-generated pull requests.",
+        html_url="https://github.com/example/project/issues/42#issuecomment-1",
+        created_at=now,
+        updated_at=now,
+    )
+    issue = issue.model_copy(update={"comments": issue.comments + 1, "discussion": [comment]})
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+
+    with pytest.raises(PolicyError, match="the repository is held"):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert not github.mutated
+    assert [(hold.scope, hold.scope_key) for hold in store.active_holds()] == [
+        (StopScope.REPOSITORY, "example/project")
+    ]
+
+
 def test_base_movement_during_policy_fetch_stops_before_remote_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
