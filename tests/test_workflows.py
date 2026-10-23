@@ -494,6 +494,39 @@ def test_security_integration_runs_live_rootful_docker_isolation() -> None:
     )
 
 
+def test_e2e_workflow_prepares_with_read_only_tokens_and_keeps_the_evidence() -> None:
+    document = yaml.safe_load((ROOT / ".github" / "workflows" / "e2e.yml").read_text())
+    # YAML 1.1 reads the bare key `on` as True.
+    triggers = document[True]
+    job = document["jobs"]["prepare"]
+    steps = job["steps"]
+    run = next(step for step in steps if step["name"] == "Prepare the issue")
+    evidence = next(step for step in steps if step["name"] == "Keep the run evidence")
+
+    assert set(triggers) == {"workflow_dispatch", "push"}
+    assert triggers["workflow_dispatch"]["inputs"]["issue"]["required"] is True
+    assert triggers["push"] == {"branches": ["e2e/**"]}
+    assert document["permissions"] == {"contents": "read"}
+    assert "permissions" not in job
+    assert job["runs-on"] == "ubuntu-24.04"
+    assert isinstance(job["timeout-minutes"], int)
+    for step in steps:
+        uses = str(step.get("uses", ""))
+        assert not uses or _PINNED_ACTION.fullmatch(uses)
+        if uses.startswith("actions/checkout@"):
+            assert step["with"]["persist-credentials"] is False
+        # Event text and secrets reach commands only through env.
+        assert "${{" not in str(step.get("run", ""))
+    assert run["env"]["AUTOCONTRIBUTE_GITHUB_TOKEN"] == "${{ github.token }}"
+    assert run["env"]["OPENAI_API_KEY"] == "${{ secrets.OPENAI_API_KEY }}"
+    secrets = re.findall(r"secrets\.([A-Z_]+)", (ROOT / ".github/workflows/e2e.yml").read_text())
+    assert set(secrets) == {"OPENAI_API_KEY"}
+    assert "autocontribute run" in run["run"] and "--json" in run["run"]
+    assert "publish" not in run["run"] and "approve" not in run["run"]
+    assert evidence["if"] == "${{ always() }}"
+    assert "autocontribute-state/runs" in evidence["with"]["path"]
+
+
 def _template_workflow(name: str) -> dict[str, object]:
     return yaml.safe_load((TEMPLATE / ".github" / "workflows" / name).read_text())
 

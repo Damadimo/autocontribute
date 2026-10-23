@@ -1,0 +1,103 @@
+name: E2E
+
+# Prepares one real issue with the stored OpenAI key, from issue to approval review, and keeps
+# the run's evidence. It never publishes: the only GitHub token is this workflow's read-only
+# token. Start it by hand with an issue, or push a branch under e2e/ whose e2e/issue.txt
+# names the issue. A run costs up to the default per-run budget of 10 USD.
+on:
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: Issue to prepare, as owner/repository#number
+        required: true
+        type: string
+  push:
+    branches: ["e2e/**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare one issue
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.9.30"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install this checkout
+        run: uv sync --locked
+      - name: Choose the issue
+        id: issue
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ISSUE: ${{ inputs.issue }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            reference="$INPUT_ISSUE"
+          elif [ -f e2e/issue.txt ]; then
+            reference="$(tr -d '[:space:]' < e2e/issue.txt)"
+          else
+            echo "::error::A push to e2e/** needs an e2e/issue.txt that names owner/repository#number"
+            exit 1
+          fi
+          if ! [[ "$reference" =~ ^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#[1-9][0-9]*$ ]]; then
+            echo "::error::The issue must be owner/repository#number"
+            exit 1
+          fi
+          {
+            printf 'reference=%s\n' "$reference"
+            printf 'repository=%s\n' "${BASH_REMATCH[1]}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Write the configuration
+        shell: bash
+        env:
+          REPOSITORY: ${{ steps.issue.outputs.repository }}
+        run: |
+          {
+            printf 'github:\n'
+            printf '  auth: token\n'
+            printf '  token_env: AUTOCONTRIBUTE_GITHUB_TOKEN\n'
+            printf '  repositories: ["%s"]\n' "$REPOSITORY"
+            printf 'storage:\n'
+            printf '  path: %s/autocontribute-state\n' "$RUNNER_TEMP"
+          } > "$RUNNER_TEMP/autocontribute.yml"
+      - name: Prepare the issue
+        shell: bash
+        env:
+          ISSUE: ${{ steps.issue.outputs.reference }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # Read-only: enough for public reads and search, never for publishing.
+          AUTOCONTRIBUTE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::Set OPENAI_API_KEY as a repository secret"
+            exit 1
+          fi
+          uv run --locked autocontribute run \
+            --config "$RUNNER_TEMP/autocontribute.yml" \
+            --issue "$ISSUE" \
+            --json | tee "$RUNNER_TEMP/run.json"
+      - name: Keep the run evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-evidence
+          path: |
+            ${{ runner.temp }}/run.json
+            ${{ runner.temp }}/autocontribute-state/runs
+          retention-days: 14
+          if-no-files-found: warn
