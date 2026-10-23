@@ -11,8 +11,9 @@ github:
   owners: []
   include_labels: ["help wanted", "bug", "confirmed", "accepted", "status: help wanted",
                    "contributions welcome", "pr welcome"]
-  exclude_labels: ["security", "breaking change", "needs design", "discussion", "blocked",
-                   "good first issue", "first-timers-only"]
+  exclude_labels: ["security", "breaking change", "needs-*", "question", "discussion", "design",
+                   "rfc", "proposal", "wontfix", "duplicate", "invalid", "stale", "blocked",
+                   "good first issue", "first-timers-only", "beginner"]  # * matches any text
   labels: {}  # per repository: {owner/repo: {include: [...], exclude: [...]}}
   min_stars: 0
   require_unassigned: true

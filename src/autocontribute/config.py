@@ -129,12 +129,22 @@ class GitHubConfig(StrictModel):
         default_factory=lambda: [
             "security",
             "breaking change",
-            "needs design",
+            # Undecided, unconfirmed or closed-in-spirit work; * matches any text.
+            "needs-*",
+            "question",
             "discussion",
+            "design",
+            "rfc",
+            "proposal",
+            "wontfix",
+            "duplicate",
+            "invalid",
+            "stale",
             "blocked",
             # Maintainers keep these for people making their first contribution.
             "good first issue",
             "first-timers-only",
+            "beginner",
         ]
     )
     labels: dict[str, RepositoryLabels] = Field(default_factory=dict)
