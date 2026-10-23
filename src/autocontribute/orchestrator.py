@@ -639,7 +639,7 @@ class Orchestrator:
         """Return the agent's confirmed fix, or end the run when the agent gave none."""
 
         assert self._evidence is not None
-        self._evidence.check = _latest_check(checks)
+        self._evidence.check = checks.latest
         if isinstance(outcome, SubmittedFix):
             self._evidence.check = checks.results[outcome.check.diff_sha256]
             return outcome
@@ -822,10 +822,6 @@ class Orchestrator:
 def _ai_policy(eligibility: EligibilityResult) -> RepositoryAiPolicy | None:
     raw = eligibility.evidence.get(AI_POLICY_EVIDENCE_KEY)
     return None if raw is None else RepositoryAiPolicy.model_validate_json(raw)
-
-
-def _latest_check(checks: FixChecks) -> FixCheckResult | None:
-    return next(reversed(checks.results.values()), None)
 
 
 def _patch_text(workspace: RepositoryWorkspace) -> str:

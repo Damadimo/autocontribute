@@ -238,6 +238,22 @@ def test_a_reproduced_fix_passes_red_green_and_regression(harness: Harness) -> N
     assert "Tests that already existed are edited: tests/test_calc.py" in harness.text
 
 
+def test_the_latest_check_is_the_last_diff_checked(harness: Harness) -> None:
+    harness.write("src/calc.py", _FIXED)
+    first = harness.check()
+    harness.write("README.md", "calc, fixed\n")
+    second = harness.check()
+    harness.write("README.md", "calc\n")
+
+    again = harness.check()
+
+    assert first.diff_sha256 != second.diff_sha256
+    assert again.diff_sha256 == first.diff_sha256
+    assert harness.checks.latest is again
+    # Checking the first diff again keeps its old place among the results.
+    assert list(harness.checks.results) == [first.diff_sha256, second.diff_sha256]
+
+
 def test_a_test_that_passes_without_the_fix_reproduces_nothing(harness: Harness) -> None:
     harness.write("src/calc.py", _FIXED)
     harness.write(
