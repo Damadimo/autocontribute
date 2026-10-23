@@ -9,7 +9,7 @@ from typer.testing import CliRunner, Result
 
 import autocontribute.cli as cli
 from autocontribute.cli import app
-from autocontribute.config import load_config
+from autocontribute.config import AutocontributeConfig, load_config
 from autocontribute.discovery import (
     LEGAL_REQUIREMENTS_EVIDENCE_KEY,
     DiscoveryOutcome,
@@ -1345,8 +1345,12 @@ def test_scheduled_preflight_gates_only_on_the_global_stop(
     assert len(RunStore(state).active_holds()) == 1
 
 
-def test_run_expires_runs_left_unapproved_past_the_grace_period(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(("hours_past_expiry", "expired"), [(-1, False), (1, True)])
+def test_run_expires_runs_left_unapproved_past_approval_lifetime_plus_seven_days(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hours_past_expiry: int,
+    expired: bool,
 ) -> None:
     config = tmp_path / "autocontribute.yml"
     state = tmp_path / "state"
@@ -1356,41 +1360,29 @@ def test_run_expires_runs_left_unapproved_past_the_grace_period(
     waiting.status = RunStatus.READY_FOR_APPROVAL
     store.save(waiting, event="test.ready", details={})
     _SkippingOrchestrator.calls = []
+    offset = (
+        timedelta(hours=AutocontributeConfig().publishing.approval_expires_hours)
+        + timedelta(days=7)
+        + timedelta(hours=hours_past_expiry)
+    )
 
-    class EightDaysLater(datetime):
+    class Later(datetime):
         @classmethod
         def now(cls, tz=None):  # type: ignore[no-untyped-def]
-            return datetime.now(tz) + timedelta(days=8)
+            return datetime.now(tz) + offset
 
-    monkeypatch.setattr(cli, "datetime", EightDaysLater)
+    monkeypatch.setattr(cli, "datetime", Later)
     monkeypatch.setattr(cli, "GitHubClient", _ClosableGitHub)
     monkeypatch.setattr(cli, "Orchestrator", _SkippingOrchestrator)
 
     result = runner.invoke(app, ["run", "--config", str(config)])
 
     assert result.exit_code == 0, result.output
-    assert f"Expired unapproved run `{waiting.run_id}`" in result.output
-    assert store.get(waiting.run_id).status == RunStatus.CANCELLED
+    assert (f"Expired unapproved run `{waiting.run_id}`" in result.output) is expired
+    assert store.get(waiting.run_id).status == (
+        RunStatus.CANCELLED if expired else RunStatus.READY_FOR_APPROVAL
+    )
     assert _SkippingOrchestrator.calls == ["run"]
-
-
-def test_run_keeps_runs_still_inside_the_grace_period(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config = tmp_path / "autocontribute.yml"
-    state = tmp_path / "state"
-    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
-    store = RunStore(state)
-    waiting = store.create_run()
-    waiting.status = RunStatus.READY_FOR_APPROVAL
-    store.save(waiting, event="test.ready", details={})
-    monkeypatch.setattr(cli, "GitHubClient", _ClosableGitHub)
-    monkeypatch.setattr(cli, "Orchestrator", _SkippingOrchestrator)
-
-    result = runner.invoke(app, ["run", "--config", str(config)])
-
-    assert result.exit_code == 0, result.output
-    assert store.get(waiting.run_id).status == RunStatus.READY_FOR_APPROVAL
 
 
 @pytest.mark.parametrize("already_active", [False, True])
