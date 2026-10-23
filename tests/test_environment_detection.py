@@ -386,6 +386,44 @@ jobs:
     assert "tox -e py312-extra" in recipe.setup_commands[-2]
 
 
+def test_a_job_with_per_test_results_wins_over_an_earlier_test_script(tmp_path: Path) -> None:
+    # psf/black: release_tests.yml sorts first and runs a script; test.yml runs pytest via tox.
+    signals = _signals(
+        tmp_path / "repository",
+        {
+            "setup.py": "from setuptools import setup\nsetup()\n",
+            "scripts/release_tests.py": "print('ok')\n",
+            "tox.ini": "[testenv]\ncommands =\n    pytest tests --run-optional no_jupyter\n",
+            ".github/workflows/release_tests.yml": """
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: coverage run scripts/release_tests.py
+""",
+            ".github/workflows/test.yml": """
+on: pull_request
+jobs:
+  main:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+      - run: tox -e ci-py$(echo ${{ matrix.python-version }} | tr -d '.') -- -v
+""",
+        },
+    )
+
+    recipe = detect_recipe("acme/demo", signals)
+
+    assert recipe.test_framework == "pytest"
+    assert recipe.test_command == (
+        f"python -m pytest tests --run-optional no_jupyter {_PYTEST_REPORT}"
+    )
+
+
 def test_nox_sessions_install_with_nox_and_rerun_without_installing(tmp_path: Path) -> None:
     signals = _signals(
         tmp_path / "repository",

@@ -287,13 +287,25 @@ def _find_test_run(
     language: Language,
     python_minor: Callable[[CiJob], int | None] = lambda _job: None,
 ) -> tuple[CiTestRun | None, CiJob | None]:
-    """The first CI job whose tests run in the given language, and that job."""
+    """The CI job whose tests run in the given language, and its test run.
 
+    The first job whose tests report per-test results wins; a job that runs a bare test script,
+    such as a release check, is used only when no job in the language does.
+    """
+
+    first: tuple[CiTestRun, CiJob] | None = None
     for job in ci_jobs(sources.signals):
         run = job_test_run(sources, job, python_minor=python_minor(job))
-        if run is not None and _language_of(run.tests[0]) == language:
+        if run is None or _language_of(run.tests[0]) != language:
+            continue
+        if run.tests[0].runner in _PER_TEST_RUNNERS:
             return run, job
-    return None, None
+        first = first or (run, job)
+    return first or (None, None)
+
+
+# Runners whose reports name each test; others count the whole suite as one test.
+_PER_TEST_RUNNERS: Final = frozenset({"pytest", "jest", "vitest", "mocha", "go", "cargo"})
 
 
 def _language_of(invocation: Invocation) -> Language | None:
