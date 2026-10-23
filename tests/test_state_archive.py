@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import sqlite3
 import tarfile
+from contextlib import closing
 from datetime import timedelta
 from pathlib import Path
 
@@ -225,3 +227,132 @@ def test_state_commands_round_trip_through_the_cli(tmp_path: Path) -> None:
     assert forced.exit_code == 0, forced.output
     assert "released 0 lease(s)" in " ".join(forced.output.split())
     assert RunStore(tmp_path / "target").get(run.run_id).status is RunStatus.QUEUED
+
+
+def _saved_run(store: RunStore, status: RunStatus, **fields: object) -> str:
+    manifest = store.create_run()
+    manifest.status = status
+    for name, value in fields.items():
+        setattr(manifest, name, value)
+    store.save(manifest, event="fixture.saved", details={})
+    return manifest.run_id
+
+
+def _trusted_state(root: Path) -> tuple[RunStore, dict[RunStatus, str]]:
+    store = RunStore(root)
+    runs = {
+        status: _saved_run(store, status)
+        for status in (
+            RunStatus.READY_FOR_APPROVAL,
+            RunStatus.APPROVED,
+            RunStatus.SUBMITTING,
+            RunStatus.FAILED,
+        )
+    }
+    runs[RunStatus.PR_OPEN] = _saved_run(
+        store, RunStatus.PR_OPEN, pull_request_url="https://github.com/example/project/pull/7"
+    )
+    return store, runs
+
+
+def _preparation_of(trusted: RunStore, tmp_path: Path) -> RunStore:
+    archive = tmp_path / "base.tar.gz"
+    export_state(trusted, archive)
+    import_state(archive, tmp_path / "prepared")
+    return RunStore(tmp_path / "prepared")
+
+
+def test_append_only_import_takes_what_a_preparation_may_add(tmp_path: Path) -> None:
+    trusted, runs = _trusted_state(tmp_path / "trusted")
+    prepared = _preparation_of(trusted, tmp_path)
+    ready = prepared.get(runs[RunStatus.READY_FOR_APPROVAL])
+    prepared.transition(ready, RunStatus.CANCELLED, reason="its review cannot be built")
+    approved = prepared.get(runs[RunStatus.APPROVED])
+    prepared.transition(approved, RunStatus.CANCELLED, reason="the approval expired")
+    published = prepared.get(runs[RunStatus.PR_OPEN])
+    prepared.save(published, event="lifecycle.observed", details={})
+    added = _saved_run(prepared, RunStatus.READY_FOR_APPROVAL)
+    prepared.trip_circuit_breaker(source="maintainer", reason="stop", trigger_hash="d" * 64)
+    archive = tmp_path / "prepared.tar.gz"
+    export_state(prepared, archive)
+
+    import_state(archive, trusted.root, append_only=True)
+
+    saved = RunStore(trusted.root)
+    assert saved.get(added).status is RunStatus.READY_FOR_APPROVAL
+    assert saved.get(runs[RunStatus.APPROVED]).status is RunStatus.CANCELLED
+    assert saved.get(runs[RunStatus.SUBMITTING]).status is RunStatus.SUBMITTING
+    assert saved.circuit_breaker_status().is_tripped
+
+
+def _forge(prepared: RunStore, runs: dict[RunStatus, str], change: str) -> None:
+    if change == "approve":
+        ready = prepared.get(runs[RunStatus.READY_FOR_APPROVAL])
+        ready.status = RunStatus.APPROVED
+        prepared.save(ready, event="forged.approval", details={})
+    elif change == "end_submitting":
+        submitting = prepared.get(runs[RunStatus.SUBMITTING])
+        submitting.status = RunStatus.FAILED
+        prepared.save(submitting, event="forged.failure", details={})
+    elif change == "forget_pull_request":
+        published = prepared.get(runs[RunStatus.PR_OPEN])
+        published.pull_request_url = "https://github.com/example/project/pull/8"
+        prepared.save(published, event="forged.url", details={})
+    elif change == "add_published":
+        _saved_run(prepared, RunStatus.PR_OPEN)
+    elif change == "end_stop":
+        prepared.resume_circuit_breaker(
+            actor="forger",
+            reason="forged",
+            expected_trigger_hash=prepared.circuit_breaker_status().active_revision or "",
+        )
+    elif change == "rewrite_status_column":
+        with closing(sqlite3.connect(prepared.database_path)) as connection, connection:
+            connection.execute(
+                "UPDATE runs SET status = 'cancelled' WHERE run_id = ?",
+                (runs[RunStatus.APPROVED],),
+            )
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ("approve", r"\(ready_for_approval to approved\)"),
+        ("end_submitting", r"\(submitting to failed\)"),
+        ("forget_pull_request", r"rewrites run .* \(pr_open to pr_open\)"),
+        ("add_published", "adds run"),
+        ("end_stop", "ends a safety stop"),
+        ("rewrite_status_column", "disagrees with its state row"),
+    ],
+)
+def test_append_only_import_refuses_what_only_an_approval_or_operator_may_do(
+    tmp_path: Path,
+    change: str,
+    message: str,
+) -> None:
+    trusted, runs = _trusted_state(tmp_path / "trusted")
+    trusted.trip_circuit_breaker(source="maintainer", reason="stop", trigger_hash="c" * 64)
+    prepared = _preparation_of(trusted, tmp_path)
+    _forge(prepared, runs, change)
+    archive = tmp_path / "prepared.tar.gz"
+    export_state(prepared, archive)
+    before = export_state(trusted, tmp_path / "before.tar.gz").sha256
+
+    with pytest.raises(StateError, match=message):
+        import_state(archive, trusted.root, append_only=True)
+
+    assert export_state(RunStore(trusted.root), tmp_path / "after.tar.gz").sha256 == before
+
+
+def test_append_only_import_refuses_a_fresh_state_in_place_of_saved_work(tmp_path: Path) -> None:
+    trusted, runs = _trusted_state(tmp_path / "trusted")
+    trusted.trip_circuit_breaker(source="maintainer", reason="stop", trigger_hash="c" * 64)
+    archive = tmp_path / "fresh.tar.gz"
+    export_state(RunStore(tmp_path / "fresh"), archive)
+
+    with pytest.raises(StateError, match="drops or rewrites"):
+        import_state(archive, trusted.root, append_only=True)
+
+    saved = RunStore(trusted.root)
+    assert saved.circuit_breaker_status().is_tripped
+    assert saved.get(runs[RunStatus.READY_FOR_APPROVAL]).status is RunStatus.READY_FOR_APPROVAL

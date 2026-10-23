@@ -45,7 +45,9 @@ command.
 - `record` runs on a fresh machine and runs no repository code. It accepts only `state.tar.gz`
   and `prepared.json` from `prepare`, checks their sizes and hashes, opens the state and verifies
   its records, and renders each issue from that state, so the issue shows what the approval
-  fingerprint covers.
+  fingerprint covers. It saves the state only if it keeps everything the saved state holds: a
+  preparation may add runs, start a safety stop, and cancel runs waiting for approval, but never
+  approve, publish, or end a stop.
 - `approve` checks the comment again from the event file and from GitHub: the issue is open,
   this runner opened it, it carries the `autocontribute:awaiting-approval` label, your account
   wrote the comment, nobody edited it, and it reads exactly `/approve` and 12 characters of the

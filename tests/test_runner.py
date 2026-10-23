@@ -1233,6 +1233,52 @@ def test_actions_record_drops_a_preparation_when_the_state_moved(
     assert github.issues == {}
 
 
+def test_actions_record_refuses_a_prepared_state_that_drops_saved_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "prepared").mkdir()
+    config, trusted, _, _ = _runner_ready_run(tmp_path)
+    trusted.trip_circuit_breaker(source="maintainer", reason="stop", trigger_hash="c" * 64)
+    origin = _state_remote(tmp_path)
+    checkout = _checkout(origin, tmp_path / "branch")
+    export_state(trusted, tmp_path / "trusted.tar.gz")
+    StateBranch(checkout, token=None).save(tmp_path / "trusted.tar.gz", message="seed")
+    saved = _remote_file(origin, STATE_ARCHIVE)
+    forged = tmp_path / "artifact"
+    forged.mkdir()
+    exported = export_state(RunStore(tmp_path / "fresh"), forged / STATE_ARCHIVE)
+    write_prepared(
+        forged,
+        PreparedState(
+            base_state_sha256=file_sha256(checkout / STATE_ARCHIVE),
+            state_sha256=exported.sha256,
+            run_id=None,
+        ),
+    )
+    github = FakeRunnerGitHub()
+    _actions_environment(tmp_path, monkeypatch, github)
+    monkeypatch.setattr(cli, "_github_client", lambda *_: _ReviewGitHub())
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "actions",
+            "record",
+            "--input",
+            str(forged),
+            "--state",
+            str(checkout),
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "drops or rewrites" in result.output
+    assert _remote_file(origin, STATE_ARCHIVE) == saved
+    assert github.issues == {}
+
+
 def _approve_setup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, body: str | None = None
 ) -> tuple[list[str], FakeRunnerGitHub, Path, str, int, Path]:

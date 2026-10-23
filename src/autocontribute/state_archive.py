@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
-from autocontribute.domain import TERMINAL_STATUSES
+from autocontribute.domain import TERMINAL_STATUSES, RunManifest, RunStatus
 from autocontribute.exceptions import StateError
 from autocontribute.store import RunStore
 
@@ -28,6 +28,21 @@ _ENTRY_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,255}$")
 _MAX_ENTRIES = 10_000
 _MAX_BYTES = 1 << 30
 _FINISHED_STATUSES = frozenset(status.value for status in TERMINAL_STATUSES)
+# Only an approval, given by a person outside any preparation, moves a run into these.
+_APPROVED_STATUSES = frozenset({RunStatus.APPROVED, RunStatus.SUBMITTING, RunStatus.PR_OPEN})
+_WAITING_STATUSES = frozenset({RunStatus.READY_FOR_APPROVAL, RunStatus.APPROVED})
+# Rows that _assert_extends compares itself, or bookkeeping that no decision reads; every other
+# table may only gain rows.
+_REWRITABLE_TABLES = frozenset(
+    {
+        "runs",
+        "circuit_breaker",
+        "leases",
+        "lease_generations",
+        "manifest_artifact_sync",
+        "schema_metadata",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,17 +88,20 @@ def import_state(
     *,
     force: bool = False,
     release_leases: bool = False,
+    append_only: bool = False,
 ) -> int:
     """Replace the state at ``root`` with an exported archive; return the leases released.
 
     The archive is unpacked next to ``root`` and opened as a store, which checks the schema and
     reconciles reservations, and every event chain is verified before anything is replaced.
+    With ``append_only`` the archive comes from a job that ran untrusted code, and it replaces
+    the state at ``root`` (empty if there is none) only if it extends that state.
     """
 
     root = root.expanduser().resolve()
     if root.is_symlink() or (root.exists() and not root.is_dir()):
         raise StateError(f"State path {root} is not a directory")
-    if _holds_state(root) and not force:
+    if _holds_state(root) and not (force or append_only):
         raise StateError(f"{root} already holds state; pass --force to replace it")
     root.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{root.name}.import-", dir=root.parent))
@@ -92,6 +110,8 @@ def import_state(
         try:
             store = RunStore(staging)
             store.verify_event_chains()
+            if append_only:
+                _assert_extends(RunStore(root), store)
         except sqlite3.DatabaseError as exc:
             raise StateError(f"The archived database is not usable state: {exc}") from exc
         released = store.release_all_leases() if release_leases else 0
@@ -106,6 +126,88 @@ def import_state(
     else:
         staging.rename(root)
     return released
+
+
+def _assert_extends(trusted: RunStore, prepared: RunStore) -> None:
+    """Refuse a prepared state that drops or rewrites what the trusted state holds.
+
+    A preparation adds runs and events, may start a safety stop, and cancels runs whose
+    approval can no longer publish. It never approves or publishes, and never ends a stop.
+    """
+
+    with closing(sqlite3.connect(prepared.database_path)) as connection:
+        connection.execute("ATTACH DATABASE ? AS trusted", (str(trusted.database_path),))
+        tables = [
+            str(name)
+            for (name,) in connection.execute(
+                "SELECT name FROM trusted.sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        for table in tables:
+            if table in _REWRITABLE_TABLES:
+                continue
+            # Table names come from the trusted schema, which the store checked.
+            (dropped,) = connection.execute(
+                f'SELECT count(*) FROM (SELECT * FROM trusted."{table}" '
+                f'EXCEPT SELECT * FROM main."{table}")'
+            ).fetchone()
+            if dropped:
+                raise StateError(
+                    f"The prepared state drops or rewrites {dropped} saved {table} row(s)"
+                )
+        changed = connection.execute(
+            "SELECT run_id, main.runs.status, main.runs.manifest_json "
+            "FROM (SELECT * FROM trusted.runs EXCEPT SELECT * FROM main.runs) "
+            "LEFT JOIN main.runs USING (run_id)"
+        ).fetchall()
+        added = connection.execute(
+            "SELECT run_id, status, manifest_json FROM main.runs "
+            "WHERE run_id NOT IN (SELECT run_id FROM trusted.runs)"
+        ).fetchall()
+    before = trusted.circuit_breaker_status()
+    after = prepared.circuit_breaker_status()
+    if after.epoch != before.epoch or (before.is_tripped and not after.is_tripped):
+        raise StateError("The prepared state ends a safety stop")
+    for run_id, status, manifest_json in added:
+        if _prepared_run(run_id, status, manifest_json).status in _APPROVED_STATUSES:
+            raise StateError(f"The prepared state adds run {run_id} as {status}")
+    for run_id, status, manifest_json in changed:
+        if status is None:
+            raise StateError(f"The prepared state drops run {run_id}")
+        saved = trusted.get(run_id)
+        current = _prepared_run(run_id, status, manifest_json)
+        if not _preparation_may_change(saved, current):
+            raise StateError(
+                f"The prepared state rewrites run {run_id} "
+                f"({saved.status.value} to {current.status.value})"
+            )
+
+
+def _prepared_run(run_id: object, status: object, manifest_json: object) -> RunManifest:
+    try:
+        manifest = RunManifest.model_validate_json(str(manifest_json))
+    except ValueError as exc:
+        raise StateError(f"The prepared state holds an invalid run {run_id}") from exc
+    if manifest.run_id != run_id or manifest.status.value != status:
+        raise StateError(f"The prepared run {run_id} disagrees with its state row")
+    return manifest
+
+
+def _preparation_may_change(saved: RunManifest, current: RunManifest) -> bool:
+    if saved.status == RunStatus.PR_OPEN:
+        # Lifecycle observation may record what it saw, but the pull request stays tracked.
+        return (
+            current.status == RunStatus.PR_OPEN
+            and current.pull_request_url == saved.pull_request_url
+        )
+    if saved.status == RunStatus.SUBMITTING:
+        return False
+    if saved.status in _WAITING_STATUSES:
+        return current.status == RunStatus.CANCELLED
+    if saved.status in TERMINAL_STATUSES:
+        return current.status == saved.status
+    return current.status not in _APPROVED_STATUSES
 
 
 def _run_evidence(runs_dir: Path, run_id: str) -> list[tuple[str, Path]]:
