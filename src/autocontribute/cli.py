@@ -633,6 +633,52 @@ def cancel_run(
     console.print(f"[yellow]Cancelled[/yellow] `{run_id}`.")
 
 
+@runs_app.command(name="abandon")
+def abandon_run(
+    run_id: Annotated[str, typer.Argument(help="Submitting run identifier to abandon.")],
+    reason: Annotated[
+        str,
+        typer.Option("--reason", help="Why the publication is abandoned; recorded in the ledger."),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", help="Abandon without asking for confirmation."),
+    ] = False,
+) -> None:
+    """Fail a submitting run whose publication left no branch or pull request on GitHub.
+
+    Exit codes: 0 abandoned, 4 GitHub has the branch or pull request, so resume it with
+    `publish`, 1 anything else.
+    """
+
+    normalized_reason = reason.strip()
+    if not normalized_reason:
+        _fail("--reason must explain why the publication is abandoned")
+    settings = _config(config)
+    store = RunStore(settings.storage.path)
+    try:
+        manifest = store.get(run_id)
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    if manifest.status != RunStatus.SUBMITTING:
+        _fail(f"Run {run_id} is {manifest.status.value}; only submitting runs can be abandoned")
+    _show_report(manifest)
+    if not yes and not typer.confirm(
+        f"Check that run {run_id} left nothing on GitHub, then mark it failed and release its issue"
+    ):
+        raise typer.Abort()
+    try:
+        with _github_client(settings, store) as github:
+            manifest = Publisher(settings, store, github).abandon(run_id, reason=normalized_reason)
+    except PublicationResumeRequired as exc:
+        _fail(f"{exc}; resume it with `autocontribute publish {run_id}`", exit_code=4)
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    _refresh_report(store, manifest)
+    console.print(f"[yellow]Abandoned[/yellow] `{run_id}`; its issue is released.")
+
+
 @config_app.command(name="validate")
 def validate_config(config: ConfigOption = DEFAULT_CONFIG) -> None:
     """Parse configuration and print a credential-free summary."""

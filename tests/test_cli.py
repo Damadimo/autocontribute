@@ -2027,6 +2027,101 @@ def test_runs_check_reports_a_run_it_cannot_check(
     }
 
 
+def _submitting_state(tmp_path: Path) -> tuple[Path, RunStore, str]:
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+    store = RunStore(state)
+    run = store.create_run()
+    run.status = RunStatus.SUBMITTING
+    store.save(run, event="test.submitting", details={})
+    return config, store, run.run_id
+
+
+def test_runs_abandon_confirms_then_fails_the_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id = _submitting_state(tmp_path)
+    reasons: list[str] = []
+
+    class AbandoningPublisher:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def abandon(self, abandoned: str, *, reason: str):  # type: ignore[no-untyped-def]
+            reasons.append(reason)
+            manifest = store.get(abandoned)
+            manifest.status = RunStatus.FAILED
+            store.save(manifest, event="test.abandoned", details={})
+            return manifest
+
+    monkeypatch.setattr(cli, "GitHubClient", _ContextGitHub)
+    monkeypatch.setattr(cli, "Publisher", AbandoningPublisher)
+    command = ["runs", "abandon", run_id, "--reason", "  Stuck by D3  ", "--config", str(config)]
+
+    declined = runner.invoke(app, command, input="n\n")
+    abandoned = runner.invoke(app, [*command, "--yes"])
+
+    assert declined.exit_code == 1
+    assert f"Check that run {run_id} left nothing on GitHub" in declined.output
+    assert abandoned.exit_code == 0, abandoned.output
+    assert reasons == ["Stuck by D3"]
+    assert f"Abandoned `{run_id}`" in abandoned.output
+    assert store.get(run_id).status is RunStatus.FAILED
+
+
+def test_runs_abandon_sends_remote_state_back_to_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id = _submitting_state(tmp_path)
+
+    class RemoteStatePublisher:
+        def __init__(self, *_: object) -> None:
+            pass
+
+        def abandon(self, abandoned: str, *, reason: str) -> None:
+            raise PublicationResumeRequired("The contribution branch exists")
+
+    monkeypatch.setattr(cli, "GitHubClient", _ContextGitHub)
+    monkeypatch.setattr(cli, "Publisher", RemoteStatePublisher)
+
+    result = runner.invoke(
+        app,
+        ["runs", "abandon", run_id, "--reason", "Stuck", "--yes", "--config", str(config)],
+    )
+
+    assert result.exit_code == 4
+    output = " ".join(result.output.split())
+    assert f"The contribution branch exists; resume it with `autocontribute publish {run_id}`" in (
+        output
+    )
+    assert store.get(run_id).status is RunStatus.SUBMITTING
+
+
+def test_runs_abandon_refuses_blank_reasons_and_runs_that_are_not_submitting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, _, run_id = _approved_state(tmp_path)
+    monkeypatch.setattr(cli, "_github_client", _forbid_github)
+
+    blank = runner.invoke(
+        app,
+        ["runs", "abandon", run_id, "--reason", " ", "--yes", "--config", str(config)],
+    )
+    approved = runner.invoke(
+        app,
+        ["runs", "abandon", run_id, "--reason", "Stuck", "--yes", "--config", str(config)],
+    )
+
+    assert blank.exit_code == 1
+    assert "--reason must explain why the publication is abandoned" in blank.output
+    assert approved.exit_code == 1
+    assert "only submitting runs can be abandoned" in " ".join(approved.output.split())
+
+
 def test_manual_publish_returns_reconciled_target_without_a_new_publish_call(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
