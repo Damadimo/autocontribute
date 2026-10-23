@@ -474,4 +474,6 @@ def test_security_integration_runs_live_rootful_docker_isolation() -> None:
     assert job["runs-on"] == "ubuntu-24.04"
     assert "strategy" not in job
     assert rootful["env"]["AUTOCONTRIBUTE_RUN_DOCKER_TESTS"] == "1"
-    assert rootful["run"] == "uv run pytest -q tests/test_sandbox_live.py"
+    assert rootful["run"] == (
+        "uv run pytest -q tests/test_sandbox_live.py tests/test_environments_live.py"
+    )
