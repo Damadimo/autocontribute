@@ -40,7 +40,8 @@ _REFUSAL_CATEGORIES: Final = frozenset(
     {"cyber", "bio", "frontier_llm", "reasoning_extraction", "general_harms"}
 )
 # The status each error type is documented with. An error event inside a stream arrives on the
-# stream's 200 response, so its type is the only sign of how the request failed.
+# stream's 200 response, so its type is the only sign of how the request failed; an unlisted type
+# keeps no status and is retried like a dropped connection.
 _ERROR_TYPE_STATUSES: Final[Mapping[str, int]] = MappingProxyType(
     {
         "invalid_request_error": 400,
