@@ -625,3 +625,107 @@ def test_context_index_fails_instead_of_omitting_files_at_file_limit(
 
     with pytest.raises(RepositoryError, match="file limit"):
         workspace.context_index(max_files=1)
+
+
+def _plant_program(tmp_path: Path, name: str) -> tuple[Path, Path]:
+    """Write a host program that leaves a marker file when anything runs it."""
+
+    marker = tmp_path / f"{name}-ran"
+    program = tmp_path / f"{name}.sh"
+    program.write_text(f'#!/bin/sh\ntouch "{marker}"\ncat\n', encoding="utf-8")
+    program.chmod(0o755)
+    return program, marker
+
+
+@pytest.mark.parametrize("variable", ["clean", "smudge", "process"])
+def test_planted_filter_driver_is_refused_before_host_git_runs_it(
+    tmp_path: Path, source_repository: tuple[Path, str, str], variable: str
+) -> None:
+    # The map-sandbox §0.10 attack: a writable .git/config plus a .gitattributes line
+    # made `git add --all` in the temporary index run a chosen command on the host.
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+    pristine = _clone(source, first_sha, tmp_path / "pristine")
+    program, marker = _plant_program(tmp_path, "filter")
+    for target in (workspace, pristine):
+        with (target.path / ".git" / "config").open("a", encoding="utf-8") as config:
+            config.write(f'[filter "Planted.x"]\n\t{variable} = {program}\n')
+        (target.path / ".gitattributes").write_text("* filter=Planted.x\n", encoding="utf-8")
+    (workspace.path / "README.md").write_text("changed\n", encoding="utf-8")
+
+    for operation in (
+        workspace.changed_paths,
+        workspace.diff_bytes,
+        workspace.patch_bytes,
+        lambda: pristine.apply_patch("diff --git a/x b/x\n"),
+    ):
+        with pytest.raises(RepositoryError, match=r"filter command: filter\.Planted\.x\."):
+            operation()
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("config", "attributes"),
+    [
+        ("[core]\n\tfsmonitor = {program}\n", None),
+        ("[diff]\n\texternal = {program}\n", None),
+        ('[diff "planted"]\n\ttextconv = {program}\n\tcommand = {program}\n', "* diff=planted\n"),
+    ],
+)
+def test_planted_git_programs_do_not_run_during_patch_extraction(
+    tmp_path: Path,
+    source_repository: tuple[Path, str, str],
+    config: str,
+    attributes: str | None,
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+    program, marker = _plant_program(tmp_path, "program")
+    with (workspace.path / ".git" / "config").open("a", encoding="utf-8") as handle:
+        handle.write(config.format(program=program))
+    if attributes is not None:
+        (workspace.path / ".gitattributes").write_text(attributes, encoding="utf-8")
+    (workspace.path / "README.md").write_text("changed\n", encoding="utf-8")
+
+    patch = workspace.patch_bytes()
+
+    assert b"+changed" in patch
+    assert workspace.changed_paths()
+    assert not marker.exists()
+
+
+def test_patch_bytes_keeps_symlinks_for_the_diff_gates(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+    (workspace.path / "link").symlink_to("/etc/passwd")
+
+    patch = workspace.patch_bytes()
+
+    assert b"new file mode 120000" in patch
+    with pytest.raises(RepositoryError, match="symlink"):
+        workspace.diff_bytes()
+
+
+def test_apply_patch_checks_the_whole_patch_before_changing_anything(
+    tmp_path: Path, source_repository: tuple[Path, str, str]
+) -> None:
+    source, first_sha, _ = source_repository
+    workspace = _clone(source, first_sha, tmp_path / "workspace")
+    target = _clone(source, first_sha, tmp_path / "target")
+    (workspace.path / "README.md").write_text("improved\n", encoding="utf-8")
+    (workspace.path / "delete.txt").unlink()
+    patch = workspace.patch_bytes().decode("utf-8")
+
+    (target.path / "delete.txt").write_text("drifted\n", encoding="utf-8")
+    with pytest.raises(RepositoryError, match="patch does not apply"):
+        target.apply_patch(patch)
+    assert (target.path / "README.md").read_text(encoding="utf-8") == "first\n"
+
+    (target.path / "delete.txt").write_text("remove me\n", encoding="utf-8")
+    target.apply_patch(patch)
+    assert (target.path / "README.md").read_text(encoding="utf-8") == "improved\n"
+    assert not (target.path / "delete.txt").exists()
+    with pytest.raises(RepositoryError, match="empty patch"):
+        target.apply_patch("")
