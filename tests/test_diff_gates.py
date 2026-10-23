@@ -381,6 +381,34 @@ def test_a_token_fails_the_secrets_gate_without_its_value(workspace: RepositoryW
     assert _TOKEN not in str(outcome)
 
 
+# Assembled at runtime, like the token above.
+_KEY_HEADER = "-----BEGIN " + "PRIVATE KEY-----"
+_KEY_FOOTER = "-----END " + "PRIVATE KEY-----"
+
+
+def test_a_key_header_without_key_material_passes(workspace: RepositoryWorkspace) -> None:
+    source = (
+        f'HEADER = "{_KEY_HEADER}"\n\n\ndef is_key(text):\n    return text.startswith(HEADER)\n'
+    )
+    _write(workspace, {"src/pem.py": source})
+
+    _, gates = _gates(workspace)
+
+    assert not _failed(gates)
+
+
+def test_a_key_block_fails_the_secrets_gate(workspace: RepositoryWorkspace) -> None:
+    body = "\n".join("A" * 64 for _ in range(3))
+    _write(workspace, {"src/key.py": f'KEY = """{_KEY_HEADER}\n{body}\n{_KEY_FOOTER}"""\n'})
+
+    _, gates = _gates(workspace)
+
+    assert gates["secrets"] == (
+        False,
+        "credentials found (values withheld): private key in src/key.py",
+    )
+
+
 def test_a_host_secret_value_is_flagged_for_the_breaker(workspace: RepositoryWorkspace) -> None:
     _write(workspace, {"src/calc.py": f"# {_HOST_SECRET}\n" + _BASE["src/calc.py"]})
 

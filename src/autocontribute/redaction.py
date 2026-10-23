@@ -124,14 +124,15 @@ def contains_high_confidence_token(text: str) -> bool:
     return bool(high_confidence_token_labels(text))
 
 
-def high_confidence_token_labels(text: str) -> list[str]:
+def high_confidence_token_labels(text: str, *, include_key_header: bool = True) -> list[str]:
     """Name the kinds of high-confidence token in text, without the values.
 
-    A private key header alone counts, as in :func:`contains_high_confidence_token`.
+    A private key header alone counts, as in :func:`contains_high_confidence_token`, unless
+    ``include_key_header`` is false: code that parses keys holds the header as a constant.
     """
 
     labels = [label for label, pattern in HIGH_CONFIDENCE_TOKEN_PATTERNS if pattern.search(text)]
-    if "private key" not in labels and _PRIVATE_KEY_HEADER.search(text):
+    if include_key_header and "private key" not in labels and _PRIVATE_KEY_HEADER.search(text):
         labels.append("private key")
     return labels
 
