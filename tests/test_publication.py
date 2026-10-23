@@ -107,6 +107,7 @@ def test_publication_git_environment_has_a_non_shared_fallback_home(
 ) -> None:
     monkeypatch.delenv("HOME", raising=False)
     monkeypatch.setenv("AUTOCONTRIBUTE_GITHUB_TOKEN", "must-not-be-inherited")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
 
     environment = publication_module._git_environment()
 
@@ -115,6 +116,8 @@ def test_publication_git_environment_has_a_non_shared_fallback_home(
     assert environment["GIT_CONFIG_GLOBAL"] == "/dev/null"
     assert environment["GIT_TERMINAL_PROMPT"] == "0"
     assert "AUTOCONTRIBUTE_GITHUB_TOKEN" not in environment
+    # The push goes through the operator's proxy, as host git's clone does.
+    assert environment["HTTPS_PROXY"] == "http://proxy.example:3128"
 
 
 class _FixtureEligibilityGitHub:
