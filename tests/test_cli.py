@@ -2,9 +2,10 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 import autocontribute.cli as cli
 from autocontribute.cli import app
@@ -28,7 +29,13 @@ from autocontribute.domain import (
     ReviewScores,
     RunStatus,
 )
-from autocontribute.exceptions import GitHubError, PublicationResumeRequired, StateError
+from autocontribute.exceptions import (
+    CircuitBreakerTrigger,
+    GitHubError,
+    PublicationResumeRequired,
+    StateError,
+    StopScope,
+)
 from autocontribute.github import DirectoryEntry
 from autocontribute.lifecycle import LifecycleSyncResult
 from autocontribute.orchestrator import RunInvocationMode
@@ -873,6 +880,75 @@ def test_safety_cli_persists_stop_status_and_audited_resume(tmp_path: Path) -> N
     assert breaker.epoch == 2
 
 
+def _repository_hold(state: Path) -> None:
+    RunStore(state).record_stop(
+        CircuitBreakerTrigger(
+            source="github_lifecycle:example/project#7:closed_unmerged",
+            reason="Pull request was closed without being merged",
+            trigger_hash="a" * 64,
+            scope=StopScope.REPOSITORY,
+            scope_key="example/project",
+            expires_at=datetime(2030, 1, 1, tzinfo=UTC),
+        )
+    )
+
+
+def test_safety_status_lists_holds_and_release_clears_one(tmp_path: Path) -> None:
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+    _repository_hold(state)
+
+    text = runner.invoke(app, ["safety", "status", "--config", str(config)])
+    as_json = runner.invoke(app, ["safety", "status", "--config", str(config), "--json"])
+
+    def release(hold_id: str, reason: str = "Reviewed the closed PR") -> Result:
+        return runner.invoke(
+            app,
+            [
+                "safety",
+                "release",
+                hold_id,
+                "--actor",
+                "operator",
+                "--reason",
+                reason,
+                "--config",
+                str(config),
+            ],
+        )
+
+    blank = release("1", " ")
+    released = release("1")
+    again = release("1")
+    missing = release("99")
+
+    assert text.exit_code == 0, text.output
+    assert "OPERATIONAL" in text.output
+    assert (
+        "  1. repository example/project (until 2030-01-01T00:00:00+00:00): "
+        "github_lifecycle:example/project#7:closed_unmerged: "
+        "Pull request was closed without being merged"
+    ) in text.output
+    assert as_json.exit_code == 0, as_json.output
+    (hold,) = json.loads(as_json.output)["holds"]
+    assert {key: hold[key] for key in ("id", "scope", "scope_key", "expires_at")} == {
+        "id": 1,
+        "scope": "repository",
+        "scope_key": "example/project",
+        "expires_at": "2030-01-01T00:00:00+00:00",
+    }
+    assert blank.exit_code == 1
+    assert released.exit_code == 0, released.output
+    assert "Released hold 1." in released.output
+    assert "already released" in again.output
+    assert missing.exit_code == 1
+    assert "Unknown hold: 99" in missing.output
+    assert RunStore(state).active_holds() == []
+    cleared = runner.invoke(app, ["safety", "status", "--config", str(config)])
+    assert "Active holds: none" in cleared.output
+
+
 def test_safety_stop_while_stopped_records_new_evidence_and_validates_input(
     tmp_path: Path,
 ) -> None:
@@ -1178,6 +1254,108 @@ def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monk
 
     assert result.exit_code == 0, result.output
     assert calls == ["sync:True", "run", "close"]
+
+
+class _SkippingOrchestrator:
+    """Records that preparation started and ends the run as skipped."""
+
+    calls: ClassVar[list[str]] = []
+
+    def __init__(self, _: object, *, store: RunStore, github: object) -> None:
+        self.store = store
+
+    def __enter__(self):  # type: ignore[no-untyped-def]
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        pass
+
+    def run(self, **_: object):  # type: ignore[no-untyped-def]
+        self.calls.append("run")
+        manifest = self.store.create_run()
+        manifest.status = RunStatus.SKIPPED
+        manifest.skip_reason = "fixture"
+        self.store.save(manifest, event="test.skipped", details={})
+        return manifest
+
+
+class _ClosableGitHub:
+    def __init__(self, *_: object, **__: object) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_scheduled_preflight_gates_only_on_the_global_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+    _SkippingOrchestrator.calls = []
+
+    def fake_sync(_: object, store: RunStore, __: object, **kwargs: object) -> LifecycleSyncResult:
+        _repository_hold(store.root)
+        return LifecycleSyncResult(observations=())
+
+    monkeypatch.setattr(cli, "GitHubClient", _ClosableGitHub)
+    monkeypatch.setattr(cli, "Orchestrator", _SkippingOrchestrator)
+    monkeypatch.setattr(cli, "_sync_lifecycle", fake_sync)
+
+    result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert _SkippingOrchestrator.calls == ["run"]
+    assert len(RunStore(state).active_holds()) == 1
+
+
+def test_run_expires_runs_left_unapproved_past_the_grace_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+    store = RunStore(state)
+    waiting = store.create_run()
+    waiting.status = RunStatus.READY_FOR_APPROVAL
+    store.save(waiting, event="test.ready", details={})
+    _SkippingOrchestrator.calls = []
+
+    class EightDaysLater(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[no-untyped-def]
+            return datetime.now(tz) + timedelta(days=8)
+
+    monkeypatch.setattr(cli, "datetime", EightDaysLater)
+    monkeypatch.setattr(cli, "GitHubClient", _ClosableGitHub)
+    monkeypatch.setattr(cli, "Orchestrator", _SkippingOrchestrator)
+
+    result = runner.invoke(app, ["run", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert f"Expired unapproved run `{waiting.run_id}`" in result.output
+    assert store.get(waiting.run_id).status == RunStatus.CANCELLED
+    assert _SkippingOrchestrator.calls == ["run"]
+
+
+def test_run_keeps_runs_still_inside_the_grace_period(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+    store = RunStore(state)
+    waiting = store.create_run()
+    waiting.status = RunStatus.READY_FOR_APPROVAL
+    store.save(waiting, event="test.ready", details={})
+    monkeypatch.setattr(cli, "GitHubClient", _ClosableGitHub)
+    monkeypatch.setattr(cli, "Orchestrator", _SkippingOrchestrator)
+
+    result = runner.invoke(app, ["run", "--config", str(config)])
+
+    assert result.exit_code == 0, result.output
+    assert store.get(waiting.run_id).status == RunStatus.READY_FOR_APPROVAL
 
 
 @pytest.mark.parametrize("already_active", [False, True])

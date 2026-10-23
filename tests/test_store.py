@@ -2343,6 +2343,37 @@ def test_recovery_only_fails_safe_in_flight_stages_and_is_idempotent(tmp_path: P
     assert store.recover_stale_runs(stale_before=cutoff, reason="again") == []
 
 
+def test_unapproved_ready_runs_expire_to_cancelled(tmp_path: Path) -> None:
+    store = RunStore(tmp_path / "state")
+    expired = store.create_run()
+    _set_status(store, expired, RunStatus.READY_FOR_APPROVAL)
+    preserved = {}
+    for status in (RunStatus.APPROVED, RunStatus.PLANNING, RunStatus.PR_OPEN):
+        run = store.create_run()
+        _set_status(store, run, status)
+        preserved[status] = run
+    cutoff = datetime.now(UTC)
+    fresh = store.create_run()
+    _set_status(store, fresh, RunStatus.READY_FOR_APPROVAL)
+
+    retired = store.expire_ready_for_approval_runs(ready_before=cutoff, reason="nobody approved")
+
+    assert [run.run_id for run in retired] == [expired.run_id]
+    loaded = store.get(expired.run_id)
+    assert loaded.status == RunStatus.CANCELLED
+    assert loaded.error is None
+    assert store.events(expired.run_id)[-1]["event_type"] == "run.expired"
+    assert json.loads(store.events(expired.run_id)[-1]["details"]) == {
+        "from": "ready_for_approval",
+        "to": "cancelled",
+        "reason": "nobody approved",
+    }
+    assert store.get(fresh.run_id).status == RunStatus.READY_FOR_APPROVAL
+    for status, run in preserved.items():
+        assert store.get(run.run_id).status == status
+    assert store.expire_ready_for_approval_runs(ready_before=cutoff, reason="again") == []
+
+
 def _workspace_with_clone(store: RunStore, run: RunManifest) -> Path:
     clone = store.workspace_dir(run.run_id) / "repository"
     clone.mkdir()

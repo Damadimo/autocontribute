@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
@@ -61,7 +61,7 @@ lifecycle_app = typer.Typer(
     no_args_is_help=True,
 )
 safety_app = typer.Typer(
-    help="Inspect or explicitly change the persistent operational circuit breaker.",
+    help="Inspect or explicitly change the global safety stop and the scoped holds.",
     no_args_is_help=True,
 )
 policy_app = typer.Typer(
@@ -84,6 +84,8 @@ _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 # Prepared work that has not started publishing. Earlier stages belong to a live worker, and a
 # submitting run must be reconciled with GitHub before its state can change.
 _CANCELLABLE_STATUSES = frozenset({RunStatus.READY_FOR_APPROVAL, RunStatus.APPROVED})
+# How long a prepared run may wait for approval beyond the approval lifetime itself.
+_UNAPPROVED_RUN_GRACE = timedelta(days=7)
 
 
 @app.command()
@@ -224,6 +226,7 @@ def run_once(
     store = RunStore(settings.storage.path)
     github: GitHubClient | None = None
     try:
+        _expire_unapproved_runs(settings, store)
         github = _github_client(settings, store)
         if scheduled:
             _sync_lifecycle(settings, store, github, scheduled_preflight=True)
@@ -609,14 +612,16 @@ def safety_status(
     config: ConfigOption = DEFAULT_CONFIG,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit the machine-readable breaker status."),
+        typer.Option("--json", help="Emit the machine-readable breaker status and holds."),
     ] = False,
 ) -> None:
-    """Show whether preparation and publication are stopped, and why."""
+    """Show whether preparation and publication are stopped or held, and why."""
 
     settings = _config(config)
     try:
-        status = RunStore(settings.storage.path).circuit_breaker_status()
+        store = RunStore(settings.storage.path)
+        status = store.circuit_breaker_status()
+        holds = store.active_holds()
     except AutocontributeError as exc:
         _fail(str(exc))
     if json_output:
@@ -637,6 +642,21 @@ def safety_status(
                             "trigger_hash": trigger.trigger_hash,
                         }
                         for trigger in status.active_triggers
+                    ],
+                    "holds": [
+                        {
+                            "id": hold.hold_id,
+                            "scope": hold.scope.value,
+                            "scope_key": hold.scope_key,
+                            "source": hold.source,
+                            "reason": hold.reason,
+                            "trigger_hash": hold.trigger_hash,
+                            "created_at": hold.created_at.isoformat(),
+                            "expires_at": (
+                                hold.expires_at.isoformat() if hold.expires_at else None
+                            ),
+                        }
+                        for hold in holds
                     ],
                 },
                 indent=2,
@@ -662,6 +682,18 @@ def safety_status(
         console.print("[green]OPERATIONAL[/green]")
     console.print(f"Safety epoch: {status.epoch}")
     console.print(f"Changed: {status.changed_at.isoformat()}")
+    if not holds:
+        console.print("Active holds: none")
+        return
+    console.print("Active holds (release with `safety release HOLD_ID`):")
+    for hold in holds:
+        until = f"until {hold.expires_at.isoformat()}" if hold.expires_at else "until released"
+        console.print(
+            f"  {hold.hold_id}. {hold.scope.value} {hold.scope_key} ({until}): "
+            f"{hold.source}: {hold.reason}",
+            markup=False,
+            soft_wrap=True,
+        )
 
 
 @safety_app.command(name="stop")
@@ -735,6 +767,27 @@ def safety_resume(
         console.print("[yellow]Safety stop was not active.[/yellow]")
         return
     console.print("[green]Safety stop explicitly resumed.[/green]")
+
+
+@safety_app.command(name="release")
+def safety_release(
+    hold_id: Annotated[int, typer.Argument(help="Hold ID shown by `safety status`.", min=1)],
+    actor: Annotated[str, typer.Option(help="Operator identity recorded in the audit trail.")],
+    reason: Annotated[str, typer.Option(help="Reviewed evidence supporting the release.")],
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Release one hold after review; the same evidence never holds again, new evidence does."""
+
+    settings = _config(config)
+    store = RunStore(settings.storage.path)
+    try:
+        released = store.release_hold(hold_id, actor=actor, reason=reason)
+    except (AutocontributeError, TypeError, ValueError) as exc:
+        _fail(str(exc))
+    if not released:
+        console.print(f"[yellow]Hold {hold_id} was already released.[/yellow]")
+        return
+    console.print(f"[green]Released hold {hold_id}.[/green]")
 
 
 @app.command()
@@ -853,6 +906,22 @@ def _github_client(
         settings.github,
         safety_trigger_handler=store.record_stop,
     )
+
+
+def _expire_unapproved_runs(settings: AutocontributeConfig, store: RunStore) -> None:
+    """Cancel prepared runs left unapproved well past the approval lifetime."""
+
+    expired = store.expire_ready_for_approval_runs(
+        ready_before=datetime.now(UTC)
+        - timedelta(hours=settings.publishing.approval_expires_hours)
+        - _UNAPPROVED_RUN_GRACE,
+        reason=(
+            "Nobody approved the prepared run within publishing.approval_expires_hours plus 7 days"
+        ),
+    )
+    for manifest in expired:
+        _refresh_report(store, manifest)
+        console.print(f"[yellow]Expired[/yellow] unapproved run `{manifest.run_id}`.")
 
 
 def _sync_lifecycle(

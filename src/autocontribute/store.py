@@ -2389,16 +2389,62 @@ class RunStore:
     ) -> builtins.list[RunManifest]:
         """Atomically fail abandoned local preparation stages and append ledger evidence."""
 
-        cutoff = _aware_utc(stale_before, field="stale_before")
-        recovery_reason = _bounded_text(reason, field="recovery reason", maximum=2_000)
+        return self._retire_runs(
+            RECOVERABLE_IN_FLIGHT_STATUSES,
+            RunStatus.FAILED,
+            updated_before=stale_before,
+            reason=reason,
+            event="run.recovered",
+            record_error=True,
+            limit=limit,
+        )
+
+    def expire_ready_for_approval_runs(
+        self,
+        *,
+        ready_before: datetime,
+        reason: str,
+        limit: int = 100,
+    ) -> builtins.list[RunManifest]:
+        """Cancel prepared runs that nobody approved in time.
+
+        A run reaches ``ready_for_approval`` in its last save and is saved again only when it is
+        approved or cancelled, so its update time is when it became ready.
+        """
+
+        return self._retire_runs(
+            frozenset({RunStatus.READY_FOR_APPROVAL}),
+            RunStatus.CANCELLED,
+            updated_before=ready_before,
+            reason=reason,
+            event="run.expired",
+            record_error=False,
+            limit=limit,
+        )
+
+    def _retire_runs(
+        self,
+        statuses: frozenset[RunStatus],
+        target: RunStatus,
+        *,
+        updated_before: datetime,
+        reason: str,
+        event: str,
+        record_error: bool,
+        limit: int,
+    ) -> builtins.list[RunManifest]:
+        """Move runs unchanged in ``statuses`` since the cutoff to ``target`` in one transaction."""
+
+        cutoff = _aware_utc(updated_before, field="run cutoff")
+        retire_reason = _bounded_text(reason, field=f"{event} reason", maximum=2_000)
         if not 1 <= limit <= 1_000:
-            raise ValueError("stale run limit must be between 1 and 1000")
-        recoverable = tuple(sorted(status.value for status in RECOVERABLE_IN_FLIGHT_STATUSES))
-        placeholders = ",".join("?" for _ in recoverable)
-        recovered_at = utc_now()
-        recovered: builtins.list[RunManifest] = []
+            raise ValueError("run limit must be between 1 and 1000")
+        retirable = tuple(sorted(status.value for status in statuses))
+        placeholders = ",".join("?" for _ in retirable)
+        retired_at = utc_now()
+        retired: builtins.list[RunManifest] = []
         # Only placeholder tokens are interpolated; all status values remain bound parameters.
-        recovery_query = (
+        query = (
             "SELECT run_id, status, updated_at, manifest_json FROM runs "
             f"WHERE status IN ({placeholders}) AND updated_at < ? "
             "ORDER BY updated_at ASC, run_id ASC LIMIT ?"
@@ -2406,13 +2452,13 @@ class RunStore:
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
             rows = connection.execute(
-                recovery_query,
-                (*recoverable, cutoff.isoformat(), limit),
+                query,
+                (*retirable, cutoff.isoformat(), limit),
             ).fetchall()
             for row in rows:
                 run_id = str(row["run_id"])
                 previous_status = _stored_run_status(row["status"], run_id=run_id)
-                if previous_status not in RECOVERABLE_IN_FLIGHT_STATUSES:
+                if previous_status not in statuses:
                     continue
                 try:
                     manifest = RunManifest.model_validate_json(row["manifest_json"])
@@ -2420,9 +2466,10 @@ class RunStore:
                     raise StateError(f"Run {run_id} contains an invalid manifest") from exc
                 if manifest.run_id != run_id or manifest.status != previous_status:
                     raise StateError(f"Run {run_id} manifest disagrees with its state row")
-                manifest.status = RunStatus.FAILED
-                manifest.error = recovery_reason
-                manifest.updated_at = recovered_at
+                manifest.status = target
+                if record_error:
+                    manifest.error = retire_reason
+                manifest.updated_at = retired_at
                 manifest_json = manifest.model_dump_json()
                 result = connection.execute(
                     """
@@ -2430,8 +2477,8 @@ class RunStore:
                     WHERE run_id = ? AND status = ? AND updated_at = ?
                     """,
                     (
-                        RunStatus.FAILED.value,
-                        recovered_at.isoformat(),
+                        target.value,
+                        retired_at.isoformat(),
                         manifest_json,
                         run_id,
                         previous_status.value,
@@ -2439,28 +2486,28 @@ class RunStore:
                     ),
                 )
                 if result.rowcount != 1:
-                    raise StateError(f"Run {run_id} changed while recovery was in progress")
+                    raise StateError(f"Run {run_id} changed while it was being retired")
                 self._append_event(
                     connection,
                     run_id,
-                    "run.recovered",
+                    event,
                     {
                         "from": previous_status.value,
-                        "to": RunStatus.FAILED.value,
-                        "reason": recovery_reason,
+                        "to": target.value,
+                        "reason": retire_reason,
                     },
                 )
                 _mark_manifest_artifact_sync(
                     connection,
                     run_id=run_id,
-                    updated_at=recovered_at.isoformat(),
+                    updated_at=retired_at.isoformat(),
                     manifest_json=manifest_json,
                 )
-                recovered.append(manifest)
+                retired.append(manifest)
         self.synchronize_manifest_artifacts()
-        for manifest in recovered:
+        for manifest in retired:
             self._remove_workspace(manifest.run_id)
-        return recovered
+        return retired
 
     def acquire_lease(
         self,
