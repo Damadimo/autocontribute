@@ -11,6 +11,7 @@ from autocontribute.config import GitHubConfig
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     GitHubError,
+    GitHubHTTPError,
     GitHubRateLimitError,
     GitHubRequestNotSentError,
     GitHubSafetyError,
@@ -998,6 +999,28 @@ def test_mutation_is_never_retried_on_transient_5xx(monkeypatch) -> None:  # typ
         github.ensure_fork("upstream/project", "octocat")
 
     assert requests == 2
+
+
+def test_http_error_carries_status_request_id_and_validation_detail() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422,
+            headers={"X-GitHub-Request-Id": "ABCD:1234"},
+            json={
+                "message": "Validation Failed",
+                "errors": [
+                    {"resource": "PullRequest", "message": "No commits between main and fix"}
+                ],
+            },
+        )
+
+    with _client(handler) as github, pytest.raises(GitHubHTTPError) as excinfo:
+        github.get_pull_request("example/project", 7)
+
+    assert excinfo.value.status_code == 422
+    assert excinfo.value.request_id == "ABCD:1234"
+    assert excinfo.value.github_message == "Validation Failed; No commits between main and fix"
+    assert "returned 422" in str(excinfo.value)
 
 
 def test_get_retries_transport_errors_and_recovers(monkeypatch) -> None:  # type: ignore[no-untyped-def]

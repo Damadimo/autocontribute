@@ -37,6 +37,7 @@ from autocontribute.domain import (
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     GitHubError,
+    GitHubHTTPError,
     GitHubRequestNotSentError,
     PolicyError,
     PublicationResumeRequired,
@@ -3820,13 +3821,7 @@ def test_ambiguous_pull_request_post_is_never_sent_twice(
     assert durable.status == RunStatus.SUBMITTING
     assert durable.pull_request_creation_started
     assert posts == 1
-    breaker = store.circuit_breaker_status()
-    assert breaker.active_revision is not None
-    assert store.resume_circuit_breaker(
-        actor="operator",
-        reason="verify the exactly-once retry guard",
-        expected_trigger_hash=breaker.active_revision,
-    )
+    assert not store.circuit_breaker_status().is_tripped
 
     with pytest.raises(PublicationResumeRequired, match="second POST is forbidden"):
         publisher.publish(run_id)
@@ -3974,7 +3969,7 @@ def test_unreadable_reconciliation_after_lost_response_keeps_conservative_stop(
     assert durable.pull_request_creation_started
     assert durable.pull_request_url is None
     assert github.calls.count("create_pull_request") == 1
-    assert store.circuit_breaker_status().is_tripped
+    assert not store.circuit_breaker_status().is_tripped
 
 
 def test_unsent_post_with_failed_release_keeps_conservative_stop(
@@ -4021,10 +4016,10 @@ def test_unsent_post_with_failed_release_keeps_conservative_stop(
     assert durable.pull_request_creation_started
     assert durable.pull_request_url is None
     assert github.calls.count("create_pull_request") == 1
-    assert store.circuit_breaker_status().is_tripped
+    assert not store.circuit_breaker_status().is_tripped
 
 
-def test_malformed_post_response_retains_submitting_and_trips_breaker(
+def test_malformed_post_response_keeps_only_its_run_submitting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4060,7 +4055,185 @@ def test_malformed_post_response_retains_submitting_and_trips_breaker(
     assert durable.pull_request_creation_started
     assert durable.pull_request_url is None
     assert github.calls.count("create_pull_request") == 1
-    assert store.circuit_breaker_status().is_tripped
+    assert not store.circuit_breaker_status().is_tripped
+
+
+def _refusing_publisher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: GitHubHTTPError,
+) -> tuple[RunStore, str, FakePublishingGitHub, Publisher, list[tuple[str, str, str]]]:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    github = FakePublishingGitHub(issue, manifest.base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    deleted: list[tuple[str, str, str]] = []
+
+    def refused_post(*args, **kwargs) -> PullRequestDetails:  # type: ignore[no-untyped-def]
+        del args
+        kwargs.pop("before_mutation")()
+        github.calls.append("create_pull_request")
+        raise refusal
+
+    def delete(
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        *,
+        expected_repository_id: int,
+        expected_repository_node_id: str,
+        lease_guard: LeaseHeartbeatGuard,
+        before_mutation,  # type: ignore[no-untyped-def]
+    ) -> None:
+        del expected_repository_id, expected_repository_node_id
+        lease_guard.assert_owned()
+        before_mutation()
+        deleted.append((fork, branch, commit_sha))
+        github.branch_sha = None
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+    monkeypatch.setattr(publisher, "_delete_remote_branch", delete)
+    monkeypatch.setattr(github, "create_pull_request", refused_post)
+    return store, run_id, github, publisher, deleted
+
+
+@pytest.mark.parametrize(
+    ("status_code", "github_message"),
+    [
+        (422, "Validation Failed; No commits between main and fix"),
+        (403, "Pull request creation is limited to collaborators"),
+        (404, "Not Found"),
+    ],
+)
+def test_definitive_pull_request_refusal_removes_branch_and_fails_only_the_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    github_message: str,
+) -> None:
+    refusal = GitHubHTTPError(
+        f"GitHub returned {status_code}",
+        status_code=status_code,
+        request_id="ABCD:1234",
+        github_message=github_message,
+    )
+    store, run_id, github, publisher, deleted = _refusing_publisher(tmp_path, monkeypatch, refusal)
+
+    with pytest.raises(PolicyError, match=f"refused the pull request \\({status_code}\\)"):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    assert durable.status == RunStatus.FAILED
+    assert durable.error == f"GitHub refused the pull request ({status_code}): {github_message}"
+    assert durable.pull_request_creation_started is False
+    assert deleted == [("octocat/project", durable.branch_name, durable.commit_sha)]
+    assert github.calls.count("create_pull_request") == 1
+    assert not store.circuit_breaker_status().is_tripped
+    events = store.events(run_id)
+    refused = next(
+        json.loads(event["details"])
+        for event in events
+        if event["event_type"] == "pull_request.creation.refused"
+    )
+    assert refused["status_code"] == str(status_code)
+    assert refused["request_id"] == "ABCD:1234"
+    assert refused["github_message"] == github_message
+    assert [event["event_type"] for event in events][-2:] == [
+        "publication.compensation.verified",
+        "run.transitioned",
+    ]
+
+
+def test_refused_pull_request_that_already_exists_is_adopted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refusal = GitHubHTTPError(
+        "GitHub returned 422",
+        status_code=422,
+        request_id="ABCD:1234",
+        github_message="Validation Failed; A pull request already exists",
+    )
+    _store, run_id, github, publisher, deleted = _refusing_publisher(tmp_path, monkeypatch, refusal)
+    original_find = github.find_pull_request
+
+    def find_after_post(repository: str, *, head: str) -> str | None:
+        if "create_pull_request" in github.calls:
+            github.existing_pr = "https://github.com/example/project/pull/7"
+        return original_find(repository, head=head)
+
+    monkeypatch.setattr(github, "find_pull_request", find_after_post)
+
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert published.pull_request_url == "https://github.com/example/project/pull/7"
+    assert deleted == []
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 500, 502])
+def test_retryable_status_on_pull_request_post_is_run_scoped_ambiguity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    refusal = GitHubHTTPError(
+        f"GitHub returned {status_code}",
+        status_code=status_code,
+        request_id="ABCD:1234",
+        github_message="try again",
+    )
+    store, run_id, _github, publisher, deleted = _refusing_publisher(tmp_path, monkeypatch, refusal)
+
+    with pytest.raises(PublicationResumeRequired, match="will not send a second POST"):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    assert durable.status == RunStatus.SUBMITTING
+    assert durable.pull_request_creation_started
+    assert deleted == []
+    assert not store.circuit_breaker_status().is_tripped
+
+
+def test_refusal_cleanup_interrupted_after_its_marker_resumes_to_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refusal = GitHubHTTPError(
+        "GitHub returned 422",
+        status_code=422,
+        request_id="ABCD:1234",
+        github_message="Validation Failed",
+    )
+    store, run_id, github, publisher, deleted = _refusing_publisher(tmp_path, monkeypatch, refusal)
+    original_resume = publisher._resume_started_compensation
+
+    def crash_before_cleanup(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated crash after the refusal marker")
+
+    monkeypatch.setattr(publisher, "_resume_started_compensation", crash_before_cleanup)
+    with pytest.raises(RuntimeError, match="after the refusal marker"):
+        publisher.publish(run_id)
+    monkeypatch.setattr(publisher, "_resume_started_compensation", original_resume)
+
+    stranded = store.get(run_id)
+    assert stranded.status == RunStatus.SUBMITTING
+    assert stranded.publication_compensation_reason == "pre_pr_creation_refused"
+    assert deleted == []
+
+    finished = publisher.publish(run_id)
+
+    assert finished.status == RunStatus.FAILED
+    assert deleted == [("octocat/project", finished.branch_name, finished.commit_sha)]
+    assert github.calls.count("create_pull_request") == 1
 
 
 @pytest.mark.parametrize("outcome", ["merged", "closed_unmerged"])

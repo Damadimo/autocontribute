@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Literal, NoReturn, cast
 
 from autocontribute.approval import (
     ApprovalReview,
@@ -50,6 +50,7 @@ from autocontribute.domain import (
 )
 from autocontribute.exceptions import (
     GitHubError,
+    GitHubHTTPError,
     GitHubRequestNotSentError,
     GitHubSafetyError,
     PolicyError,
@@ -78,6 +79,13 @@ _SAFE_SLUG = re.compile(r"[^a-z0-9-]+")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+# Each compensation reason is proven by exactly one marker event written before cleanup starts.
+_COMPENSATION_MARKERS = {
+    "pre_pr_base_moved": "publication.base_moved_before_pull_request",
+    "pre_pr_policy_stale": "publication.policy_stale_before_pull_request",
+    "pre_pr_creation_refused": "publication.pull_request_refused",
+    "created_pr_base_moved": "publication.compensation.started",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -1307,8 +1315,9 @@ class Publisher:
         try:
             self._check_pre_pull_request_policy_freshness(manifest)
         except PolicyError as exc:
-            self._compensate_stale_pre_pull_request_branch(
+            self._compensate_pre_pull_request_branch(
                 manifest,
+                reason="pre_pr_policy_stale",
                 fork=fork,
                 branch=branch,
                 commit_sha=commit_sha,
@@ -1428,8 +1437,9 @@ class Publisher:
             )
         except Exception as exc:
             if mutation_boundary_failure is not None:
-                self._compensate_stale_pre_pull_request_branch(
+                self._compensate_pre_pull_request_branch(
                     manifest,
+                    reason="pre_pr_policy_stale",
                     fork=fork,
                     branch=branch,
                     commit_sha=commit_sha,
@@ -1448,23 +1458,25 @@ class Publisher:
                 # The POST provably never left this client, so no remote pull request can
                 # exist for this durable intent. Release the creation marker; a later
                 # scheduled run retries the exact same POST without a global stop.
-                if self._release_unsent_pull_request_creation(
+                if self._release_pull_request_creation(
                     manifest,
-                    creation_details=creation_details,
-                    error_type=type(exc).__name__,
+                    event="pull_request.creation.not_sent",
+                    details={**creation_details, "error_type": type(exc).__name__},
                 ):
                     raise
             else:
                 # A transport or response failure may follow a successful POST. Reconcile the
                 # exact head once: an existing PR is adopted as the durable canonical identity,
-                # while an absent or unreadable result keeps the conservative stop because a
-                # slow POST could still land after this read.
+                # while an absent or unreadable result keeps the run's marker because a slow
+                # POST could still land after this read. A definitive refusal created nothing.
                 reconciled_pr: str | None = None
+                reconciled = False
                 try:
                     reconciled_pr = self.github.find_pull_request(
                         repository_name,
                         head=head,
                     )
+                    reconciled = True
                 except GitHubSafetyError:
                     raise
                 except Exception:
@@ -1479,13 +1491,20 @@ class Publisher:
                         allow_new_repository_identity=False,
                         lease_guard=lease_guard,
                     )
-            self._trip_ambiguous_pull_request_creation(
-                manifest,
-                error_type=type(exc).__name__,
-            )
+                refusal = _definitive_refusal(exc)
+                if reconciled and refusal is not None:
+                    self._fail_refused_pull_request_creation(
+                        manifest,
+                        refusal,
+                        creation_details=creation_details,
+                        fork=fork,
+                        branch=branch,
+                        commit_sha=commit_sha,
+                        lease_guard=lease_guard,
+                    )
             raise PublicationResumeRequired(
                 "Pull-request creation may have succeeded, but GitHub did not return a durable "
-                "canonical identity. Autonomous retries will not send a second POST; exact remote "
+                "canonical identity. This run will not send a second POST; exact remote "
                 "reconciliation is required"
             ) from exc
         try:
@@ -1496,13 +1515,9 @@ class Publisher:
         except PublicationResumeRequired:
             raise
         except Exception as exc:
-            self._trip_ambiguous_pull_request_creation(
-                manifest,
-                error_type=type(exc).__name__,
-            )
             raise PublicationResumeRequired(
                 "GitHub returned from pull-request creation, but its canonical identity could not "
-                "be persisted. Autonomous retries will not send a second POST"
+                "be persisted. This run will not send a second POST"
             ) from exc
         mismatches = self._created_pull_request_mismatches(
             created_pull_request,
@@ -2196,27 +2211,23 @@ class Publisher:
             trigger_hash=trigger_hash,
         )
 
-    def _release_unsent_pull_request_creation(
+    def _release_pull_request_creation(
         self,
         manifest: RunManifest,
         *,
-        creation_details: dict[str, str],
-        error_type: str,
+        event: str,
+        details: dict[str, str],
     ) -> bool:
-        """Durably release a creation intent whose POST provably never left this client.
+        """Durably release a creation intent whose POST provably created nothing.
 
         Returns True only when the release is durable; a False result means the durable
-        marker may still claim an in-flight creation, so the caller must keep the
+        marker may still claim an in-flight creation, so the caller must keep the run's
         conservative ambiguity stop.
         """
 
         manifest.pull_request_creation_started = False
         try:
-            self.store.save(
-                manifest,
-                event="pull_request.creation.not_sent",
-                details={**creation_details, "error_type": error_type},
-            )
+            self.store.save(manifest, event=event, details=details)
         except Exception:
             try:
                 marker_is_durable = self.store.get(manifest.run_id).pull_request_creation_started
@@ -2229,39 +2240,53 @@ class Publisher:
             return not manifest.pull_request_creation_started
         return True
 
-    def _trip_ambiguous_pull_request_creation(
+    def _fail_refused_pull_request_creation(
         self,
         manifest: RunManifest,
+        refusal: GitHubHTTPError,
         *,
-        error_type: str,
-    ) -> None:
-        if manifest.candidate is None or not manifest.branch_name or not manifest.commit_sha:
-            raise StateError(
-                "Ambiguous pull-request creation lacks durable repository, branch, or commit "
-                "evidence"
-            )
-        self._trip_publication_breaker(
-            source="publication:pull_request_creation_ambiguous",
-            reason=(
-                "A pull-request creation attempt has no durably resolved canonical PR identity; "
-                "autonomous publication is stopped so the attempt cannot be duplicated"
-            ),
-            evidence={
-                "repository": manifest.candidate.repository,
-                "branch": manifest.branch_name,
-                "commit_sha": manifest.commit_sha,
-                "error_type": error_type,
-            },
-        )
+        creation_details: dict[str, str],
+        fork: str,
+        branch: str,
+        commit_sha: str,
+        lease_guard: LeaseHeartbeatGuard,
+    ) -> NoReturn:
+        """Remove the pushed branch and fail the run after GitHub refused the exact POST."""
 
-    def _stop_ambiguous_pull_request_creation(self, manifest: RunManifest) -> None:
-        self._trip_ambiguous_pull_request_creation(
-            manifest,
-            error_type="unresolved_retry",
+        message = (
+            f"GitHub refused the pull request ({refusal.status_code}): "
+            f"{refusal.github_message or 'no message'}"
         )
+        manifest.error = message
+        if not self._release_pull_request_creation(
+            manifest,
+            event="pull_request.creation.refused",
+            details={
+                **creation_details,
+                "status_code": str(refusal.status_code),
+                "request_id": refusal.request_id,
+                "github_message": refusal.github_message,
+            },
+        ):
+            raise PublicationResumeRequired(
+                "GitHub refused the pull request, but the creation marker could not be released"
+            ) from refusal
+        self._compensate_pre_pull_request_branch(
+            manifest,
+            reason="pre_pr_creation_refused",
+            fork=fork,
+            branch=branch,
+            commit_sha=commit_sha,
+            lease_guard=lease_guard,
+        )
+        raise PolicyError(message) from refusal
+
+    @staticmethod
+    def _stop_ambiguous_pull_request_creation(manifest: RunManifest) -> NoReturn:
         raise PublicationResumeRequired(
-            "The durable pull-request creation attempt has no resolved canonical PR. A second POST "
-            "is forbidden; reconcile the exact head or retain SUBMITTING for operator review"
+            f"Run {manifest.run_id} has a pull-request creation attempt with no resolved "
+            "canonical PR. A second POST is forbidden; reconcile the exact head or keep the run "
+            "submitting for operator review"
         )
 
     def _finalize_absent_pre_post_publication(
@@ -2415,13 +2440,8 @@ class Publisher:
             raise StateError("Started publication compensation lacks durable marker evidence")
         self.store.verify_event_chains(run_id=manifest.run_id)
         events = tuple(self.store.events(manifest.run_id))
-        marker_types = {
-            "pre_pr_base_moved": "publication.base_moved_before_pull_request",
-            "pre_pr_policy_stale": "publication.policy_stale_before_pull_request",
-            "created_pr_base_moved": "publication.compensation.started",
-        }
         try:
-            marker_type = marker_types[reason]
+            marker_type = _COMPENSATION_MARKERS[reason]
         except KeyError:
             raise StateError("Unsupported publication compensation reason") from None
         markers = tuple(
@@ -2465,7 +2485,7 @@ class Publisher:
                 or current_base == manifest.base_sha.casefold()
             ):
                 raise StateError("Pre-PR base compensation marker lacks an exact base race")
-        elif reason == "pre_pr_policy_stale":
+        elif reason in {"pre_pr_policy_stale", "pre_pr_creation_refused"}:
             expected = {
                 "repository": manifest.candidate.repository,
                 **expected_common,
@@ -2627,7 +2647,7 @@ class Publisher:
             lease_guard=lease_guard,
         )
 
-        if reason in {"pre_pr_base_moved", "pre_pr_policy_stale"}:
+        if reason in {"pre_pr_base_moved", "pre_pr_policy_stale", "pre_pr_creation_refused"}:
             if manifest.pull_request_url is not None or manifest.pull_request_creation_started:
                 raise StateError("Pre-PR compensation contains pull-request creation evidence")
             lease_guard.assert_owned()
@@ -3240,23 +3260,24 @@ class Publisher:
         )
         return manifest
 
-    def _compensate_stale_pre_pull_request_branch(
+    def _compensate_pre_pull_request_branch(
         self,
         manifest: RunManifest,
         *,
+        reason: Literal["pre_pr_policy_stale", "pre_pr_creation_refused"],
         fork: str,
         branch: str,
         commit_sha: str,
         lease_guard: LeaseHeartbeatGuard,
     ) -> None:
-        """Durably remove the exact pushed branch after a proven pre-POST stale read."""
+        """Durably remove the exact pushed branch when no pull request can follow it."""
 
         assert manifest.candidate is not None
         lease_guard.assert_owned()
-        manifest.publication_compensation_reason = "pre_pr_policy_stale"
+        manifest.publication_compensation_reason = reason
         self.store.save(
             manifest,
-            event="publication.policy_stale_before_pull_request",
+            event=_COMPENSATION_MARKERS[reason],
             details={
                 "repository": manifest.candidate.repository,
                 "fork": fork,
@@ -3927,6 +3948,21 @@ class Publisher:
         if not prefix:
             prefix = "autocontribute"
         return f"{prefix}/issue-{manifest.candidate.number}-{manifest.run_id[:8]}"
+
+
+def _definitive_refusal(exc: Exception) -> GitHubHTTPError | None:
+    """Return a GitHub answer that proves the request was rejected without effect.
+
+    408 and 429 say the request was not processed yet, so they stay ambiguous like 5xx.
+    """
+
+    if (
+        isinstance(exc, GitHubHTTPError)
+        and 400 <= exc.status_code < 500
+        and exc.status_code not in {408, 429}
+    ):
+        return exc
+    return None
 
 
 def _classify_exact_human_approval(
