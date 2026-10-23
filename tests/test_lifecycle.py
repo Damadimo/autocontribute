@@ -7,9 +7,16 @@ import pytest
 
 from autocontribute.coordination import LeaseHeartbeatGuard
 from autocontribute.domain import IssueCandidate, RepositoryInfo, RunManifest, RunStatus
-from autocontribute.exceptions import GitHubError, StateError
+from autocontribute.exceptions import (
+    CircuitBreakerTrigger,
+    GitHubError,
+    GitHubSafetyError,
+    StateError,
+    StopScope,
+)
 from autocontribute.github import (
     CheckRunDetails,
+    CommitComparison,
     CommitStatusDetails,
     GitHubComment,
     PullRequestDetails,
@@ -17,6 +24,7 @@ from autocontribute.github import (
     PullRequestReview,
 )
 from autocontribute.lifecycle import (
+    REPOSITORY_COOLDOWN,
     LifecycleObserver,
     LifecycleSignalKind,
     PullRequestLifecycleSnapshot,
@@ -132,6 +140,8 @@ def _snapshot(
     checks: tuple[CheckRunDetails, ...] = (),
     statuses: tuple[CommitStatusDetails, ...] = (),
     references: tuple[PullRequestReference, ...] = (),
+    publishing_login: str | None = "octocat",
+    head_comparison: CommitComparison | None = None,
 ) -> PullRequestLifecycleSnapshot:
     return PullRequestLifecycleSnapshot(
         expected_head_sha=expected_head_sha,
@@ -142,6 +152,8 @@ def _snapshot(
         check_runs=checks,
         commit_statuses=statuses,
         references=references,
+        publishing_login=publishing_login,
+        head_comparison=head_comparison,
     )
 
 
@@ -160,8 +172,10 @@ class FakeLifecycleGitHub:
         self.check_runs: list[CheckRunDetails] = []
         self.statuses: list[CommitStatusDetails] = []
         self.references: list[PullRequestReference] = []
+        self.comparison: CommitComparison | None = None
         self.get_calls = 0
         self.reference_calls = 0
+        self.compare_calls = 0
 
     def get_pull_request(self, repository: str, number: int) -> PullRequestDetails:
         value = self.pull_requests[min(self.get_calls, len(self.pull_requests) - 1)]
@@ -211,15 +225,19 @@ class FakeLifecycleGitHub:
         self.reference_calls += 1
         return self.references
 
+    def compare_commits(self, repository: str, base: str, head: str) -> CommitComparison | None:
+        self.compare_calls += 1
+        return self.comparison
+
 
 class FakeLifecycleStore:
     def __init__(self) -> None:
-        self.triggers: dict[str, tuple[str, str]] = {}
+        self.triggers: dict[str, CircuitBreakerTrigger] = {}
 
-    def trip_circuit_breaker(self, *, source: str, reason: str, trigger_hash: str) -> bool:
-        if trigger_hash in self.triggers:
+    def record_stop(self, trigger: CircuitBreakerTrigger) -> bool:
+        if trigger.trigger_hash in self.triggers:
             return False
-        self.triggers[trigger_hash] = (source, reason)
+        self.triggers[trigger.trigger_hash] = trigger
         return True
 
 
@@ -263,6 +281,7 @@ def _published_run(
     run.commit_sha = commit_sha
     run.pull_request_url = pull_request_url or f"https://github.com/{repository}/pull/{number}"
     run.publishing_api_origin = publishing_api_origin
+    run.publishing_login = "octocat"
     lease_owner = f"lifecycle-fixture-{run.run_id}"
     lease = store.acquire_lease(
         "autocontribute.run",
@@ -277,7 +296,7 @@ def _published_run(
     return run
 
 
-def test_observer_trips_each_signal_once_across_observations() -> None:
+def test_observer_records_attention_and_each_stop_once_across_observations() -> None:
     pull_request = _pull_request(issue_comment_count=1)
     github = FakeLifecycleGitHub([pull_request, pull_request, pull_request, pull_request])
     github.reviews = [_review(10, state="CHANGES_REQUESTED")]
@@ -290,22 +309,36 @@ def test_observer_trips_each_signal_once_across_observations() -> None:
         repository="example/project",
         number=7,
         expected_head_sha="a" * 40,
+        publishing_login="octocat",
     )
     second = observer.observe(
         repository="example/project",
         number=7,
         expected_head_sha="a" * 40,
+        publishing_login="octocat",
     )
 
     assert first.snapshot == second.snapshot
-    assert len(store.triggers) == 3
-    assert len(first.newly_tripped) == 3
-    assert second.newly_tripped == ()
     assert {signal.kind for signal in first.signals} == {
         LifecycleSignalKind.CHANGES_REQUESTED,
-        LifecycleSignalKind.MAINTAINER_STOP,
+        LifecycleSignalKind.AUTOMATION_STOP,
         LifecycleSignalKind.CI_FAILED,
     }
+    assert [item.kind for item in first.attention] == ["changes_requested", "ci_failed"]
+    assert first.attention == tuple(
+        item.model_copy(update={"observed_at": first.attention[0].observed_at})
+        for item in second.attention
+    )
+    (hold,) = store.triggers.values()
+    assert (hold.scope, hold.scope_key, hold.maintainer_stop) == (
+        StopScope.REPOSITORY,
+        "example/project",
+        True,
+    )
+    assert hold.expires_at is None
+    assert first.newly_recorded == (hold.trigger_hash,)
+    assert second.newly_recorded == ()
+    assert github.compare_calls == 0
 
 
 def test_classifier_ignores_untrusted_stop_text_and_superseded_ci_failures() -> None:
@@ -340,19 +373,22 @@ def test_classifier_ignores_untrusted_stop_text_and_superseded_ci_failures() -> 
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "kind"),
     [
-        "Do not stop the tests; please close this PR.",
-        "Don't stop CI, but withdraw this contribution.",
-        "Never stop checking regressions; stop automated submissions.",
+        ("Do not stop the tests; please close this PR.", LifecycleSignalKind.MAINTAINER_STOP),
+        ("Don't stop CI, but withdraw this contribution.", LifecycleSignalKind.MAINTAINER_STOP),
+        (
+            "Never stop checking regressions; stop automated submissions.",
+            LifecycleSignalKind.AUTOMATION_STOP,
+        ),
     ],
 )
 def test_classifier_preserves_stop_requests_after_an_unrelated_negated_directive(
-    body: str,
+    body: str, kind: LifecycleSignalKind
 ) -> None:
     signals = classify_lifecycle(_snapshot(issue_comments=(_comment(1, body),)))
 
-    assert [signal.kind for signal in signals] == [LifecycleSignalKind.MAINTAINER_STOP]
+    assert [signal.kind for signal in signals] == [kind]
 
 
 @pytest.mark.parametrize(
@@ -365,6 +401,215 @@ def test_classifier_preserves_stop_requests_after_an_unrelated_negated_directive
 )
 def test_classifier_ignores_negated_stop_directives(body: str) -> None:
     assert classify_lifecycle(_snapshot(issue_comments=(_comment(1, body),))) == ()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Don't change this file; the PR should only touch the parser",
+        "Please don't add a new dependency in this PR",
+        "Do not merge this PR until CI is green",
+        "Stop the work loop when the flag is set",
+        "Don't worry, I think this will work.",
+        "I don't think this PR needs a changelog entry.",
+        "Don't forget to add a test to this PR.",
+        "Thanks! Let's stop here and merge this PR.",
+        "Could you rebase? I don't see the fix in the PR yet.",
+        "We do not accept PRs without a linked issue.",
+    ],
+)
+def test_review_chatter_that_names_a_pull_request_is_not_a_stop(body: str) -> None:
+    assert classify_lifecycle(_snapshot(issue_comments=(_comment(1, body),))) == ()
+
+
+@pytest.mark.parametrize(
+    ("body", "kind"),
+    [
+        ("Please close this PR.", LifecycleSignalKind.MAINTAINER_STOP),
+        ("Stop this PR and all automated work.", LifecycleSignalKind.MAINTAINER_STOP),
+        ("No PR is needed here.", LifecycleSignalKind.MAINTAINER_STOP),
+        ("Stop this automated contribution.", LifecycleSignalKind.AUTOMATION_STOP),
+        ("We don\u2019t accept AI-generated changes.", LifecycleSignalKind.AUTOMATION_STOP),
+        ("Bot pull requests will be closed.", LifecycleSignalKind.AUTOMATION_STOP),
+        ("Please don't open LLM-generated PRs here.", LifecycleSignalKind.AUTOMATION_STOP),
+        ("We are not accepting outside contributions.", LifecycleSignalKind.AUTOMATION_STOP),
+    ],
+)
+def test_stop_text_is_aimed_at_this_pull_request_or_at_automation(
+    body: str, kind: LifecycleSignalKind
+) -> None:
+    signals = classify_lifecycle(_snapshot(reviews=(_review(1, body=body),)))
+
+    assert [signal.kind for signal in signals] == [kind]
+
+
+@pytest.mark.parametrize(
+    ("conclusion", "kinds"),
+    [
+        ("failure", [LifecycleSignalKind.CI_FAILED]),
+        ("timed_out", [LifecycleSignalKind.CI_FAILED]),
+        ("startup_failure", [LifecycleSignalKind.CI_FAILED]),
+        ("action_required", []),
+        ("cancelled", []),
+        ("neutral", []),
+        ("skipped", []),
+        ("stale", []),
+    ],
+)
+def test_only_checks_that_failed_on_the_patch_need_attention(
+    conclusion: str, kinds: list[LifecycleSignalKind]
+) -> None:
+    signals = classify_lifecycle(_snapshot(checks=(_check(10, conclusion),)))
+
+    assert [signal.kind for signal in signals] == kinds
+
+
+def _moved_head(**changes: object) -> PullRequestLifecycleSnapshot:
+    values: dict[str, object] = {
+        "pull_request": _pull_request(head_sha="b" * 40),
+        "head_comparison": CommitComparison(
+            status="ahead",
+            total_commits=2,
+            author_logins=("maintainer", "pre-commit-ci[bot]"),
+        ),
+    }
+    values.update(changes)
+    return _snapshot(**values)  # type: ignore[arg-type]
+
+
+def test_commits_added_by_other_accounts_only_need_attention() -> None:
+    (signal,) = classify_lifecycle(_moved_head())
+
+    assert signal.kind == LifecycleSignalKind.MAINTAINER_PUSH
+    assert signal.attention(NOW) is not None
+    assert signal.stops(api_origin="https://api.github.com", observed_at=NOW) == ()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"head_comparison": None},
+        {"publishing_login": None},
+        {
+            "head_comparison": CommitComparison(
+                status="diverged", total_commits=1, author_logins=("maintainer",)
+            )
+        },
+        {
+            "head_comparison": CommitComparison(
+                status="ahead", total_commits=1, author_logins=(None,)
+            )
+        },
+        {
+            "head_comparison": CommitComparison(
+                status="ahead", total_commits=2, author_logins=("maintainer", "OctoCat")
+            )
+        },
+        {
+            "head_comparison": CommitComparison(
+                status="ahead", total_commits=300, author_logins=("maintainer",)
+            )
+        },
+    ],
+)
+def test_head_drift_from_an_unknown_pusher_stays_a_global_stop(changes: dict[str, object]) -> None:
+    (signal,) = classify_lifecycle(_moved_head(**changes))
+
+    assert signal.kind == LifecycleSignalKind.HEAD_DRIFT
+    assert signal.attention(NOW) is None
+    (stop,) = signal.stops(api_origin="https://api.github.com", observed_at=NOW)
+    assert stop.scope == StopScope.GLOBAL
+    assert stop.trigger_hash == signal.trigger_hash()
+
+
+def test_observer_compares_commits_only_when_the_head_moved() -> None:
+    moved = _pull_request(head_sha="b" * 40)
+    github = FakeLifecycleGitHub([moved, moved])
+    github.comparison = CommitComparison(
+        status="ahead", total_commits=1, author_logins=("maintainer",)
+    )
+    store = FakeLifecycleStore()
+
+    observation = LifecycleObserver(github, store).observe(
+        repository="example/project",
+        number=7,
+        expected_head_sha="a" * 40,
+        publishing_login="octocat",
+    )
+
+    assert github.compare_calls == 1
+    assert [item.kind for item in observation.attention] == ["maintainer_push"]
+    assert store.triggers == {}
+
+
+def test_signals_record_stops_at_their_scope(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    closed = _pull_request(state="closed", closed_at=NOW, issue_comment_count=1)
+    github = FakeLifecycleGitHub([closed, closed])
+    github.issue_comments = [_comment(1, "Please close this PR; it duplicates #6.")]
+
+    observation = LifecycleObserver(github, store).observe(
+        repository="example/project",
+        number=7,
+        expected_head_sha="a" * 40,
+        publishing_login="octocat",
+    )
+
+    assert observation.snapshot.pull_request_state == "closed"
+    assert len(observation.newly_recorded) == 3
+    assert not store.circuit_breaker_status().is_tripped
+    holds = {(hold.scope, hold.source.rsplit(":", 1)[1]): hold for hold in store.active_holds()}
+    assert set(holds) == {
+        (StopScope.PULL_REQUEST, "maintainer_stop"),
+        (StopScope.REPOSITORY, "maintainer_stop"),
+        (StopScope.REPOSITORY, "closed_unmerged"),
+    }
+    assert holds[(StopScope.PULL_REQUEST, "maintainer_stop")].scope_key == closed.html_url
+    assert holds[(StopScope.PULL_REQUEST, "maintainer_stop")].expires_at is None
+    for kind in ("maintainer_stop", "closed_unmerged"):
+        hold = holds[(StopScope.REPOSITORY, kind)]
+        assert hold.scope_key == "example/project"
+        assert hold.expires_at is not None
+        assert hold.expires_at - hold.created_at == pytest.approx(
+            REPOSITORY_COOLDOWN, abs=timedelta(seconds=5)
+        )
+    assert store.active_holds(now=datetime.now(UTC) + REPOSITORY_COOLDOWN + timedelta(minutes=1))
+
+
+def test_revert_holds_the_repository_and_all_publication(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    merged = _pull_request(
+        state="closed",
+        merged=True,
+        merged_at=NOW,
+        closed_at=NOW,
+        merge_commit_sha="b" * 40,
+    )
+    github = FakeLifecycleGitHub([merged, merged])
+    github.references = [
+        PullRequestReference(
+            identifier=1,
+            source_url="https://github.com/example/project/pull/8",
+            source_title="Revert parser fix",
+            source_body="Reverts example/project#7",
+            source_state="closed",
+            source_merged_at=NOW + timedelta(hours=1),
+            created_at=NOW + timedelta(minutes=30),
+        )
+    ]
+
+    LifecycleObserver(github, store).observe(
+        repository="example/project",
+        number=7,
+        expected_head_sha="a" * 40,
+        publishing_login="octocat",
+    )
+
+    assert {(hold.scope, hold.scope_key) for hold in store.active_holds()} == {
+        (StopScope.REPOSITORY, "example/project"),
+        (StopScope.PUBLICATION, "https://api.github.com"),
+    }
+    assert not store.circuit_breaker_status().is_tripped
 
 
 def test_classifier_detects_head_drift_and_closed_unmerged() -> None:
@@ -397,7 +642,7 @@ def test_edited_stop_evidence_produces_a_new_trigger_hash() -> None:
     assert original_signal.trigger_hash() != edited_signal.trigger_hash()
 
 
-def test_edited_stop_evidence_retrips_breaker_after_operator_resume(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_edited_stop_evidence_returns_a_released_hold(tmp_path) -> None:  # type: ignore[no-untyped-def]
     store = RunStore(tmp_path / "state")
     pull_request = _pull_request(issue_comment_count=1)
     github = FakeLifecycleGitHub([pull_request, pull_request])
@@ -409,28 +654,25 @@ def test_edited_stop_evidence_retrips_breaker_after_operator_resume(tmp_path) ->
         repository="example/project",
         number=7,
         expected_head_sha="a" * 40,
+        publishing_login="octocat",
     )
-    assert len(first.newly_tripped) == 1
-    first_status = store.circuit_breaker_status()
-    assert first_status.active_revision is not None
-    assert store.resume_circuit_breaker(
-        actor="operator",
-        reason="reviewed original request",
-        expected_trigger_hash=first_status.active_revision,
-    )
+    assert len(first.newly_recorded) == 1
+    (hold,) = store.active_holds()
+    assert store.release_hold(hold.hold_id, actor="operator", reason="reviewed original request")
 
     unchanged = observer.observe(
         repository="example/project",
         number=7,
         expected_head_sha="a" * 40,
+        publishing_login="octocat",
     )
-    assert unchanged.newly_tripped == ()
-    assert not store.circuit_breaker_status().is_tripped
+    assert unchanged.newly_recorded == ()
+    assert store.active_holds() == []
 
     github.issue_comments = [
         replace(
             original,
-            body="Stop this PR and all automated work.",
+            body="Stop all automated work on this project.",
             updated_at=NOW + timedelta(minutes=1),
         )
     ]
@@ -438,11 +680,13 @@ def test_edited_stop_evidence_retrips_breaker_after_operator_resume(tmp_path) ->
         repository="example/project",
         number=7,
         expected_head_sha="a" * 40,
+        publishing_login="octocat",
     )
 
-    assert len(edited.newly_tripped) == 1
-    assert edited.newly_tripped != first.newly_tripped
-    assert store.circuit_breaker_status().is_tripped
+    assert len(edited.newly_recorded) == 1
+    assert edited.newly_recorded != first.newly_recorded
+    assert [item.scope for item in store.active_holds()] == [StopScope.REPOSITORY]
+    assert not store.circuit_breaker_status().is_tripped
 
 
 def test_revert_requires_merged_source_and_explicit_target() -> None:
@@ -511,11 +755,13 @@ def test_observer_reads_revert_references_only_for_merged_pull_requests() -> Non
         repository="example/project",
         number=7,
         expected_head_sha="a" * 40,
+        publishing_login="octocat",
     )
     reverted = LifecycleObserver(merged_github, FakeLifecycleStore()).observe(
         repository="example/project",
         number=7,
         expected_head_sha="a" * 40,
+        publishing_login="octocat",
     )
 
     assert open_github.reference_calls == 0
@@ -535,6 +781,7 @@ def test_observer_rejects_top_level_race_before_tripping() -> None:
             repository="example/project",
             number=7,
             expected_head_sha="a" * 40,
+            publishing_login="octocat",
         )
 
     assert store.triggers == {}
@@ -578,9 +825,11 @@ def test_observer_fences_takeover_after_remote_observation(tmp_path) -> None:  #
             repository="example/project",
             number=7,
             expected_head_sha="a" * 40,
+            publishing_login="octocat",
         )
 
     assert not store.circuit_breaker_status().is_tripped
+    assert store.active_holds() == []
 
 
 @pytest.mark.parametrize(
@@ -624,9 +873,118 @@ def test_lifecycle_sync_observes_every_published_run(tmp_path) -> None:  # type:
 
     assert result.runs_checked == 1
     assert result.signals_detected == 0
-    assert result.newly_tripped == 0
+    assert result.newly_recorded == 0
+    assert result.failures == ()
     assert github.get_calls == 2
     assert not store.circuit_breaker_status().is_tripped
+
+
+def test_lifecycle_sync_keeps_attention_on_the_run_and_stops_after_close(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    run = _published_run(store)
+    github = FakeLifecycleGitHub([_pull_request()] * 4)
+    github.reviews = [_review(10, state="CHANGES_REQUESTED")]
+    github.check_runs = [_check(30, "failure"), replace(_check(31, "cancelled"), name="lint")]
+
+    first = sync_open_pull_requests(github, store)
+    events_after_first = len(store.events(run.run_id))
+    second = sync_open_pull_requests(github, store)
+
+    observed = store.get(run.run_id)
+    assert (first.signals_detected, second.signals_detected) == (2, 2)
+    assert observed.pull_request_state == "open"
+    assert [item.kind for item in observed.pull_request_attention] == [
+        "changes_requested",
+        "ci_failed",
+    ]
+    assert len(store.events(run.run_id)) == events_after_first
+    assert store.events(run.run_id)[-1]["event_type"] == "lifecycle.observed"
+    assert not store.circuit_breaker_status().is_tripped
+    assert store.active_holds() == []
+
+    closed = _pull_request(state="closed", closed_at=NOW)
+    github.pull_requests = [closed] * 2
+    github.get_calls = 0
+    github.reviews = []
+    github.check_runs = []
+    sync_open_pull_requests(github, store)
+
+    assert store.get(run.run_id).pull_request_state == "closed"
+    assert store.get(run.run_id).status == RunStatus.PR_OPEN
+    assert [hold.scope_key for hold in store.active_holds()] == ["example/project"]
+    assert store.list_open_pull_request_runs() == []
+    assert sync_open_pull_requests(github, store).runs_checked == 0
+    assert github.get_calls == 2
+
+
+class PartlyUnreadableGitHub(FakeLifecycleGitHub):
+    """Serves each requested pull request but cannot read checks in one repository."""
+
+    def __init__(self, unreadable: str, error: type[GitHubError] = GitHubError) -> None:
+        super().__init__()
+        self.unreadable = unreadable
+        self.error = error
+        self.attempts = 0
+
+    def get_pull_request(self, repository: str, number: int) -> PullRequestDetails:
+        self.get_calls += 1
+        return _pull_request(
+            repository=repository,
+            number=number,
+            html_url=f"https://github.com/{repository}/pull/{number}",
+        )
+
+    def list_check_runs(
+        self, repository: str, ref: str, *, max_check_runs: int = 500
+    ) -> list[CheckRunDetails]:
+        if repository != self.unreadable:
+            return []
+        self.attempts += 1
+        message = (
+            f"GitHub returned 403 for GET /repos/{repository}/commits/{ref}/check-runs "
+            f"(request ABCD:{self.attempts}): Resource not accessible by personal access token"
+        )
+        if self.error is GitHubSafetyError:
+            raise GitHubSafetyError(
+                message,
+                trigger=CircuitBreakerTrigger(source="fixture", reason="fixture", trigger_hash="x"),
+            )
+        raise self.error(message)
+
+
+def test_one_unreadable_pull_request_does_not_stop_lifecycle_sync(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    broken = _published_run(store, repository="example/broken", number=3)
+    healthy = _published_run(store, repository="example/healthy", number=4)
+    github = PartlyUnreadableGitHub("example/broken")
+
+    first = sync_open_pull_requests(github, store)
+    second = sync_open_pull_requests(github, store)
+
+    assert first.runs_checked == 2
+    assert [observation.snapshot.pull_request.number for observation in first.observations] == [4]
+    (failure,) = first.failures
+    assert failure.run_id == broken.run_id
+    assert failure.pull_request_url == "https://github.com/example/broken/pull/3"
+    assert "Resource not accessible" in failure.error
+    assert len(second.failures) == 1
+    (attention,) = store.get(broken.run_id).pull_request_attention
+    assert attention.kind == "observation_failed"
+    assert "request ABCD" not in attention.reason
+    assert store.get(broken.run_id).pull_request_state is None
+    assert store.get(healthy.run_id).pull_request_state == "open"
+    assert not store.circuit_breaker_status().is_tripped
+
+
+def test_lifecycle_sync_still_ends_on_a_github_safety_stop(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    broken = _published_run(store, repository="example/broken", number=3)
+    github = PartlyUnreadableGitHub("example/broken", GitHubSafetyError)
+
+    with pytest.raises(GitHubSafetyError):
+        sync_open_pull_requests(github, store)
+
+    assert store.get(broken.run_id).pull_request_attention == []
 
 
 def test_lifecycle_sync_observes_ghes_pull_request_bound_to_durable_origin(tmp_path) -> None:

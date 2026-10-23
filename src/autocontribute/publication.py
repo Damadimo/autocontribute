@@ -597,9 +597,14 @@ class Publisher:
             repository=repository,
             number=number,
             expected_head_sha=manifest.commit_sha,
+            publishing_login=manifest.publishing_login,
         )
         lease_guard.assert_owned()
         self.store.assert_circuit_breaker_clear()
+        self.store.assert_publication_not_held(
+            repository,
+            pull_request_url=manifest.pull_request_url,
+        )
         return observation.snapshot.pull_request
 
     def _bind_or_validate_upstream_identity(
