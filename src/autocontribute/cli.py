@@ -14,6 +14,7 @@ from urllib.parse import quote
 import typer
 import yaml
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from autocontribute import __version__
@@ -165,12 +166,13 @@ def discover(
         console.print(f"[yellow]{outcome.no_candidate_reason}[/yellow]")
         return
     issue, repository, eligibility = outcome.selection
-    console.print(f"[bold green]{issue.reference}[/bold green] — {issue.title}")
+    console.print(f"[bold green]{issue.reference}[/bold green] — {escape(issue.title)}")
     console.print(issue.html_url)
     console.print(f"Repository: {repository.full_name} ({repository.stars:,} stars)")
     console.print(f"Candidate readiness: {eligibility.score}/100")
+    # Evidence quotes repository files verbatim; markup parsing would alter or reject them.
     for name, evidence in eligibility.evidence.items():
-        console.print(f"  {name}: {evidence}")
+        console.print(f"  {name}: {evidence}", markup=False, soft_wrap=True)
     console.print(outcome.summary, markup=False)
 
 
