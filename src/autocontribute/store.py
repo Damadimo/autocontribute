@@ -10,7 +10,7 @@ import re
 import shutil
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1484,8 +1484,8 @@ class RunStore:
         the bound.
         """
 
-        return self._list_runs_with_status(
-            RunStatus.PR_OPEN,
+        return self.list_with_statuses(
+            {RunStatus.PR_OPEN},
             limit=limit,
             resource="open pull-request",
             open_pull_requests_only=True,
@@ -1496,8 +1496,8 @@ class RunStore:
     ) -> builtins.list[RunManifest]:
         """Return every run whose pull request merged at or after ``merged_since``."""
 
-        return self._list_runs_with_status(
-            RunStatus.PR_OPEN,
+        return self.list_with_statuses(
+            {RunStatus.PR_OPEN},
             limit=limit,
             resource="recently merged pull-request",
             merged_since=_aware_utc(merged_since, field="merge watch start"),
@@ -1506,25 +1506,28 @@ class RunStore:
     def list_submitting_runs(self, *, limit: int = 100) -> builtins.list[RunManifest]:
         """Return every ambiguous publication intent for remote reconciliation."""
 
-        return self._list_runs_with_status(
-            RunStatus.SUBMITTING,
+        return self.list_with_statuses(
+            {RunStatus.SUBMITTING},
             limit=limit,
             resource="submitting",
         )
 
-    def _list_runs_with_status(
+    def list_with_statuses(
         self,
-        status: RunStatus,
+        statuses: Collection[RunStatus],
         *,
         limit: int,
         resource: str,
         open_pull_requests_only: bool = False,
         merged_since: datetime | None = None,
     ) -> builtins.list[RunManifest]:
-        """Enumerate a complete bounded status set and validate row/manifest agreement."""
+        """Enumerate a complete bounded status set, oldest first, and validate each row."""
 
         if not 1 <= limit <= 10_000:
             raise ValueError(f"{resource} run limit must be between 1 and 10000")
+        selected = tuple(sorted({RunStatus(status).value for status in statuses}))
+        if not selected:
+            raise ValueError("at least one run status is required")
         merged_after = (
             None if open_pull_requests_only or merged_since is None else merged_since.isoformat()
         )
@@ -1532,7 +1535,7 @@ class RunStore:
             rows = connection.execute(
                 """
                 SELECT run_id, manifest_json FROM runs
-                WHERE status = :status
+                WHERE status IN (SELECT value FROM json_each(:statuses))
                     AND (
                         NOT :open_only
                         OR coalesce(json_extract(manifest_json, '$.pull_request_state'), 'open')
@@ -1549,7 +1552,7 @@ class RunStore:
                 ORDER BY created_at ASC, run_id ASC LIMIT :limit
                 """,
                 {
-                    "status": status.value,
+                    "statuses": json.dumps(selected),
                     "open_only": open_pull_requests_only,
                     "merged_after": merged_after,
                     "limit": limit + 1,
@@ -1564,7 +1567,7 @@ class RunStore:
                 manifest = RunManifest.model_validate_json(row["manifest_json"])
             except (TypeError, ValueError) as exc:
                 raise StateError(f"Run {run_id} contains an invalid manifest") from exc
-            if manifest.run_id != run_id or manifest.status != status:
+            if manifest.run_id != run_id or manifest.status.value not in selected:
                 raise StateError(f"Run {run_id} manifest disagrees with its state row")
             manifests.append(manifest)
         return manifests
