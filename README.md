@@ -84,7 +84,7 @@ Many runs end `skipped` or `rejected`: no issue passed the rules, the plan found
 - **Disclosure.** Every PR body includes the `policy.ai_disclosure` text, and PRs open as drafts.
 - **Limits.** At most 1 new PR per UTC day and 2 open PRs, and none to a repository where your account has an open PR or a closed one updated in the last 7 days ([details](docs/configuration.md#publishing)).
 - **Repository policies.** It skips repositories whose policy files ban agent-made contributions or ask for human-written PR text (unless you opt in), repositories that take PRs only from collaborators or vouched contributors, and repositories that require a CLA or DCO until you attest with `policy attest` ([details](docs/configuration.md#legal-attestations)).
-- **Stops.** `lifecycle sync` checks the PRs Autocontribute opened and stops all work after a maintainer requests changes or asks you to stop, CI fails, the PR branch changes, or a PR is closed unmerged or reverted; `publish` syncs first. A maintainer's stop request on a candidate issue, repeated GitHub abuse-limit responses, or `safety stop --actor NAME --reason TEXT` also stop all work. `safety status` shows why; to restart work, pass the "Active trigger-set revision" it prints to `safety resume`.
+- **Stops.** `lifecycle sync` checks the PRs Autocontribute opened; `publish` syncs first. Review requests and CI failures are noted on the run. A PR closed unmerged, a request to close it, or a maintainer turning away automated contributions holds that repository; a revert also holds all publication. An unexpected push to a PR branch, a suspended account, or `safety stop --actor NAME --reason TEXT` stops all work. `safety status` shows the stop and every hold; `safety release HOLD_ID` lifts a hold, and `safety resume` with the "Active trigger-set revision" lifts the stop ([details](docs/how-it-works.md#lifecycle-sync-holds-and-the-safety-stop)).
 
 ## Costs
 
@@ -116,10 +116,11 @@ cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod
 | `runs cancel RUN_ID --reason TEXT` | Cancel a run that is ready for approval or approved. |
 | `config validate` | Check the config file and print a summary. |
 | `config show` | Print the config with defaults filled in; it shows secret names, never values. |
-| `lifecycle sync` | Check the PRs Autocontribute opened and stop all work on an adverse signal. |
-| `safety status` | Show whether work is stopped, why, and the trigger-set revision that `safety resume` needs. |
+| `lifecycle sync` | Check the PRs Autocontribute opened, note routine events, and hold or stop work on adverse ones. |
+| `safety status` | Show whether work is stopped or held, why, and the trigger-set revision that `safety resume` needs. |
 | `safety stop` | Stop all preparation and publication (`--actor`, `--reason`). |
 | `safety resume` | Resume after you resolve the cause (`--actor`, `--reason`, `--expected-trigger-hash`). |
+| `safety release HOLD_ID` | Lift one hold after you review it (`--actor`, `--reason`). |
 | `policy inspect REPO` | Link a repository's policy files and show the CLA or DCO requirements it detects. |
 | `policy attest REPO` | After you confirm, print a `policy.legal_attestations` entry (`--cla-completed`, `--authorize-dco-signoff`). |
 
