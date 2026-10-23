@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import subprocess
 from datetime import UTC, datetime, timedelta, tzinfo
 
@@ -997,7 +998,7 @@ def test_mutation_is_never_retried_on_transient_5xx(monkeypatch) -> None:  # typ
         return httpx.Response(502, json={"message": "bad gateway"})
 
     with _client(handler) as github, pytest.raises(GitHubError, match="returned 502"):
-        github.ensure_fork("upstream/project", "octocat")
+        github.ensure_fork("upstream/project", "octocat/project", upstream_repository_id=1001)
 
     assert requests == 2
 
@@ -1082,7 +1083,7 @@ def test_mutation_connect_failure_is_classified_as_not_sent(monkeypatch) -> None
         _client(handler) as github,
         pytest.raises(GitHubRequestNotSentError, match="could not be sent"),
     ):
-        github.ensure_fork("upstream/project", "octocat")
+        github.ensure_fork("upstream/project", "octocat/project", upstream_repository_id=1001)
 
     assert posts == 1
 
@@ -1099,17 +1100,134 @@ def test_mutation_read_failure_is_not_classified_as_not_sent(monkeypatch) -> Non
         raise httpx.ReadError("connection lost mid-response")
 
     with _client(handler) as github, pytest.raises(GitHubError) as excinfo:
-        github.ensure_fork("upstream/project", "octocat")
+        github.ensure_fork("upstream/project", "octocat/project", upstream_repository_id=1001)
 
     assert not isinstance(excinfo.value, GitHubRequestNotSentError)
 
 
-def test_existing_unrelated_repository_cannot_be_reused_as_fork() -> None:
+def _access_payload(
+    full_name: str,
+    *,
+    fork_parent_id: int | None = None,
+    **fields: object,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": 2001,
+        "node_id": "R_fixture_2001",
+        "full_name": full_name,
+        "owner": {"login": full_name.split("/", 1)[0]},
+        "fork": fork_parent_id is not None,
+        **fields,
+    }
+    if fork_parent_id is not None:
+        payload["parent"] = {
+            "id": fork_parent_id,
+            "node_id": "R_fixture_parent",
+            "full_name": "upstream/project",
+        }
+    return payload
+
+
+def test_repository_access_reports_owner_push_and_pull_request_policy() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"fork": False, "full_name": "octocat/project"})
+        if request.url.path == "/repos/upstream/project":
+            return httpx.Response(
+                200,
+                json=_access_payload(
+                    "upstream/project",
+                    permissions={"admin": False, "push": True, "pull": True},
+                    has_pull_requests=True,
+                    pull_request_creation_policy="collaborators_only",
+                ),
+            )
+        if request.url.path == "/repos/octocat/project":
+            return httpx.Response(200, json=_access_payload("octocat/project", fork_parent_id=1001))
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    with _client(handler) as github:
+        upstream = github.get_repository_access("upstream/project")
+        fork = github.get_repository_access("octocat/project")
+        missing = github.get_repository_access("octocat/missing")
+
+    assert upstream is not None and fork is not None
+    assert upstream.owner == "upstream"
+    assert upstream.can_push is True
+    assert upstream.has_pull_requests is True
+    assert upstream.pull_requests_from_collaborators_only is True
+    assert upstream.fork_parent is None
+    assert fork.can_push is None
+    assert fork.pull_requests_from_collaborators_only is False
+    assert fork.fork_parent is not None and fork.fork_parent.database_id == 1001
+    assert missing is None
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"has_pull_requests": "yes"},
+        {"pull_request_creation_policy": "maintainers_only"},
+        {"permissions": {"push": "true"}},
+    ],
+)
+def test_repository_access_rejects_unknown_settings(fields: dict[str, object]) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_access_payload("upstream/project", **fields))
+
+    with _client(handler) as github, pytest.raises(GitHubError):
+        github.get_repository_access("upstream/project")
+
+
+def test_ensure_fork_creates_the_named_fork_with_only_the_default_branch() -> None:
+    requests: list[tuple[str, str, bytes]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path, request.content))
+        if request.method == "GET":
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(202, json=_access_payload("octocat/project", fork_parent_id=1001))
+
+    with _client(handler) as github:
+        fork = github.ensure_fork(
+            "upstream/project",
+            "octocat/project",
+            upstream_repository_id=1001,
+        )
+
+    assert fork == "octocat/project"
+    assert requests[-1][:2] == ("POST", "/repos/upstream/project/forks")
+    assert json.loads(requests[-1][2]) == {"name": "project", "default_branch_only": True}
+
+
+def test_ensure_fork_reports_the_name_github_chose_for_an_existing_fork() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(202, json=_access_payload("octocat/project-1", fork_parent_id=1001))
+
+    with _client(handler) as github:
+        fork = github.ensure_fork(
+            "upstream/project",
+            "octocat/project",
+            upstream_repository_id=1001,
+        )
+
+    assert fork == "octocat/project-1"
+
+
+def test_existing_fork_of_another_upstream_cannot_be_reused() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_access_payload("octocat/project", fork_parent_id=9999))
 
     with _client(handler) as github, pytest.raises(GitHubError, match="not a fork"):
-        github.ensure_fork("upstream/project", "octocat")
+        github.ensure_fork("upstream/project", "octocat/project", upstream_repository_id=1001)
+
+
+def test_existing_unrelated_repository_cannot_be_reused_as_fork() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_access_payload("octocat/project"))
+
+    with _client(handler) as github, pytest.raises(GitHubError, match="not a fork"):
+        github.ensure_fork("upstream/project", "octocat/project", upstream_repository_id=1001)
 
 
 def test_ensure_fork_callback_can_block_creation_before_post() -> None:
@@ -1131,7 +1249,8 @@ def test_ensure_fork_callback_can_block_creation_before_post() -> None:
     ):
         github.ensure_fork(
             "upstream/project",
-            "octocat",
+            "octocat/project",
+            upstream_repository_id=1001,
             before_mutation=block_creation,
         )
 
@@ -1145,19 +1264,13 @@ def test_ensure_fork_does_not_invoke_mutation_callback_for_existing_fork() -> No
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append((request.method, request.url.path))
-        return httpx.Response(
-            200,
-            json={
-                "fork": True,
-                "full_name": "octocat/project",
-                "parent": {"full_name": "upstream/project"},
-            },
-        )
+        return httpx.Response(200, json=_access_payload("octocat/project", fork_parent_id=1001))
 
     with _client(handler) as github:
         fork = github.ensure_fork(
             "upstream/project",
-            "octocat",
+            "octocat/project",
+            upstream_repository_id=1001,
             before_mutation=lambda: callbacks.append("called"),
         )
 
@@ -2425,6 +2538,46 @@ def test_create_pull_request_returns_canonical_success_details() -> None:
     assert details.number == 7
     assert details.head_sha == "a" * 40
     assert details.base_sha == "c" * 40
+
+
+@pytest.mark.parametrize(
+    ("head", "head_repository", "maintainer_can_modify"),
+    [
+        ("octocat:fix", "octocat/project", True),
+        ("example:fix", "example/project", None),
+    ],
+)
+def test_create_pull_request_lets_maintainers_edit_only_fork_heads(
+    head: str,
+    head_repository: str,
+    maintainer_can_modify: bool | None,
+) -> None:
+    bodies: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(request.content))
+        payload = _pull_request_payload()
+        payload["head"] = {
+            **payload["head"],  # type: ignore[dict-item]
+            "label": head,
+            "repo": {"id": 2001, "node_id": "R_fixture_2001", "full_name": head_repository},
+        }
+        return httpx.Response(201, json=payload)
+
+    with _client(handler) as github:
+        github.create_pull_request(
+            "example/project",
+            title="Fix parser boundary",
+            body="Fixes #42.",
+            head=head,
+            expected_head_sha="a" * 40,
+            expected_head_repository=head_repository,
+            base="main",
+            expected_base_sha="c" * 40,
+            draft=False,
+        )
+
+    assert bodies[0].get("maintainer_can_modify") == maintainer_can_modify
 
 
 def test_create_pull_request_callback_can_block_before_post() -> None:

@@ -148,8 +148,12 @@ the target repository and base commit, the publishing account, and a fingerprint
 A failed recheck pushes nothing and leaves the run `approved`: retry `publish` after a limit clears,
 or run `autocontribute runs cancel RUN_ID --reason "TEXT"` and [retry the issue](#run-states) (also
 the way past an expired approval). Once the rechecks pass, the attempt uses that day's slot and
-starts the cooldown even if a later step fails. `publish` creates or reuses your fork
-(`<login>/<repository>`), commits as `identity.name` and `identity.email` (if empty, your login and
+starts the cooldown even if a later step fails. The review shows where the branch goes: the
+repository itself when your account owns it (or, with `publishing.login` empty, can push to it),
+otherwise your fork `<login>/<repository>`, which `publish` creates or reuses; set
+`publishing.head_strategy: fork` to always use the fork. A branch in the repository itself may not
+change CI configuration, because its push workflows run with the repository's secrets. `publish`
+commits as `identity.name` and `identity.email` (if empty, your login and
 `<account ID>+<login>@users.noreply.github.com`), and pushes the new branch
 `<publishing.branch_prefix>/issue-<number>-<run ID prefix>`, never overwriting an existing one. If
 the base, issue, or policy files changed meanwhile, it deletes the branch and the run ends `failed`;

@@ -27,6 +27,7 @@ from autocontribute.domain import (
     IssueCandidate,
     RunManifest,
     RunStatus,
+    publication_head,
     utc_now,
 )
 from autocontribute.environments import EnvironmentBaseline, EnvironmentRecipe
@@ -269,7 +270,7 @@ def _assert_merged_publication_compensation_events(
     )
     if repository.casefold() != manifest.candidate.repository.casefold():
         raise StateError("Merged publication compensation belongs to another repository")
-    expected_fork = f"{manifest.publishing_login}/{manifest.candidate.repository.split('/', 1)[1]}"
+    expected_fork = publication_head(manifest).repository
     rows = connection.execute(
         """
         SELECT id, event_type, details_json FROM events
@@ -447,7 +448,8 @@ def _assert_failed_publication_compensation_events(
         raise StateError("Publication compensation lacks durable identity")
     if (manifest.fork_repository_id is None) != (manifest.fork_repository_node_id is None):
         raise StateError("Publication compensation has partial immutable fork identity")
-    expected_fork = f"{manifest.publishing_login}/{manifest.candidate.repository.split('/', 1)[1]}"
+    head = publication_head(manifest)
+    expected_fork = head.repository
     fork_identity: dict[str, str]
     if manifest.fork_repository_id is None:
         branch_was_pushed = connection.execute(
@@ -475,7 +477,7 @@ def _assert_failed_publication_compensation_events(
         "publishing_api_origin": manifest.publishing_api_origin,
         "upstream_repository_id": str(manifest.upstream_repository_id),
         "upstream_repository_node_id": manifest.upstream_repository_node_id,
-        "head": f"{manifest.publishing_login}:{manifest.branch_name}",
+        "head": head.label,
         "fork": expected_fork,
         **fork_identity,
         "branch": manifest.branch_name,
@@ -870,6 +872,9 @@ class _ManifestArtifactSyncError(StateError):
 @dataclass(frozen=True, slots=True)
 class _PublicationIntent:
     branch_name: str
+    # None only for runs approved before the head repository was bound; their intent
+    # events keep the exact earlier shape.
+    head_repository: str | None
     publication_draft: bool
     publication_ready_for_review: bool
     publishing_login: str
@@ -880,8 +885,10 @@ class _PublicationIntent:
     commit_committer_email: str
 
     def manifest_fields(self) -> dict[str, str | bool]:
+        head = {} if self.head_repository is None else {"head_repository": self.head_repository}
         return {
             "branch_name": self.branch_name,
+            **head,
             "publication_draft": self.publication_draft,
             "publication_ready_for_review": self.publication_ready_for_review,
             "publishing_login": self.publishing_login,
@@ -893,8 +900,10 @@ class _PublicationIntent:
         }
 
     def event_details(self, *, repository: str) -> dict[str, str]:
+        head = {} if self.head_repository is None else {"head_repository": self.head_repository}
         return {
             "repository": repository,
+            **head,
             "branch": self.branch_name,
             "draft": "true" if self.publication_draft else "false",
             "ready_for_review": "true" if self.publication_ready_for_review else "false",
@@ -2211,6 +2220,7 @@ class RunStore:
         repository: str,
         *,
         branch_name: str,
+        head_repository: str | None,
         publication_draft: bool,
         publication_ready_for_review: bool = False,
         publishing_login: str,
@@ -2238,6 +2248,7 @@ class RunStore:
         )
         intent = _publication_intent(
             branch_name=branch_name,
+            head_repository=head_repository,
             publication_draft=publication_draft,
             publication_ready_for_review=publication_ready_for_review,
             publishing_login=publishing_login,
@@ -4696,6 +4707,7 @@ def _publication_reservation_request(
 def _publication_intent(
     *,
     branch_name: str,
+    head_repository: str | None,
     publication_draft: bool,
     publication_ready_for_review: bool,
     publishing_login: str,
@@ -4716,6 +4728,15 @@ def _publication_intent(
             branch_name,
             field="publication branch name",
             maximum=255,
+        ),
+        head_repository=(
+            None
+            if head_repository is None
+            else _canonical_publication_intent_text(
+                head_repository,
+                field="publication head repository",
+                maximum=255,
+            )
         ),
         publication_draft=publication_draft,
         publication_ready_for_review=publication_ready_for_review,

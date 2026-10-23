@@ -8,9 +8,10 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from autocontribute.config import PublishingConfig
 from autocontribute.domain import Approval, RunManifest, utc_now
@@ -19,7 +20,12 @@ from autocontribute.exceptions import PolicyError
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_FINGERPRINT_DOMAIN = b"autocontribute.approval.v4\x00"
+# v5 adds the head repository. A run approved before it was bound keeps its v4 bytes and
+# domain, so its approval still authorizes recovery of the fork publication it began.
+_FINGERPRINT_DOMAINS = {
+    4: b"autocontribute.approval.v4\x00",
+    5: b"autocontribute.approval.v5\x00",
+}
 
 
 class ApprovalManifest(BaseModel):
@@ -31,8 +37,9 @@ class ApprovalManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: int = Field(default=4, frozen=True)
+    schema_version: Literal[4, 5] = 4
     repository: str
+    head_repository: str | None = None
     issue_number: int = Field(gt=0)
     base_sha: str
     preparation_fingerprint: str
@@ -57,6 +64,19 @@ class ApprovalManifest(BaseModel):
         if not _REPOSITORY.fullmatch(value):
             raise ValueError("repository must use owner/name syntax")
         return value
+
+    @field_validator("head_repository")
+    @classmethod
+    def valid_head_repository(cls, value: str | None) -> str | None:
+        if value is not None and not _REPOSITORY.fullmatch(value):
+            raise ValueError("head_repository must use owner/name syntax")
+        return value
+
+    @model_validator(mode="after")
+    def schema_matches_head_binding(self) -> ApprovalManifest:
+        if self.schema_version != (4 if self.head_repository is None else 5):
+            raise ValueError("schema_version 5 binds head_repository; version 4 has none")
+        return self
 
     @field_validator("base_sha")
     @classmethod
@@ -226,7 +246,9 @@ def build_approval_manifest(
     assert run.commit_committer_name is not None
     assert run.commit_committer_email is not None
     return ApprovalManifest(
+        schema_version=4 if run.head_repository is None else 5,
         repository=run.candidate.repository,
+        head_repository=run.head_repository,
         issue_number=run.candidate.number,
         base_sha=run.base_sha,
         preparation_fingerprint=run.preparation_fingerprint,
@@ -251,12 +273,15 @@ def manifest_fingerprint(manifest: ApprovalManifest) -> str:
     """Return a domain-separated SHA-256 fingerprint of canonical JSON."""
 
     canonical = json.dumps(
-        manifest.model_dump(mode="json"),
+        manifest.model_dump(
+            mode="json",
+            exclude={"head_repository"} if manifest.head_repository is None else None,
+        ),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return hashlib.sha256(_FINGERPRINT_DOMAIN + canonical).hexdigest()
+    return hashlib.sha256(_FINGERPRINT_DOMAINS[manifest.schema_version] + canonical).hexdigest()
 
 
 def create_approval(

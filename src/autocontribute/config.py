@@ -649,6 +649,9 @@ class PublishingConfig(StrictModel):
     # Empty means the token owner. Setting it lets a job without the publishing token prepare
     # and render reviews; approve and publish still require the token to belong to this login.
     login: str = ""
+    # auto: push the branch to the upstream itself when the login can push there (it owns the
+    # repository, or the token has push access and login is empty); otherwise use a fork.
+    head_strategy: Literal["auto", "fork"] = "auto"
     approval_expires_hours: int = Field(default=72, ge=1, le=168)
     branch_prefix: str = "autocontribute"
     draft: bool = False
@@ -898,6 +901,7 @@ quality:
 
 publishing:
   login: ""                        # empty = the GitHub token's account
+  head_strategy: auto              # auto | fork
   approval_expires_hours: 72
   draft: false
   ready_for_review: true           # applies only when draft is true

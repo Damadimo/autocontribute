@@ -14,7 +14,7 @@ Autocontribute finds open issues in GitHub repositories you choose, prepares a s
 5. **Check:** your validation commands run in Docker with no network. A bug fix also needs a reproduction that fails before the change and passes after it.
 6. **Review:** a critic model reviews the diff, check output, and PR text in a fresh context, and hard gates on size, paths, secrets, and scores must all pass.
 7. **Approve:** you read the exact diff, check output, and PR text, then approve.
-8. **Publish:** Autocontribute rechecks that the issue, policy files, and base commit are unchanged, then opens a PR from your fork.
+8. **Publish:** Autocontribute rechecks that the issue, policy files, and base commit are unchanged, then opens a PR from your fork, or from a branch in the repository itself if you own it.
 
 [docs/how-it-works.md](docs/how-it-works.md) covers each step, the hard gates, and the run states.
 
@@ -70,7 +70,7 @@ autocontribute run --issue owner/repo#123   # or prepare one specific issue
 autocontribute runs list                    # recent runs and their status
 autocontribute runs show RUN_ID             # the evidence for one run
 autocontribute approve RUN_ID               # read the exact diff, checks, and PR text, then approve
-autocontribute publish RUN_ID               # fork, push one branch, open the PR
+autocontribute publish RUN_ID               # push one branch, open the PR
 ```
 
 Many runs end `skipped` or `rejected`: no issue passed the rules, the plan found nothing safe to change, a check failed, or the critic objected. These are normal outcomes; `failed` means an error stopped the run. Each run's evidence is in `.autocontribute/runs/RUN_ID/` next to your config file (set by `storage.path`): the patch, every command's output, the model-call records, and a `report.md` summary.
@@ -109,7 +109,7 @@ cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod
 | `discover` | Show the best current candidate issue without cloning, model calls, or GitHub writes. |
 | `run` | Prepare one contribution or skip; `--issue owner/repo#N` pins an issue, `--scheduled` makes an [unattended attempt](#scheduling). |
 | `approve RUN_ID` | Show the exact diff, check output, and PR text, then record your approval. |
-| `publish RUN_ID` | Create or reuse your fork, push one branch, and open one pull request. |
+| `publish RUN_ID` | Push one branch to your fork (or to the repository itself if you own it) and open one pull request. |
 | `version` | Print the installed version. |
 | `runs list` | List recent runs and their status. |
 | `runs show RUN_ID` | Show the evidence for one run. |

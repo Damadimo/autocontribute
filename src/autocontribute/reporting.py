@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import unicodedata
 
-from autocontribute.approval import ApprovalReview
+from autocontribute.approval import ApprovalManifest, ApprovalReview
 from autocontribute.domain import CommandResult, RunManifest
 from autocontribute.exceptions import PolicyError
 
@@ -173,6 +173,7 @@ def render_approval_review(review: ApprovalReview) -> str:
         "## Publication target and identity",
         "",
         f"- Repository: {approval.repository}",
+        f"- Head repository: {_head_repository_line(approval)}",
         f"- Issue: {approval.repository}#{approval.issue_number}",
         f"- Base branch: {approval.base_branch}",
         f"- Base commit: {approval.base_sha}",
@@ -246,6 +247,14 @@ def render_approval_review(review: ApprovalReview) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _head_repository_line(approval: ApprovalManifest) -> str:
+    head = approval.head_repository
+    if head is None:
+        raise PolicyError("Approval review is missing its head repository")
+    mode = "same repository" if head.casefold() == approval.repository.casefold() else "fork"
+    return f"{head} ({mode})"
 
 
 def _append_command_result(lines: list[str], heading: str, result: CommandResult) -> None:

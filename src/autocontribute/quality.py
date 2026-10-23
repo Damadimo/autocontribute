@@ -753,6 +753,19 @@ def _secret_findings(files: Sequence[_DiffFile]) -> list[str]:
     return sorted(findings)
 
 
+def workflow_paths(diff: str) -> list[str]:
+    """Return the CI configuration paths a patch adds, changes, or removes."""
+
+    return sorted(
+        {
+            path
+            for item in _parse_git_diff(diff)
+            for path in (item.old_path, item.new_path)
+            if path != "/dev/null" and _is_workflow_path(path)
+        }
+    )
+
+
 def secret_findings(diff: str) -> list[str]:
     """Return credential-like findings without retaining or returning matched values."""
 
@@ -773,4 +786,5 @@ __all__ = [
     "environment_failure_signature",
     "infrastructure_failure_reason",
     "secret_findings",
+    "workflow_paths",
 ]
