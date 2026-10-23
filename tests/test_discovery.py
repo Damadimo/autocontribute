@@ -304,6 +304,7 @@ SCORE_PARTS = ("invitation", "specificity", "smallness", "freshness", "testabili
     ("updates", "score"),
     [
         ({"labels": ["bug"]}, 65),
+        ({"labels": ["kind/bug"]}, 65),
         (
             {
                 "title": "Parser crashes on empty input",
@@ -1052,6 +1053,48 @@ def test_search_uses_the_repository_spelling_of_invitation_labels_and_synonyms(t
             "unassigned": True,
             "page": 1,
         }
+    ]
+
+
+def test_search_reads_labels_through_emoji_and_category_prefixes(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    # Spellings from pylint, tqdm, poetry, tokio and pip.
+    github = SearchGitHub(
+        [_issue(labels=["kind/bug"])],
+        labels=[
+            "Help wanted 🙏",
+            "Bug :beetle:",
+            "kind/bug",
+            "status/confirmed",
+            "E-help-wanted",
+            "C-bug",
+            "type: bug",
+            "Downstream Bug 🪲",
+            "bug: upstream",
+            "C-feature-accepted",
+            "S-needs-triage",
+            "type: question",
+            "resolution: duplicate",
+        ],
+    )
+    service = DiscoveryService(  # type: ignore[arg-type]
+        _discovery_config("example/project"), github, RunStore(tmp_path)
+    )
+
+    service.discover()
+
+    assert github.searches[0]["include"] == [
+        "Help wanted 🙏",
+        "Bug :beetle:",
+        "kind/bug",
+        "status/confirmed",
+        "E-help-wanted",
+        "C-bug",
+        "type: bug",
+    ]
+    assert github.searches[0]["exclude"] == [
+        "S-needs-triage",
+        "type: question",
+        "resolution: duplicate",
     ]
 
 
