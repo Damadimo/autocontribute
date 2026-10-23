@@ -37,6 +37,7 @@ def outside(tmp_path: Path) -> Path:
         ("/workspace", ""),
         ("/workspace/", ""),
         (".", ""),
+        ("", ""),
         ("src/", "src"),
     ],
 )
@@ -49,7 +50,6 @@ def test_model_paths_are_normalized_to_the_workspace(
 @pytest.mark.parametrize(
     ("path", "message"),
     [
-        ("", "non-empty"),
         ("src/\0module.py", "NUL"),
         ("/etc/passwd", "outside /workspace"),
         ("/workspaces/other", "outside /workspace"),

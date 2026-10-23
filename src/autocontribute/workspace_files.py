@@ -43,8 +43,8 @@ class WorkspaceFiles:
         Paths may be relative or start with ``/workspace``, as the agent sees them.
         """
 
-        if not isinstance(path, str) or not path or "\0" in path:
-            raise RepositoryError("Path must be a non-empty string without NUL bytes")
+        if not isinstance(path, str) or "\0" in path:
+            raise RepositoryError("Path must be a string without NUL bytes")
         candidate = PurePosixPath(path)
         if candidate.is_absolute():
             try:
