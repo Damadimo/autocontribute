@@ -143,6 +143,10 @@ class EnvironmentRecipeError(AutocontributeError):
     """No recipe for building a repository's test environment could be found."""
 
 
+class SuiteReportError(AutocontributeError):
+    """A test runner's report is malformed, too large, or of an unsupported kind."""
+
+
 class StateError(AutocontributeError):
     """A run attempted an invalid or stale state transition."""
 
