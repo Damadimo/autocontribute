@@ -99,13 +99,13 @@ _CHECKLIST: Final = (
 
 _OUT_OF_TIME: Final = "the run is out of time"
 
-TestRunKind = Literal["red", "green", "related", "full_suite", "rerun"]
+SuiteRunKind = Literal["red", "green", "related", "full_suite", "rerun"]
 
 
-class TestRunEvidence(DomainModel):
+class SuiteRunEvidence(DomainModel):
     """One test run, as the agent, the critic and ``validation.json`` see it."""
 
-    kind: TestRunKind
+    kind: SuiteRunKind
     command: str
     exit_code: int
     timed_out: bool
@@ -131,7 +131,7 @@ class RedGreenEvidence(DomainModel):
     reproduced: list[str]
     # Files or modules whose tests could not be collected without the fix.
     uncollected: list[str]
-    runs: list[TestRunEvidence]
+    runs: list[SuiteRunEvidence]
 
 
 class RegressionEvidence(DomainModel):
@@ -142,7 +142,7 @@ class RegressionEvidence(DomainModel):
     full_suite: bool
     # Tests that passed in every baseline run and fail with the patch in every run here.
     new_failures: list[str]
-    runs: list[TestRunEvidence]
+    runs: list[SuiteRunEvidence]
 
 
 class FixCheckResult(DomainModel):
@@ -298,7 +298,7 @@ class FixChecks:
         tests = [file.path for file in split.tests.files if not _deleted(file)]
         if not tests:
             return _red_green("not_applicable", "the patch changes no test", None, [])
-        runs: list[TestRunEvidence] = []
+        runs: list[SuiteRunEvidence] = []
         found: Reproduction | None = None
         if split.sources.files:
             _patched_copy(self._snapshot, self._red, split.tests, self._workspace.base_sha)
@@ -337,7 +337,7 @@ class FixChecks:
 
     def _regression(self, patch: Patch) -> RegressionEvidence:
         paths = [file.path for file in patch.files]
-        runs: list[TestRunEvidence] = []
+        runs: list[SuiteRunEvidence] = []
         related = related_test_command(self._recipe, paths, self._tree(patch.files))
         related_ran = False
         if related is not None:
@@ -371,7 +371,7 @@ class FixChecks:
         return _regression("passed", detail, False, [], runs)
 
     def _regression_run(
-        self, kind: TestRunKind, command: str | None, runs: list[TestRunEvidence]
+        self, kind: SuiteRunKind, command: str | None, runs: list[SuiteRunEvidence]
     ) -> _RegressionRun | None:
         """Run one regression command and re-run its new failures; None when out of time."""
 
@@ -409,10 +409,10 @@ class FixChecks:
         deleted = {file.path for file in files if _deleted(file)}
         return (self._base_paths | {file.path for file in files}) - deleted
 
-    def _evidence(self, kind: TestRunKind, command: str | None, run: SuiteRun) -> TestRunEvidence:
+    def _evidence(self, kind: SuiteRunKind, command: str | None, run: SuiteRun) -> SuiteRunEvidence:
         statuses = [result.status for result in run.results.values()]
         tail = redact_text(scrub_for_model(run.output_tail, self._host_values))
-        return TestRunEvidence(
+        return SuiteRunEvidence(
             kind=kind,
             command=command or self._recipe.test_command,
             exit_code=run.exit_code,
@@ -520,7 +520,7 @@ def _regression_lines(evidence: RegressionEvidence) -> list[str]:
     return lines
 
 
-def _run_lines(runs: Sequence[TestRunEvidence], *, show_tail: bool) -> list[str]:
+def _run_lines(runs: Sequence[SuiteRunEvidence], *, show_tail: bool) -> list[str]:
     lines = [
         f"- {run.kind} run `{run.command}`: {run.passed} passed, {run.failed} failed, "
         f"{run.skipped} skipped, exit {run.exit_code}"
@@ -538,7 +538,7 @@ def _red_green(
     status: Literal["passed", "failed", "not_applicable"],
     detail: str,
     found: Reproduction | None,
-    runs: list[TestRunEvidence],
+    runs: list[SuiteRunEvidence],
 ) -> RedGreenEvidence:
     return RedGreenEvidence(
         status=status,
@@ -555,14 +555,14 @@ def _regression(
     detail: str,
     full_suite: bool,
     found: list[str],
-    runs: list[TestRunEvidence],
+    runs: list[SuiteRunEvidence],
 ) -> RegressionEvidence:
     return RegressionEvidence(
         status=status, detail=detail, full_suite=full_suite, new_failures=found, runs=runs
     )
 
 
-def _not_reproduced(found: Reproduction, red: TestRunEvidence) -> str:
+def _not_reproduced(found: Reproduction, red: SuiteRunEvidence) -> str:
     if red.failure or red.timed_out:
         return f"the tests did not run without the fix: {red.failure or 'the run timed out'}"
     if found.uncollected and not found.targets:
@@ -666,7 +666,7 @@ __all__ = [
     "FixChecks",
     "RedGreenEvidence",
     "RegressionEvidence",
-    "TestRunEvidence",
-    "TestRunKind",
+    "SuiteRunEvidence",
+    "SuiteRunKind",
     "render_check",
 ]
