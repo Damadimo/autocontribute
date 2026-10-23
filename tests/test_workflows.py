@@ -187,12 +187,19 @@ def test_ci_package_installs_the_built_wheel_in_a_clean_environment() -> None:
         step for step in steps if step["name"] == "Install the wheel in a clean environment"
     )
     smoke = next(step for step in steps if step["name"] == "Run the installed command")
+    prompts = next(
+        step for step in steps if step["name"] == "Load the system prompts from the installed wheel"
+    )
 
-    assert steps.index(build) < steps.index(install) < steps.index(smoke)
+    assert steps.index(build) < steps.index(install) < steps.index(smoke) < steps.index(prompts)
     assert build["run"] == "uv build --clear"
     assert 'uv venv --python 3.12 "${RUNNER_TEMP}/autocontribute-package"' in install["run"]
     assert "dist/autocontribute-*.whl" in install["run"]
     assert "autocontribute-package/bin/autocontribute --help" in smoke["run"]
+    # Isolated mode and the runner's temp directory keep the source tree off sys.path.
+    assert prompts["run"].startswith('cd "${RUNNER_TEMP}"\n')
+    assert "autocontribute-package/bin/python -I -c" in prompts["run"]
+    assert "load_instructions(kind)" in prompts["run"]
 
 
 def test_security_integration_always_materializes_fail_closed_gate() -> None:

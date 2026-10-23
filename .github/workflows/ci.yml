@@ -137,3 +137,13 @@ jobs:
         run: |
           cd "${RUNNER_TEMP}"
           autocontribute-package/bin/autocontribute --help
+      - name: Load the system prompts from the installed wheel
+        run: |
+          cd "${RUNNER_TEMP}"
+          autocontribute-package/bin/python -I -c '
+          from typing import get_args
+          from autocontribute.instructions import load_instructions
+          from autocontribute.transcript import TranscriptKind
+          for kind in get_args(TranscriptKind):
+              assert load_instructions(kind), kind
+          '
