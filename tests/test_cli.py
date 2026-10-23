@@ -569,7 +569,10 @@ def _discovery_outcome(*, selected: bool) -> DiscoveryOutcome:
             eligibility=EligibilityResult(
                 eligible=not blockers,
                 score=70 if not blockers else 40,
-                evidence={"invitation": "25/25"},
+                evidence={
+                    "invitation": "25/25",
+                    "ai_policy": "disclose AI use as [our policy](docs/ai.md) says [/b]",
+                },
                 blockers=blockers,
             ),
             blocker_kinds=kinds,
@@ -653,6 +656,10 @@ def test_discover_explain_lists_every_issue_skip_and_error(
             "searched; 1 issue could not be evaluated."
         )
         assert "example/project#42" in plain.output
+        assert (
+            "  ai_policy: disclose AI use as [our policy](docs/ai.md) says [/b]"
+            in plain.output.splitlines()
+        )
         for output in (plain.output, explained.output):
             assert summary in " ".join(output.split())
     else:
