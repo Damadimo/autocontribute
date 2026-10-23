@@ -2743,6 +2743,23 @@ def test_linked_policy_page_that_cannot_be_read_blocks_the_repository(tmp_path) 
     ]
 
 
+def test_policy_paths_that_differ_only_by_case_block_the_repository(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): "Contribution guidelines.",
+            ("example/project", "contributing.md"): "Other contribution guidelines.",
+        }
+    )
+
+    result = DiscoveryService(AutocontributeConfig(), github, RunStore(tmp_path)).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository()
+    )
+
+    assert result.blockers == [
+        "policy paths of example/project differ only by case; their precedence is ambiguous"
+    ]
+
+
 def test_vouch_file_blocks_the_repository(tmp_path) -> None:  # type: ignore[no-untyped-def]
     github = PolicyGitHub(
         {

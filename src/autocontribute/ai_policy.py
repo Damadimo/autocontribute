@@ -15,6 +15,10 @@ from pydantic import Field
 from autocontribute.domain import DomainModel
 
 AiPolicyStance = Literal["ban", "conditional", "permissive", "none", "unclear"]
+# Files written for coding agents; their rules bind an agent even when they never say "AI".
+AGENT_INSTRUCTION_FILES = frozenset(
+    {"agents.md", "claude.md", "gemini.md", "copilot-instructions.md"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,7 +110,6 @@ _AI_TERM = re.compile(
     r"|machine[\s-]+generated|vibe[\s-]+cod\w*)\b",
     re.I,
 )
-_AGENT_INSTRUCTION_FILE = re.compile(r"(?:agents|claude|gemini|copilot-instructions)\.md")
 _DISCLOSURE = re.compile(r"\b(?:disclos\w*|assisted-by|generated-by)\b", re.I)
 _TRAILER = re.compile(r"\b(?:assisted-by|generated-by)\b", re.I)
 _HUMAN_TEXT_RULE = re.compile(
@@ -179,7 +182,7 @@ def ai_policy_files(files: Sequence[PolicyFile]) -> list[PolicyFile]:
         file
         for file in files
         if _AI_TERM.search(file.text)
-        or _AGENT_INSTRUCTION_FILE.fullmatch(PurePosixPath(file.path.casefold()).name)
+        or PurePosixPath(file.path.casefold()).name in AGENT_INSTRUCTION_FILES
     ]
 
 
@@ -265,6 +268,7 @@ def _collapsed(text: str) -> str:
 
 
 __all__ = [
+    "AGENT_INSTRUCTION_FILES",
     "AiPolicyQuote",
     "AiPolicyStance",
     "PolicyFile",
