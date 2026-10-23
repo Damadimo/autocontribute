@@ -2,14 +2,19 @@ name: E2E
 
 # Prepares one real issue with the stored OpenAI key, from issue to approval review, and keeps
 # the run's evidence. It never publishes: the only GitHub token is this workflow's read-only
-# token. Start it by hand with an issue, or push a branch under e2e/ whose e2e/issue.txt
-# names the issue. A run costs up to the default per-run budget of 10 USD.
+# token. Name an issue to prepare it, or name repositories to let discovery and triage pick one,
+# as the runner's daily job does. Start it by hand, or push a branch under e2e/ with
+# e2e/issue.txt or e2e/repositories.txt. A run costs up to the default per-run budget of 10 USD.
 on:
   workflow_dispatch:
     inputs:
       issue:
         description: Issue to prepare, as owner/repository#number
-        required: true
+        required: false
+        type: string
+      repositories:
+        description: Or repositories for discovery to pick from, as owner/repository, space-separated
+        required: false
         type: string
   push:
     branches: ["e2e/**"]
@@ -39,46 +44,66 @@ jobs:
           enable-cache: true
       - name: Install this checkout
         run: uv sync --locked
-      - name: Choose the issue
-        id: issue
+      - name: Choose the issue or repositories
+        id: target
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
           INPUT_ISSUE: ${{ inputs.issue }}
+          INPUT_REPOSITORIES: ${{ inputs.repositories }}
         run: |
+          issue=""
+          repositories=""
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            reference="$INPUT_ISSUE"
+            issue="$(printf '%s' "$INPUT_ISSUE" | tr -d '[:space:]')"
+            repositories="$INPUT_REPOSITORIES"
           elif [ -f e2e/issue.txt ]; then
-            reference="$(tr -d '[:space:]' < e2e/issue.txt)"
-          else
-            echo "::error::A push to e2e/** needs an e2e/issue.txt that names owner/repository#number"
+            issue="$(tr -d '[:space:]' < e2e/issue.txt)"
+          elif [ -f e2e/repositories.txt ]; then
+            repositories="$(cat e2e/repositories.txt)"
+          fi
+          if [ -n "$issue" ]; then
+            if ! [[ "$issue" =~ ^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#[1-9][0-9]*$ ]]; then
+              echo "::error::The issue must be owner/repository#number"
+              exit 1
+            fi
+            repositories="${BASH_REMATCH[1]}"
+          fi
+          read -r -a names <<< "$(printf '%s' "$repositories" | tr ',\n' '  ')"
+          if [ "${#names[@]}" -eq 0 ]; then
+            echo "::error::Name an issue (owner/repository#number) or repositories (owner/repository)"
             exit 1
           fi
-          if ! [[ "$reference" =~ ^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#[1-9][0-9]*$ ]]; then
-            echo "::error::The issue must be owner/repository#number"
-            exit 1
-          fi
+          for name in "${names[@]}"; do
+            if ! [[ "$name" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+              echo "::error::Repositories must be owner/repository"
+              exit 1
+            fi
+          done
           {
-            printf 'reference=%s\n' "$reference"
-            printf 'repository=%s\n' "${BASH_REMATCH[1]}"
+            printf 'issue=%s\n' "$issue"
+            printf 'repositories=%s\n' "${names[*]}"
           } >> "$GITHUB_OUTPUT"
       - name: Write the configuration
         shell: bash
         env:
-          REPOSITORY: ${{ steps.issue.outputs.repository }}
+          REPOSITORIES: ${{ steps.target.outputs.repositories }}
         run: |
           {
             printf 'github:\n'
             printf '  auth: token\n'
             printf '  token_env: AUTOCONTRIBUTE_GITHUB_TOKEN\n'
-            printf '  repositories: ["%s"]\n' "$REPOSITORY"
+            printf '  repositories:\n'
+            for name in $REPOSITORIES; do
+              printf '    - "%s"\n' "$name"
+            done
             printf 'storage:\n'
             printf '  path: %s/autocontribute-state\n' "$RUNNER_TEMP"
           } > "$RUNNER_TEMP/autocontribute.yml"
       - name: Prepare the issue
         shell: bash
         env:
-          ISSUE: ${{ steps.issue.outputs.reference }}
+          ISSUE: ${{ steps.target.outputs.issue }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           # Read-only: enough for public reads and search, never for publishing.
           AUTOCONTRIBUTE_GITHUB_TOKEN: ${{ github.token }}
@@ -87,9 +112,15 @@ jobs:
             echo "::error::Set OPENAI_API_KEY as a repository secret"
             exit 1
           fi
+          if [ -n "$ISSUE" ]; then
+            target=(--issue "$ISSUE")
+          else
+            # Discovery and triage pick the issue, as in the runner's daily job.
+            target=(--scheduled)
+          fi
           uv run --locked autocontribute run \
             --config "$RUNNER_TEMP/autocontribute.yml" \
-            --issue "$ISSUE" \
+            "${target[@]}" \
             --json | tee "$RUNNER_TEMP/run.json"
       - name: Keep the run evidence
         if: ${{ always() }}
