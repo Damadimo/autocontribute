@@ -27,8 +27,6 @@ class StopScope(StrEnum):
     PUBLICATION = "publication"
     REPOSITORY = "repository"
     PULL_REQUEST = "pull_request"
-    ISSUE = "issue"
-    RUN = "run"
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,8 +34,7 @@ class CircuitBreakerTrigger:
     """Credential-free evidence identifying one immutable safety event.
 
     A global trigger trips the circuit breaker. Any other scope holds only ``scope_key`` (an
-    owner/name, pull-request URL, owner/name#number, run ID, or API origin) until it expires or an
-    operator releases it.
+    owner/name, pull-request URL, or API origin) until it expires or an operator releases it.
     """
 
     source: str

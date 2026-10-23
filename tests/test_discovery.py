@@ -1699,7 +1699,7 @@ def test_issue_discussion_holds_do_not_escalate_to_a_global_stop(tmp_path) -> No
     assert not service.store.circuit_breaker_status().is_tripped
 
 
-def test_held_repositories_are_not_searched_and_held_issues_not_read(tmp_path) -> None:  # type: ignore[no-untyped-def]
+def test_held_repositories_are_not_searched(tmp_path) -> None:  # type: ignore[no-untyped-def]
     store = RunStore(tmp_path)
     store.record_stop(
         CircuitBreakerTrigger(
@@ -1711,26 +1711,13 @@ def test_held_repositories_are_not_searched_and_held_issues_not_read(tmp_path) -
             expires_at=datetime.now(UTC) + timedelta(days=30),
         )
     )
-    store.record_stop(
-        CircuitBreakerTrigger(
-            source="operator",
-            reason="maintainer asked us to leave this one alone",
-            trigger_hash="held-issue",
-            scope=StopScope.ISSUE,
-            scope_key="example/project#41",
-        )
-    )
     github = IsolationGitHub(
         {
             "held/project": [_repository_issue("held/project", 1)],
-            "example/project": [
-                _repository_issue("example/project", 41),
-                _repository_issue("example/project", 42),
-            ],
+            "example/project": [_repository_issue("example/project", 42)],
         },
         failures={
             "search:held/project": AssertionError("a held repository must not be searched"),
-            "issue:example/project#41": AssertionError("a held issue must not be read"),
         },
     )
     service = DiscoveryService(  # type: ignore[arg-type]
@@ -1741,12 +1728,10 @@ def test_held_repositories_are_not_searched_and_held_issues_not_read(tmp_path) -
 
     assert outcome.selection is not None
     assert outcome.selection[0].reference == "example/project#42"
-    assert outcome.held_candidates == 1
     assert [name for name, _ in outcome.skipped_repositories] == ["held/project"]
     assert outcome.skipped_repositories[0][1].endswith(
         "Pull request was closed without being merged"
     )
-    assert "1 issue is held" in outcome.summary
 
 
 def test_issue_description_stop_request_fails_closed_without_tripping_global_breaker(

@@ -194,9 +194,9 @@ Routine events stop nothing. Each one is noted once on its run (`pull_request_at
   (`action_required`, `cancelled`, `neutral`, `skipped`, and `stale` are ignored);
 - another GitHub account adds commits on top of the prepared commit.
 
-A hold stops work on one repository, PR, or issue, or stops all publication, until it expires or
-you release it. Discovery skips held repositories and issues. `publish` refuses held repositories
-and PRs, and refuses everything while publication is held.
+A hold stops work on one repository or PR, or stops all publication, until it expires or you
+release it. Discovery skips held repositories. `publish` refuses held repositories and PRs, and
+refuses everything while publication is held.
 
 | Event | Hold |
 | --- | --- |
