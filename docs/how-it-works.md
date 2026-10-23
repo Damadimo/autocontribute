@@ -286,3 +286,11 @@ evidence does.
 
 Never delete or roll back `state.sqlite3`; the limits and the safety stop depend on it. Delete the
 state directory only when a newer version says it cannot migrate it.
+
+To keep state on a machine that has no disk between jobs, such as a GitHub Actions runner,
+`state export --output FILE` writes one `.tar.gz` with a consistent copy of `state.sqlite3` and the
+`runs/<run-id>/` files of runs that are not finished yet; workspaces are left out. Exporting the
+same state twice gives the same bytes. `state import FILE` unpacks it beside `storage.path`,
+checks the database and every audit chain, and only then makes it the state; it refuses to replace
+existing state without `--force`. `--release-leases` drops the locks a crashed job left behind; use
+it only when no job that wrote the archive can still be running.
