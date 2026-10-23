@@ -35,7 +35,10 @@ Blockers, by category
   issue does not require. Give the path and line.
 
 Give each blocker a check_command that fails while the blocker holds, when one exists. The
-controller runs it on a clean copy and drops blockers whose check passes or cannot run. Bound a
+controller runs it on a clean copy of the patched repository in a fresh container, so files you
+wrote under /tmp and changes to /workspace are gone: a check must use the repository's files or
+inline code, such as `python -c '...'` or a heredoc it writes in the same command. Blockers whose
+check passes or cannot run, including one that cannot find its file, are dropped. Bound a
 check that may run long with `timeout N`, as in `timeout 60 python -m pytest tests/test_x.py`. A
 check that runs out of time confirms a regression or issue_not_fixed blocker, since the hang is
 the bug, and drops any other.

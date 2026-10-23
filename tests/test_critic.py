@@ -327,3 +327,34 @@ def test_running_out_of_time_while_checking_blockers_does_not_approve(tmp_path: 
 
     assert isinstance(outcome, DidNotFinish) and outcome.reason == "time"
     assert harness.sandbox.checked == [] and harness.critic.rounds == []
+
+
+def test_checks_that_cannot_find_their_files_or_tests_did_not_run(tmp_path: Path) -> None:
+    sandbox = FakeSandbox(
+        {
+            "python -m pytest /tmp/test_repro.py": _ran(
+                4, output_tail="ERROR: file or directory not found: /tmp/test_repro.py"
+            ),
+            "python /tmp/repro.py": _ran(
+                2, output_tail="python: can't open file '/tmp/repro.py': [Errno 2] No such file"
+            ),
+            "python -m pytest -k nothing tests": _ran(5, output_tail="no tests ran"),
+            "python -m pytest tests/test_calc.py": _ran(1, output_tail="1 failed"),
+        }
+    )
+    harness = Harness(tmp_path, sandbox, "openai")
+    kept = _blocker("issue_not_fixed", "still wrong", "python -m pytest tests/test_calc.py")
+
+    outcome = harness.review(
+        _review(
+            "request_changes",
+            _blocker("issue_not_fixed", "repro fails", "python -m pytest /tmp/test_repro.py"),
+            _blocker("regression", "breaks", "python /tmp/repro.py", path="other.py"),
+            _blocker("definite_bug", "wrong", "python -m pytest -k nothing tests", path="x.py"),
+            kept,
+        )
+    )
+
+    assert isinstance(outcome, CriticRound)
+    assert [blocker.model_dump() for blocker in outcome.confirmed] == [kept]
+    assert [dropped.reason for dropped in outcome.dropped] == ["its check could not run"] * 3
