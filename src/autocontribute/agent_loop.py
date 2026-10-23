@@ -84,6 +84,11 @@ _TOKEN_REFUSAL: Final = (
     "placeholder such as <TOKEN> in its place and call the tool again."
 )
 
+_SECOND_SUBMIT: Final = (
+    "Not run: a turn may call submit once. Read the result of the first call, then call submit "
+    "again in a later turn."
+)
+
 StopReason = Literal[
     "turns",
     "budget",
@@ -342,6 +347,7 @@ class AgentLoop(Generic[SubmissionT]):
         messages: list[str] = []
         outcome: LoopOutcome[SubmissionT] | None = None
         invalid = 0
+        submitted = False
         for call in turn.tool_calls:
             if outcome is not None:
                 results.append(
@@ -352,8 +358,14 @@ class AgentLoop(Generic[SubmissionT]):
                 self._end_failure_streak()
                 results.append(refused(call, _TOKEN_REFUSAL))
                 invalid += 1
+            elif call.name == self._submit_name and submitted:
+                # A second submit would answer the first one's result unread, such as a fix
+                # confirmed before its check report was seen.
+                results.append(refused(call, _SECOND_SUBMIT))
+                invalid += 1
             elif call.name == self._submit_name:
                 self._end_failure_streak()
+                submitted = True
                 result, outcome, was_invalid = self._submit(call, last_turn=last_turn)
                 results.append(result)
                 invalid += was_invalid
