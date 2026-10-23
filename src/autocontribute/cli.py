@@ -321,7 +321,7 @@ def run_once(
         _expire_unapproved_runs(settings, store)
         github = _github_client(settings, store)
         if scheduled:
-            _sync_lifecycle(settings, store, github, scheduled_preflight=True)
+            _sync_lifecycle(settings, store, github)
             store.assert_circuit_breaker_clear()
         with Orchestrator(settings, store=store, github=github) as orchestrator:
             manifest = orchestrator.run(
@@ -1004,9 +1004,16 @@ def lifecycle_sync(config: ConfigOption = DEFAULT_CONFIG) -> None:
     try:
         with _github_client(settings, store) as github:
             result = _sync_lifecycle(settings, store, github)
+        waiting = store.list_submitting_runs()
     except (AutocontributeError, ValueError) as exc:
         _fail(str(exc))
     _print_lifecycle_result(result)
+    for manifest in waiting:
+        console.print(
+            f"Run {manifest.run_id} is still submitting: finish it with `autocontribute publish "
+            f"{manifest.run_id}`, or end it with `autocontribute runs abandon {manifest.run_id}`.",
+            markup=False,
+        )
     status = store.circuit_breaker_status()
     if status.is_tripped:
         console.print(
@@ -1323,7 +1330,7 @@ def actions_prepare(
     error: str | None = None
     try:
         with _github_client(settings, store) as github:
-            lifecycle = _sync_lifecycle(settings, store, github, scheduled_preflight=True)
+            lifecycle = _sync_lifecycle(settings, store, github, reconcile_submitting=False)
             attention = attention_items(lifecycle, store.list_open_pull_request_runs())
             store.assert_circuit_breaker_clear()
             with Orchestrator(settings, store=store, github=github) as orchestrator:
@@ -1633,8 +1640,16 @@ def _sync_lifecycle(
     github: GitHubClient,
     *,
     publication_retry_run_id: str | None = None,
-    scheduled_preflight: bool = False,
+    reconcile_submitting: bool = True,
 ) -> LifecycleSyncResult:
+    """Observe published pull requests, then record what GitHub shows for submitting runs.
+
+    Only ``publication_retry_run_id`` resumes. Any other run that waits for `publish` or
+    `runs abandon` stays submitting and counts toward the limits, but stops no other run.
+    Without ``reconcile_submitting`` it only observes, as a job without the publishing token
+    must: reconciliation first confirms that the token belongs to the run's publishing login.
+    """
+
     publisher = Publisher(settings, store, github)
     reconciliation_failures: list[tuple[str, AutocontributeError]] = []
     with LeaseHeartbeatGuard(
@@ -1650,24 +1665,14 @@ def _sync_lifecycle(
             assert_owned=lease_guard.assert_owned,
         )
         lease_guard.assert_owned()
-        for manifest in store.list_submitting_runs():
+        submitting = store.list_submitting_runs() if reconcile_submitting else []
+        for manifest in submitting:
             lease_guard.assert_owned()
             try:
                 publisher._reconcile_submitting(manifest.run_id, lease_guard=lease_guard)
             except PublicationResumeRequired:
                 lease_guard.assert_owned()
                 if manifest.run_id != publication_retry_run_id:
-                    if scheduled_preflight:
-                        continue
-                    reconciliation_failures.append(
-                        (
-                            manifest.run_id,
-                            PublicationResumeRequired(
-                                f"Run {manifest.run_id} requires publication resumption; use "
-                                f"`autocontribute publish {manifest.run_id}` after review"
-                            ),
-                        )
-                    )
                     continue
                 lease_guard.assert_owned()
                 try:

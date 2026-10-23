@@ -19,6 +19,7 @@ from autocontribute.doctor import DoctorCheck
 from autocontribute.domain import RunManifest, RunStatus
 from autocontribute.exceptions import (
     ConfigurationError,
+    GitHubHTTPError,
     PolicyError,
     PublicationLimitError,
     StateError,
@@ -956,8 +957,8 @@ def test_actions_prepare_restores_runs_and_exports_the_state_for_record(
             self.store.write_artifact(manifest.run_id, "report.md", "# report\n")
             return manifest
 
-    def sync(*_: object, scheduled_preflight: bool = False, **__: object) -> LifecycleSyncResult:
-        assert scheduled_preflight
+    def sync(*_: object, reconcile_submitting: bool = True) -> LifecycleSyncResult:
+        assert not reconcile_submitting
         calls.append("sync")
         return LifecycleSyncResult(observations=())
 
@@ -990,6 +991,72 @@ def test_actions_prepare_restores_runs_and_exports_the_state_for_record(
     assert restored.get(ready_run).status == RunStatus.READY_FOR_APPROVAL
     assert restored.get(prepared.run_id).status == RunStatus.SKIPPED
     assert "**skipped**" in (tmp_path / "summary.md").read_text(encoding="utf-8")
+
+
+def test_actions_prepare_runs_beside_a_submitting_run_without_the_publishing_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "prepared").mkdir()
+    config, prepared_store, _, runner_dir = _runner_ready_run(tmp_path)
+    submitting = prepared_store.create_run()
+    submitting.status = RunStatus.SUBMITTING
+    prepared_store.save(submitting, event="test.unanswered_post", details={})
+    origin = _state_remote(tmp_path)
+    checkout = _checkout(origin, tmp_path / "branch")
+    export_state(prepared_store, tmp_path / "base.tar.gz")
+    StateBranch(checkout, token=None).save(tmp_path / "base.tar.gz", message="seed")
+    for name, value in _environment(tmp_path).items():
+        monkeypatch.setenv(name, value)
+    calls: list[str] = []
+
+    class WorkflowToken(_ReviewGitHub):
+        def authenticated_login(self) -> str:
+            calls.append("GET /user")
+            raise GitHubHTTPError(
+                "GitHub returned 403 for GET /user",
+                status_code=403,
+                request_id="ABCD:1",
+                github_message="Resource not accessible by integration",
+            )
+
+    class Preparation:
+        def __init__(self, _: object, *, store: RunStore, github: object) -> None:
+            self.store = store
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def run(self, **_: object) -> RunManifest:
+            calls.append("run")
+            manifest = self.store.create_run()
+            manifest.status = RunStatus.SKIPPED
+            self.store.save(manifest, event="test.skipped", details={})
+            return manifest
+
+    monkeypatch.setattr(cli, "_github_client", lambda *_: WorkflowToken())
+    monkeypatch.setattr(cli, "Orchestrator", Preparation)
+
+    result = cli_runner.invoke(
+        app,
+        [
+            "actions",
+            "prepare",
+            "--state",
+            str(checkout),
+            "--output",
+            str(tmp_path / "out"),
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == ["run"]
+    restored = RunStore(runner_dir / "state")
+    assert restored.get(submitting.run_id).status == RunStatus.SUBMITTING
 
 
 def _without_evidence(output: Path) -> Path:
