@@ -63,6 +63,17 @@ class SuiteRun:
 
 
 @dataclass(frozen=True, slots=True)
+class CheckRun:
+    """One command run offline on a fresh copy, after the recipe's build commands."""
+
+    exit_code: int
+    timed_out: bool
+    # Why the run says nothing about the command: a build command or the container failed.
+    failure: str | None
+    output_tail: str
+
+
+@dataclass(frozen=True, slots=True)
 class Reproduction:
     """What the tests of a patch show on the unpatched source (the red step of §7.1)."""
 
@@ -95,7 +106,7 @@ def run_suite(
 
     copy = source.with_name(f"{source.name}.run-{secrets.token_hex(4)}")
     copy_workspace(source, copy)
-    environment = {**recipe.env, **recipe.offline_env}
+    environment = offline_environment(recipe)
     try:
         with SessionContainer(
             config,
@@ -105,27 +116,19 @@ def run_suite(
             store_root=store_root,
             volumes=(TOOL_ROOT,),
         ) as container:
-            for command in recipe.build_commands:
-                built = container.exec(
-                    command, timeout_seconds=timeout_seconds, environment=environment
+            build = run_build_commands(container, recipe, timeout_seconds=timeout_seconds)
+            if build is not None:
+                built, reason = build
+                return SuiteRun(
+                    built.exit_code,
+                    # The failure says the build timed out; timed_out is the test command's.
+                    timed_out=False,
+                    duration_seconds=built.duration_seconds,
+                    results={},
+                    per_test=False,
+                    failure=reason,
+                    output_tail=_tail(built.stdout, built.stderr),
                 )
-                if built.infrastructure_failure is not None or not built.result.passed:
-                    outcome = (
-                        "timed out"
-                        if built.result.timed_out
-                        else f"failed with exit {built.result.exit_code}"
-                    )
-                    return SuiteRun(
-                        built.result.exit_code,
-                        # The failure says the build timed out; timed_out is the test command's.
-                        timed_out=False,
-                        duration_seconds=built.result.duration_seconds,
-                        results={},
-                        per_test=False,
-                        failure=built.infrastructure_failure
-                        or f"the build command {outcome}: {command}",
-                        output_tail=_tail(built.result.stdout, built.result.stderr),
-                    )
             tested = container.exec(
                 recipe.test_command if test_command is None else test_command,
                 timeout_seconds=timeout_seconds,
@@ -148,6 +151,74 @@ def run_suite(
             )
     finally:
         remove_workspace_copy(copy)
+
+
+def run_check(
+    config: SandboxConfig,
+    *,
+    image_id: str,
+    recipe: EnvironmentRecipe,
+    source: Path,
+    run_id: str,
+    store_root: Path,
+    command: str,
+    timeout_seconds: int,
+) -> CheckRun:
+    """Run the recipe's build commands and then ``command`` offline on a copy of ``source``."""
+
+    copy = source.with_name(f"{source.name}.check-{secrets.token_hex(4)}")
+    copy_workspace(source, copy)
+    try:
+        with SessionContainer(
+            config,
+            image=image_id,
+            workspace=copy,
+            run_id=run_id,
+            store_root=store_root,
+            volumes=(TOOL_ROOT,),
+        ) as container:
+            build = run_build_commands(container, recipe, timeout_seconds=timeout_seconds)
+            if build is not None:
+                built, failure = build
+                return CheckRun(built.exit_code, False, failure, _tail(built.stdout, built.stderr))
+            checked = container.exec(
+                command, timeout_seconds=timeout_seconds, environment=offline_environment(recipe)
+            )
+            result = checked.result
+            return CheckRun(
+                result.exit_code,
+                result.timed_out,
+                checked.infrastructure_failure,
+                _tail(result.stdout, result.stderr),
+            )
+    finally:
+        remove_workspace_copy(copy)
+
+
+def run_build_commands(
+    container: SessionContainer, recipe: EnvironmentRecipe, *, timeout_seconds: int
+) -> tuple[CommandResult, str] | None:
+    """Run the recipe's offline build commands; return the failing one's result and why."""
+
+    for command in recipe.build_commands:
+        built = container.exec(
+            command, timeout_seconds=timeout_seconds, environment=offline_environment(recipe)
+        )
+        if built.infrastructure_failure is not None or not built.result.passed:
+            outcome = (
+                "timed out"
+                if built.result.timed_out
+                else f"failed with exit {built.result.exit_code}"
+            )
+            failure = built.infrastructure_failure or f"the build command {outcome}: {command}"
+            return built.result, failure
+    return None
+
+
+def offline_environment(recipe: EnvironmentRecipe) -> dict[str, str]:
+    """The variables that build, test and agent commands run with, without network."""
+
+    return {**recipe.env, **recipe.offline_env}
 
 
 def run_baseline(
@@ -265,10 +336,17 @@ def reproduction(baseline: EnvironmentBaseline, red: SuiteRun) -> Reproduction:
     fails for an import, syntax or collection error, or a run that timed out, reproduces
     nothing: the test may only be failing because the code it calls does not exist yet. A
     file, module or package that fails as a whole is reported in ``uncollected`` instead.
+    Without per-test results the suite is the one target, when it passed on the base.
     """
 
-    if red.failure is not None or red.timed_out or not red.per_test:
+    if red.failure is not None or red.timed_out:
         return Reproduction((), (), ())
+    if not red.per_test:
+        suite = red.results.get(SUITE_TEST_ID)
+        if SUITE_TEST_ID not in baseline.pass_stable or suite is None:
+            return Reproduction((), (), ())
+        reproduced = suite.status == "failed" and not _not_reproduced(suite.message)
+        return Reproduction((SUITE_TEST_ID,), (SUITE_TEST_ID,) if reproduced else (), ())
     known = {*baseline.pass_stable, *baseline.fail_before, *baseline.flaky, *baseline.skip}
     stable = set(baseline.pass_stable)
     new = [
@@ -277,14 +355,14 @@ def reproduction(baseline: EnvironmentBaseline, red: SuiteRun) -> Reproduction:
         if test_id not in known or (test_id in stable and result.status in _FAILING)
     ]
     targets = [test_id for test_id, result in new if not result.collection_error]
-    reproduced = [
+    reproduced_targets = [
         test_id
         for test_id in targets
         if red.results[test_id].status == "failed"
-        and not any(text in red.results[test_id].message for text in _NOT_REPRODUCED_SIGNATURES)
+        and not _not_reproduced(red.results[test_id].message)
     ]
     uncollected = [test_id for test_id, result in new if result.collection_error]
-    return Reproduction(tuple(targets), tuple(reproduced), tuple(uncollected))
+    return Reproduction(tuple(targets), tuple(reproduced_targets), tuple(uncollected))
 
 
 def green_failure(found: Reproduction, green: Sequence[SuiteRun]) -> str | None:
@@ -379,6 +457,10 @@ def _read_results(
         return {}, str(exc)
 
 
+def _not_reproduced(message: str) -> bool:
+    return any(text in message for text in _NOT_REPRODUCED_SIGNATURES)
+
+
 def _within(test_id: str, scope: str) -> bool:
     # Tests carry their file, module or package as a prefix: `tests.test_x::test_y` or
     # `tests.test_x.TestZ::test_y` for pytest, `src/x.test.js::...`, `example.com/m/pkg::Test`.
@@ -397,13 +479,17 @@ def _tail(stdout: str, stderr: str) -> str:
 __all__ = [
     "BASELINE_TIME_LIMIT_SECONDS",
     "SUITE_TEST_ID",
+    "CheckRun",
     "Reproduction",
     "SuiteRun",
     "acceptance_failure",
     "green_failure",
     "new_failures",
+    "offline_environment",
     "reproduction",
     "run_baseline",
+    "run_build_commands",
+    "run_check",
     "run_suite",
     "still_failing",
     "summarize_baseline",
