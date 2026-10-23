@@ -259,6 +259,12 @@ class FixChecks:
         result = self._result(sha, gates, split.tests, split.sources, red_green, regression, notes)
         return self._report(result, patch.text)
 
+    def check_text(self, submission: AgentSubmission) -> str | None:
+        """Say why a confirming submission's pull request text cannot be published, or None."""
+
+        gate = _text_gate(submission)
+        return None if gate.passed else gate.evidence
+
     def _split(self, patch: Patch) -> PatchSplit:
         try:
             return split_patch(patch, WorkspaceFiles(self._workspace.path))

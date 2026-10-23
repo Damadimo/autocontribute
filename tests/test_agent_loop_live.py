@@ -151,6 +151,9 @@ class _Checker:
             text=f"{patch.text}\nTests: exit {tests.result.exit_code}",
         )
 
+    def check_text(self, submission: AgentSubmission) -> str | None:
+        return None
+
 
 def _call(provider: Provider, name: str, arguments: dict[str, JsonValue]) -> ToolCall:
     prefix = "call" if provider == "openai" else "toolu"
