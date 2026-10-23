@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.resources
 import json
 import os
 import re
@@ -21,7 +22,9 @@ from typing import Final, Literal
 
 from autocontribute.config import SandboxConfig
 from autocontribute.domain import CommandResult
+from autocontribute.egress_proxy import LISTEN_PORT, READY_MESSAGE
 from autocontribute.exceptions import SandboxError
+from autocontribute.host_environment import proxy_environment
 from autocontribute.repository import RepositoryWorkspace
 
 _CONTAINER_WORKSPACE: Final = "/workspace"
@@ -52,6 +55,23 @@ _DOCKER_OBJECT_ID: Final = re.compile(r"^[0-9a-f]{12,64}$")
 _DOCKER_CONTROL_TIMEOUT_SECONDS: Final = 30
 _REAP_ATTEMPTS: Final = 3
 _REAP_SETTLE_SECONDS: Final = 0.05
+_ROOT_USER: Final = "0:0"
+_DOCKER_NAME: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_IMAGE_ID: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
+_LABEL_NAME: Final = re.compile(r"^[a-z0-9][a-z0-9.-]{0,127}$")
+_LABEL_VALUE: Final = re.compile(r"^[A-Za-z0-9._:/@-]{0,256}$")
+_ALLOWED_HOST: Final = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
+_IMAGE_PULL_TIMEOUT_SECONDS: Final = 1_800
+_EGRESS_PROXY_IMAGE: Final = (
+    "python:3.12-alpine@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a532f470e83807815d"
+)
+_EGRESS_PROXY_READY_SECONDS: Final = 30
+_EGRESS_PROXY_POLL_SECONDS: Final = 0.1
+# What a setup container's root bootstrap may need: CHOWN to give /opt/ac to the command
+# user, and for apt, writing and chmod-ing files it does not own and dropping to `_apt`.
+SETUP_CAPABILITIES: Final = frozenset({"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"})
 _DOCKER_RUNTIME_INFO_FORMAT: Final = (
     '{"security_options":{{json .SecurityOptions}},'
     '"cgroup_version":{{json .CgroupVersion}},'
@@ -325,6 +345,11 @@ class SessionContainer:
     The main process runs as 65534, so commands can neither signal it nor read its
     environment. After every command the session kills whatever the command left running,
     so no process writes to the workspace while host-side tools read or edit it.
+
+    A setup container (DESIGN §5.2) is the same with a writable root filesystem, the setup
+    network instead of none, and the capabilities its root bootstrap needs. ``volumes`` get a
+    fresh volume each, filled from the image, so an environment image's tool homes and caches
+    under /opt/ac stay writable while the rest of the root is read-only.
     """
 
     def __init__(
@@ -336,17 +361,31 @@ class SessionContainer:
         run_id: str,
         store_root: Path,
         docker_binary: str = "docker",
+        network: str = "none",
+        writable_root: bool = False,
+        capabilities: Collection[str] = (),
+        volumes: Sequence[str] = (),
     ) -> None:
         _validate_image(image)
         if not _RUN_ID.fullmatch(run_id):
             raise SandboxError("Run identifier cannot label a sandbox container")
         if not docker_binary or "\0" in docker_binary:
             raise SandboxError("Docker binary is invalid")
+        if not _DOCKER_NAME.fullmatch(network):
+            raise SandboxError("Sandbox network name is invalid")
+        if not set(capabilities) <= SETUP_CAPABILITIES:
+            raise SandboxError("Sandbox containers may regain only the setup capabilities")
+        if any("," in path for path in volumes):
+            raise SandboxError("Volume paths cannot be represented safely as Docker mounts")
         self.config = config
         self.image = image
         self.workspace = _workspace_path(workspace)
         self.run_id = run_id
         self.docker_binary = docker_binary
+        self.network = network
+        self.writable_root = writable_root
+        self.capabilities = tuple(sorted(capabilities))
+        self.volumes = tuple(_container_directory(path) for path in volumes)
         self._store_label = _store_label(store_root)
         # One Docker endpoint for the whole session, as in SandboxRunner.
         self._docker_environment = docker_client_environment()
@@ -387,16 +426,22 @@ class SessionContainer:
         timeout_seconds: int,
         workdir: str = _CONTAINER_WORKSPACE,
         environment: Mapping[str, str] | None = None,
+        as_root: bool = False,
     ) -> SessionCommandResult:
-        """Run one command in a fresh shell, then kill whatever it left running."""
+        """Run one command in a fresh shell, then kill whatever it left running.
+
+        ``as_root`` runs it as uid 0, for a setup container's bootstrap. Without CAP_KILL,
+        root can signal only its own processes, so the main process still survives it.
+        """
 
         _validate_command(command)
         if timeout_seconds < 1:
             raise SandboxError("Sandbox command timeout must be at least one second")
+        user = _ROOT_USER if as_root else self.command_user
         arguments = [
             self.docker_binary,
             "exec",
-            f"--user={self._command_user}",
+            f"--user={user}",
             f"--workdir={_container_directory(workdir)}",
             self.name,
             "/usr/bin/env",
@@ -413,15 +458,113 @@ class SessionContainer:
             cwd=self.workspace,
             timeout_seconds=timeout_seconds,
             environment=self._docker_environment,
-            cleanup=self._signal_command_processes,
+            cleanup=lambda: self._signal_processes(user),
         )
         # Checked after every command: a process can be killed for memory inside a
         # command that still exits 0.
         failure = self._infrastructure_failure()
-        if failure is None and self._reap():
+        if failure is None and self._reap(user):
             return SessionCommandResult(result, None, restarted=False)
         self.restart()
         return SessionCommandResult(result, failure, restarted=True)
+
+    @property
+    def command_user(self) -> str:
+        """Return the uid:gid that commands run as."""
+
+        if not self._command_user:
+            raise SandboxError("Sandbox session is not started")
+        return self._command_user
+
+    def pipe(self, command: str, text: str, *, timeout_seconds: int) -> bool:
+        """Run one short command as the command user with ``text`` on its standard input.
+
+        Unlike :meth:`exec`, nothing is reaped afterwards, so the command must not leave
+        processes behind. Returns whether it exited 0.
+        """
+
+        _validate_command(command)
+        completed = _docker_control(
+            self.docker_binary,
+            [
+                "exec",
+                "--interactive",
+                f"--user={self.command_user}",
+                self.name,
+                "/usr/bin/env",
+                "-i",
+                "PATH=/usr/bin:/bin",
+                _SESSION_SHELL,
+                "-c",
+                command,
+            ],
+            self._docker_environment,
+            input_text=text,
+            timeout_seconds=timeout_seconds,
+        )
+        return completed is not None and completed.returncode == 0
+
+    def read_file(self, path: str, *, max_bytes: int) -> bytes | None:
+        """Return a file from the container, or ``None`` if it is missing or over ``max_bytes``."""
+
+        arguments = [
+            self.docker_binary,
+            "exec",
+            f"--user={self.command_user}",
+            self.name,
+            "/bin/cat",
+            "--",
+            _container_directory(path),
+        ]
+        try:
+            process = subprocess.Popen(
+                arguments,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env=self._docker_environment,
+            )
+        except OSError:
+            return None
+        assert process.stdout is not None
+        capture = _BoundedCapture(limit=max_bytes)
+        reader = threading.Thread(target=capture.consume, args=(process.stdout,), daemon=True)
+        reader.start()
+        try:
+            exit_code: int | None = process.wait(timeout=_DOCKER_CONTROL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            exit_code = None
+        reader.join(timeout=5)
+        process.stdout.close()
+        if exit_code != 0 or capture.truncated:
+            return None
+        return bytes(capture.data)
+
+    def commit(self, labels: Mapping[str, str]) -> str:
+        """Save the container as an image that differs from it only by ``labels``.
+
+        Every step ran through ``docker exec``, so the image keeps the neutral ``sleep``
+        command and an environment without proxy values. Returns the image ID.
+        """
+
+        changes: list[str] = []
+        for name, value in labels.items():
+            if not _LABEL_NAME.fullmatch(name) or not _LABEL_VALUE.fullmatch(value):
+                raise SandboxError(f"Image label {name!r} is not a plain name and value")
+            changes.append(f"--change=LABEL {name}={value}")
+        committed = _docker_control(
+            self.docker_binary,
+            ["commit", *changes, self.name],
+            self._docker_environment,
+            timeout_seconds=self.config.command_timeout_seconds,
+        )
+        image_id = committed.stdout.strip() if committed is not None else ""
+        if committed is None or committed.returncode != 0 or not _IMAGE_ID.fullmatch(image_id):
+            detail = _first_line(committed.stderr) if committed is not None else ""
+            raise SandboxError(f"Could not commit the setup container: {detail or 'no image ID'}")
+        return image_id
 
     def save_output(self, number: int, text: str) -> str | None:
         """Write a command's full output into the container for the agent to search.
@@ -433,24 +576,12 @@ class SessionContainer:
         if number < 1:
             raise SandboxError("Output log numbers start at 1")
         path = f"{_SESSION_OUTPUT_DIRECTORY}/{number}.log"
-        written = _docker_control(
-            self.docker_binary,
-            [
-                "exec",
-                "--interactive",
-                f"--user={self._command_user}",
-                self.name,
-                "/usr/bin/env",
-                "-i",
-                "PATH=/usr/bin:/bin",
-                _SESSION_SHELL,
-                "-c",
-                f"mkdir -p {_SESSION_OUTPUT_DIRECTORY} && cat > {path}",
-            ],
-            self._docker_environment,
-            input_text=text,
+        written = self.pipe(
+            f"mkdir -p {_SESSION_OUTPUT_DIRECTORY} && cat > {path}",
+            text,
+            timeout_seconds=_DOCKER_CONTROL_TIMEOUT_SECONDS,
         )
-        return path if written is not None and written.returncode == 0 else None
+        return path if written else None
 
     def restart(self) -> None:
         """Kill every process and start the container again.
@@ -514,9 +645,13 @@ class SessionContainer:
                 self.config,
                 user=f"{_SESSION_MAIN_UID}:{_SESSION_MAIN_UID}",
                 tmp_size=_SESSION_TMP_SIZE,
+                network=self.network,
+                read_only=not self.writable_root,
+                capabilities=self.capabilities,
             ),
             f"--workdir={_CONTAINER_WORKSPACE}",
             *_workspace_mounts(self.workspace),
+            *(f"--mount=type=volume,dst={path}" for path in self.volumes),
             self.image,
             "-i",
             "PATH=/usr/bin:/bin",
@@ -524,17 +659,15 @@ class SessionContainer:
             "infinity",
         ]
 
-    def _signal_command_processes(self) -> None:
+    def _signal_processes(self, user: str) -> None:
         # The shell builtin forks nothing, so it runs even when leftovers hold every
         # slot under the pids limit.
-        self._docker(
-            "exec", f"--user={self._command_user}", self.name, _SESSION_SHELL, "-c", "kill -KILL -1"
-        )
+        self._docker("exec", f"--user={user}", self.name, _SESSION_SHELL, "-c", "kill -KILL -1")
 
-    def _reap(self) -> bool:
-        uid = self._command_user.partition(":")[0]
+    def _reap(self, user: str) -> bool:
+        uid = user.partition(":")[0]
         for _ in range(_REAP_ATTEMPTS):
-            self._signal_command_processes()
+            self._signal_processes(user)
             listed = self._docker("top", self.name, "-o", "pid,uid")
             if listed is None or listed.returncode != 0:
                 return False
@@ -601,6 +734,269 @@ def remove_leftover_containers(
             if _DOCKER_OBJECT_ID.fullmatch(object_id) and run_id not in unfinished_run_ids:
                 # Best effort, like workspace cleanup: the next sweep retries.
                 _docker_control(docker_binary, [*removal, object_id], environment)
+
+
+class EgressNetwork:
+    """An internal Docker network whose only way out is the allowlisting egress proxy.
+
+    Setup containers join the network and reach the proxy by name (DESIGN §5.2). The proxy
+    container alone is also on the default bridge, and it alone receives the operator's
+    upstream proxy; it runs the standard-library proxy from ``egress_proxy.py`` in a pinned
+    python:3.12-alpine image.
+    """
+
+    def __init__(
+        self,
+        *,
+        allowed_hosts: Collection[str],
+        run_id: str,
+        store_root: Path,
+        docker_binary: str = "docker",
+    ) -> None:
+        if not _RUN_ID.fullmatch(run_id):
+            raise SandboxError("Run identifier cannot label a sandbox network")
+        if not docker_binary or "\0" in docker_binary:
+            raise SandboxError("Docker binary is invalid")
+        invalid = sorted(host for host in allowed_hosts if not _ALLOWED_HOST.fullmatch(host))
+        if invalid:
+            raise SandboxError(f"Egress allowlist entries must be host names: {invalid}")
+        self.allowed_hosts = tuple(sorted(set(allowed_hosts)))
+        self.docker_binary = docker_binary
+        self._labels = (
+            f"--label={_RUN_LABEL}={run_id}",
+            f"--label={_STORE_LABEL}={_store_label(store_root)}",
+        )
+        suffix = secrets.token_hex(4)
+        self.network = f"ac-{run_id}-net-{suffix}"
+        self.proxy = f"ac-{run_id}-proxy-{suffix}"
+        self._docker_environment = docker_client_environment()
+        self._started = False
+
+    def __enter__(self) -> EgressNetwork:
+        self.start()
+        return self
+
+    def __exit__(self, *_exception: object) -> None:
+        self.remove()
+
+    @property
+    def proxy_url(self) -> str:
+        return f"http://{self.proxy}:{LISTEN_PORT}"
+
+    def start(self) -> None:
+        """Create the network and start the proxy on it; :meth:`remove` tears both down."""
+
+        if self._started:
+            raise SandboxError("Egress network is already started")
+        pull_image(_EGRESS_PROXY_IMAGE, docker_binary=self.docker_binary)
+        self._started = True
+        try:
+            self._require(
+                ("network", "create", "--internal", *self._labels, self.network),
+                "create the setup network",
+            )
+            self._start_proxy()
+            self._require(
+                ("network", "connect", self.network, self.proxy),
+                "attach the egress proxy to the setup network",
+            )
+            self._wait_until_ready()
+        except BaseException:
+            self.remove()
+            raise
+
+    def refused_requests(self) -> list[str]:
+        """Return the proxy's log lines for requests it refused."""
+
+        logs = self._docker("logs", self.proxy)
+        if logs is None:
+            return []
+        return [line for line in logs.stdout.splitlines() if line.startswith("deny ")]
+
+    def remove(self) -> None:
+        """Remove the proxy and the network; safe to call again."""
+
+        if not self._started:
+            return
+        # Best effort: remove_leftover_containers finds survivors by their labels.
+        self._docker("rm", "--force", "--volumes", self.proxy)
+        self._docker("network", "rm", self.network)
+        self._started = False
+
+    def _start_proxy(self) -> None:
+        source = importlib.resources.files("autocontribute").joinpath("egress_proxy.py")
+        upstream = {
+            name: value
+            for name, value in proxy_environment().items()
+            if name in _DOCKER_CLI_PROXY_NAMES and value
+        }
+        arguments = [
+            "run",
+            "--detach",
+            f"--name={self.proxy}",
+            *self._labels,
+            "--pull=never",
+            # Readiness and refused requests are read from the proxy's own log.
+            "--log-driver=json-file",
+            "--log-opt=max-size=10m",
+            "--network=bridge",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--user=65534:65534",
+            "--memory=256m",
+            "--memory-swap=256m",
+            "--cpus=1",
+            "--pids-limit=64",
+            "--ulimit=nofile=4096:4096",
+            "--init",
+            # A bare name takes the operator's value from the client's environment, so the
+            # credentials never appear on a command line. Blank values keep the Docker CLI
+            # from injecting the proxies of its own configuration.
+            *(
+                f"--env={name}" if name in upstream else f"--env={name}="
+                for name in _DOCKER_CLI_PROXY_NAMES
+            ),
+            _EGRESS_PROXY_IMAGE,
+            "python3",
+            "-u",
+            "-c",
+            source.read_text(encoding="utf-8"),
+            *(f"--allow={host}" for host in self.allowed_hosts),
+        ]
+        started = _docker_control(
+            self.docker_binary, arguments, {**self._docker_environment, **upstream}
+        )
+        self._check(started, "start the egress proxy")
+
+    def _wait_until_ready(self) -> None:
+        deadline = time.monotonic() + _EGRESS_PROXY_READY_SECONDS
+        while True:
+            logs = self._docker("logs", self.proxy)
+            if logs is not None and READY_MESSAGE in logs.stdout:
+                return
+            running = self._docker("inspect", "--format", "{{.State.Running}}", self.proxy)
+            if running is None or running.stdout.strip() != "true" or time.monotonic() > deadline:
+                errors = logs.stderr.strip().splitlines() if logs is not None else []
+                detail = f": {errors[-1][:300]}" if errors else ""
+                raise SandboxError(f"The egress proxy did not start{detail}")
+            time.sleep(_EGRESS_PROXY_POLL_SECONDS)
+
+    def _require(self, arguments: Sequence[str], action: str) -> None:
+        self._check(self._docker(*arguments), action)
+
+    @staticmethod
+    def _check(completed: subprocess.CompletedProcess[str] | None, action: str) -> None:
+        if completed is None or completed.returncode != 0:
+            detail = _first_line(completed.stderr) if completed is not None else ""
+            raise SandboxError(f"Could not {action}: {detail or 'Docker did not answer'}")
+
+    def _docker(self, *arguments: str) -> subprocess.CompletedProcess[str] | None:
+        return _docker_control(self.docker_binary, arguments, self._docker_environment)
+
+
+@dataclass(frozen=True, slots=True)
+class ImageIdentity:
+    """A local image: what ``--pull=never`` runs, and what identifies it across machines."""
+
+    image_id: str
+    # The registry digest of the reference when the image came from a registry; otherwise
+    # the image ID, which identifies a locally built or committed image.
+    digest: str
+    labels: Mapping[str, str]
+
+
+def inspect_image(reference: str, *, docker_binary: str = "docker") -> ImageIdentity | None:
+    """Return a local image's identity, or ``None`` when it is not present."""
+
+    _validate_image(reference)
+    inspected = _docker_control(
+        docker_binary,
+        ["image", "inspect", "--format", "{{json .}}", reference],
+        docker_client_environment(),
+    )
+    if inspected is None or inspected.returncode != 0:
+        return None
+    try:
+        details = json.loads(inspected.stdout)
+    except json.JSONDecodeError as exc:
+        raise SandboxError("Docker returned malformed image details") from exc
+    image_id = details.get("Id") if isinstance(details, dict) else None
+    if not isinstance(image_id, str) or not _IMAGE_ID.fullmatch(image_id):
+        raise SandboxError("Docker returned malformed image details")
+    labels = (details.get("Config") or {}).get("Labels") or {}
+    repository_digests = details.get("RepoDigests") or []
+    return ImageIdentity(
+        image_id,
+        _registry_digest(reference, repository_digests) or image_id,
+        {str(name): str(value) for name, value in labels.items()},
+    )
+
+
+def pull_image(reference: str, *, docker_binary: str = "docker") -> ImageIdentity:
+    """Make an image present locally and return its identity.
+
+    A reference pinned by digest is pulled only when missing. A tag is pulled every time, so
+    a moved tag is noticed; when the registry cannot be reached, a local copy is used.
+    """
+
+    present = inspect_image(reference, docker_binary=docker_binary)
+    if present is not None and "@sha256:" in reference:
+        return present
+    pulled = _docker_control(
+        docker_binary,
+        ["pull", "--quiet", reference],
+        docker_client_environment(),
+        timeout_seconds=_IMAGE_PULL_TIMEOUT_SECONDS,
+    )
+    if pulled is not None and pulled.returncode == 0:
+        present = inspect_image(reference, docker_binary=docker_binary)
+    if present is None:
+        detail = _first_line(pulled.stderr) if pulled is not None else ""
+        raise SandboxError(f"Could not pull image {reference}: {detail or 'Docker did not answer'}")
+    return present
+
+
+def tag_image(image_id: str, tag: str, *, docker_binary: str = "docker") -> None:
+    """Tag an image so pruning keeps it, and drop the repository's other tags.
+
+    Removing an old tag deletes its image unless a container still uses it, so each
+    repository keeps one environment image.
+    """
+
+    if not _IMAGE_ID.fullmatch(image_id):
+        raise SandboxError("Image ID must be sha256:<64 hex digits>")
+    _validate_image(tag)
+    environment = docker_client_environment()
+    tagged = _docker_control(docker_binary, ["tag", image_id, tag], environment)
+    if tagged is None or tagged.returncode != 0:
+        detail = _first_line(tagged.stderr) if tagged is not None else ""
+        raise SandboxError(f"Could not tag image {image_id}: {detail or 'Docker did not answer'}")
+    repository = tag.rpartition(":")[0]
+    listed = _docker_control(
+        docker_binary,
+        ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", repository],
+        environment,
+    )
+    for line in [] if listed is None or listed.returncode != 0 else listed.stdout.splitlines():
+        if line.strip() and line.strip() != tag:
+            # Best effort, like container cleanup: an image in use stays until next time.
+            _docker_control(docker_binary, ["image", "rm", line.strip()], environment)
+
+
+def _registry_digest(reference: str, repository_digests: object) -> str | None:
+    name, _, pinned = reference.partition("@")
+    if pinned:
+        return pinned if _IMAGE_ID.fullmatch(pinned) else None
+    last_component = name.rpartition("/")[2]
+    repository = name.rpartition(":")[0] if ":" in last_component else name
+    if not isinstance(repository_digests, list):
+        return None
+    for entry in repository_digests:
+        entry_repository, _, digest = str(entry).partition("@")
+        if entry_repository == repository and _IMAGE_ID.fullmatch(digest):
+            return digest
+    return None
 
 
 def _execute(
@@ -692,15 +1088,24 @@ class _BoundedCapture:
         return output.decode("utf-8", errors="replace")
 
 
-def docker_isolation_arguments(config: SandboxConfig, *, user: str, tmp_size: str) -> list[str]:
+def docker_isolation_arguments(
+    config: SandboxConfig,
+    *,
+    user: str,
+    tmp_size: str,
+    network: str = "none",
+    read_only: bool = True,
+    capabilities: Collection[str] = (),
+) -> list[str]:
     """Return the ``docker run`` flags that every repository container shares."""
 
     return [
         "--pull=never",
         "--log-driver=none",
-        "--network=none",
-        "--read-only",
+        f"--network={network}",
+        *(["--read-only"] if read_only else []),
         "--cap-drop=ALL",
+        *(f"--cap-add={capability}" for capability in sorted(capabilities)),
         "--security-opt=no-new-privileges",
         # A private IPC namespace that still has /dev/shm; --ipc=none breaks
         # multiprocessing locks and process pools.
@@ -740,8 +1145,9 @@ def _docker_control(
     environment: dict[str, str],
     *,
     input_text: str | None = None,
+    timeout_seconds: int = _DOCKER_CONTROL_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str] | None:
-    """Run one short Docker management command; ``None`` means it did not finish."""
+    """Run one Docker management command; ``None`` means it did not finish."""
 
     try:
         return subprocess.run(
@@ -752,7 +1158,7 @@ def _docker_control(
             encoding="utf-8",
             errors="replace",
             check=False,
-            timeout=_DOCKER_CONTROL_TIMEOUT_SECONDS,
+            timeout=timeout_seconds,
             env=environment,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -926,8 +1332,11 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 __all__ = [
+    "SETUP_CAPABILITIES",
     "DockerDaemonMode",
     "DockerSandbox",
+    "EgressNetwork",
+    "ImageIdentity",
     "SandboxRunner",
     "SessionCommandResult",
     "SessionContainer",
@@ -935,5 +1344,8 @@ __all__ = [
     "docker_client_environment",
     "docker_container_identity",
     "docker_isolation_arguments",
+    "inspect_image",
+    "pull_image",
     "remove_leftover_containers",
+    "tag_image",
 ]
