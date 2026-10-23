@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from autocontribute.providers import _assert_secret_free_model_output
 from autocontribute.redaction import (
     HIGH_CONFIDENCE_TOKEN_PATTERNS,
     MAX_ARTIFACT_CHARACTERS,
@@ -157,3 +158,34 @@ def test_exact_host_values_are_replaced_wherever_they_appear() -> None:
         f"and {MODEL_INPUT_REDACTION}"
     )
     assert not contains_host_secret(scrubbed, host_values)
+
+
+_PEM_HEADER = "-----BEGIN " + "PRIVATE KEY-----"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        f'PEM_HEADER = "{_PEM_HEADER}"',
+        f"if data.startswith(b'{_PEM_HEADER}'):",
+        f"{_PEM_HEADER}\n    return parse(data)\n",
+    ],
+)
+def test_a_private_key_header_without_key_material_is_left_alone(line: str) -> None:
+    assert scrub_for_model(line, frozenset()) == line
+    assert redact_model_input(line) == line
+    assert redact_text(line) == line
+    _assert_secret_free_model_output("OPENAI_API_KEY", "openai-key-placeholder", line)
+    # Publication text has no reason to quote a header, so the check still flags it.
+    assert contains_high_confidence_token(line)
+
+
+def test_a_cut_off_private_key_loses_its_body_but_not_the_following_line() -> None:
+    body = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n  VJTUt9Us8cKjMzEfYyjiWA4R4\n"
+    text = f"$ head -3 key.pem\n{_PEM_HEADER}\n{body}$ ls\n"
+
+    scrubbed = scrub_for_model(text, frozenset())
+
+    assert scrubbed == f"$ head -3 key.pem\n{MODEL_INPUT_REDACTION}\n$ ls\n"
+    assert redact_text(text) == "$ head -3 key.pem\n[REDACTED:CREDENTIAL]\n$ ls\n"
+    assert scrub_for_model(f"{_PEM_HEADER}\n{body.rstrip()}", frozenset()) == MODEL_INPUT_REDACTION
