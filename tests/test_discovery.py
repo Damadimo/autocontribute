@@ -1611,7 +1611,12 @@ def test_stop_aimed_at_automation_holds_the_repository_until_released(tmp_path) 
     github = IsolationGitHub(
         {
             "example/project": held,
-            "other/project": [_repository_issue("other/project", 7)],
+            # Ranks below #40, so it wins only because #40 is dropped with its repository.
+            "other/project": [
+                _repository_issue(
+                    "other/project", 7, updated_at=datetime.now(UTC) - timedelta(days=5)
+                )
+            ],
         }
     )
     service = DiscoveryService(  # type: ignore[arg-type]
@@ -1732,6 +1737,34 @@ def test_held_repositories_are_not_searched(tmp_path) -> None:  # type: ignore[n
     assert outcome.skipped_repositories[0][1].endswith(
         "Pull request was closed without being merged"
     )
+
+
+def test_evaluate_reports_a_held_repository_and_records_a_new_hold(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    service = DiscoveryService(AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+    turned_away = _issue(
+        number=41,
+        comments=1,
+        discussion=[
+            _comment(
+                body="We are not accepting AI-generated pull requests.",
+                author="maintainer",
+                association="OWNER",
+            )
+        ],
+    )
+
+    clean_before = service.evaluate(_issue(), _repository())
+    stopped = service.evaluate(turned_away, _repository())
+    clean_after = service.evaluate(_issue(), _repository())
+
+    assert clean_before.eligible
+    (hold,) = service.store.active_holds()
+    assert (hold.scope, hold.scope_key) == (StopScope.REPOSITORY, "example/project")
+    held = f"the repository is held (hold {hold.hold_id}): {hold.reason}"
+    assert not stopped.eligible
+    assert held in stopped.blockers
+    assert not clean_after.eligible
+    assert clean_after.blockers == [held]
 
 
 def test_issue_description_stop_request_fails_closed_without_tripping_global_breaker(
