@@ -37,16 +37,21 @@ HIGH_CONFIDENCE_TOKEN_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] =
         "JSON Web Token",
         re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
     ),
-    # A whole key block when its end marker is present, otherwise the header alone.
+    # The key material itself: through the end marker, or through the base64 lines after the
+    # header when the output was cut off. A header alone is a constant in every TLS library, and
+    # replacing it would change code the model edits while a cut-off key's body stayed visible.
     (
         "private key",
         re.compile(
             r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
-            r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY-----)?",
+            r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
+            r"|(?:[ \t]*\r?\n[ \t]*[A-Za-z0-9+/=]{16,})+[ \t]*(?=\r?\n|$))",
             re.S,
         ),
     ),
 )
+# Checks that flag text instead of rewriting it also stop on a header alone.
+_PRIVATE_KEY_HEADER = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
 _AUTHORIZATION_VALUE = re.compile(
     r"(?im)(?P<prefix>\bAuthorization\s*:\s*(?:Bearer|Basic)\s+)"
     r"(?P<value>[^\s\\\"']{8,})"
@@ -111,7 +116,14 @@ def contains_host_secret(text: str, host_values: frozenset[str]) -> bool:
 
 
 def contains_high_confidence_token(text: str) -> bool:
-    return any(pattern.search(text) for _label, pattern in HIGH_CONFIDENCE_TOKEN_PATTERNS)
+    """Return whether text holds a high-confidence token or a private key header.
+
+    Publication text has no reason to quote even a bare header, so the header alone counts here.
+    """
+
+    return _PRIVATE_KEY_HEADER.search(text) is not None or any(
+        pattern.search(text) for _label, pattern in HIGH_CONFIDENCE_TOKEN_PATTERNS
+    )
 
 
 def redact_text(text: str, *, secret_env_names: Iterable[str] = ()) -> str:
