@@ -63,7 +63,7 @@ Each run's evidence is in `.autocontribute/runs/RUN_ID/`: the patch, the test re
 
 ## Costs
 
-Every model request reserves its worst-case cost first. By default a run may spend up to $10 and all runs together $25 in 24 hours (`budget` in [Configuration](docs/configuration.md#budget)). Turning down a candidate issue costs about a tenth of a cent. Set a spending limit with your model provider too.
+Every model request reserves its worst-case cost first. By default a run may spend up to $10 and all runs together $25 in 24 hours (`budget` in [Configuration](docs/configuration.md#budget)). In testing, turning down a candidate issue cost about a tenth of a cent, and a complete fix for a sqlfluff issue cost $1.75 with OpenAI's models: 40 requests in a 39-minute run. Set a spending limit with your model provider too.
 
 ## Commands
 
