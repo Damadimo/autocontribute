@@ -312,7 +312,8 @@ class ModelBudgetReservation(DomainModel):
     """A durable, conservative charge recorded before one external model request."""
 
     call: int = Field(ge=1)
-    role: Literal["scout", "builder", "critic"]
+    # The one-shot roles, then the budget scopes of the agent loop (``budget.py``).
+    role: Literal["scout", "builder", "critic", "setup", "agent", "triage"]
     input_tokens: int = Field(ge=1)
     output_tokens: int = Field(ge=1)
     cost_usd: Decimal = Field(default=Decimal("0"), ge=0)
