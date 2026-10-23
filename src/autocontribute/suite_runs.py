@@ -36,6 +36,8 @@ _MAX_FLAKY_SHARE: Final = 0.02
 # than this many and they are most of the failures (research-envsetup.md §B9).
 _MAX_INFRASTRUCTURE_FAILURES: Final = 5
 _FAILING: Final[frozenset[CaseStatus]] = frozenset({"failed", "error"})
+# What a test that passed in every baseline run must not become with a patch.
+_REGRESSED: Final[frozenset[CaseStatus]] = frozenset({"failed", "error", "skipped"})
 _NOT_REPRODUCED_SIGNATURES: Final = (
     "ImportError",
     "ModuleNotFoundError",
@@ -404,7 +406,7 @@ def new_failures(
     removed_tests: Collection[str] = (),
     full_suite: bool = True,
 ) -> list[str]:
-    """Return tests that passed in every baseline run and now fail, error or disappear.
+    """Return tests that passed in every baseline run and now fail, error, skip or disappear.
 
     Tests the patch deleted or renamed are left out, and so is every test missing from a run
     of related tests only (``full_suite=False``), which never ran them. Failing-before and
@@ -419,20 +421,20 @@ def new_failures(
         result = run.results.get(test_id)
         if test_id in removed_tests:
             continue
-        if (result is None and full_suite) or (result is not None and result.status in _FAILING):
+        if (result is None and full_suite) or (result is not None and result.status in _REGRESSED):
             failures.append(test_id)
     return failures
 
 
 def still_failing(candidates: Collection[str], rerun: SuiteRun) -> list[str]:
-    """Keep the candidate failures that fail, error or are missing again in ``rerun``."""
+    """Keep the candidate failures that fail, error, skip or are missing again in ``rerun``."""
 
     if rerun.failure is not None or rerun.timed_out:
         return sorted(candidates)
     return sorted(
         test_id
         for test_id in candidates
-        if (result := rerun.results.get(test_id)) is None or result.status in _FAILING
+        if (result := rerun.results.get(test_id)) is None or result.status in _REGRESSED
     )
 
 
