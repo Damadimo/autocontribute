@@ -369,6 +369,9 @@ def step(request: TurnRequest) -> Turn:
 
 
 def _turn(response: Response, *, kind: TranscriptKind) -> Turn:
+    # A response that failed before generating anything can come without usage.
+    if response.status == "failed":
+        raise _failure(response.error)
     response_id, model = _response_identity(response)
     usage = _responses_usage(response.usage)
     if response.status == "incomplete":
@@ -386,8 +389,6 @@ def _turn(response: Response, *, kind: TranscriptKind) -> Turn:
         if reason in _SAFE_INCOMPLETE_REASONS:
             raise ModelError(f"Model response was incomplete: {reason}")
         raise ModelError("Model response did not complete")
-    if response.status == "failed":
-        raise _failure(response.error)
     if response.status != "completed":
         raise ModelError("Model response did not complete")
     output_items: list[dict[str, JsonValue]] = []
