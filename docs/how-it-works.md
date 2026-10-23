@@ -156,6 +156,11 @@ the base, issue, or policy files changed meanwhile, it deletes the branch and th
 otherwise it opens a PR against the default branch. With `publishing.draft: true` it opens a draft
 and then marks it ready for review if `publishing.ready_for_review` is true.
 
+If GitHub refuses the PR (for example, the repository accepts PRs only from collaborators or caps
+open PRs), `publish` deletes the branch and the run ends `failed` with GitHub's message. If GitHub's
+answer is lost, that run stays `submitting` and never sends a second request; other runs are not
+affected.
+
 ## Run states
 
 ```text

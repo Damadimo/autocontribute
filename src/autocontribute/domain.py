@@ -365,6 +365,7 @@ class RunManifest(DomainModel):
         Literal[
             "pre_pr_base_moved",
             "pre_pr_policy_stale",
+            "pre_pr_creation_refused",
             "created_pr_base_moved",
         ]
         | None

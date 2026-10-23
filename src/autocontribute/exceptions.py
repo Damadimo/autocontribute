@@ -60,6 +60,23 @@ class GitHubRateLimitError(GitHubError):
     """GitHub kept rate limiting past the waits this run allows; a later run can retry."""
 
 
+class GitHubHTTPError(GitHubError):
+    """GitHub answered with a non-success HTTP status after retries were exhausted."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        request_id: str,
+        github_message: str,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.request_id = request_id
+        self.github_message = github_message
+
+
 class GitHubRequestNotSentError(GitHubError):
     """A GitHub request provably failed before any bytes reached the remote host.
 

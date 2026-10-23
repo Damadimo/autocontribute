@@ -24,6 +24,7 @@ from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     ConfigurationError,
     GitHubError,
+    GitHubHTTPError,
     GitHubRateLimitError,
     GitHubRequestNotSentError,
     GitHubSafetyError,
@@ -457,9 +458,13 @@ class GitHubClient:
                     continue
             if not 200 <= response.status_code < 300:
                 request_id = response.headers.get("X-GitHub-Request-Id", "unknown")
-                raise GitHubError(
+                github_message = _error_message(response)
+                raise GitHubHTTPError(
                     f"GitHub returned {response.status_code} for {method} {path} "
-                    f"(request {request_id}): {response_message}"
+                    f"(request {request_id}): {github_message}",
+                    status_code=response.status_code,
+                    request_id=request_id,
+                    github_message=github_message,
                 )
             if response.status_code == 204:
                 return None
@@ -2524,6 +2529,25 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
         return max(1.0, float(int(retry_after.strip())))
     except ValueError:
         return None
+
+
+def _error_message(response: httpx.Response) -> str:
+    """Join GitHub's message with its per-field validation errors, bounded."""
+
+    message = _response_message(response)
+    try:
+        payload = response.json()
+    except ValueError:
+        return message
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    if not isinstance(errors, list):
+        return message
+    details = [
+        str(error["message"])
+        for error in errors
+        if isinstance(error, dict) and error.get("message") is not None
+    ]
+    return "; ".join(part for part in (message, *details) if part)[:1_000]
 
 
 def _rate_limit_wait_seconds(response: httpx.Response, attempt: int) -> float:
