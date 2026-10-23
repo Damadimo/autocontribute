@@ -411,7 +411,8 @@ def _log(decision: str, method: str, target: str, reason: str) -> None:
 
 
 async def _serve_forever(proxy: EgressProxy) -> None:
-    server = await proxy.start("0.0.0.0", LISTEN_PORT)
+    # Inside its own container: the setup container reaches it over the internal network.
+    server = await proxy.start("0.0.0.0", LISTEN_PORT)  # nosec B104
     print(READY_MESSAGE, flush=True)
     async with server:
         await server.serve_forever()

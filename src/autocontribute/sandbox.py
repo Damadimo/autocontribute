@@ -35,10 +35,12 @@ SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 _SESSION_SHELL: Final = "/bin/sh"
 _SESSION_TMP_SIZE: Final = "1g"
 _SESSION_MAIN_UID: Final = 65_534
-_SESSION_OUTPUT_DIRECTORY: Final = "/tmp/ac-out"
+# The container's own /tmp: a private tmpfs that no other container or host process shares.
+CONTAINER_TMP: Final = "/tmp"  # nosec B108
+_SESSION_OUTPUT_DIRECTORY: Final = f"{CONTAINER_TMP}/ac-out"
 _SESSION_ENVIRONMENT: Final = (
-    ("HOME", "/tmp/home"),
-    ("TMPDIR", "/tmp"),
+    ("HOME", f"{CONTAINER_TMP}/home"),
+    ("TMPDIR", CONTAINER_TMP),
     ("PATH", SAFE_CONTAINER_PATH),
     ("CI", "1"),
     ("NO_COLOR", "1"),
