@@ -47,7 +47,7 @@ def select_pull_request_template(guidance: Mapping[str, str]) -> tuple[str, str]
     candidates = {
         path: content
         for path, content in guidance.items()
-        if _is_pull_request_template(path) and content.strip()
+        if is_pull_request_template(path) and content.strip()
     }
     if not candidates:
         return None
@@ -243,7 +243,9 @@ def _validate_safe_template_tasks(
         )
 
 
-def _is_pull_request_template(path: str) -> bool:
+def is_pull_request_template(path: str) -> bool:
+    """Return whether a repository path is a GitHub pull request template."""
+
     lowered = path.casefold().strip("/")
     name = PurePosixPath(lowered).name
     markdown = name.endswith((".md", ".markdown"))
@@ -331,6 +333,7 @@ def _visible_markdown_mask(value: str) -> str:
 
 __all__ = [
     "complete_pull_request_template_tasks",
+    "is_pull_request_template",
     "select_pull_request_template",
     "validate_pull_request_template",
     "validate_pull_request_template_draft",
