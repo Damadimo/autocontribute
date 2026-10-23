@@ -371,7 +371,7 @@ def test_openai_shell_output_echoes_max_output_length_only_when_the_call_set_it(
     assert "max_output_length" not in transcript.items[-1]
 
 
-def test_anthropic_results_and_reminder_of_one_turn_share_one_user_message() -> None:
+def test_anthropic_results_of_one_turn_and_the_text_after_them_share_one_user_message() -> None:
     transcript = _transcript("claude-opus-5-5")
     append_user_text(transcript, "Fix issue 12.")
     second_call = {**_ANTHROPIC_BASH_CALL, "id": "toolu_02B", "input": {"command": "ls"}}
@@ -394,8 +394,8 @@ def test_anthropic_results_and_reminder_of_one_turn_share_one_user_message() -> 
             ToolResult(call_id="toolu_01A09q90qw90lq917835lq9", output="print('hi')\n"),
             ToolResult(call_id="toolu_02B", output="ls: cannot access", is_error=True),
         ],
-        reminder="10 turns left; submit soon.",
     )
+    append_user_text(transcript, "10 turns left; submit soon.")
 
     assert transcript.items[2:] == [
         {
@@ -420,7 +420,51 @@ def test_anthropic_results_and_reminder_of_one_turn_share_one_user_message() -> 
     assert transcript.appended_bytes == len(canonical_json(transcript.items[2]))
 
 
-def test_openai_reminder_is_a_user_message_after_the_results() -> None:
+def test_anthropic_user_text_joins_the_user_content_added_since_the_last_turn() -> None:
+    transcript = _transcript("claude-opus-5-5")
+    append_user_text(transcript, "Fix issue 12.")
+    append_user_text(transcript, "AGENTS.md: run make test.")
+
+    assert transcript.items == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Fix issue 12."},
+                {"type": "text", "text": "AGENTS.md: run make test."},
+            ],
+        }
+    ]
+    assert transcript.appended_items == 2
+    assert transcript.appended_bytes == len(canonical_json(transcript.items[0]))
+
+    text = {"type": "text", "text": "The fix is ready."}
+    turn = Turn(
+        stop="end_turn",
+        output_items=(_ANTHROPIC_THINKING, text),
+        tool_calls=(),
+        response_id="msg_01",
+        model="claude-opus-5-5",
+        usage=_USAGE,
+    )
+    append_turn(transcript, turn)
+    append_user_text(transcript, "Continue; call submit when you are done.")
+    append_user_text(transcript, "Blockers from the review: none.")
+
+    assert [item["role"] for item in transcript.items] == ["user", "assistant", "user"]
+    assert transcript.items[1:] == [
+        {"role": "assistant", "content": [_ANTHROPIC_THINKING, text]},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Continue; call submit when you are done."},
+                {"type": "text", "text": "Blockers from the review: none."},
+            ],
+        },
+    ]
+    assert transcript.appended_bytes == len(canonical_json(transcript.items[2]))
+
+
+def test_openai_text_after_the_results_is_a_user_message_of_its_own() -> None:
     transcript = _transcript()
     append_user_text(transcript, "Fix issue 12.")
     append_turn(transcript, _openai_turn(_OPENAI_SUBMIT_CALL))
@@ -428,8 +472,8 @@ def test_openai_reminder_is_a_user_message_after_the_results() -> None:
     append_tool_results(
         transcript,
         [ToolResult(call_id="call_3ef1b8c79a4d6520", output="Error: pr_title is missing.")],
-        reminder="10 turns left; submit soon.",
     )
+    append_user_text(transcript, "10 turns left; submit soon.")
 
     assert transcript.items[-2:] == [
         {
@@ -627,10 +671,9 @@ def test_later_reservations_add_the_last_turn_and_what_followed_it() -> None:
         [ToolResult(call_id="toolu_01A09q90qw90lq917835lq9", output="print('hi')\n")],
     )
     append_user_text(transcript, "10 turns left.")
-    appended_bytes = len(canonical_json(transcript.items[2])) + len(
-        canonical_json(transcript.items[3])
-    )
+    appended_bytes = len(canonical_json(transcript.items[2]))
 
+    assert len(transcript.items) == 3
     assert transcript.appended_bytes == appended_bytes
     # prior input and output, appended bytes, 64 per replayed or appended item, and the slack
     assert next_input_reservation(transcript) == 2_412 + 160 + appended_bytes + 64 * (2 + 2) + 1_024

@@ -307,8 +307,8 @@ def test_next_request_replays_the_turn_unchanged_and_answers_it_in_one_user_mess
                 is_error=True,
             )
         ],
-        reminder="9 turns left.",
     )
+    append_user_text(transcript, "9 turns left.")
     anthropic_adapter.step(_request(items=transcript.items))
 
     first, second = (_body(request) for request in requests)
