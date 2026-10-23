@@ -2012,6 +2012,47 @@ def test_commit_status_without_a_creator_is_accepted() -> None:
     ]
 
 
+def test_commit_comparison_reads_each_new_commit_author() -> None:
+    responses = {
+        "ahead": httpx.Response(
+            200,
+            json={
+                "status": "ahead",
+                "total_commits": 3,
+                "commits": [
+                    {"sha": "c" * 40, "author": {"login": "maintainer"}},
+                    {"sha": "d" * 40, "author": {"login": "pre-commit-ci[bot]"}},
+                    {"sha": "e" * 40, "author": None},
+                ],
+            },
+        ),
+        "gone": httpx.Response(404, json={"message": "Not Found"}),
+        "odd": httpx.Response(200, json={"status": "sideways", "total_commits": 0}),
+    }
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return responses[request.url.path.split("/")[3]]
+
+    with _client(handler) as github:
+        comparison = github.compare_commits("example/ahead", "a" * 40, "b" * 40)
+        missing = github.compare_commits("example/gone", "a" * 40, "b" * 40)
+        with pytest.raises(GitHubError, match="unsupported commit comparison status"):
+            github.compare_commits("example/odd", "a" * 40, "b" * 40)
+        with pytest.raises(GitHubError, match="comparison head SHA"):
+            github.compare_commits("example/ahead", "a" * 40, "main")
+
+    assert comparison is not None
+    assert comparison.status == "ahead"
+    assert comparison.total_commits == 3
+    assert comparison.author_logins == ("maintainer", "pre-commit-ci[bot]", None)
+    assert missing is None
+    assert requests[0].url.path == f"/repos/example/ahead/compare/{'a' * 40}...{'b' * 40}"
+    assert requests[0].url.params["per_page"] == "100"
+    assert len(requests) == 3
+
+
 def test_pull_request_timeline_overflow_fails_closed() -> None:
     pages: list[int] = []
 

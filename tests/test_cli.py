@@ -1768,4 +1768,6 @@ def test_lifecycle_sync_command_reports_bounded_summary(tmp_path: Path, monkeypa
     result = runner.invoke(app, ["lifecycle", "sync", "--config", str(config)])
 
     assert result.exit_code == 0, result.output
-    assert "Lifecycle sync: 0 PR(s), 0 safety signal(s), 0 new trigger(s)" in result.output
+    assert (
+        "Lifecycle sync: 0 PR(s), 0 signal(s), 0 new stop(s), 0 unreadable PR(s)." in result.output
+    )

@@ -1393,12 +1393,17 @@ class RunStore:
             )
 
     def list_open_pull_request_runs(self, *, limit: int = 1_000) -> builtins.list[RunManifest]:
-        """Return every lifecycle-managed PR, failing instead of truncating the set."""
+        """Return every PR still open when last observed, failing instead of truncating the set.
+
+        Merged and closed pull requests are never observed again, so they do not count toward
+        the bound.
+        """
 
         return self._list_runs_with_status(
             RunStatus.PR_OPEN,
             limit=limit,
             resource="open pull-request",
+            open_pull_requests_only=True,
         )
 
     def list_submitting_runs(self, *, limit: int = 100) -> builtins.list[RunManifest]:
@@ -1416,16 +1421,23 @@ class RunStore:
         *,
         limit: int,
         resource: str,
+        open_pull_requests_only: bool = False,
     ) -> builtins.list[RunManifest]:
         """Enumerate a complete bounded status set and validate row/manifest agreement."""
 
         if not 1 <= limit <= 10_000:
             raise ValueError(f"{resource} run limit must be between 1 and 10000")
+        state_filter = (
+            "AND coalesce(json_extract(manifest_json, '$.pull_request_state'), 'open') = 'open'"
+            if open_pull_requests_only
+            else ""
+        )
         with self._connection() as connection:
             rows = connection.execute(
-                """
+                # Only the fixed filter above is interpolated; values stay bound parameters.
+                f"""
                 SELECT run_id, manifest_json FROM runs
-                WHERE status = ? ORDER BY created_at ASC, run_id ASC LIMIT ?
+                WHERE status = ? {state_filter} ORDER BY created_at ASC, run_id ASC LIMIT ?
                 """,
                 (status.value, limit + 1),
             ).fetchall()

@@ -2990,7 +2990,7 @@ def test_initial_draft_to_ready_observes_adverse_lifecycle_before_mutation(
             author="maintainer",
             author_association="OWNER",
             state="CHANGES_REQUESTED",
-            body="Please stop and revise this pull request.",
+            body="Please close this pull request; the parser is being rewritten.",
             html_url="https://github.com/example/project/pull/7#pullrequestreview-1",
             submitted_at=datetime.now(UTC),
         )
@@ -3006,12 +3006,16 @@ def test_initial_draft_to_ready_observes_adverse_lifecycle_before_mutation(
         )[-1],
     )
 
-    with pytest.raises(StateError, match="Circuit breaker is tripped"):
+    with pytest.raises(PolicyError, match="Publication is held"):
         publisher.publish(run_id)
 
     assert "mark_pull_request_ready_for_review" not in github.calls
     assert "list_pull_request_reviews" in github.calls
-    assert store.circuit_breaker_status().is_tripped
+    assert not store.circuit_breaker_status().is_tripped
+    assert {hold.scope for hold in store.active_holds()} == {
+        StopScope.PULL_REQUEST,
+        StopScope.REPOSITORY,
+    }
 
 
 def test_ready_retry_observes_current_run_and_blocks_on_new_adverse_evidence(
@@ -3054,7 +3058,7 @@ def test_ready_retry_observes_current_run_and_blocks_on_new_adverse_evidence(
             author="maintainer",
             author_association="MEMBER",
             state="CHANGES_REQUESTED",
-            body="Do not continue with this automated contribution.",
+            body="We do not accept AI-generated contributions.",
             html_url="https://github.com/example/project/pull/7#pullrequestreview-2",
             submitted_at=datetime.now(UTC),
         )
@@ -3062,13 +3066,13 @@ def test_ready_retry_observes_current_run_and_blocks_on_new_adverse_evidence(
     github.calls.clear()
     github.mutated = False
 
-    with pytest.raises(StateError, match="Circuit breaker is tripped"):
+    with pytest.raises(PolicyError, match="Publication is held"):
         publisher.publish(run_id)
 
     assert "list_pull_request_reviews" in github.calls
     assert "mark_pull_request_ready_for_review" not in github.calls
     assert not github.mutated
-    assert store.circuit_breaker_status().is_tripped
+    assert [hold.scope for hold in store.active_holds()] == [StopScope.REPOSITORY]
 
 
 def test_ready_for_review_recovers_after_remote_success_before_durable_completion(

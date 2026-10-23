@@ -281,6 +281,21 @@ class QualityReport(DomainModel):
         return [gate for gate in self.gates if not gate.passed]
 
 
+PullRequestAttentionKind = Literal[
+    "changes_requested", "ci_failed", "maintainer_push", "observation_failed"
+]
+
+
+class PullRequestAttention(DomainModel):
+    """A routine pull-request event for the approving human to handle; it stops no work."""
+
+    kind: PullRequestAttentionKind
+    reason: str
+    source_url: str
+    evidence_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    observed_at: datetime
+
+
 class Approval(DomainModel):
     actor: str
     approved_at: datetime
@@ -356,6 +371,9 @@ class RunManifest(DomainModel):
     ) = None
     pull_request_url: str | None = None
     pull_request_node_id: str | None = Field(default=None, min_length=1, max_length=256)
+    # Set by lifecycle sync; sync stops observing a pull request once it is merged or closed.
+    pull_request_state: Literal["open", "merged", "closed"] | None = None
+    pull_request_attention: list[PullRequestAttention] = Field(default_factory=list)
     skip_reason: str | None = None
     error: str | None = None
     model_calls: int = 0
@@ -407,6 +425,8 @@ __all__ = [
     "IssueComment",
     "ModelBudgetReservation",
     "PatchProposal",
+    "PullRequestAttention",
+    "PullRequestAttentionKind",
     "QualityReport",
     "RepositoryInfo",
     "RunManifest",

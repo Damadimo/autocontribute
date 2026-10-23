@@ -1,4 +1,4 @@
-"""Read-only pull-request observation and deterministic safety signals."""
+"""Read-only pull-request observation and deterministic, scoped safety signals."""
 
 from __future__ import annotations
 
@@ -7,15 +7,29 @@ import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Final, Protocol
+from typing import Final, Literal, Protocol
 from urllib.parse import urlparse
 
-from autocontribute.domain import RunManifest, RunStatus
-from autocontribute.exceptions import ConfigurationError, GitHubError, StateError
+from autocontribute.domain import (
+    PullRequestAttention,
+    PullRequestAttentionKind,
+    RunManifest,
+    RunStatus,
+    utc_now,
+)
+from autocontribute.exceptions import (
+    CircuitBreakerTrigger,
+    ConfigurationError,
+    GitHubError,
+    GitHubSafetyError,
+    StateError,
+    StopScope,
+)
 from autocontribute.github import (
     CheckRunDetails,
+    CommitComparison,
     CommitStatusDetails,
     GitHubComment,
     PullRequestDetails,
@@ -25,22 +39,35 @@ from autocontribute.github import (
 from autocontribute.github_origin import canonical_api_origin, web_origin_for_api
 
 _MAINTAINER_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
-_NONPASSING_CHECK_CONCLUSIONS = frozenset(
-    {"action_required", "cancelled", "failure", "stale", "startup_failure", "timed_out"}
-)
+# Action-required, cancelled, neutral, skipped and stale runs say nothing about the patch: they
+# wait for a human, were superseded, or did not apply.
+_FAILING_CHECK_CONCLUSIONS = frozenset({"failure", "startup_failure", "timed_out"})
 _FAILING_COMMIT_STATES = frozenset({"error", "failure"})
-_MAINTAINER_STOP = re.compile(
+_AUTOMATION = (
+    r"(?:ai(?:-generated|-assisted|-written)?|llms?(?:-generated)?|automat(?:ed|ion)|bots?|"
+    r"agents?|agentic|machine-generated)"
+)
+_SUBMISSIONS = r"(?:pull\s+requests?|prs?|contributions?|submissions?|patch(?:es)?)"
+# The directive must govern its object directly: review chatter such as "don't add a dependency
+# in this PR" or "let's stop here and merge this PR" names a PR without asking anyone to stop.
+_PROJECT_STOP = re.compile(
     r"(?:"
-    r"\b(?:do\s+not|don't|stop|cease|hold\s+off|not\s+accepting|"
-    r"no\s+longer\s+accept(?:ing)?)\b[^\n.!?]{0,120}"
-    r"\b(?:ai(?:-generated|-assisted)?|automat(?:ed|ion)|bots?|pull\s+requests?|prs?|"
-    r"contributions?|submissions?|work)\b"
-    r"|\b(?:ai(?:-generated|-assisted)?|automat(?:ed|ion)|bots?|pull\s+requests?|prs?|"
-    r"contributions?|submissions?)\b[^\n.!?]{0,120}"
-    r"\b(?:not\s+(?:accepted|allowed|welcome)|are\s+closed)\b"
-    r"|\b(?:close|withdraw)\s+(?:this\s+)?(?:pull\s+request|pr|contribution)\b"
-    r"|\bno\s+(?:pull\s+requests?|prs?|contributions?)\s+(?:are\s+)?needed\b"
+    rf"\b(?:stop|cease|do\s+not\s+(?:send|open|submit)|don't\s+(?:send|open|submit))\s+"
+    rf"(?:(?:all|any|further|more|these|this|the|your)\s+)*{_AUTOMATION}\b"
+    rf"|\b(?:do\s+not|don't|not|no\s+longer|won't|will\s+not)\s+accept(?:ing)?\s+"
+    rf"(?:any\s+)?{_AUTOMATION}\b"
+    r"|\b(?:not|no\s+longer)\s+accepting\s+(?:any\s+)?(?:new\s+|outside\s+|external\s+)?"
+    r"(?:pull\s+requests|prs|contributions|submissions)\b"
+    rf"|\b{_AUTOMATION}(?:[\s-]+\w+)?[\s-]+{_SUBMISSIONS}\s+(?:are|will\s+be)\s+"
+    r"(?:not\s+(?:accepted|allowed|welcome)|closed|rejected)\b"
     r")",
+    re.IGNORECASE,
+)
+_PULL_REQUEST_STOP = re.compile(
+    r"\b(?:close|withdraw|abandon)\s+(?:(?:this|your|the)\s+)?"
+    r"(?:pull\s+request|pr|contribution|patch)\b"
+    r"|\bstop\s+(?:this|your)\s+(?:pull\s+request|pr|contribution|work)\b"
+    r"|\bno\s+(?:pull\s+request|pr|contribution)\s+(?:is\s+)?needed\b",
     re.IGNORECASE,
 )
 _NEGATED_STOP_DIRECTIVE = re.compile(
@@ -50,13 +77,16 @@ _NEGATED_STOP_DIRECTIVE = re.compile(
 )
 _PULL_REQUEST_PATH: Final = re.compile(r"/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 _COMMIT_SHA: Final = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})")
+# Request IDs differ on every attempt; without them a failure that repeats is recorded once.
+_REQUEST_ID: Final = re.compile(r"\s*\(request [^)]*\)")
 MAX_LIFECYCLE_RUNS: Final = 1_000
+REPOSITORY_COOLDOWN: Final = timedelta(days=30)
 
 
 class LifecycleStore(Protocol):
     """The narrow durable interface needed by lifecycle observation."""
 
-    def trip_circuit_breaker(self, *, source: str, reason: str, trigger_hash: str) -> bool: ...
+    def record_stop(self, trigger: CircuitBreakerTrigger) -> bool: ...
 
 
 class LifecycleRunStore(LifecycleStore, Protocol):
@@ -65,6 +95,8 @@ class LifecycleRunStore(LifecycleStore, Protocol):
     def list_open_pull_request_runs(
         self, *, limit: int = MAX_LIFECYCLE_RUNS
     ) -> list[RunManifest]: ...
+
+    def save(self, manifest: RunManifest, *, event: str, details: dict[str, str]) -> None: ...
 
 
 class LifecycleGitHub(Protocol):
@@ -109,14 +141,30 @@ class LifecycleGitHub(Protocol):
         self, repository: str, number: int, *, max_events: int = 1_000
     ) -> list[PullRequestReference]: ...
 
+    def compare_commits(self, repository: str, base: str, head: str) -> CommitComparison | None: ...
+
 
 class LifecycleSignalKind(StrEnum):
     HEAD_DRIFT = "head_drift"
+    MAINTAINER_PUSH = "maintainer_push"
     CHANGES_REQUESTED = "changes_requested"
     MAINTAINER_STOP = "maintainer_stop"
+    AUTOMATION_STOP = "automation_stop"
     CI_FAILED = "ci_failed"
     CLOSED_UNMERGED = "closed_unmerged"
     REVERTED = "reverted"
+
+
+_STOP_REASONS: Final = {
+    LifecycleSignalKind.AUTOMATION_STOP: "turns away automated or AI contributions",
+    LifecycleSignalKind.MAINTAINER_STOP: "asks to close or stop this pull request",
+}
+# Routine review and CI events go to the approving human and stop nothing.
+_ATTENTION_KINDS: Final[dict[LifecycleSignalKind, PullRequestAttentionKind]] = {
+    LifecycleSignalKind.CHANGES_REQUESTED: "changes_requested",
+    LifecycleSignalKind.CI_FAILED: "ci_failed",
+    LifecycleSignalKind.MAINTAINER_PUSH: "maintainer_push",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +177,15 @@ class PullRequestLifecycleSnapshot:
     check_runs: tuple[CheckRunDetails, ...]
     commit_statuses: tuple[CommitStatusDetails, ...]
     references: tuple[PullRequestReference, ...]
+    publishing_login: str | None = None
+    # Read only when the head moved: the commits between the prepared commit and the new head.
+    head_comparison: CommitComparison | None = None
+
+    @property
+    def pull_request_state(self) -> Literal["open", "merged", "closed"]:
+        if self.pull_request.merged:
+            return "merged"
+        return "closed" if self.pull_request.state == "closed" else "open"
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +193,7 @@ class LifecycleSignal:
     kind: LifecycleSignalKind
     repository: str
     pull_request_number: int
+    pull_request_url: str
     evidence_key: str
     reason: str
     source_url: str
@@ -154,33 +212,101 @@ class LifecycleSignal:
             }
         )
 
+    def attention(self, observed_at: datetime) -> PullRequestAttention | None:
+        kind = _ATTENTION_KINDS.get(self.kind)
+        if kind is None:
+            return None
+        return PullRequestAttention(
+            kind=kind,
+            reason=self.reason,
+            source_url=self.source_url,
+            evidence_hash=self.trigger_hash(),
+            observed_at=observed_at,
+        )
+
+    def stops(self, *, api_origin: str, observed_at: datetime) -> tuple[CircuitBreakerTrigger, ...]:
+        """The scoped stops this signal records, from narrowest to widest."""
+
+        cooldown = observed_at + REPOSITORY_COOLDOWN
+        match self.kind:
+            case LifecycleSignalKind.HEAD_DRIFT:
+                return (self._stop(StopScope.GLOBAL),)
+            case LifecycleSignalKind.CLOSED_UNMERGED:
+                return (self._stop(StopScope.REPOSITORY, self.repository, expires_at=cooldown),)
+            case LifecycleSignalKind.MAINTAINER_STOP:
+                return (
+                    self._stop(StopScope.PULL_REQUEST, self.pull_request_url),
+                    self._stop(StopScope.REPOSITORY, self.repository, expires_at=cooldown),
+                )
+            case LifecycleSignalKind.AUTOMATION_STOP:
+                return (self._stop(StopScope.REPOSITORY, self.repository, maintainer_stop=True),)
+            case LifecycleSignalKind.REVERTED:
+                return (
+                    self._stop(StopScope.REPOSITORY, self.repository),
+                    self._stop(StopScope.PUBLICATION, api_origin),
+                )
+        return ()
+
+    def _stop(
+        self,
+        scope: StopScope,
+        scope_key: str = "",
+        *,
+        expires_at: datetime | None = None,
+        maintainer_stop: bool = False,
+    ) -> CircuitBreakerTrigger:
+        return CircuitBreakerTrigger(
+            source=self.source,
+            reason=f"{self.reason}: {self.source_url}",
+            trigger_hash=(
+                self.trigger_hash()
+                if scope is StopScope.GLOBAL
+                else _hash_payload({"scope": scope.value, "signal": self.trigger_hash()})
+            ),
+            scope=scope,
+            scope_key=scope_key,
+            expires_at=expires_at,
+            maintainer_stop=maintainer_stop,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class LifecycleObservation:
     snapshot: PullRequestLifecycleSnapshot
     signals: tuple[LifecycleSignal, ...]
-    newly_tripped: tuple[str, ...]
+    attention: tuple[PullRequestAttention, ...]
+    newly_recorded: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleFailure:
+    """A pull request whose observation failed; the others were still observed."""
+
+    run_id: str
+    pull_request_url: str
+    error: str
 
 
 @dataclass(frozen=True, slots=True)
 class LifecycleSyncResult:
     observations: tuple[LifecycleObservation, ...]
+    failures: tuple[LifecycleFailure, ...] = ()
 
     @property
     def runs_checked(self) -> int:
-        return len(self.observations)
+        return len(self.observations) + len(self.failures)
 
     @property
     def signals_detected(self) -> int:
         return sum(len(item.signals) for item in self.observations)
 
     @property
-    def newly_tripped(self) -> int:
-        return sum(len(item.newly_tripped) for item in self.observations)
+    def newly_recorded(self) -> int:
+        return sum(len(item.newly_recorded) for item in self.observations)
 
 
 class LifecycleObserver:
-    """Collect one complete bounded snapshot and activate hard stops."""
+    """Collect one complete bounded snapshot and record its stops at their scope."""
 
     def __init__(
         self,
@@ -199,6 +325,7 @@ class LifecycleObserver:
         repository: str,
         number: int,
         expected_head_sha: str,
+        publishing_login: str | None,
     ) -> LifecycleObservation:
         normalized_repository = _identity(repository, field="repository")
         expected_sha = _identity(expected_head_sha, field="expected head SHA")
@@ -226,6 +353,13 @@ class LifecycleObserver:
             self.github.list_pull_request_references(normalized_repository, number)
             if pull_request.merged
             else []
+        )
+        head_comparison = (
+            None
+            if pull_request.head_sha.casefold() == expected_sha.casefold()
+            else self.github.compare_commits(
+                pull_request.head_repository, expected_sha, pull_request.head_sha
+            )
         )
 
         # A second top-level read catches comment/review/state/head races during pagination.
@@ -264,22 +398,26 @@ class LifecycleObserver:
                     key=lambda reference: (reference.created_at, reference.identifier),
                 )
             ),
+            publishing_login=publishing_login,
+            head_comparison=head_comparison,
         )
         signals = classify_lifecycle(snapshot)
-        newly_tripped: list[str] = []
+        observed_at = utc_now()
+        attention: list[PullRequestAttention] = []
+        newly_recorded: list[str] = []
         for signal in signals:
-            trigger_hash = signal.trigger_hash()
-            self._assert_lease_owned()
-            if self.store.trip_circuit_breaker(
-                source=signal.source,
-                reason=signal.reason,
-                trigger_hash=trigger_hash,
-            ):
-                newly_tripped.append(trigger_hash)
+            item = signal.attention(observed_at)
+            if item is not None:
+                attention.append(item)
+            for trigger in signal.stops(api_origin=self.github.api_origin, observed_at=observed_at):
+                self._assert_lease_owned()
+                if self.store.record_stop(trigger):
+                    newly_recorded.append(trigger.trigger_hash)
         return LifecycleObservation(
             snapshot=snapshot,
             signals=signals,
-            newly_tripped=tuple(newly_tripped),
+            attention=tuple(attention),
+            newly_recorded=tuple(newly_recorded),
         )
 
     def _assert_lease_owned(self) -> None:
@@ -335,7 +473,7 @@ def sync_open_pull_requests(
     if reported_api_origin != current_api_origin:
         raise StateError("Lifecycle GitHub client returned a non-canonical API origin")
     manifests = store.list_open_pull_request_runs(limit=max_runs)
-    targets: list[tuple[str, int, str]] = []
+    targets: list[tuple[RunManifest, str, int, str]] = []
     seen: set[tuple[str, int]] = set()
     for manifest in manifests:
         if manifest.status != RunStatus.PR_OPEN:
@@ -384,28 +522,83 @@ def sync_open_pull_requests(
         if identity in seen:
             raise StateError("Multiple durable runs refer to the same open pull request")
         seen.add(identity)
-        targets.append((repository, number, commit_sha))
+        targets.append((manifest, repository, number, commit_sha))
 
     observer = LifecycleObserver(github, store, assert_owned=assert_owned)
     observations: list[LifecycleObservation] = []
-    for repository, number, commit_sha in targets:
+    failures: list[LifecycleFailure] = []
+    for manifest, repository, number, commit_sha in targets:
         if assert_owned is not None:
             assert_owned()
-        observation = observer.observe(
-            repository=repository,
-            number=number,
-            expected_head_sha=commit_sha,
-        )
+        pull_request_url = manifest.pull_request_url or ""
+        try:
+            observation = observer.observe(
+                repository=repository,
+                number=number,
+                expected_head_sha=commit_sha,
+                publishing_login=manifest.publishing_login,
+            )
+        except GitHubSafetyError:
+            raise
+        except GitHubError as exc:
+            # One unreadable pull request must not hide the others or stop preparation.
+            failures.append(LifecycleFailure(manifest.run_id, pull_request_url, str(exc)))
+            state = manifest.pull_request_state
+            attention: tuple[PullRequestAttention, ...] = (
+                _observation_failure(pull_request_url, exc),
+            )
+        else:
+            observations.append(observation)
+            state = observation.snapshot.pull_request_state
+            attention = observation.attention
         if assert_owned is not None:
             assert_owned()
-        observations.append(observation)
-    return LifecycleSyncResult(observations=tuple(observations))
+        _record_on_run(store, manifest, state=state, attention=attention)
+    return LifecycleSyncResult(observations=tuple(observations), failures=tuple(failures))
+
+
+def _observation_failure(pull_request_url: str, error: GitHubError) -> PullRequestAttention:
+    message = _REQUEST_ID.sub("", str(error))
+    return PullRequestAttention(
+        kind="observation_failed",
+        reason=f"Lifecycle sync could not read this pull request: {message}",
+        source_url=pull_request_url,
+        evidence_hash=_hash_payload(
+            {"kind": "observation_failed", "pull_request": pull_request_url, "error": message}
+        ),
+        observed_at=utc_now(),
+    )
+
+
+def _record_on_run(
+    store: LifecycleRunStore,
+    manifest: RunManifest,
+    *,
+    state: Literal["open", "merged", "closed"] | None,
+    attention: tuple[PullRequestAttention, ...],
+) -> None:
+    """Save the observed state and each attention entry the run does not have yet."""
+
+    known = {item.evidence_hash for item in manifest.pull_request_attention}
+    new = [item for item in attention if item.evidence_hash not in known]
+    if state == manifest.pull_request_state and not new:
+        return
+    manifest.pull_request_state = state
+    manifest.pull_request_attention.extend(new)
+    store.save(
+        manifest,
+        event="lifecycle.observed",
+        details={
+            "pull_request_state": state or "unknown",
+            "attention": ",".join(item.kind for item in new) or "none",
+        },
+    )
 
 
 def classify_lifecycle(
     snapshot: PullRequestLifecycleSnapshot,
 ) -> tuple[LifecycleSignal, ...]:
-    """Return deterministic blocking signals without model judgment or mutable state."""
+    """Return deterministic signals without model judgment or mutable state."""
 
     pull_request = snapshot.pull_request
     signals: list[LifecycleSignal] = []
@@ -413,10 +606,21 @@ def classify_lifecycle(
     if pull_request.head_sha.casefold() != snapshot.expected_head_sha.casefold():
         signals.append(
             _signal(
+                LifecycleSignalKind.MAINTAINER_PUSH,
+                pull_request,
+                evidence_key=pull_request.head_sha.casefold(),
+                reason="Someone with push access to the repository added commits to this PR",
+                source_url=pull_request.html_url,
+            )
+            if _pushed_by_others(snapshot)
+            else _signal(
                 LifecycleSignalKind.HEAD_DRIFT,
                 pull_request,
                 evidence_key=pull_request.head_sha.casefold(),
-                reason="Published pull-request head no longer matches the prepared commit",
+                reason=(
+                    "Published pull-request head no longer matches the prepared commit, and not "
+                    "every new commit comes from another GitHub account"
+                ),
                 source_url=pull_request.html_url,
             )
         )
@@ -444,7 +648,8 @@ def classify_lifecycle(
 
     # Explicit stop text remains safety evidence even if a later review changes its vote.
     for review in snapshot.reviews:
-        if _is_maintainer(review.author, review.author_association) and _requests_stop(review.body):
+        stop = _stop_kind(review.body)
+        if stop is not None and _is_maintainer(review.author, review.author_association):
             review_version = _evidence_version(
                 review.author,
                 review.author_association,
@@ -453,12 +658,10 @@ def classify_lifecycle(
             )
             signals.append(
                 _signal(
-                    LifecycleSignalKind.MAINTAINER_STOP,
+                    stop,
                     pull_request,
                     evidence_key=(f"review-stop:{review.identifier}:{review_version}"),
-                    reason=(
-                        "A maintainer review explicitly asks the contribution or automation to stop"
-                    ),
+                    reason=f"A maintainer review {_STOP_REASONS[stop]}",
                     source_url=review.html_url,
                 )
             )
@@ -468,9 +671,8 @@ def classify_lifecycle(
         ("review-comment", snapshot.review_comments),
     ):
         for comment in comments:
-            if _is_maintainer(comment.author, comment.author_association) and _requests_stop(
-                comment.body
-            ):
+            stop = _stop_kind(comment.body)
+            if stop is not None and _is_maintainer(comment.author, comment.author_association):
                 comment_version = _evidence_version(
                     comment.author,
                     comment.author_association,
@@ -479,19 +681,16 @@ def classify_lifecycle(
                 )
                 signals.append(
                     _signal(
-                        LifecycleSignalKind.MAINTAINER_STOP,
+                        stop,
                         pull_request,
                         evidence_key=(f"{comment_kind}:{comment.identifier}:{comment_version}"),
-                        reason=(
-                            "A maintainer comment explicitly asks the contribution or automation "
-                            "to stop"
-                        ),
+                        reason=f"A maintainer comment {_STOP_REASONS[stop]}",
                         source_url=comment.html_url,
                     )
                 )
 
     for check in _latest_check_runs(snapshot.check_runs):
-        if check.status == "completed" and check.conclusion in _NONPASSING_CHECK_CONCLUSIONS:
+        if check.status == "completed" and check.conclusion in _FAILING_CHECK_CONCLUSIONS:
             signals.append(
                 _signal(
                     LifecycleSignalKind.CI_FAILED,
@@ -572,6 +771,7 @@ def _signal(
         kind=kind,
         repository=pull_request.repository,
         pull_request_number=pull_request.number,
+        pull_request_url=pull_request.html_url,
         evidence_key=evidence_key,
         reason=reason,
         source_url=source_url,
@@ -590,11 +790,40 @@ def _is_maintainer(author: str, association: str) -> bool:
     )
 
 
-def _requests_stop(text: str) -> bool:
+def _stop_kind(text: str) -> LifecycleSignalKind | None:
+    """Whether text asks to stop automated work in general, this pull request, or nothing."""
+
     # Mask only the negated directive itself. Skipping its whole sentence would also discard a
     # later, independent stop such as "Don't stop CI, but withdraw this contribution."
-    without_negated_directives = _NEGATED_STOP_DIRECTIVE.sub("", text)
-    return _MAINTAINER_STOP.search(without_negated_directives) is not None
+    unmasked = text.replace("\u2019", "'")
+    without_negated_directives = _NEGATED_STOP_DIRECTIVE.sub("", unmasked)
+    if _PROJECT_STOP.search(without_negated_directives):
+        return LifecycleSignalKind.AUTOMATION_STOP
+    if _PULL_REQUEST_STOP.search(without_negated_directives):
+        return LifecycleSignalKind.MAINTAINER_STOP
+    return None
+
+
+def _pushed_by_others(snapshot: PullRequestLifecycleSnapshot) -> bool:
+    """Whether the new head keeps the prepared commit and adds only other accounts' commits.
+
+    GitHub lets only the fork owner and people with push access to the upstream repository push
+    to the branch, so such commits come from the project. A rewritten history, or a commit by the
+    publishing account or by no known account, may come from this tool's own credentials.
+    """
+
+    comparison = snapshot.head_comparison
+    login = snapshot.publishing_login
+    return (
+        comparison is not None
+        and login is not None
+        and comparison.status == "ahead"
+        and 0 < comparison.total_commits == len(comparison.author_logins)
+        and all(
+            author is not None and author.casefold() != login.casefold()
+            for author in comparison.author_logins
+        )
+    )
 
 
 def _latest_check_runs(

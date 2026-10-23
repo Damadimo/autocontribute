@@ -202,6 +202,15 @@ class LinkedPullRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class CommitComparison:
+    """The commits a head has beyond a base, with the GitHub account that authored each one."""
+
+    status: str
+    total_commits: int
+    author_logins: tuple[str | None, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PullRequestReference:
     """One PR-to-PR timeline reference used only as explicit revert evidence."""
 
@@ -1428,6 +1437,34 @@ class GitHubClient:
             resource="commit statuses",
         )
 
+    def compare_commits(self, repository: str, base: str, head: str) -> CommitComparison | None:
+        """Compare two commits, or return None when GitHub no longer has one of them."""
+
+        base_sha = _full_git_sha(base, field="comparison base SHA")
+        head_sha = _full_git_sha(head, field="comparison head SHA")
+        data = self._request(
+            "GET",
+            f"/repos/{quote(repository, safe='/')}/compare/{base_sha}...{head_sha}",
+            params={"per_page": 100},
+            allow_not_found=True,
+        )
+        if data is None:
+            return None
+        payload = _mapping(data, resource="commit comparison")
+        status = _nonempty(payload.get("status"), field="commit comparison status")
+        if status not in {"ahead", "behind", "diverged", "identical"}:
+            raise GitHubError("GitHub returned an unsupported commit comparison status")
+        return CommitComparison(
+            status=status,
+            total_commits=_nonnegative_count(
+                payload.get("total_commits"), field="commit comparison total"
+            ),
+            author_logins=tuple(
+                _commit_author_login(commit)
+                for commit in _mapping_list(payload.get("commits"), resource="compared commits")
+            ),
+        )
+
     def list_pull_request_references(
         self,
         repository: str,
@@ -2112,6 +2149,16 @@ def _user_login(value: object, *, resource: str) -> str:
     return _nonempty(user.get("login"), field=f"{resource} user login")
 
 
+def _commit_author_login(commit: dict[str, Any]) -> str | None:
+    """The GitHub account a commit's author email maps to, if GitHub knows one."""
+
+    author = commit.get("author")
+    login = author.get("login") if isinstance(author, dict) else None
+    if not isinstance(login, str) or not _GITHUB_LOGIN.fullmatch(login.removesuffix("[bot]")):
+        return None
+    return login
+
+
 def _author_association(value: object, *, resource: str) -> str:
     association = _nonempty(value, field=f"{resource} author association").upper()
     if association not in _AUTHOR_ASSOCIATIONS:
@@ -2394,6 +2441,7 @@ def _rate_limit_wait_seconds(response: httpx.Response, attempt: int) -> float:
 
 __all__ = [
     "CheckRunDetails",
+    "CommitComparison",
     "CommitStatusDetails",
     "DirectoryEntry",
     "ForkIdentity",

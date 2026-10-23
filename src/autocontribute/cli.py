@@ -925,8 +925,9 @@ def _print_lifecycle_result(result: LifecycleSyncResult) -> None:
     console.print(
         "Lifecycle sync: "
         f"{result.runs_checked} PR(s), "
-        f"{result.signals_detected} safety signal(s), "
-        f"{result.newly_tripped} new trigger(s)."
+        f"{result.signals_detected} signal(s), "
+        f"{result.newly_recorded} new stop(s), "
+        f"{len(result.failures)} unreadable PR(s)."
     )
     for item in result.observations:
         for signal in item.signals:
@@ -935,6 +936,12 @@ def _print_lifecycle_result(result: LifecycleSyncResult) -> None:
                 f"{signal.reason} ({signal.source_url})",
                 markup=False,
             )
+    for failure in result.failures:
+        console.print(
+            f"- observation failed: run {failure.run_id} ({failure.pull_request_url}): "
+            f"{failure.error}",
+            markup=False,
+        )
 
 
 def _print_outcome(manifest: RunManifest, store: RunStore) -> None:
