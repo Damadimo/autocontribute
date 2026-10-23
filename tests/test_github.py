@@ -1170,6 +1170,25 @@ def test_compare_commits_marks_a_full_file_list_incomplete() -> None:
     assert not comparison.complete
 
 
+@pytest.mark.parametrize(
+    ("payload", "complete"),
+    [
+        ({"status": "ahead", "ahead_by": 40, "total_commits": 40}, False),
+        ({"status": "ahead", "ahead_by": 40, "files": []}, False),
+        ({"status": "identical", "ahead_by": 0, "files": []}, True),
+    ],
+)
+def test_compare_commits_proves_nothing_unchanged_without_a_file_list(
+    payload: dict[str, object],
+    complete: bool,
+) -> None:
+    with _client(lambda request: httpx.Response(200, json=payload)) as github:
+        comparison = github.compare_commits("upstream/project", "a" * 40, "b" * 40)
+
+    assert comparison.changed_paths == frozenset()
+    assert comparison.complete is complete
+
+
 def test_repository_access_reports_owner_push_and_pull_request_policy() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/repos/upstream/project":

@@ -1414,17 +1414,24 @@ class GitHubClient:
         status = data.get("status")
         if status not in {"ahead", "behind", "diverged", "identical"}:
             raise GitHubError("GitHub returned an unsupported commit comparison status")
-        files = _mapping_list(data.get("files", []), resource="compared files")
+        listed = data.get("files")
+        files = _mapping_list([] if listed is None else listed, resource="compared files")
         paths: set[str] = set()
         for item in files:
             paths.add(_nonempty(item.get("filename"), field="compared file name"))
             previous = item.get("previous_filename")
             if previous is not None:
                 paths.add(_nonempty(previous, field="compared previous file name"))
+        # GitHub may leave the file list out, and lists no file only for equal trees; without a
+        # list that covers the commits, no path is proven unchanged.
         return CommitComparison(
             status=status,
             changed_paths=frozenset(paths),
-            complete=len(files) < _COMPARE_FILE_LIMIT,
+            complete=(
+                listed is not None
+                and len(files) < _COMPARE_FILE_LIMIT
+                and (bool(files) or data.get("ahead_by") == 0)
+            ),
         )
 
     def ref_sha(self, repository: str, ref: str) -> str | None:
