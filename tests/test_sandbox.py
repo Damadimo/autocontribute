@@ -9,7 +9,7 @@ import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -18,7 +18,16 @@ import autocontribute.sandbox as sandbox
 from autocontribute.config import SandboxConfig
 from autocontribute.domain import CommandResult
 from autocontribute.exceptions import SandboxError
-from autocontribute.sandbox import DockerSandbox, SandboxRunner, SessionContainer
+from autocontribute.sandbox import (
+    DockerSandbox,
+    EgressNetwork,
+    ImageIdentity,
+    SandboxRunner,
+    SessionContainer,
+    inspect_image,
+    pull_image,
+    tag_image,
+)
 
 _SESSION_IMAGE = "alpine@sha256:d406446bc05b82480756ce8f1287964d28768c23955fa9480d2a74a2eae7a654"
 _RUN_ID = "0123456789abcdef"
@@ -484,6 +493,9 @@ class _ScriptedDocker:
     def __init__(self) -> None:
         self.calls: list[list[str]] = []
         self.inputs: list[str | None] = []
+        self.timeouts: list[int] = []
+        # Answers by the first argument of a call, for calls the session tests do not script.
+        self.answers: dict[str, subprocess.CompletedProcess[str]] = {}
         self.commands: list[list[str]] = []
         # Queued answers; once a queue is empty the container is healthy and clean.
         self.states: list[str] = []
@@ -499,10 +511,12 @@ class _ScriptedDocker:
         _environment: dict[str, str],
         *,
         input_text: str | None = None,
+        timeout_seconds: int = 30,
     ) -> subprocess.CompletedProcess[str]:
         call = list(arguments)
         self.calls.append(call)
         self.inputs.append(input_text)
+        self.timeouts.append(timeout_seconds)
         if call[0] == "run" and self.run_failure is not None:
             return subprocess.CompletedProcess(call, 125, "", self.run_failure)
         if call[0] == "inspect":
@@ -514,6 +528,8 @@ class _ScriptedDocker:
             return subprocess.CompletedProcess(call, 0, table + leftover, "")
         if call[0] == "start":
             return subprocess.CompletedProcess(call, self.start_exit_code, "", "")
+        if call[0] in self.answers:
+            return self.answers[call[0]]
         return subprocess.CompletedProcess(call, 0, "", "")
 
     def execute(
@@ -549,6 +565,7 @@ def _session(
     docker: _ScriptedDocker,
     *,
     mode: sandbox.DockerDaemonMode = "rootful",
+    **options: Any,
 ) -> SessionContainer:
     workspace = tmp_path / "workspace"
     (workspace / ".git").mkdir(parents=True, exist_ok=True)
@@ -563,6 +580,7 @@ def _session(
         workspace=workspace,
         run_id=_RUN_ID,
         store_root=tmp_path / "state",
+        **options,
     )
 
 
@@ -932,6 +950,334 @@ def test_session_requires_a_real_git_directory_and_a_safe_run_id(
             store_root=tmp_path / "state",
         )
     assert docker.calls == []
+
+
+def test_setup_session_has_a_writable_root_its_network_and_bootstrap_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = _ScriptedDocker()
+    session = _session(
+        tmp_path,
+        monkeypatch,
+        docker,
+        network="ac-run-net-1234",
+        writable_root=True,
+        capabilities={"SETUID", "CHOWN"},
+    )
+
+    session.start()
+
+    run = docker.calls[0]
+    assert "--network=ac-run-net-1234" in run
+    assert "--network=none" not in run
+    assert "--read-only" not in run
+    assert [flag for flag in run if flag.startswith("--cap-")] == [
+        "--cap-drop=ALL",
+        "--cap-add=CHOWN",
+        "--cap-add=SETUID",
+    ]
+
+
+def test_environment_session_gets_a_fresh_volume_for_tool_homes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = _ScriptedDocker()
+    session = _session(tmp_path, monkeypatch, docker, volumes=["/opt/ac"])
+
+    session.start()
+
+    run = docker.calls[0]
+    assert "--read-only" in run
+    assert "--mount=type=volume,dst=/opt/ac" in run
+    assert run.index("--mount=type=volume,dst=/opt/ac") < run.index(_SESSION_IMAGE)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"network": "--privileged"},
+        {"network": "bad name"},
+        {"capabilities": {"SYS_ADMIN"}},
+        {"capabilities": {"CHOWN", "NET_ADMIN"}},
+        {"volumes": ["relative/path"]},
+        {"volumes": ["/opt/ac,readonly=false"]},
+        {"volumes": ["/opt/../etc"]},
+    ],
+)
+def test_session_rejects_unsafe_container_options(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    options: dict[str, Any],
+) -> None:
+    with pytest.raises(SandboxError):
+        _session(tmp_path, monkeypatch, _ScriptedDocker(), **options)
+
+
+def test_root_bootstrap_runs_and_reaps_as_uid_0(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = _ScriptedDocker()
+    session = _session(tmp_path, monkeypatch, docker, writable_root=True)
+    session.start()
+    docker.leftovers = ["4200   0\n"]
+
+    outcome = session.exec("apt-get install -y less", timeout_seconds=30, as_root=True)
+
+    assert docker.commands[0][2] == "--user=0:0"
+    assert ["exec", "--user=0:0", session.name, "/bin/sh", "-c", "kill -KILL -1"] in docker.calls
+    assert ["exec", "--user=1000:1000", session.name, "/bin/sh", "-c", "kill -KILL -1"] not in (
+        docker.calls
+    )
+    assert docker.calls.count(["top", session.name, "-o", "pid,uid"]) == 2
+    assert not outcome.restarted
+
+
+def test_session_pipes_text_to_a_short_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = _ScriptedDocker()
+    session = _session(tmp_path, monkeypatch, docker)
+    session.start()
+
+    assert session.pipe("tar -cf /opt/ac/w.tar -T -", "./node_modules\n", timeout_seconds=600)
+
+    assert docker.calls[-1] == [
+        "exec",
+        "--interactive",
+        "--user=1000:1000",
+        session.name,
+        "/usr/bin/env",
+        "-i",
+        "PATH=/usr/bin:/bin",
+        "/bin/sh",
+        "-c",
+        "tar -cf /opt/ac/w.tar -T -",
+    ]
+    assert docker.inputs[-1] == "./node_modules\n"
+    assert docker.timeouts[-1] == 600
+    docker.answers["exec"] = subprocess.CompletedProcess([], 2, "", "tar: error")
+    assert not session.pipe("tar -cf /opt/ac/w.tar -T -", "./x\n", timeout_seconds=600)
+
+
+def test_session_reads_container_files_up_to_a_size_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_docker = tmp_path / "fake-docker"
+    fake_docker.write_text(
+        "#!/bin/sh\n"
+        "for last; do :; done\n"
+        'case "$last" in /tmp/missing) exit 1 ;; esac\n'
+        "printf '%s' '<testsuites/>'\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    docker = _ScriptedDocker()
+    session = _session(tmp_path, monkeypatch, docker, docker_binary=str(fake_docker))
+    session.start()
+
+    assert session.read_file("/tmp/ac-report.xml", max_bytes=100) == b"<testsuites/>"
+    assert session.read_file("/tmp/ac-report.xml", max_bytes=5) is None
+    assert session.read_file("/tmp/missing", max_bytes=100) is None
+    with pytest.raises(SandboxError):
+        session.read_file("relative.xml", max_bytes=100)
+
+
+def test_session_commits_with_only_label_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = _ScriptedDocker()
+    session = _session(tmp_path, monkeypatch, docker, writable_root=True)
+    session.start()
+    image_id = "sha256:" + "c" * 64
+    docker.answers["commit"] = subprocess.CompletedProcess([], 0, f"{image_id}\n", "")
+
+    committed = session.commit({"org.autocontribute.environment": "sha256:" + "d" * 64})
+
+    assert committed == image_id
+    assert docker.calls[-1] == [
+        "commit",
+        "--change=LABEL org.autocontribute.environment=sha256:" + "d" * 64,
+        session.name,
+    ]
+    assert docker.timeouts[-1] == SandboxConfig().command_timeout_seconds
+    with pytest.raises(SandboxError, match="plain name and value"):
+        session.commit({"org.autocontribute.environment": "x\nRUN evil"})
+    docker.answers["commit"] = subprocess.CompletedProcess([], 1, "", "no space left on device")
+    with pytest.raises(SandboxError, match="no space left on device"):
+        session.commit({})
+
+
+def _egress_docker(monkeypatch: pytest.MonkeyPatch, docker: _ScriptedDocker) -> None:
+    monkeypatch.setattr(sandbox, "_docker_control", docker.control)
+    monkeypatch.setattr(sandbox, "pull_image", lambda *_args, **_kwargs: None)
+    docker.answers["logs"] = subprocess.CompletedProcess([], 0, "egress proxy listening\n", "")
+
+
+def test_egress_network_puts_the_proxy_on_both_networks_with_the_operator_proxy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = _ScriptedDocker()
+    _egress_docker(monkeypatch, docker)
+    recorded: list[dict[str, str]] = []
+    original = docker.control
+
+    def control(
+        binary: str, arguments: Sequence[str], environment: dict[str, str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        recorded.append(environment)
+        return original(binary, arguments, environment, **kwargs)
+
+    monkeypatch.setattr(sandbox, "_docker_control", control)
+    monkeypatch.setenv("HTTPS_PROXY", "http://operator:s3cret@proxy.corp:3128")
+    monkeypatch.delenv("HTTP_PROXY", raising=False)
+    monkeypatch.delenv("http_proxy", raising=False)
+    monkeypatch.delenv("https_proxy", raising=False)
+    network = EgressNetwork(
+        allowed_hosts=["pypi.org", "files.pythonhosted.org"],
+        run_id=_RUN_ID,
+        store_root=tmp_path / "state",
+    )
+
+    with network:
+        assert network.proxy_url == f"http://{network.proxy}:3128"
+        create, run, connect = docker.calls[:3]
+        assert create[:3] == ["network", "create", "--internal"]
+        assert create[-1] == network.network
+        assert f"--label=org.autocontribute.run={_RUN_ID}" in create
+        assert run[:3] == ["run", "--detach", f"--name={network.proxy}"]
+        for flag in (
+            "--network=bridge",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--user=65534:65534",
+            "--pids-limit=64",
+            "--env=HTTPS_PROXY",
+            "--env=HTTP_PROXY=",
+            "--env=NO_PROXY=",
+        ):
+            assert flag in run
+        assert "s3cret" not in "\n".join(run)
+        assert recorded[1]["HTTPS_PROXY"] == "http://operator:s3cret@proxy.corp:3128"
+        assert all("HTTPS_PROXY" not in environment for environment in recorded[2:])
+        image = run.index(sandbox._EGRESS_PROXY_IMAGE)
+        assert run[image + 1 : image + 4] == ["python3", "-u", "-c"]
+        assert "class EgressProxy" in run[image + 4]
+        assert run[image + 5 :] == ["--allow=files.pythonhosted.org", "--allow=pypi.org"]
+        assert connect == ["network", "connect", network.network, network.proxy]
+
+    assert docker.calls[-2:] == [
+        ["rm", "--force", "--volumes", network.proxy],
+        ["network", "rm", network.network],
+    ]
+
+
+def test_egress_network_reports_refused_requests_and_cleans_up_a_failed_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = _ScriptedDocker()
+    _egress_docker(monkeypatch, docker)
+    docker.answers["logs"] = subprocess.CompletedProcess(
+        [], 0, "egress proxy listening\nallow CONNECT pypi.org:443\ndeny CONNECT evil:443\n", ""
+    )
+    with EgressNetwork(
+        allowed_hosts=["pypi.org"], run_id=_RUN_ID, store_root=tmp_path / "state"
+    ) as network:
+        assert network.refused_requests() == ["deny CONNECT evil:443"]
+
+    docker = _ScriptedDocker()
+    _egress_docker(monkeypatch, docker)
+    docker.answers["logs"] = subprocess.CompletedProcess([], 0, "", "ValueError: bad proxy\n")
+    docker.states = ["false"]
+    network = EgressNetwork(
+        allowed_hosts=["pypi.org"], run_id=_RUN_ID, store_root=tmp_path / "state"
+    )
+    with pytest.raises(SandboxError, match="egress proxy did not start: ValueError: bad proxy"):
+        network.start()
+    assert docker.calls[-2:] == [
+        ["rm", "--force", "--volumes", network.proxy],
+        ["network", "rm", network.network],
+    ]
+
+
+@pytest.mark.parametrize("host", ["192.168.5.2", "pypi.org/simple", "-oops", "localhost"])
+def test_egress_allowlist_takes_host_names_only(tmp_path: Path, host: str) -> None:
+    with pytest.raises(SandboxError, match="host names"):
+        EgressNetwork(allowed_hosts=[host], run_id=_RUN_ID, store_root=tmp_path / "state")
+
+
+def test_image_identity_prefers_the_registry_digest_of_the_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = _ScriptedDocker()
+    monkeypatch.setattr(sandbox, "_docker_control", docker.control)
+    image_id = "sha256:" + "1" * 64
+    registry = "sha256:" + "2" * 64
+    details = {
+        "Id": image_id,
+        "RepoDigests": [f"other@sha256:{'3' * 64}", f"python@{registry}"],
+        "Config": {"Labels": {"org.autocontribute.environment": "abc"}},
+    }
+    docker.answers["image"] = subprocess.CompletedProcess([], 0, json.dumps(details), "")
+
+    assert inspect_image("python:3.13-slim-bookworm") == ImageIdentity(
+        image_id, registry, {"org.autocontribute.environment": "abc"}
+    )
+    unrelated = inspect_image("ghcr.io/acme/tool:1.2")
+    assert unrelated is not None and unrelated.digest == image_id
+    pinned = inspect_image(f"python@sha256:{'4' * 64}")
+    assert pinned is not None and pinned.digest == "sha256:" + "4" * 64
+    docker.answers["image"] = subprocess.CompletedProcess([], 1, "", "No such image")
+    assert inspect_image("python:3.13-slim-bookworm") is None
+
+
+def test_pull_uses_a_present_pinned_image_and_falls_back_to_a_local_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = _ScriptedDocker()
+    monkeypatch.setattr(sandbox, "_docker_control", docker.control)
+    details = {"Id": "sha256:" + "1" * 64, "RepoDigests": [], "Config": {"Labels": None}}
+    docker.answers["image"] = subprocess.CompletedProcess([], 0, json.dumps(details), "")
+
+    pull_image(f"python@sha256:{'4' * 64}")
+    assert [call[0] for call in docker.calls] == ["image"]
+
+    docker.answers["pull"] = subprocess.CompletedProcess([], 1, "", "registry unreachable")
+    assert pull_image("python:3.13").image_id == "sha256:" + "1" * 64
+    assert ["pull", "--quiet", "python:3.13"] in docker.calls
+
+    docker.answers["image"] = subprocess.CompletedProcess([], 1, "", "No such image")
+    with pytest.raises(SandboxError, match="registry unreachable"):
+        pull_image("python:3.13")
+
+
+def test_tagging_an_environment_image_drops_the_repository_s_older_tags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docker = _ScriptedDocker()
+    monkeypatch.setattr(sandbox, "_docker_control", docker.control)
+    image_id = "sha256:" + "5" * 64
+    docker.answers["image"] = subprocess.CompletedProcess(
+        [], 0, "autocontribute-env/acme__demo:old\nautocontribute-env/acme__demo:new\n", ""
+    )
+
+    tag_image(image_id, "autocontribute-env/acme__demo:new")
+
+    assert docker.calls == [
+        ["tag", image_id, "autocontribute-env/acme__demo:new"],
+        ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", "autocontribute-env/acme__demo"],
+        ["image", "rm", "autocontribute-env/acme__demo:old"],
+    ]
+    with pytest.raises(SandboxError, match="sha256"):
+        tag_image("latest", "autocontribute-env/acme__demo:new")
 
 
 def test_leftover_sweep_removes_finished_or_unknown_runs_of_this_store_only(
