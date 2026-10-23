@@ -49,7 +49,11 @@ anything a linter catches. Put minor observations in notes.
 Verdict
 - approve: no blockers.
 - request_changes: blockers the author can fix; give each a fix_hint.
-- abandon: the approach is wrong, or the issue should not be fixed this way.
+- abandon: the approach is wrong, or the issue should not be fixed this way. Abandon also when
+  the tests for the changed code cannot run in this environment, for example because an optional
+  dependency or plugin they need is missing, and the new test runs only by stubbing modules or
+  loading source files by path, or sits outside the project's tests for that code: a maintainer
+  would not accept that test, and nothing here shows the change works.
 Set no_test_needed only when the change needs no test (documentation, typing, build or CI
 configuration), and say why in the summary.
 
