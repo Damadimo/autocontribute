@@ -192,7 +192,7 @@ Routine events stop nothing. Each one is noted once on its run (`pull_request_at
 - a maintainer (owner, member, or collaborator, not a bot) requests changes in their latest review;
 - a check's latest run ends `failure`, `timed_out`, or `startup_failure`, or a commit status fails
   (`action_required`, `cancelled`, `neutral`, `skipped`, and `stale` are ignored);
-- another GitHub account adds commits on top of the prepared commit.
+- another GitHub account pushes commits on top of the prepared commit.
 
 A hold stops work on one repository or PR, or stops all publication, until it expires or you
 release it. Discovery skips held repositories. `publish` refuses held repositories and PRs, and
@@ -210,8 +210,10 @@ The safety stop is one global switch that never clears itself: while it is on, `
 `publish` refuse for every repository, though a cleanup that an earlier `publish` started
 (deleting its branch or closing its PR) still finishes. It turns on when:
 
-- a published PR's head changed, and either the prepared commit is gone or a new commit comes from
-  your account or from no known GitHub account (this tool never pushes to an open PR);
+- a published PR's head changed, and GitHub's push record for the branch does not show that every
+  push since the prepared commit was a plain (not force) push by another account; commit authors
+  are not trusted for this, because anyone can set an author email (this tool never pushes to an
+  open PR);
 - maintainers of two repositories turn away your PRs as automated contributions within 30 days,
   counting only holds you have not released (a comment on a candidate issue holds its repository
   but does not count, because it is addressed to every contributor);

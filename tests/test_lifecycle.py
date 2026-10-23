@@ -16,8 +16,8 @@ from autocontribute.exceptions import (
     StopScope,
 )
 from autocontribute.github import (
+    BranchPush,
     CheckRunDetails,
-    CommitComparison,
     CommitStatusDetails,
     GitHubComment,
     PullRequestDetails,
@@ -142,7 +142,7 @@ def _snapshot(
     statuses: tuple[CommitStatusDetails, ...] = (),
     references: tuple[PullRequestReference, ...] = (),
     publishing_login: str | None = "octocat",
-    head_comparison: CommitComparison | None = None,
+    head_pushes: tuple[BranchPush, ...] = (),
 ) -> PullRequestLifecycleSnapshot:
     return PullRequestLifecycleSnapshot(
         expected_head_sha=expected_head_sha,
@@ -154,7 +154,7 @@ def _snapshot(
         commit_statuses=statuses,
         references=references,
         publishing_login=publishing_login,
-        head_comparison=head_comparison,
+        head_pushes=head_pushes,
     )
 
 
@@ -173,10 +173,10 @@ class FakeLifecycleGitHub:
         self.check_runs: list[CheckRunDetails] = []
         self.statuses: list[CommitStatusDetails] = []
         self.references: list[PullRequestReference] = []
-        self.comparison: CommitComparison | None = None
+        self.pushes: list[BranchPush] | Exception = []
         self.get_calls = 0
         self.reference_calls = 0
-        self.compare_calls = 0
+        self.push_calls: list[tuple[str, str]] = []
 
     def get_pull_request(self, repository: str, number: int) -> PullRequestDetails:
         value = self.pull_requests[min(self.get_calls, len(self.pull_requests) - 1)]
@@ -226,9 +226,11 @@ class FakeLifecycleGitHub:
         self.reference_calls += 1
         return self.references
 
-    def compare_commits(self, repository: str, base: str, head: str) -> CommitComparison | None:
-        self.compare_calls += 1
-        return self.comparison
+    def list_branch_pushes(self, repository: str, branch: str) -> list[BranchPush]:
+        self.push_calls.append((repository, branch))
+        if isinstance(self.pushes, Exception):
+            raise self.pushes
+        return self.pushes
 
 
 class FakeLifecycleStore:
@@ -339,7 +341,7 @@ def test_observer_records_attention_and_each_stop_once_across_observations() -> 
     assert hold.expires_at is None
     assert first.newly_recorded == (hold.trigger_hash,)
     assert second.newly_recorded == ()
-    assert github.compare_calls == 0
+    assert github.push_calls == []
 
 
 def test_classifier_ignores_untrusted_stop_text_and_superseded_ci_failures() -> None:
@@ -491,20 +493,29 @@ def test_only_checks_that_failed_on_the_patch_need_attention(
     assert [signal.kind for signal in signals] == kinds
 
 
+def _push(
+    before: str, after: str, actor: str | None = "maintainer", activity_type: str = "push"
+) -> BranchPush:
+    return BranchPush(
+        ref="refs/heads/fix-lifecycle",
+        activity_type=activity_type,
+        before=before * 40,
+        after=after * 40,
+        actor_login=actor,
+    )
+
+
 def _moved_head(**changes: object) -> PullRequestLifecycleSnapshot:
     values: dict[str, object] = {
         "pull_request": _pull_request(head_sha="b" * 40),
-        "head_comparison": CommitComparison(
-            status="ahead",
-            total_commits=2,
-            author_logins=("maintainer", "pre-commit-ci[bot]"),
-        ),
+        # Newest first, as GitHub lists them.
+        "head_pushes": (_push("c", "b", "pre-commit-ci[bot]"), _push("a", "c")),
     }
     values.update(changes)
     return _snapshot(**values)  # type: ignore[arg-type]
 
 
-def test_commits_added_by_other_accounts_only_need_attention() -> None:
+def test_pushes_by_other_accounts_only_need_attention() -> None:
     (signal,) = classify_lifecycle(_moved_head())
 
     assert signal.kind == LifecycleSignalKind.MAINTAINER_PUSH
@@ -515,28 +526,16 @@ def test_commits_added_by_other_accounts_only_need_attention() -> None:
 @pytest.mark.parametrize(
     "changes",
     [
-        {"head_comparison": None},
+        {"head_pushes": ()},
         {"publishing_login": None},
-        {
-            "head_comparison": CommitComparison(
-                status="diverged", total_commits=1, author_logins=("maintainer",)
-            )
-        },
-        {
-            "head_comparison": CommitComparison(
-                status="ahead", total_commits=1, author_logins=(None,)
-            )
-        },
-        {
-            "head_comparison": CommitComparison(
-                status="ahead", total_commits=2, author_logins=("maintainer", "OctoCat")
-            )
-        },
-        {
-            "head_comparison": CommitComparison(
-                status="ahead", total_commits=300, author_logins=("maintainer",)
-            )
-        },
+        # Commit authorship follows the author email, which anyone can set; this push came from
+        # the publishing account however its commits name their author.
+        {"head_pushes": (_push("a", "b", "OctoCat"),)},
+        {"head_pushes": (_push("c", "b"), _push("a", "c", "octocat"))},
+        {"head_pushes": (_push("a", "b", None),)},
+        {"head_pushes": (_push("a", "b", activity_type="force_push"),)},
+        # A gap in the record: no push is known to lead from the prepared commit.
+        {"head_pushes": (_push("c", "b"),)},
     ],
 )
 def test_head_drift_from_an_unknown_pusher_stays_a_global_stop(changes: dict[str, object]) -> None:
@@ -549,12 +548,10 @@ def test_head_drift_from_an_unknown_pusher_stays_a_global_stop(changes: dict[str
     assert stop.trigger_hash == signal.trigger_hash()
 
 
-def test_observer_compares_commits_only_when_the_head_moved() -> None:
+def test_observer_reads_pushes_only_when_the_head_moved() -> None:
     moved = _pull_request(head_sha="b" * 40)
     github = FakeLifecycleGitHub([moved, moved])
-    github.comparison = CommitComparison(
-        status="ahead", total_commits=1, author_logins=("maintainer",)
-    )
+    github.pushes = [_push("a", "b")]
     store = FakeLifecycleStore()
 
     observation = LifecycleObserver(github, store).observe(
@@ -564,9 +561,26 @@ def test_observer_compares_commits_only_when_the_head_moved() -> None:
         publishing_login="octocat",
     )
 
-    assert github.compare_calls == 1
+    assert github.push_calls == [("example/project", "fix-lifecycle")]
     assert [item.kind for item in observation.attention] == ["maintainer_push"]
     assert store.triggers == {}
+
+
+def test_unreadable_push_record_keeps_head_drift_a_global_stop() -> None:
+    moved = _pull_request(head_sha="b" * 40)
+    github = FakeLifecycleGitHub([moved, moved])
+    github.pushes = GitHubError("GitHub returned 403 for GET /repos/example/project/activity")
+    store = FakeLifecycleStore()
+
+    observation = LifecycleObserver(github, store).observe(
+        repository="example/project",
+        number=7,
+        expected_head_sha="a" * 40,
+        publishing_login="octocat",
+    )
+
+    assert [signal.kind for signal in observation.signals] == [LifecycleSignalKind.HEAD_DRIFT]
+    assert [trigger.scope for trigger in store.triggers.values()] == [StopScope.GLOBAL]
 
 
 def test_signals_record_stops_at_their_scope(tmp_path) -> None:  # type: ignore[no-untyped-def]

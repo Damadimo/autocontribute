@@ -221,12 +221,18 @@ class LinkedPullRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class CommitComparison:
-    """The commits a head has beyond a base, with the GitHub account that authored each one."""
+class BranchPush:
+    """One update of a branch, with the account whose credential made it.
 
-    status: str
-    total_commits: int
-    author_logins: tuple[str | None, ...]
+    A commit's author comes from its author email, which anyone can set; the pusher cannot be
+    chosen that way.
+    """
+
+    ref: str
+    activity_type: str
+    before: str
+    after: str
+    actor_login: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1493,33 +1499,24 @@ class GitHubClient:
             resource="commit statuses",
         )
 
-    def compare_commits(self, repository: str, base: str, head: str) -> CommitComparison | None:
-        """Compare two commits, or return None when GitHub no longer has one of them."""
+    def list_branch_pushes(self, repository: str, branch: str) -> list[BranchPush]:
+        """Return the latest updates of one branch, newest first; empty when GitHub has none."""
 
-        base_sha = _full_git_sha(base, field="comparison base SHA")
-        head_sha = _full_git_sha(head, field="comparison head SHA")
+        ref = f"refs/heads/{_input_nonempty(branch, field='branch')}"
         data = self._request(
             "GET",
-            f"/repos/{quote(repository, safe='/')}/compare/{base_sha}...{head_sha}",
-            params={"per_page": 100},
+            f"/repos/{quote(repository, safe='/')}/activity",
+            params={"ref": ref, "per_page": 100},
             allow_not_found=True,
         )
         if data is None:
-            return None
-        payload = _mapping(data, resource="commit comparison")
-        status = _nonempty(payload.get("status"), field="commit comparison status")
-        if status not in {"ahead", "behind", "diverged", "identical"}:
-            raise GitHubError("GitHub returned an unsupported commit comparison status")
-        return CommitComparison(
-            status=status,
-            total_commits=_nonnegative_count(
-                payload.get("total_commits"), field="commit comparison total"
-            ),
-            author_logins=tuple(
-                _commit_author_login(commit)
-                for commit in _mapping_list(payload.get("commits"), resource="compared commits")
-            ),
-        )
+            return []
+        pushes = [
+            _parse_branch_push(item) for item in _mapping_list(data, resource="repository activity")
+        ]
+        if any(push.ref != ref for push in pushes):
+            raise GitHubError("GitHub returned activity for a different ref than requested")
+        return pushes
 
     def list_pull_request_references(
         self,
@@ -2205,14 +2202,20 @@ def _user_login(value: object, *, resource: str) -> str:
     return _nonempty(user.get("login"), field=f"{resource} user login")
 
 
-def _commit_author_login(commit: dict[str, Any]) -> str | None:
-    """The GitHub account a commit's author email maps to, if GitHub knows one."""
-
-    author = commit.get("author")
-    login = author.get("login") if isinstance(author, dict) else None
-    if not isinstance(login, str) or not _GITHUB_LOGIN.fullmatch(login.removesuffix("[bot]")):
-        return None
-    return login
+def _parse_branch_push(data: dict[str, Any]) -> BranchPush:
+    actor = data.get("actor")
+    login = actor.get("login") if isinstance(actor, dict) else None
+    return BranchPush(
+        ref=_nonempty(data.get("ref"), field="activity ref"),
+        activity_type=_nonempty(data.get("activity_type"), field="activity type"),
+        before=_full_git_sha(data.get("before"), field="activity before SHA"),
+        after=_full_git_sha(data.get("after"), field="activity after SHA"),
+        actor_login=(
+            login
+            if isinstance(login, str) and _GITHUB_LOGIN.fullmatch(login.removesuffix("[bot]"))
+            else None
+        ),
+    )
 
 
 def _author_association(value: object, *, resource: str) -> str:
@@ -2525,8 +2528,8 @@ def _rate_limit_wait_seconds(response: httpx.Response, attempt: int) -> float:
 
 
 __all__ = [
+    "BranchPush",
     "CheckRunDetails",
-    "CommitComparison",
     "CommitStatusDetails",
     "DirectoryEntry",
     "ForkIdentity",

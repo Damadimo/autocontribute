@@ -29,8 +29,8 @@ from autocontribute.exceptions import (
     StopScope,
 )
 from autocontribute.github import (
+    BranchPush,
     CheckRunDetails,
-    CommitComparison,
     CommitStatusDetails,
     GitHubComment,
     PullRequestDetails,
@@ -129,7 +129,7 @@ class LifecycleGitHub(Protocol):
         self, repository: str, number: int, *, max_events: int = 1_000
     ) -> list[PullRequestReference]: ...
 
-    def compare_commits(self, repository: str, base: str, head: str) -> CommitComparison | None: ...
+    def list_branch_pushes(self, repository: str, branch: str) -> list[BranchPush]: ...
 
 
 class LifecycleSignalKind(StrEnum):
@@ -166,8 +166,9 @@ class PullRequestLifecycleSnapshot:
     commit_statuses: tuple[CommitStatusDetails, ...]
     references: tuple[PullRequestReference, ...]
     publishing_login: str | None = None
-    # Read only when the head moved: the commits between the prepared commit and the new head.
-    head_comparison: CommitComparison | None = None
+    # Read only when the head moved: the head branch's latest updates, newest first; empty when
+    # GitHub could not show them.
+    head_pushes: tuple[BranchPush, ...] = ()
 
     @property
     def pull_request_state(self) -> Literal["open", "merged", "closed"]:
@@ -346,13 +347,17 @@ class LifecycleObserver:
             if pull_request.merged
             else []
         )
-        head_comparison = (
-            None
-            if pull_request.head_sha.casefold() == expected_sha.casefold()
-            else self.github.compare_commits(
-                pull_request.head_repository, expected_sha, pull_request.head_sha
-            )
-        )
+        head_pushes: list[BranchPush] = []
+        if pull_request.head_sha.casefold() != expected_sha.casefold():
+            try:
+                head_pushes = self.github.list_branch_pushes(
+                    pull_request.head_repository, pull_request.head_ref
+                )
+            except (GitHubSafetyError, GitHubRateLimitError):
+                raise
+            except GitHubError:
+                # Who pushed stays unknown, which classifies as a possible credential leak.
+                head_pushes = []
 
         # A second top-level read catches comment/review/state/head races during pagination.
         confirmed = self.github.get_pull_request(normalized_repository, number)
@@ -391,7 +396,7 @@ class LifecycleObserver:
                 )
             ),
             publishing_login=publishing_login,
-            head_comparison=head_comparison,
+            head_pushes=tuple(head_pushes),
         )
         signals = classify_lifecycle(snapshot)
         observed_at = utc_now()
@@ -609,8 +614,8 @@ def classify_lifecycle(
                 pull_request,
                 evidence_key=pull_request.head_sha.casefold(),
                 reason=(
-                    "Published pull-request head no longer matches the prepared commit, and not "
-                    "every new commit comes from another GitHub account"
+                    "Published pull-request head no longer matches the prepared commit, and "
+                    "GitHub does not show that every push since then came from another account"
                 ),
                 source_url=pull_request.html_url,
             )
@@ -798,25 +803,37 @@ def _stop_kind(text: str) -> LifecycleSignalKind | None:
 
 
 def _pushed_by_others(snapshot: PullRequestLifecycleSnapshot) -> bool:
-    """Whether the new head keeps the prepared commit and adds only other accounts' commits.
+    """Whether fast-forward pushes by other accounts lead from the prepared commit to the head.
 
     GitHub lets only the fork owner and people with push access to the upstream repository push
-    to the branch, so such commits come from the project. A rewritten history, or a commit by the
-    publishing account or by no known account, may come from this tool's own credentials.
+    to the branch, so such pushes come from the project. Commit authorship cannot tell them from
+    a push made with this tool's own credentials, because it follows the author email; the
+    pusher can. A force push, a push by the publishing account or by no known account, or a gap
+    in GitHub's record may come from this tool's credentials.
     """
 
-    comparison = snapshot.head_comparison
     login = snapshot.publishing_login
-    return (
-        comparison is not None
-        and login is not None
-        and comparison.status == "ahead"
-        and 0 < comparison.total_commits == len(comparison.author_logins)
-        and all(
-            author is not None and author.casefold() != login.casefold()
-            for author in comparison.author_logins
-        )
-    )
+    if login is None:
+        return False
+    # Newest first, so a commit that a later push restored maps to that later push.
+    pushes_by_result: dict[str, BranchPush] = {}
+    for update in snapshot.head_pushes:
+        pushes_by_result.setdefault(update.after.casefold(), update)
+    current = snapshot.pull_request.head_sha.casefold()
+    expected = snapshot.expected_head_sha.casefold()
+    for _ in snapshot.head_pushes:
+        if current == expected:
+            return True
+        push = pushes_by_result.get(current)
+        if (
+            push is None
+            or push.activity_type != "push"
+            or push.actor_login is None
+            or push.actor_login.casefold() == login.casefold()
+        ):
+            return False
+        current = push.before.casefold()
+    return current == expected
 
 
 def _latest_check_runs(

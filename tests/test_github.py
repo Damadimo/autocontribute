@@ -2157,22 +2157,22 @@ def test_commit_status_without_a_creator_is_accepted() -> None:
     ]
 
 
-def test_commit_comparison_reads_each_new_commit_author() -> None:
+def test_branch_pushes_name_the_account_that_pushed() -> None:
+    def activity(actor: object, *, ref: str = "refs/heads/fix") -> dict[str, object]:
+        return {
+            "id": 1,
+            "ref": ref,
+            "activity_type": "push",
+            "before": "a" * 40,
+            "after": "b" * 40,
+            "timestamp": "2026-10-20T12:00:00Z",
+            "actor": actor,
+        }
+
     responses = {
-        "ahead": httpx.Response(
-            200,
-            json={
-                "status": "ahead",
-                "total_commits": 3,
-                "commits": [
-                    {"sha": "c" * 40, "author": {"login": "maintainer"}},
-                    {"sha": "d" * 40, "author": {"login": "pre-commit-ci[bot]"}},
-                    {"sha": "e" * 40, "author": None},
-                ],
-            },
-        ),
+        "pushed": httpx.Response(200, json=[activity({"login": "maintainer"}), activity(None)]),
         "gone": httpx.Response(404, json={"message": "Not Found"}),
-        "odd": httpx.Response(200, json={"status": "sideways", "total_commits": 0}),
+        "odd": httpx.Response(200, json=[activity(None, ref="refs/heads/main")]),
     }
     requests: list[httpx.Request] = []
 
@@ -2181,20 +2181,18 @@ def test_commit_comparison_reads_each_new_commit_author() -> None:
         return responses[request.url.path.split("/")[3]]
 
     with _client(handler) as github:
-        comparison = github.compare_commits("example/ahead", "a" * 40, "b" * 40)
-        missing = github.compare_commits("example/gone", "a" * 40, "b" * 40)
-        with pytest.raises(GitHubError, match="unsupported commit comparison status"):
-            github.compare_commits("example/odd", "a" * 40, "b" * 40)
-        with pytest.raises(GitHubError, match="comparison head SHA"):
-            github.compare_commits("example/ahead", "a" * 40, "main")
+        pushes = github.list_branch_pushes("example/pushed", "fix")
+        missing = github.list_branch_pushes("example/gone", "fix")
+        with pytest.raises(GitHubError, match="different ref"):
+            github.list_branch_pushes("example/odd", "fix")
 
-    assert comparison is not None
-    assert comparison.status == "ahead"
-    assert comparison.total_commits == 3
-    assert comparison.author_logins == ("maintainer", "pre-commit-ci[bot]", None)
-    assert missing is None
-    assert requests[0].url.path == f"/repos/example/ahead/compare/{'a' * 40}...{'b' * 40}"
-    assert requests[0].url.params["per_page"] == "100"
+    assert [(push.actor_login, push.before, push.after) for push in pushes] == [
+        ("maintainer", "a" * 40, "b" * 40),
+        (None, "a" * 40, "b" * 40),
+    ]
+    assert missing == []
+    assert requests[0].url.path == "/repos/example/pushed/activity"
+    assert dict(requests[0].url.params) == {"ref": "refs/heads/fix", "per_page": "100"}
     assert len(requests) == 3
 
 
