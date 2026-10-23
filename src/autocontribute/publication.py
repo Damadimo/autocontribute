@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import re
@@ -18,9 +17,11 @@ from pathlib import Path
 from typing import Literal, NoReturn, cast
 
 from autocontribute.approval import (
+    FINGERPRINT_PREFIX,
     ApprovalReview,
     build_approval_manifest,
     create_approval,
+    fingerprint_matches,
     manifest_fingerprint,
     validate_approval,
 )
@@ -51,6 +52,7 @@ from autocontribute.domain import (
     publication_head,
 )
 from autocontribute.exceptions import (
+    ApprovalMismatchError,
     GitHubError,
     GitHubHTTPError,
     GitHubRequestNotSentError,
@@ -87,6 +89,7 @@ _SAFE_SLUG = re.compile(r"[^a-z0-9-]+")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_APPROVAL_SOURCE = re.compile(r"^https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[\x21-\x7e]{0,1900}$")
 _FORK_READY_BACKOFF_SECONDS = (1, 2, 4, 8, 16, 32)
 # Each compensation reason is proven by exactly one marker event written before cleanup starts.
 _COMPENSATION_MARKERS = {
@@ -601,26 +604,34 @@ def approve_run(
     github: GitHubClient,
     attestation: str,
     reviewed_fingerprint: str,
+    source: str | None = None,
 ) -> RunManifest:
+    """Approve the run when ``reviewed_fingerprint`` is its fingerprint or a 12+ hex prefix.
+
+    ``source`` is the https URL where the approval was given, such as an issue comment; it is
+    recorded in the attestation and as its own ledger event.
+    """
+
+    if not FINGERPRINT_PREFIX.fullmatch(reviewed_fingerprint):
+        raise PolicyError("A reviewed fingerprint must be 12 to 64 lowercase hex characters")
+    if source is not None and not _APPROVAL_SOURCE.fullmatch(source):
+        raise PolicyError("An approval source must be an https URL without spaces")
     account = _token_account(config, github)
     actor = account.login
     review = _build_approval_review(config, store, run_id, account=account, github=github)
-    if not hmac.compare_digest(reviewed_fingerprint, review.fingerprint):
-        raise PolicyError(
+    if not fingerprint_matches(reviewed_fingerprint, review.fingerprint):
+        raise ApprovalMismatchError(
             "Approval evidence changed after review; inspect the run again before approving"
         )
     manifest = review.run
     manifest.approval = create_approval(
         review.manifest,
         actor=actor,
-        attestation=attestation,
+        attestation=attestation if source is None else f"{attestation} Source: {source}",
         config=config.publishing,
     )
-    return store.transition(
-        manifest,
-        RunStatus.APPROVED,
-        reason=f"approved by {actor}",
-        evidence=(
+    evidence: tuple[tuple[str, dict[str, str]], ...] = (
+        (
             "approval.created",
             {
                 "actor": actor,
@@ -628,6 +639,14 @@ def approve_run(
                 "manifest_hash": manifest.approval.manifest_hash,
             },
         ),
+    )
+    if source is not None:
+        evidence += (("approval.source", {"url": source}),)
+    return store.transition(
+        manifest,
+        RunStatus.APPROVED,
+        reason=f"approved by {actor}",
+        evidence=evidence,
     )
 
 

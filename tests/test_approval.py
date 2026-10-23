@@ -8,6 +8,7 @@ from autocontribute.approval import (
     ApprovalManifest,
     build_approval_manifest,
     create_approval,
+    fingerprint_matches,
     hash_diff,
     manifest_fingerprint,
     validate_approval,
@@ -121,6 +122,16 @@ def test_head_repository_is_bound_by_a_v5_fingerprint() -> None:
 def test_manifest_without_head_keeps_its_v4_fingerprint() -> None:
     # Pinned so approvals made before the head repository was bound still authorize recovery.
     assert manifest_fingerprint(_manifest()) == V4_FINGERPRINT
+
+
+def test_a_shown_fingerprint_matches_only_as_a_long_enough_exact_prefix() -> None:
+    assert fingerprint_matches(V4_FINGERPRINT, V4_FINGERPRINT)
+    assert fingerprint_matches(V4_FINGERPRINT[:12], V4_FINGERPRINT)
+    assert not fingerprint_matches(V4_FINGERPRINT[:11], V4_FINGERPRINT)
+    assert not fingerprint_matches(V4_FINGERPRINT[1:13], V4_FINGERPRINT)
+    assert not fingerprint_matches(V4_FINGERPRINT[:12].upper(), V4_FINGERPRINT)
+    assert not fingerprint_matches(V4_FINGERPRINT + "0", V4_FINGERPRINT)
+    assert not fingerprint_matches(f"{V4_FINGERPRINT[:12]}\n", V4_FINGERPRINT)
 
 
 def test_diff_hash_is_byte_exact() -> None:

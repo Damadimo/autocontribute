@@ -108,7 +108,7 @@ cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod
 | `doctor` | Check config, credentials, GitHub access, Git, Docker, and the sandbox image, and warn about configured repositories whose AI policy rules this tool out; sends small paid model probes. |
 | `discover` | Show the best current candidate issue without cloning, model calls, or GitHub writes. |
 | `run` | Prepare one contribution or skip; `--issue owner/repo#N` pins an issue, `--scheduled` makes an [unattended attempt](#scheduling). |
-| `approve RUN_ID` | Show the exact diff, check output, and PR text, then record your approval. |
+| `approve RUN_ID` | Show the exact diff, check output, and PR text, then record your approval; `--yes --fingerprint HEX` approves the fingerprint you read without a prompt. |
 | `publish RUN_ID` | Push one branch to your fork (or to the repository itself if you own it) and open one pull request. |
 | `version` | Print the installed version. |
 | `runs list` | List recent runs and their status. |

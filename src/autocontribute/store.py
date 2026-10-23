@@ -1808,7 +1808,7 @@ class RunStore:
         *,
         event: str,
         details: dict[str, str],
-        transitioned: dict[str, str] | None = None,
+        following: tuple[tuple[str, dict[str, str]], ...] = (),
     ) -> None:
         candidate = manifest.candidate
         issue_revision = compute_issue_revision(candidate) if candidate is not None else None
@@ -1885,9 +1885,9 @@ class RunStore:
                         f"Run {manifest.run_id} changed while this manifest was being saved"
                     )
                 self._append_event(connection, manifest.run_id, event, event_details)
-                if transitioned is not None:
+                for following_event, following_details in following:
                     self._append_event(
-                        connection, manifest.run_id, "run.transitioned", transitioned
+                        connection, manifest.run_id, following_event, following_details
                     )
                 _mark_manifest_artifact_sync(
                     connection,
@@ -1912,9 +1912,9 @@ class RunStore:
         target: RunStatus,
         *,
         reason: str,
-        evidence: tuple[str, dict[str, str]] | None = None,
+        evidence: tuple[tuple[str, dict[str, str]], ...] = (),
     ) -> RunManifest:
-        """Change status; ``evidence`` is one event committed in the same transaction first."""
+        """Change status; ``evidence`` events are committed in the same transaction first."""
 
         if target == manifest.status:
             return manifest
@@ -1924,16 +1924,9 @@ class RunStore:
         previous = manifest.status
         manifest.status = target
         transitioned = {"from": previous.value, "to": target.value, "reason": reason}
+        (event, details), *following = (*evidence, ("run.transitioned", transitioned))
         try:
-            if evidence is None:
-                self._save(manifest, event="run.transitioned", details=transitioned)
-            else:
-                self._save(
-                    manifest,
-                    event=evidence[0],
-                    details=evidence[1],
-                    transitioned=transitioned,
-                )
+            self._save(manifest, event=event, details=details, following=tuple(following))
         except _ManifestArtifactSyncError:
             raise
         except Exception:
