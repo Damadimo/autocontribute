@@ -56,7 +56,7 @@ MAX_TURN_SECONDS: Final = 600.0
 _SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _REQUEST_ERROR_DETAIL_KEYS = frozenset({"http_status", "provider_code", "retry_after_seconds"})
 # Provider-opaque fields by output item type: replayed as received and never scanned (§3.6).
-_OPAQUE_FIELDS: Final[Mapping[str, str]] = MappingProxyType(
+OPAQUE_FIELDS: Final[Mapping[str, str]] = MappingProxyType(
     {"reasoning": "encrypted_content", "thinking": "signature", "redacted_thinking": "data"}
 )
 _WORKER_TERM_GRACE_SECONDS = 0.25
@@ -601,7 +601,7 @@ def _reject_host_values(turn: Turn, host_values: frozenset[str]) -> None:
     visible: list[dict[str, JsonValue]] = []
     for item in turn.output_items:
         item_type = item.get("type")
-        opaque = _OPAQUE_FIELDS.get(item_type) if isinstance(item_type, str) else None
+        opaque = OPAQUE_FIELDS.get(item_type) if isinstance(item_type, str) else None
         visible.append({key: value for key, value in item.items() if key != opaque})
     arguments = [call.arguments for call in turn.tool_calls]
     for text in _model_output_strings([visible, arguments]):
@@ -844,6 +844,7 @@ def create_provider(profile: ModelProfile) -> ModelProvider:
 __all__ = [
     "MAX_TOOL_ARGUMENT_BYTES",
     "MAX_TURN_SECONDS",
+    "OPAQUE_FIELDS",
     "ModelCapabilityResponse",
     "ModelProvider",
     "ModelResult",
