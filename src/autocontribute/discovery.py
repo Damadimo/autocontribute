@@ -80,16 +80,29 @@ _DANGEROUS_LABEL = re.compile(
     r"(?:$|[\s/:_-])",
     re.I,
 )
-_CLA_TERM = r"(?:contributor(?:['\u2019]s)? license agreement|\bCLA\b)"
-_DCO_TERM = r"(?:signed[- ]off[- ]by|developer(?:['\u2019]s)? certificate of origin|\bDCO\b)"
-_CLA_REFERENCE = re.compile(rf"\b{_CLA_TERM}\b", re.I)
-_DCO_REFERENCE = re.compile(rf"\b{_DCO_TERM}\b", re.I)
-_LEGAL_SEGMENT_SPLIT = re.compile(r"(?:\r?\n)+|(?<=[.!?])\s+")
+_CLA_REFERENCE = re.compile(
+    r"\bcontributor(?:['\u2019]s)?\s+license\s+agreement\b|\bCLA\b",
+    re.I,
+)
+# Reviewers "sign off" on pull requests too; only the trailer and its tooling name the DCO.
+_DCO_REFERENCE = re.compile(
+    r"\bsigned-off-by\b|(?<![\w-])--signoff\b|\bgit\s+commit\s+(?:-\w+\s+)*-s\b"
+    r"|\bdeveloper(?:['\u2019]s)?\s+certificate\s+of\s+origin\b|\bDCO\b",
+    re.I,
+)
+# Wrapped lines stay in one segment; paragraphs, list items and headings start a new one.
+_LEGAL_SEGMENT_SPLIT = re.compile(
+    r"\r?\n[ \t]*\r?\n|\r?\n(?=[ \t]*(?:[-+*]|\d+[.)])[ \t]|[ \t]*#)|(?<=[.!?])\s+"
+)
+_MARKDOWN_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]", re.M)
+_HEADING_UNDERLINE = re.compile(r"\n[ \t]*([=\-~^\"'`#*+])\1{2,}[ \t]*$", re.M)
 _LEGAL_NEGATION_CONTRAST = re.compile(r"\b(?:although|but|except|however|unless|yet)\b", re.I)
 _LEGAL_NEGATED_PREFIX = re.compile(
     r"(?:\b(?:(?:do|does|did|will)\s+not|don't|doesn't|didn't|won't|never)\s+"
-    r"(?:add|enforce|include|need|request|require|use)[^.!?]{0,80}|"
-    r"\bno\s+(?:(?:legal\s+)?(?:need|requirement)\b[^.!?]{0,80}|(?:an?\s+)?))$",
+    r"(?:add|enforce|have|include|need|request|require|use)[^.!?]{0,80}|"
+    r"\b(?:not|never)\s+(?:be\s+)?(?:required|needed|asked)\s+to\s+sign[^.!?]{0,40}|"
+    r"\bno\s+(?:(?:legal\s+)?(?:need|requirement)\b[^.!?]{0,80}"
+    r"|(?:formal\s+|separate\s+)?(?:an?\s+)?))$",
     re.I,
 )
 _LEGAL_NEGATED_SUFFIX = re.compile(
@@ -354,8 +367,8 @@ _POLICY_NAME = re.compile(
 # A repository with this file closes pull requests from contributors its maintainers have not
 # vouched for.
 _VOUCH_FILE = ".github/vouched.td"
-_MARKDOWN_LINK = re.compile(r"\]\(\s*<?([^()\s<>]+)>?(?:\s+[\"'][^\"']*[\"'])?\s*\)")
-_REFERENCE_LINK = re.compile(r"^[ \t]{0,3}\[[^\]]+\]:[ \t]*<?([^\s<>]+)>?", re.M)
+_MARKDOWN_LINK = re.compile(r"\]\(\s*<?([^()\s<>]+)>?(?:\s+[\"'][^\"'\n]*[\"'])?\s*\)")
+_REFERENCE_LINK = re.compile(r"^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*<?([^\s<>]+)>?", re.M)
 _RST_LINK = re.compile(r"`[^`<]*<([^`<>]+)>`_{1,2}")
 _RST_TARGET = re.compile(r"^[ \t]*\.\.[ \t]+_[^:\n]+:[ \t]*(\S+)", re.M)
 _HTML_LINK = re.compile(r"\bhref\s*=\s*[\"']([^\"']+)[\"']", re.I)
@@ -374,7 +387,7 @@ LEGAL_REQUIREMENTS_EVIDENCE_KEY = "legal_requirements"
 LEGAL_ATTESTATION_EVIDENCE_KEY = "legal_attestation_sha256"
 LEGAL_POLICY_EVIDENCE_KEY = "legal_policy_sha256"
 _LEGAL_ATTESTATION_FINGERPRINT_DOMAIN = b"autocontribute.legal-attestation.v1\x00"
-_LEGAL_POLICY_FINGERPRINT_DOMAIN = b"autocontribute.legal-policy-surface.v1\x00"
+_LEGAL_POLICY_FINGERPRINT_DOMAIN = b"autocontribute.legal-policy-surface.v2\x00"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1206,7 +1219,7 @@ class DiscoveryService:
             vouched=repository_source.vouched,
             problems=(*repository_source.problems, *organization_source.problems),
             policy_sources_sha256=_policy_sources_fingerprint(sources),
-            legal_policy_sha256=_legal_policy_fingerprint(sources),
+            legal_policy_sha256=_legal_policy_fingerprint(files),
             legal_requirements=_legal_requirements(files),
         )
         self._policy_snapshots[key] = snapshot
@@ -1402,17 +1415,40 @@ def _policy_sources_fingerprint(sources: Sequence[_SourceAtRef]) -> str:
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
 
-def _legal_policy_fingerprint(sources: Sequence[_SourceAtRef]) -> str:
-    """Hash policy presence and contents without moving commit refs."""
+def _legal_policy_fingerprint(files: Sequence[PolicyFile]) -> str:
+    """Hash only what bears on a CLA or DCO, so other policy edits keep attestations valid.
 
-    payload = {
-        repository.casefold(): {
-            "present": ref is not None,
-            "files": {file.path: file.text for file in source.files},
-        }
-        for repository, ref, source in sources
-    }
+    CLA and DCO files count whole; every other file counts by the sections that name a CLA or
+    DCO.
+    """
+
+    payload: dict[str, list[str]] = {}
+    for file in files:
+        key = f"{file.repository.casefold()}:{file.path}"
+        if _is_explicit_cla_policy_path(file.path) or _is_explicit_dco_policy_path(file.path):
+            payload[key] = [file.text]
+            continue
+        sections = [
+            section
+            for section in _sections(file.text)
+            if _CLA_REFERENCE.search(section) or _DCO_REFERENCE.search(section)
+        ]
+        if sections:
+            payload[key] = sections
     return hashlib.sha256(_LEGAL_POLICY_FINGERPRINT_DOMAIN + _canonical_json(payload)).hexdigest()
+
+
+def _sections(text: str) -> list[str]:
+    """Split a document at its Markdown or reStructuredText headings."""
+
+    starts = {0, *(match.start() for match in _MARKDOWN_HEADING.finditer(text))}
+    for underline in _HEADING_UNDERLINE.finditer(text):
+        # An underline makes the line above it a heading, unless that line is blank.
+        title_start = text.rfind("\n", 0, underline.start()) + 1
+        if text[title_start : underline.start()].strip():
+            starts.add(title_start)
+    ordered = sorted(starts)
+    return [text[start:end] for start, end in zip(ordered, [*ordered[1:], len(text)], strict=True)]
 
 
 def _legal_requirements(files: Sequence[PolicyFile]) -> tuple[str, ...]:
@@ -1563,7 +1599,7 @@ def _legal_attestation_mismatch(
     if attestation is None:
         return "no attestation is configured for this repository"
     if attestation.legal_policy_sha256 != snapshot.legal_policy_sha256:
-        return "bounded policy inventories or contents changed"
+        return "the CLA or DCO text of the policy files changed"
     if tuple(attestation.legal_requirements) != snapshot.legal_requirements:
         return "detected legal requirement set changed"
     missing: list[str] = []
