@@ -28,6 +28,7 @@ from autocontribute.domain import (
     QualityReport,
     RepositoryInfo,
     ReviewScores,
+    RunManifest,
     RunStatus,
 )
 from autocontribute.exceptions import (
@@ -1613,14 +1614,8 @@ def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monk
             self.store.save(manifest, event="test.skipped", details={})
             return manifest
 
-    def fake_sync(
-        settings: object,
-        store: RunStore,
-        github: object,
-        *,
-        scheduled_preflight: bool = False,
-    ) -> LifecycleSyncResult:
-        calls.append(f"sync:{scheduled_preflight}")
+    def fake_sync(settings: object, store: RunStore, github: object) -> LifecycleSyncResult:
+        calls.append("sync")
         return LifecycleSyncResult(observations=())
 
     monkeypatch.setattr(cli, "GitHubClient", FakeGitHub)
@@ -1630,7 +1625,7 @@ def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monk
     result = runner.invoke(app, ["run", "--scheduled", "--config", str(config)])
 
     assert result.exit_code == 0, result.output
-    assert calls == ["sync:True", "run", "close"]
+    assert calls == ["sync", "run", "close"]
 
 
 class _SkippingOrchestrator:
@@ -1831,13 +1826,7 @@ def test_scheduled_preflight_fails_after_lifecycle_when_breaker_is_active(
         def __init__(self, *_: object, **__: object) -> None:
             pytest.fail("an active breaker must not construct the model orchestrator")
 
-    def fake_sync(
-        _: object,
-        observed_store: RunStore,
-        __: object,
-        **kwargs: object,
-    ) -> LifecycleSyncResult:
-        assert kwargs["scheduled_preflight"] is True
+    def fake_sync(_: object, observed_store: RunStore, __: object) -> LifecycleSyncResult:
         calls.append("observe")
         if not already_active:
             observed_store.trip_circuit_breaker(
@@ -2037,22 +2026,44 @@ def test_publish_failures_have_typed_outcomes_and_exit_codes(
     assert str(error) in " ".join(as_text.output.split())
 
 
-def test_publish_reports_another_runs_stuck_publication_as_an_error(
+def test_publish_goes_ahead_while_another_run_waits_to_be_resumed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config, _, run_id = _approved_state(tmp_path)
+    config, store, run_id = _approved_state(tmp_path)
+    stuck = store.create_run()
+    stuck.status = RunStatus.SUBMITTING
+    store.save(stuck, event="test.unanswered_post", details={})
+    calls: list[str] = []
 
-    def other_run_is_stuck(*_: object, **__: object) -> None:
-        raise PublicationResumeRequired("Run 0123456789abcdef requires publication resumption")
+    class FakePublisher:
+        def __init__(self, _: object, publisher_store: RunStore, github: object) -> None:
+            self.store = publisher_store
+
+        def _reconcile_submitting(self, other: str, *, lease_guard: object) -> None:
+            calls.append(f"reconcile:{other}")
+            raise PublicationResumeRequired("A second POST is forbidden")
+
+        def publish(self, target: str) -> RunManifest:
+            calls.append(f"publish:{target}")
+            manifest = self.store.get(target)
+            manifest.status = RunStatus.PR_OPEN
+            manifest.pull_request_url = "https://github.com/example/project/pull/7"
+            self.store.save(manifest, event="test.published", details={})
+            return manifest
 
     monkeypatch.setattr(cli, "GitHubClient", _ContextGitHub)
-    monkeypatch.setattr(cli, "_sync_lifecycle", other_run_is_stuck)
+    monkeypatch.setattr(cli, "Publisher", FakePublisher)
+    monkeypatch.setattr(
+        cli, "sync_open_pull_requests", lambda *_, **__: LifecycleSyncResult(observations=())
+    )
 
     result = runner.invoke(app, ["publish", run_id, "--yes", "--json", "--config", str(config)])
 
-    assert result.exit_code == 1
-    assert json.loads(result.output)["outcome"] == "error"
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["outcome"] == "pr_open"
+    assert calls == [f"reconcile:{stuck.run_id}", f"publish:{run_id}"]
+    assert store.get(stuck.run_id).status == RunStatus.SUBMITTING
 
 
 def test_publish_json_reports_an_unknown_run(tmp_path: Path) -> None:
@@ -2344,11 +2355,9 @@ def test_lifecycle_sync_adopts_existing_pr_without_publishing(
     assert reconciled.pull_request_url == "https://github.com/example/project/pull/7"
 
 
-@pytest.mark.parametrize("scheduled_preflight", [False, True])
 def test_lifecycle_sync_never_resumes_publication_without_an_explicit_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    scheduled_preflight: bool,
 ) -> None:
     config = tmp_path / "autocontribute.yml"
     state = tmp_path / "state"
@@ -2386,22 +2395,13 @@ def test_lifecycle_sync_never_resumes_publication_without_an_explicit_retry(
     monkeypatch.setattr(cli, "Publisher", FakePublisher)
     monkeypatch.setattr(cli, "sync_open_pull_requests", fake_sync)
 
-    if scheduled_preflight:
-        result = cli._sync_lifecycle(
-            settings,
-            store,
-            object(),  # type: ignore[arg-type]
-            scheduled_preflight=True,
-        )
-        assert result == LifecycleSyncResult(observations=())
-    else:
-        with pytest.raises(PublicationResumeRequired, match="requires publication resumption"):
-            cli._sync_lifecycle(
-                settings,
-                store,
-                object(),  # type: ignore[arg-type]
-            )
+    result = cli._sync_lifecycle(
+        settings,
+        store,
+        object(),  # type: ignore[arg-type]
+    )
 
+    assert result == LifecycleSyncResult(observations=())
     assert calls == ["observe", f"reconcile:{submitting.run_id}"]
     assert store.get(submitting.run_id).status == RunStatus.SUBMITTING
 
@@ -2562,14 +2562,14 @@ def test_lifecycle_sync_resumes_only_the_explicit_manual_retry_target(
     monkeypatch.setattr(cli, "Publisher", FakePublisher)
     monkeypatch.setattr(cli, "sync_open_pull_requests", fake_sync)
 
-    with pytest.raises(PublicationResumeRequired, match="requires publication resumption"):
-        cli._sync_lifecycle(
-            settings,
-            store,
-            object(),  # type: ignore[arg-type]
-            publication_retry_run_id=target.run_id,
-        )
+    result = cli._sync_lifecycle(
+        settings,
+        store,
+        object(),  # type: ignore[arg-type]
+        publication_retry_run_id=target.run_id,
+    )
 
+    assert result == LifecycleSyncResult(observations=())
     assert calls == [
         "observe",
         f"reconcile:{target.run_id}",
@@ -2706,3 +2706,15 @@ def test_lifecycle_sync_command_reports_bounded_summary(tmp_path: Path, monkeypa
     assert (
         "Lifecycle sync: 0 PR(s), 0 signal(s), 0 new stop(s), 0 unreadable PR(s)." in result.output
     )
+    assert "still submitting" not in result.output
+
+    store = RunStore(state)
+    waiting = store.create_run()
+    waiting.status = RunStatus.SUBMITTING
+    store.save(waiting, event="test.unanswered_post", details={})
+
+    reported = runner.invoke(app, ["lifecycle", "sync", "--config", str(config)])
+
+    assert reported.exit_code == 0, reported.output
+    assert f"Run {waiting.run_id} is still submitting" in reported.output
+    assert f"autocontribute runs abandon {waiting.run_id}" in " ".join(reported.output.split())
