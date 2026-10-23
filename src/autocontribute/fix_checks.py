@@ -27,6 +27,7 @@ from autocontribute.config import PolicyConfig, QualityConfig
 from autocontribute.diff_gates import (
     DEFAULT_MAX_SOURCE_FILES,
     DEFAULT_MAX_SOURCE_LINES,
+    changed_tests,
     diff_gates,
     is_workflow_path,
 )
@@ -305,6 +306,7 @@ class FixChecks:
             return _red_green("not_applicable", "the patch changes no test", None, [])
         runs: list[SuiteRunEvidence] = []
         found: Reproduction | None = None
+        changed = changed_tests(split.tests, WorkspaceFiles(self._workspace.path)).includes
         if split.sources.files:
             _patched_copy(self._snapshot, self._red, split.tests, self._workspace.base_sha)
             red_command = related_test_command(self._recipe, tests, self._tree(split.tests.files))
@@ -312,7 +314,7 @@ class FixChecks:
             if red is None:
                 return _red_green("failed", _OUT_OF_TIME, None, runs)
             runs.append(self._evidence("red", red_command, red))
-            found = reproduction(self._baseline, red)
+            found = reproduction(self._baseline, red, changed=changed)
         command = related_test_command(self._recipe, tests, self._tree(patch.files))
         green: list[SuiteRun] = []
         failure: str | None = None
@@ -323,7 +325,7 @@ class FixChecks:
             green.append(run)
             runs.append(self._evidence("green", command, run))
             # A patch of tests alone reproduces nothing; its new tests must pass.
-            found = found or reproduction(self._baseline, run)
+            found = found or reproduction(self._baseline, run, changed=changed)
             failure = green_failure(found, green)
         if found is None:
             raise StateError("The green step ran without finding its tests")

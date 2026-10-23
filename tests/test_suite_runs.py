@@ -40,6 +40,12 @@ _JUNIT = (
 )
 
 
+def _any_test(_test_id: str) -> bool:
+    """Take every test that passed on the base for one the patch changed."""
+
+    return True
+
+
 def _recipe(**changes: Any) -> EnvironmentRecipe:
     fields: dict[str, Any] = {
         "repository": "acme/demo",
@@ -471,7 +477,7 @@ def test_red_step_finds_new_and_newly_failing_tests_and_what_they_reproduce() ->
         ),
     )
 
-    found = reproduction(baseline, red)
+    found = reproduction(baseline, red, changed={"tests.test_cli::test_run"}.__contains__)
 
     assert found == Reproduction(
         targets=(
@@ -483,8 +489,10 @@ def test_red_step_finds_new_and_newly_failing_tests_and_what_they_reproduce() ->
         reproduced=("tests.test_cli.TestNew::test_assert", "tests.test_cli::test_run"),
         uncollected=("tests.test_calc",),
     )
-    assert reproduction(baseline, _suite({}, timed_out=True)) == Reproduction((), (), ())
-    assert reproduction(baseline, _suite({"x": "failed"}, per_test=False)).targets == ()
+    timed_out = _suite({}, timed_out=True)
+    assert reproduction(baseline, timed_out, changed=_any_test) == Reproduction((), (), ())
+    suite = _suite({"x": "failed"}, per_test=False)
+    assert reproduction(baseline, suite, changed=_any_test).targets == ()
 
 
 def test_without_per_test_results_the_suite_is_the_one_target() -> None:
@@ -496,14 +504,33 @@ def test_without_per_test_results_the_suite_is_the_one_target() -> None:
         result = CaseResult(SUITE_TEST_ID, "failed", 1.0, message)
         return _suite({}, results={SUITE_TEST_ID: result}, per_test=False)
 
-    assert reproduction(baseline, red("AssertionError: 2 != 3")) == Reproduction(
+    assert reproduction(baseline, red("AssertionError: 2 != 3"), changed=_any_test) == Reproduction(
         (SUITE_TEST_ID,), (SUITE_TEST_ID,), ()
     )
-    assert reproduction(baseline, red("ImportError: cannot import name 'add'")) == Reproduction(
+    assert reproduction(
+        baseline, red("ImportError: cannot import name 'add'"), changed=_any_test
+    ) == Reproduction((SUITE_TEST_ID,), (), ())
+    passing = _suite({SUITE_TEST_ID: "passed"}, per_test=False)
+    assert reproduction(baseline, passing, changed=_any_test) == Reproduction(
         (SUITE_TEST_ID,), (), ()
     )
-    passing = _suite({SUITE_TEST_ID: "passed"}, per_test=False)
-    assert reproduction(baseline, passing) == Reproduction((SUITE_TEST_ID,), (), ())
+
+
+def test_a_stable_test_the_patch_did_not_change_is_no_target() -> None:
+    baseline = summarize_baseline(
+        [_suite({"t::changed": "passed", "t::flaky_once": "passed"})] * 2, base_sha=_BASE_SHA
+    )
+    red = _suite(
+        {},
+        results={
+            test_id: CaseResult(test_id, "failed", 0.1, "AssertionError: x")
+            for test_id in ("t::changed", "t::flaky_once", "t::new")
+        },
+    )
+
+    found = reproduction(baseline, red, changed={"t::changed"}.__contains__)
+
+    assert found.targets == found.reproduced == ("t::changed", "t::new")
 
 
 def test_green_step_needs_every_target_to_pass_in_every_run() -> None:
@@ -559,7 +586,7 @@ def test_red_green_on_a_go_package_that_does_not_build_without_the_fix() -> None
         ),
     )
 
-    found = reproduction(baseline, red)
+    found = reproduction(baseline, red, changed=_any_test)
 
     assert found == Reproduction(targets=(), reproduced=(), uncollected=(package,))
     green = _reported(
@@ -593,7 +620,7 @@ def test_red_green_on_a_jest_file_that_fails_to_load_without_the_fix() -> None:
     }
     baseline = summarize_baseline([jest(), jest()], base_sha=_BASE_SHA)
 
-    found = reproduction(baseline, jest(loading))
+    found = reproduction(baseline, jest(loading), changed=_any_test)
 
     assert found == Reproduction(targets=(), reproduced=(), uncollected=("src/sub.test.js",))
     assert green_failure(found, [jest(passing)] * 3) is None

@@ -74,9 +74,9 @@ def _git(repository: Path, *arguments: str) -> str:
 class FakeSandbox:
     """Runs a pretend pytest on the tree it gets: results follow the code in it.
 
-    ``test_adds`` passes once add adds; a test module that imports ``missing`` fails to
-    collect; ``flaky`` lists tests that fail in their next run only; ``broken`` lists tests
-    that fail while ``src/calc.py`` holds ``raise``.
+    A test asserting ``add(1, 2) == 3`` passes once add adds; a test module that imports
+    ``missing`` fails to collect; ``flaky`` lists tests that fail in their next run only;
+    ``broken`` lists tests that fail while ``src/calc.py`` holds ``raise``.
     """
 
     def __init__(self) -> None:
@@ -107,10 +107,10 @@ class FakeSandbox:
                     module, "error", None, "ImportError: cannot import", collection_error=True
                 )
                 continue
-            for name in re.findall(r"^def (test_\w+)", text, re.MULTILINE):
+            for name, body in re.findall(r"^def (test_\w+).*\n((?:[ \t]+.*\n?)*)", text, re.M):
                 test_id = f"{module}::{name}"
                 failing = (
-                    (name == "test_adds" and "a + b" not in calc)
+                    ("add(1, 2) == 3" in body and "a + b" not in calc)
                     or (test_id in self.broken and "raise" in calc)
                     or test_id in self.flaky
                 )
@@ -440,3 +440,29 @@ def test_an_unusable_related_run_fails_unless_the_full_suite_decides(tmp_path: P
 
     assert full.regression is not None and full.regression.status == "passed"
     assert [run.kind for run in full.regression.runs] == ["related", "full_suite"]
+
+
+def test_an_unchanged_flaky_test_does_not_count_as_the_reproduction(harness: Harness) -> None:
+    # The new test passes with or without the fix, so it reproduces nothing.
+    harness.write(
+        "tests/test_calc.py", _BASE_TESTS + "\n\ndef test_new():\n    assert add(0, 2) != 5\n"
+    )
+    harness.write("src/calc.py", _FIXED)
+    # An unchanged test of the same file fails once, in the red run.
+    harness.sandbox.flaky.add("tests.test_calc::test_zero")
+
+    result = harness.check()
+
+    assert result.red_green is not None and result.red_green.status == "failed"
+    assert result.red_green.reproduced == []
+    assert result.red_green.targets == ["tests.test_calc::test_new"]
+
+
+def test_an_edited_existing_test_can_be_the_reproduction(harness: Harness) -> None:
+    harness.write("tests/test_calc.py", _BASE_TESTS.replace("add(0, 0) == 0", "add(1, 2) == 3"))
+    harness.write("src/calc.py", _FIXED)
+
+    result = harness.check()
+
+    assert result.red_green is not None and result.red_green.status == "passed"
+    assert result.red_green.reproduced == ["tests.test_calc::test_zero"]
