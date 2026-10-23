@@ -13,7 +13,7 @@ from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, Literal, Protocol, TypeVar, cast
 from urllib.parse import quote, urljoin, urlparse
 
 import httpx
@@ -65,7 +65,14 @@ _CHECK_CONCLUSIONS = frozenset(
         "timed_out",
     }
 )
-_AUTHORED_PULL_REQUEST_LIMIT = 100
+# GitHub search never returns more than 1,000 results for one query.
+_SEARCH_RESULT_LIMIT = 1_000
+_AUTHORED_PULL_REQUESTS_QUERY = (
+    "query AuthoredPullRequests($query: String!, $cursor: String) { "
+    "search(query: $query, type: ISSUE, first: 100, after: $cursor) { "
+    "pageInfo { hasNextPage endCursor } "
+    "nodes { ... on PullRequest { number url headRefName createdAt updatedAt } } } }"
+)
 _COMPARE_FILE_LIMIT = 300
 _GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
@@ -165,6 +172,17 @@ class RepositoryAccess:
     can_push: bool | None
     has_pull_requests: bool
     pull_requests_from_collaborators_only: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AuthoredPullRequest:
+    """One pull request the publishing account opened, as GitHub search reports it."""
+
+    url: str
+    repository: str
+    head_ref: str
+    created_at: datetime
+    updated_at: datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -1152,110 +1170,78 @@ class GitHubClient:
         self,
         login: str,
         *,
-        state: str = "open",
-        repository: str | None = None,
+        head_ref_prefix: str,
+        state: Literal["open"] | None = None,
         updated_after: str | None = None,
-        created_after: str | None = None,
-    ) -> list[str]:
-        if not isinstance(state, str) or state not in {"open", "closed"}:
-            raise ValueError("authored pull-request state must be 'open' or 'closed'")
+    ) -> list[AuthoredPullRequest]:
+        """List the login's pull requests whose head branch starts with ``head_ref_prefix``.
+
+        Search results carry no head branch over REST, so this uses GraphQL search and pages
+        through every result instead of refusing past one page.
+        """
+
         if not isinstance(login, str) or not _GITHUB_LOGIN.fullmatch(login):
             raise ValueError("GitHub login is not safe for an authored pull-request search")
-        if repository is not None and (
-            not isinstance(repository, str) or not _REPOSITORY_NAME.fullmatch(repository)
-        ):
-            raise ValueError("repository must use owner/name syntax")
-        for value, field in (
-            (updated_after, "updated_after"),
-            (created_after, "created_after"),
-        ):
-            if value is not None:
-                _canonical_date(value, field=field)
-
-        qualifiers = ["is:pr", f"is:{state}", f"author:{login}"]
-        if repository:
-            qualifiers.append(f"repo:{repository}")
-        if updated_after:
-            qualifiers.append(f"updated:>={updated_after}")
-        if created_after:
-            qualifiers.append(f"created:>={created_after}")
-        payload = _mapping(
-            self._request(
-                "GET",
-                "/search/issues",
-                params={
-                    "q": " ".join(qualifiers),
-                    "sort": "updated",
-                    "per_page": _AUTHORED_PULL_REQUEST_LIMIT,
-                    "page": 1,
-                },
-            ),
-            resource="authored pull request search",
-        )
-        incomplete = payload.get("incomplete_results")
-        if not isinstance(incomplete, bool):
-            raise GitHubError("GitHub returned malformed authored pull-request search metadata")
-        if incomplete:
-            raise GitHubError(
-                "GitHub returned incomplete authored pull-request search results; "
-                "account publication limits are ambiguous"
+        if not head_ref_prefix:
+            raise ValueError("authored pull-request search needs a head branch prefix")
+        qualifiers = ["is:pr", f"author:{login}"]
+        if state is not None:
+            qualifiers.append(f"is:{state}")
+        if updated_after is not None:
+            qualifiers.append(f"updated:>={_canonical_date(updated_after, field='updated_after')}")
+        pull_requests: dict[str, AuthoredPullRequest] = {}
+        cursor: str | None = None
+        for _ in range(_SEARCH_RESULT_LIMIT // 100):
+            payload = _mapping(
+                self._request(
+                    "POST",
+                    _graphql_api_path(self.config.api_url),
+                    json_body={
+                        "query": _AUTHORED_PULL_REQUESTS_QUERY,
+                        "variables": {"query": " ".join(qualifiers), "cursor": cursor},
+                    },
+                ),
+                resource="authored pull request search",
             )
-        total = _nonnegative_count(
-            payload.get("total_count"), field="authored pull request search total_count"
-        )
-        if total > _AUTHORED_PULL_REQUEST_LIMIT:
-            raise GitHubError(
-                f"Authored pull-request search found {total} results above the one-page safe "
-                f"limit of {_AUTHORED_PULL_REQUEST_LIMIT}; account publication limits are "
-                "ambiguous"
+            if payload.get("errors") is not None:
+                raise GitHubError("GitHub rejected the authored pull-request search")
+            search = _mapping(
+                _mapping(payload.get("data"), resource="authored search data").get("search"),
+                resource="authored search",
             )
-        items = _mapping_list(payload.get("items"), resource="authored pull request search results")
-        if len(items) != total:
-            raise GitHubError(
-                "GitHub returned a truncated authored pull-request search page; "
-                "account publication limits are ambiguous"
-            )
-
-        urls: list[str] = []
-        identities: set[tuple[str, int]] = set()
-        for item in items:
-            number = _identifier(item.get("number"), resource="searched pull request")
-            item_state = _nonempty(
-                item.get("state"), field="searched pull request state"
-            ).casefold()
-            if item_state != state:
-                raise GitHubError(
-                    "GitHub authored search returned a pull request in a different state"
+            for node in _mapping_list(search.get("nodes"), resource="authored search results"):
+                number = _identifier(node.get("number"), resource="searched pull request")
+                url, repository = self._canonical_pull_request_url(
+                    node.get("url"),
+                    expected_repository=None,
+                    expected_number=number,
                 )
-            pull_request = _mapping(
-                item.get("pull_request"), resource="authored search pull request identity"
-            )
-            html_url, item_repository = self._canonical_pull_request_url(
-                item.get("html_url"),
-                expected_repository=repository,
-                expected_number=number,
-            )
-            self._require_canonical_api_url(
-                item.get("repository_url"),
-                path=f"/repos/{item_repository}",
-                field="searched pull request repository URL",
-            )
-            self._require_canonical_api_url(
-                item.get("url"),
-                path=f"/repos/{item_repository}/issues/{number}",
-                field="searched pull request issue API URL",
-            )
-            self._require_canonical_api_url(
-                pull_request.get("url"),
-                path=f"/repos/{item_repository}/pulls/{number}",
-                field="searched pull request API URL",
-            )
-            identity = (item_repository.casefold(), number)
-            if identity in identities:
-                raise GitHubError("GitHub authored search returned a duplicate pull request")
-            identities.add(identity)
-            urls.append(html_url)
-        return urls
+                head_ref = _nonempty(node.get("headRefName"), field="searched head branch")
+                if url in pull_requests:
+                    raise GitHubError("GitHub authored search returned a duplicate pull request")
+                if head_ref.startswith(head_ref_prefix):
+                    pull_requests[url] = AuthoredPullRequest(
+                        url=url,
+                        repository=repository,
+                        head_ref=head_ref,
+                        created_at=_required_datetime(
+                            node.get("createdAt"), field="searched pull request creation time"
+                        ),
+                        updated_at=_required_datetime(
+                            node.get("updatedAt"), field="searched pull request update time"
+                        ),
+                    )
+            page_info = _mapping(search.get("pageInfo"), resource="authored search page")
+            has_next_page = page_info.get("hasNextPage")
+            if has_next_page is False:
+                return list(pull_requests.values())
+            if has_next_page is not True:
+                raise GitHubError("GitHub returned malformed authored search pagination")
+            cursor = _nonempty(page_info.get("endCursor"), field="authored search cursor")
+        raise GitHubError(
+            f"Authored pull-request search exceeded GitHub's {_SEARCH_RESULT_LIMIT}-result "
+            "limit; account publication limits are ambiguous"
+        )
 
     def get_file(
         self,
@@ -2710,6 +2696,7 @@ def _rate_limit_wait_seconds(response: httpx.Response, attempt: int) -> float:
 
 
 __all__ = [
+    "AuthoredPullRequest",
     "BranchPush",
     "CheckRunDetails",
     "CommitComparison",

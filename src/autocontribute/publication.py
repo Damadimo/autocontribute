@@ -1317,7 +1317,7 @@ class Publisher:
 
         if not recovering:
             self._check_head_repository(manifest, patch)
-            self._check_account_limits(login, manifest)
+            self._check_account_limits(login, manifest, branch=branch)
             self._check_freshness(manifest)
         workspace_path = self.store.workspace_dir(run_id) / "repository"
 
@@ -3795,41 +3795,67 @@ class Publisher:
             reasons = "; ".join(eligibility.blockers)
             raise PolicyError(f"Candidate no longer passes deterministic eligibility: {reasons}")
 
-    def _check_account_limits(self, login: str, manifest: RunManifest) -> None:
-        assert manifest.candidate
-        open_prs = self.github.authored_pull_requests(login, state="open")
-        if len(open_prs) >= self.config.publishing.max_open_pull_requests:
-            raise PolicyError("Maximum number of open Autocontribute-era PRs reached")
+    def _check_account_limits(self, login: str, manifest: RunManifest, *, branch: str) -> None:
+        """Count only autocontribute PRs: in-flight local runs and remote PRs on its branches.
 
-        today = datetime.now(UTC).date().isoformat()
-        recent = self.github.authored_pull_requests(
-            login,
-            state="open",
-            created_after=today,
-        ) + self.github.authored_pull_requests(
-            login,
-            state="closed",
-            created_after=today,
+        The account's other pull requests, including ones in repositories it owns, never
+        consume these limits. Local reservations enforce the same daily cap and cooldown again
+        when the intent begins.
+        """
+
+        assert manifest.candidate is not None
+        publishing = self.config.publishing
+        repository = manifest.candidate.repository.casefold()
+        head_ref_prefix = f"{self._branch_prefix()}/issue-"
+        open_pull_requests = [
+            pull_request
+            for pull_request in self.github.authored_pull_requests(
+                login,
+                head_ref_prefix=head_ref_prefix,
+                state="open",
+            )
+            if pull_request.head_ref != branch
+        ]
+        in_flight = [
+            run for run in self.store.list_submitting_runs() if run.run_id != manifest.run_id
+        ]
+        remote_urls = {pull_request.url for pull_request in open_pull_requests}
+        open_count = len(remote_urls) + sum(
+            run.pull_request_url is None or run.pull_request_url not in remote_urls
+            for run in in_flight
         )
-        if len(recent) >= self.config.publishing.max_new_pull_requests_per_day:
+        if open_count >= publishing.max_open_pull_requests:
+            raise PolicyError("Maximum number of open autocontribute pull requests reached")
+        if any(
+            pull_request.repository.casefold() == repository for pull_request in open_pull_requests
+        ) or any(
+            run.candidate is not None and run.candidate.repository.casefold() == repository
+            for run in in_flight
+        ):
+            raise PolicyError("An autocontribute pull request is already open in this repository")
+
+        now = datetime.now(UTC)
+        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        cooldown_start = now - timedelta(days=publishing.repository_cooldown_days)
+        recent = [
+            pull_request
+            for pull_request in self.github.authored_pull_requests(
+                login,
+                head_ref_prefix=head_ref_prefix,
+                updated_after=min(day_start, cooldown_start).date().isoformat(),
+            )
+            if pull_request.head_ref != branch
+        ]
+        if (
+            sum(pull_request.created_at >= day_start for pull_request in recent)
+            >= publishing.max_new_pull_requests_per_day
+        ):
             raise PolicyError("Daily new pull-request limit reached")
-
-        cooldown_start = (
-            (datetime.now(UTC) - timedelta(days=self.config.publishing.repository_cooldown_days))
-            .date()
-            .isoformat()
-        )
-        same_repo = self.github.authored_pull_requests(
-            login,
-            state="open",
-            repository=manifest.candidate.repository,
-        ) + self.github.authored_pull_requests(
-            login,
-            state="closed",
-            repository=manifest.candidate.repository,
-            updated_after=cooldown_start,
-        )
-        if same_repo:
+        if publishing.repository_cooldown_days and any(
+            pull_request.repository.casefold() == repository
+            and pull_request.updated_at >= cooldown_start
+            for pull_request in recent
+        ):
             raise PolicyError("Repository cooldown is active for this account")
 
     def _prepare_workspace(
@@ -4167,12 +4193,13 @@ class Publisher:
             "to reconcile"
         )
 
+    def _branch_prefix(self) -> str:
+        prefix = _SAFE_SLUG.sub("-", self.config.publishing.branch_prefix.casefold()).strip("-")
+        return prefix or "autocontribute"
+
     def _branch_name(self, manifest: RunManifest) -> str:
         assert manifest.candidate
-        prefix = _SAFE_SLUG.sub("-", self.config.publishing.branch_prefix.casefold()).strip("-")
-        if not prefix:
-            prefix = "autocontribute"
-        return f"{prefix}/issue-{manifest.candidate.number}-{manifest.run_id[:8]}"
+        return f"{self._branch_prefix()}/issue-{manifest.candidate.number}-{manifest.run_id[:8]}"
 
 
 def _definitive_refusal(exc: Exception) -> GitHubHTTPError | None:

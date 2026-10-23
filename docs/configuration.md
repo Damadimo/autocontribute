@@ -116,11 +116,11 @@ There is no network setting: the `docker` backend always runs checks with no net
 | `branch_prefix` | `autocontribute` | Branches are named `<prefix>/issue-<number>-<first 8 characters of the run ID>`. |
 | `draft` | `false` | Open PRs as drafts. |
 | `ready_for_review` | `true` | Mark a draft ready for review right after opening it. Has no effect when `draft` is `false`, because the PR is then ready from the start. |
-| `max_new_pull_requests_per_day` | `1` | Refuse to publish once your GitHub account has opened this many PRs in the current UTC day (1–5). |
-| `max_open_pull_requests` | `3` | Refuse to publish while your account has this many open PRs (1–20). |
-| `repository_cooldown_days` | `7` | Refuse a repository where your account has an open PR, or a closed one updated in this many days (0–365). |
+| `max_new_pull_requests_per_day` | `1` | Refuse to publish once Autocontribute has opened this many PRs in the current UTC day (1–5). |
+| `max_open_pull_requests` | `3` | Refuse to publish while this many Autocontribute PRs are open or still being published (1–20). |
+| `repository_cooldown_days` | `7` | Refuse a repository where an Autocontribute PR is open, or one was updated in this many days (0–365). |
 
-The three limits count every PR your GitHub account authored, including ones you opened yourself.
+The limits count only PRs Autocontribute opened, recognized by their `<branch_prefix>/issue-` branch names; PRs you open yourself never count.
 
 ## budget
 

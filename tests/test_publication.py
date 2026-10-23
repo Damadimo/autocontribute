@@ -45,6 +45,7 @@ from autocontribute.exceptions import (
     StopScope,
 )
 from autocontribute.github import (
+    AuthoredPullRequest,
     CheckRunDetails,
     CommitComparison,
     CommitStatusDetails,
@@ -501,6 +502,8 @@ class FakePublishingGitHub:
         self.upstream_push = False
         self.upstream_has_pull_requests = True
         self.upstream_collaborators_only = False
+        self.open_authored: list[AuthoredPullRequest] = []
+        self.recent_authored: list[AuthoredPullRequest] = []
         # A newer base that touches the patched file keeps the strict "base moved" behavior.
         self.base_changed_paths: frozenset[str] = frozenset({"fix.py"})
 
@@ -622,9 +625,18 @@ class FakePublishingGitHub:
         self.calls.append("list_pull_request_references")
         return []
 
-    def authored_pull_requests(self, *args, **kwargs) -> list[str]:  # type: ignore[no-untyped-def]
+    def authored_pull_requests(
+        self,
+        login: str,
+        *,
+        head_ref_prefix: str,
+        state: str | None = None,
+        updated_after: str | None = None,
+    ) -> list[AuthoredPullRequest]:
+        del updated_after
         self.calls.append("authored_pull_requests")
-        return []
+        listed = self.open_authored if state == "open" else self.recent_authored
+        return [item for item in listed if item.head_ref.startswith(head_ref_prefix)]
 
     def get_issue(self, repository: str, number: int) -> IssueCandidate:
         self.calls.append("get_issue")
@@ -6174,3 +6186,123 @@ def test_legacy_submitting_run_without_a_bound_head_resumes_from_its_fork(
     assert published.head_repository is None
     assert pushes == ["octocat/project"]
     assert github.last_head == f"octocat:{published.branch_name}"
+
+
+def _authored(
+    repository: str,
+    head_ref: str,
+    *,
+    age: timedelta = timedelta(days=30),
+    number: int = 100,
+) -> AuthoredPullRequest:
+    when = datetime.now(UTC) - age
+    return AuthoredPullRequest(
+        url=f"https://github.com/{repository}/pull/{number}",
+        repository=repository,
+        head_ref=head_ref,
+        created_at=when,
+        updated_at=when,
+    )
+
+
+@pytest.mark.parametrize(
+    ("open_authored", "recent_authored", "expected"),
+    [
+        (
+            [
+                _authored("a/one", "autocontribute/issue-1-aaaaaaaa", number=1),
+                _authored("b/two", "autocontribute/issue-2-bbbbbbbb", number=2),
+                _authored("c/three", "autocontribute/issue-3-cccccccc", number=3),
+            ],
+            [],
+            "Maximum number of open autocontribute pull requests",
+        ),
+        (
+            [_authored("example/project", "autocontribute/issue-9-dddddddd")],
+            [],
+            "already open in this repository",
+        ),
+        (
+            [],
+            [_authored("a/one", "autocontribute/issue-1-aaaaaaaa", age=timedelta(minutes=5))],
+            "Daily new pull-request limit",
+        ),
+        (
+            [],
+            [
+                _authored(
+                    "example/project", "autocontribute/issue-9-dddddddd", age=timedelta(days=2)
+                )
+            ],
+            "Repository cooldown is active",
+        ),
+    ],
+)
+def test_account_limits_count_autocontribute_pull_requests(
+    tmp_path: Path,
+    open_authored: list[AuthoredPullRequest],
+    recent_authored: list[AuthoredPullRequest],
+    expected: str,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    github.open_authored = open_authored
+    github.recent_authored = recent_authored
+
+    with pytest.raises(PolicyError, match=expected):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert not github.mutated
+    assert store.get(run_id).status == RunStatus.APPROVED
+
+
+def test_account_limits_ignore_other_pull_requests_and_this_runs_own_branch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    own_branch = f"autocontribute/issue-42-{run_id[:8]}"
+    personal = [
+        _authored("example/project", "fix-typo", age=timedelta(minutes=5), number=1),
+        _authored("octocat/dotfiles", "main-2", age=timedelta(minutes=5), number=2),
+        _authored("octocat/site", "redesign", age=timedelta(minutes=5), number=3),
+    ]
+    github.open_authored = [*personal, _authored("example/project", own_branch, number=4)]
+    github.recent_authored = [*personal, _authored("example/project", own_branch, number=4)]
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+
+    assert publisher.publish(run_id).status == RunStatus.PR_OPEN
+
+
+def test_account_limits_count_local_runs_still_submitting(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    github.open_authored = [
+        _authored("a/one", "autocontribute/issue-1-aaaaaaaa", number=1),
+        _authored("b/two", "autocontribute/issue-2-bbbbbbbb", number=2),
+    ]
+    manifest = store.get(run_id)
+    assert manifest.candidate is not None
+    in_flight = manifest.model_copy(
+        update={
+            "run_id": "in-flight-run",
+            "status": RunStatus.SUBMITTING,
+            "candidate": manifest.candidate.model_copy(update={"repository": "c/three"}),
+        }
+    )
+    store.list_submitting_runs = lambda *, limit=100: [in_flight]  # type: ignore[method-assign]
+
+    with pytest.raises(PolicyError, match="Maximum number of open autocontribute"):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert not github.mutated
