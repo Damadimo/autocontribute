@@ -10,6 +10,7 @@ from autocontribute.domain import IssueCandidate, RepositoryInfo, RunManifest, R
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     GitHubError,
+    GitHubRateLimitError,
     GitHubSafetyError,
     StateError,
     StopScope,
@@ -976,12 +977,15 @@ def test_one_unreadable_pull_request_does_not_stop_lifecycle_sync(tmp_path) -> N
     assert not store.circuit_breaker_status().is_tripped
 
 
-def test_lifecycle_sync_still_ends_on_a_github_safety_stop(tmp_path) -> None:  # type: ignore[no-untyped-def]
+@pytest.mark.parametrize("error", [GitHubSafetyError, GitHubRateLimitError])
+def test_lifecycle_sync_still_ends_on_a_safety_stop_or_rate_limit(
+    tmp_path, error: type[GitHubError]
+) -> None:  # type: ignore[no-untyped-def]
     store = RunStore(tmp_path / "state")
     broken = _published_run(store, repository="example/broken", number=3)
-    github = PartlyUnreadableGitHub("example/broken", GitHubSafetyError)
+    github = PartlyUnreadableGitHub("example/broken", error)
 
-    with pytest.raises(GitHubSafetyError):
+    with pytest.raises(error):
         sync_open_pull_requests(github, store)
 
     assert store.get(broken.run_id).pull_request_attention == []

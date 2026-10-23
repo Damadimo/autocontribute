@@ -38,6 +38,7 @@ from autocontribute.domain import (
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     GitHubError,
+    GitHubRateLimitError,
     GitHubSafetyError,
     PolicyError,
     StateError,
@@ -880,11 +881,12 @@ def test_repositories_below_the_baseline_are_reported_as_skipped(tmp_path) -> No
                 source="github_api", reason="suspended", trigger_hash="a"
             ),
         ),
+        GitHubRateLimitError("GitHub kept applying a secondary rate limit"),
         StateError("Circuit breaker is tripped by operator:me: maintenance"),
         StateError("Lease autocontribute.run is no longer owned by this worker"),
     ],
 )
-def test_safety_stops_and_state_errors_still_end_discovery(
+def test_safety_stops_rate_limits_and_state_errors_still_end_discovery(
     tmp_path,
     failure: Exception,
 ) -> None:  # type: ignore[no-untyped-def]

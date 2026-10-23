@@ -59,6 +59,10 @@ class GitHubSafetyError(GitHubError):
         self.trigger = trigger
 
 
+class GitHubRateLimitError(GitHubError):
+    """GitHub kept rate limiting past the waits this run allows; a later run can retry."""
+
+
 class GitHubRequestNotSentError(GitHubError):
     """A GitHub request provably failed before any bytes reached the remote host.
 

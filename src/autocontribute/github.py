@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import time
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
@@ -23,8 +24,10 @@ from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     ConfigurationError,
     GitHubError,
+    GitHubRateLimitError,
     GitHubRequestNotSentError,
     GitHubSafetyError,
+    StopScope,
 )
 from autocontribute.github_origin import canonical_api_origin, web_origin_for_api
 
@@ -65,7 +68,12 @@ _AUTHORED_PULL_REQUEST_LIMIT = 100
 _GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _REPOSITORY_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_ABUSE_WARNING = re.compile(r"(?:abuse detection|secondary rate limit|temporarily blocked)", re.I)
+_SECONDARY_RATE_LIMIT = re.compile(
+    r"(?:abuse detection|secondary rate limit|temporarily blocked)", re.I
+)
+# GitHub words its content-creation block as a secondary limit too; on a mutation it pauses
+# every publication, not one request.
+_CONTENT_CREATION_BLOCK = re.compile(r"temporarily blocked", re.I)
 _ACCOUNT_SUSPENSION = re.compile(r"account (?:was |has been |is )?suspended", re.I)
 # Bounded, self-limiting retry policy for transient GitHub responses. Waits are capped so a
 # scheduled run can never stall on GitHub's word alone, and every exhausted budget fails closed.
@@ -74,14 +82,25 @@ _MAX_SINGLE_WAIT_SECONDS = 60.0
 _MAX_TOTAL_WAIT_SECONDS = 180.0
 _TRANSIENT_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
 _TRANSIENT_STATUS_CODES = frozenset({500, 502, 503, 504})
+# GitHub asks for at least a minute after a secondary limit, then exponential backoff. These are
+# the shortest waits before each retry; one client (one run) waits at most the budget in total.
+_SECONDARY_BACKOFF_SECONDS = (60.0, 120.0, 240.0)
+_SECONDARY_WAIT_BUDGET_SECONDS = 600.0
+# GitHub allows 30 searches a minute; staying under it avoids secondary limits.
+_SEARCH_PATH = "/search/issues"
+_SEARCHES_PER_MINUTE = 25
+# Path segments after these name a file, ref, or commit range rather than a resource.
+_FREE_FORM_PATH_RESOURCES = frozenset({"compare", "contents", "ref", "refs"})
 _MAX_REPOSITORY_LABELS = 1_000
 # The contents API returns at most this many entries of one directory, without saying so.
 _MAX_DIRECTORY_ENTRIES = 1_000
 # Issues with this many comments are usually contested or need a design decision.
 _SEARCH_MAX_COMMENTS = 40
 
-# Test seam: retries sleep through this module attribute so tests never wait on wall clock.
+# Test seams: retries sleep and the search limit reads time through these module attributes, so
+# tests never wait on the wall clock.
 _sleep = time.sleep
+_monotonic = time.monotonic
 
 SafetyTriggerHandler = Callable[[CircuitBreakerTrigger], object]
 
@@ -269,6 +288,8 @@ class GitHubClient:
         self.config = config
         self._token = token or resolve_github_token(config)
         self._safety_trigger_handler = safety_trigger_handler
+        self._secondary_wait_seconds = 0.0
+        self._recent_searches: deque[float] = deque()
         self._client = httpx.Client(
             base_url=str(config.api_url).rstrip("/"),
             headers={
@@ -317,9 +338,11 @@ class GitHubClient:
         allow_not_found: bool = False,
     ) -> Any:
         total_wait = 0.0
-        abuse_responses = 0
+        secondary_limits = 0
         for attempt in range(1, _MAX_REQUEST_ATTEMPTS + 1):
             attempts_remain = attempt < _MAX_REQUEST_ATTEMPTS
+            if path == _SEARCH_PATH:
+                self._throttle_search()
             try:
                 response = self._send(method, path, params=params, json_body=json_body)
             except _TransportFailure:
@@ -335,8 +358,8 @@ class GitHubClient:
                         continue
                 raise
             response_message = _response_message(response)
-            is_abuse_warning = bool(_ABUSE_WARNING.search(response_message))
-            if response.status_code == 404 and allow_not_found and not is_abuse_warning:
+            is_secondary_limit = bool(_SECONDARY_RATE_LIMIT.search(response_message))
+            if response.status_code == 404 and allow_not_found and not is_secondary_limit:
                 return None
             if response.status_code == 403 and _ACCOUNT_SUSPENSION.search(response_message):
                 self._raise_safety_stop(
@@ -345,6 +368,42 @@ class GitHubClient:
                     path=path,
                     source="github_api:account_suspended",
                     summary="GitHub reports this account is suspended",
+                    scope=StopScope.GLOBAL,
+                )
+            if (
+                is_secondary_limit
+                and method != "GET"
+                and _CONTENT_CREATION_BLOCK.search(response_message)
+            ):
+                self._raise_safety_stop(
+                    response,
+                    method=method,
+                    path=path,
+                    source="github_api:content_creation_blocked",
+                    summary="GitHub temporarily blocked this account from creating content",
+                    scope=StopScope.PUBLICATION,
+                )
+            if is_secondary_limit:
+                secondary_limits += 1
+                wait = max(
+                    _retry_after_seconds(response) or 0.0,
+                    _SECONDARY_BACKOFF_SECONDS[
+                        min(secondary_limits, len(_SECONDARY_BACKOFF_SECONDS)) - 1
+                    ],
+                )
+                if (
+                    attempts_remain
+                    and secondary_limits <= len(_SECONDARY_BACKOFF_SECONDS)
+                    and self._secondary_wait_seconds + wait <= _SECONDARY_WAIT_BUDGET_SECONDS
+                ):
+                    _sleep(wait)
+                    self._secondary_wait_seconds += wait
+                    continue
+                request_id = response.headers.get("X-GitHub-Request-Id", "unknown")
+                raise GitHubRateLimitError(
+                    f"GitHub kept applying a secondary rate limit to {method} {path} "
+                    f"({response.status_code}, request {request_id}) after this run waited "
+                    f"{self._secondary_wait_seconds:.0f}s. The run ends; a later run can retry."
                 )
             is_rate_limited = response.status_code == 429 or (
                 response.status_code == 403
@@ -353,22 +412,7 @@ class GitHubClient:
                     or response.headers.get("X-RateLimit-Remaining") == "0"
                 )
             )
-            if is_abuse_warning or is_rate_limited:
-                if is_abuse_warning:
-                    abuse_responses += 1
-                    if abuse_responses >= 2:
-                        # The abuse signal survived an honored wait: treat it as a durable
-                        # account-level pause rather than a routine secondary rate limit.
-                        self._raise_safety_stop(
-                            response,
-                            method=method,
-                            path=path,
-                            source="github_api:persistent_abuse_limit",
-                            summary=(
-                                "GitHub repeated an abuse or account-pause response after its "
-                                "requested wait was honored"
-                            ),
-                        )
+            if is_rate_limited:
                 wait = _rate_limit_wait_seconds(response, attempt)
                 if (
                     attempts_remain
@@ -379,7 +423,7 @@ class GitHubClient:
                     total_wait += wait
                     continue
                 request_id = response.headers.get("X-GitHub-Request-Id", "unknown")
-                raise GitHubError(
+                raise GitHubRateLimitError(
                     f"GitHub rate limited {method} {path} "
                     f"({response.status_code}, request {request_id}) beyond the bounded retry "
                     f"budget (waited {total_wait:.0f}s, next wait {wait:.0f}s). "
@@ -410,6 +454,19 @@ class GitHubClient:
             except ValueError as exc:
                 raise GitHubError(f"GitHub returned invalid JSON for {method} {path}") from exc
         raise GitHubError(f"GitHub request failed after retries: {method} {path}")
+
+    def _throttle_search(self) -> None:
+        """Wait until fewer than the allowed number of searches fall in the last minute."""
+
+        now = _monotonic()
+        if len(self._recent_searches) >= _SEARCHES_PER_MINUTE:
+            wait = self._recent_searches[0] + 60.0 - now
+            if wait > 0:
+                _sleep(wait)
+                now += wait
+        while self._recent_searches and self._recent_searches[0] <= now - 60.0:
+            self._recent_searches.popleft()
+        self._recent_searches.append(now)
 
     def _send(
         self,
@@ -455,36 +512,35 @@ class GitHubClient:
         path: str,
         source: str,
         summary: str,
+        scope: StopScope,
     ) -> None:
         retry_after = response.headers.get("Retry-After")
         remaining = response.headers.get("X-RateLimit-Remaining")
         request_id = response.headers.get("X-GitHub-Request-Id")
-        evidence = {
-            "api_origin": self.api_origin,
-            "method": method,
-            "path": path,
-            "request_id": request_id,
-            "response_message": _response_message(response)[:1_000],
-            "retry_after": retry_after,
-            "source": source,
-            "status_code": response.status_code,
-            "x_ratelimit_remaining": remaining,
-        }
+        template = _path_template(path)
+        # Without per-request detail, a recurrence of a stop an operator already reviewed is the
+        # same evidence and does not stop work again.
+        evidence = {"method": method, "path": template, "source": source}
         trigger = CircuitBreakerTrigger(
             source=source,
-            reason=(
-                f"{summary} ({response.status_code} for {method} {path}; request "
-                f"{request_id or 'unknown'})."
-            ),
+            reason=f"{summary} ({method} {template}).",
             trigger_hash=hashlib.sha256(
                 json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest(),
+            scope=scope,
+            scope_key="" if scope is StopScope.GLOBAL else self.api_origin,
         )
         if self._safety_trigger_handler is not None:
             self._safety_trigger_handler(trigger)
+        stopped = (
+            "The global safety stop was activated."
+            if scope is StopScope.GLOBAL
+            else "Publication is held until an operator releases it."
+        )
         raise GitHubSafetyError(
-            f"{summary}; retry_after={retry_after!r}, remaining={remaining!r}. "
-            "The global safety stop was activated.",
+            f"{summary} ({response.status_code} for {method} {path}; request "
+            f"{request_id or 'unknown'}); retry_after={retry_after!r}, "
+            f"remaining={remaining!r}. {stopped}",
             trigger=trigger,
         )
 
@@ -2421,15 +2477,44 @@ def _response_message(response: httpx.Response) -> str:
     return str(message)[:1_000] if message is not None else ""
 
 
+def _path_template(path: str) -> str:
+    """The API path with owner, repository, number, SHA, file and ref names replaced."""
+
+    parts = path.split("?", 1)[0].strip("/").split("/")
+    first_resource = 1
+    if parts[0] == "repos" and len(parts) >= 3:
+        parts[1:3] = ["{owner}", "{repo}"]
+        first_resource = 3
+    elif parts[0] in {"orgs", "users"} and len(parts) >= 2:
+        parts[1] = "{owner}"
+        first_resource = 2
+    for index in range(first_resource, len(parts)):
+        if parts[index - 1] in _FREE_FORM_PATH_RESOURCES:
+            parts[index:] = ["{name}"]
+            break
+        if parts[index].isdigit():
+            parts[index] = "{number}"
+        elif _GIT_SHA.fullmatch(parts[index]):
+            parts[index] = "{sha}"
+    return "/" + "/".join(parts)
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after is None:
+        return None
+    try:
+        return max(1.0, float(int(retry_after.strip())))
+    except ValueError:
+        return None
+
+
 def _rate_limit_wait_seconds(response: httpx.Response, attempt: int) -> float:
     """Compute how long GitHub asked us to wait, from its most specific signal."""
 
-    retry_after = response.headers.get("Retry-After")
+    retry_after = _retry_after_seconds(response)
     if retry_after is not None:
-        try:
-            return max(1.0, float(int(retry_after.strip())))
-        except ValueError:
-            pass
+        return retry_after
     reset = response.headers.get("X-RateLimit-Reset")
     if reset is not None and response.headers.get("X-RateLimit-Remaining") == "0":
         try:

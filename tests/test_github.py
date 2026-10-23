@@ -8,8 +8,19 @@ import httpx
 import pytest
 
 from autocontribute.config import GitHubConfig
-from autocontribute.exceptions import GitHubError, GitHubRequestNotSentError, GitHubSafetyError
-from autocontribute.github import DirectoryEntry, GitHubClient, resolve_github_token
+from autocontribute.exceptions import (
+    GitHubError,
+    GitHubRateLimitError,
+    GitHubRequestNotSentError,
+    GitHubSafetyError,
+    StopScope,
+)
+from autocontribute.github import (
+    DirectoryEntry,
+    GitHubClient,
+    _path_template,
+    resolve_github_token,
+)
 from autocontribute.store import RunStore
 
 
@@ -603,11 +614,10 @@ def test_exhausted_rate_limit_retries_then_fails_without_tripping_breaker(
 
     with (
         _client(handler, safety_trigger_handler=store.record_stop) as github,
-        pytest.raises(GitHubError, match="rate limited") as raised,
+        pytest.raises(GitHubRateLimitError, match="rate limited"),
     ):
         github.authenticated_login()
 
-    assert not isinstance(raised.value, GitHubSafetyError)
     assert requests == 4
     assert waits == [60.0, 60.0, 60.0]
     assert not store.circuit_breaker_status().is_tripped
@@ -688,39 +698,40 @@ def test_permission_403_fails_without_retry_or_breaker(tmp_path, monkeypatch) ->
     assert not store.circuit_breaker_status().is_tripped
 
 
-def test_persistent_abuse_signal_is_persisted_after_honored_wait(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+@pytest.mark.parametrize(
+    "message",
+    [
+        "You have triggered an abuse detection mechanism",
+        "You have exceeded a secondary rate limit",
+    ],
+)
+def test_secondary_limit_backs_off_within_the_run_budget_then_ends_the_run(
+    tmp_path, monkeypatch, message: str
+) -> None:  # type: ignore[no-untyped-def]
     store = RunStore(tmp_path / "state")
     waits: list[float] = []
     monkeypatch.setattr("autocontribute.github._sleep", waits.append)
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            422,
-            headers={
-                "Retry-After": "60",
-                "X-GitHub-Request-Id": "fixture-request",
-            },
-            json={"message": "You have triggered an abuse detection mechanism"},
+            403,
+            headers={"Retry-After": "30", "X-GitHub-Request-Id": "fixture-request"},
+            json={"message": message},
         )
 
-    with _client(
-        handler,
-        safety_trigger_handler=store.record_stop,
-    ) as github:
-        with pytest.raises(GitHubSafetyError, match="global safety stop") as raised:
+    with _client(handler, safety_trigger_handler=store.record_stop) as github:
+        with pytest.raises(GitHubRateLimitError, match="secondary rate limit"):
             github.authenticated_login()
-        first_hash = raised.value.trigger.trigger_hash
-        with pytest.raises(GitHubSafetyError):
+        assert waits == [60.0, 120.0, 240.0]
+        with pytest.raises(GitHubRateLimitError, match="waited 600s"):
             github.authenticated_login()
 
-    assert waits == [60.0, 60.0]
-    status = store.circuit_breaker_status()
-    assert status.is_tripped
-    assert status.source == "github_api:persistent_abuse_limit"
-    assert status.trigger_hash == first_hash
+    assert waits == [60.0, 120.0, 240.0, 60.0, 120.0]
+    assert not store.circuit_breaker_status().is_tripped
+    assert store.active_holds() == []
 
 
-def test_transient_abuse_signal_recovers_without_tripping_breaker(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_secondary_limit_waits_at_least_a_minute_and_recovers(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     store = RunStore(tmp_path / "state")
     waits: list[float] = []
     monkeypatch.setattr("autocontribute.github._sleep", waits.append)
@@ -729,6 +740,12 @@ def test_transient_abuse_signal_recovers_without_tripping_breaker(tmp_path, monk
             httpx.Response(
                 403,
                 headers={"Retry-After": "30"},
+                json={"message": "You have exceeded a secondary rate limit"},
+            ),
+            httpx.Response(403, json={"message": "You have exceeded a secondary rate limit"}),
+            httpx.Response(
+                403,
+                headers={"Retry-After": "300"},
                 json={"message": "You have exceeded a secondary rate limit"},
             ),
             httpx.Response(200, json={"login": "octocat"}),
@@ -741,8 +758,50 @@ def test_transient_abuse_signal_recovers_without_tripping_breaker(tmp_path, monk
     with _client(handler, safety_trigger_handler=store.record_stop) as github:
         assert github.authenticated_login() == "octocat"
 
-    assert waits == [30.0]
+    assert waits == [60.0, 120.0, 300.0]
     assert not store.circuit_breaker_status().is_tripped
+
+
+def test_content_creation_block_on_a_mutation_holds_publication(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+    monkeypatch.setattr(
+        "autocontribute.github._sleep",
+        lambda _: pytest.fail("a content-creation block must not be retried"),
+    )
+    message = (
+        "You have exceeded a secondary rate limit and have been temporarily blocked from "
+        "content creation. Please retry your request again later."
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(404, json={"message": "Not Found"})
+        return httpx.Response(
+            403,
+            headers={"X-GitHub-Request-Id": f"request-{request.url.path}"},
+            json={"message": message},
+        )
+
+    with _client(handler, safety_trigger_handler=store.record_stop) as github:
+        with pytest.raises(GitHubSafetyError, match="Publication is held") as first:
+            github.ensure_fork("upstream/project", "octocat")
+        with pytest.raises(GitHubSafetyError) as second:
+            github.ensure_fork("other/project", "octocat")
+
+    trigger = first.value.trigger
+    assert trigger.scope == StopScope.PUBLICATION
+    assert trigger.scope_key == "https://api.github.com"
+    assert trigger.reason == (
+        "GitHub temporarily blocked this account from creating content "
+        "(POST /repos/{owner}/{repo}/forks)."
+    )
+    assert second.value.trigger == trigger
+    assert not store.circuit_breaker_status().is_tripped
+    (hold,) = store.active_holds()
+    assert (hold.scope, hold.source) == (
+        StopScope.PUBLICATION,
+        "github_api:content_creation_blocked",
+    )
 
 
 def test_account_suspension_trips_breaker_immediately(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -772,6 +831,92 @@ def test_account_suspension_trips_breaker_immediately(tmp_path, monkeypatch) -> 
     status = store.circuit_breaker_status()
     assert status.is_tripped
     assert status.source == "github_api:account_suspended"
+
+
+def test_suspension_trigger_hash_ignores_request_ids_and_names(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    store = RunStore(tmp_path / "state")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            headers={"X-GitHub-Request-Id": f"request-{request.url.path}"},
+            json={"message": "Sorry. Your account was suspended."},
+        )
+
+    triggers = []
+    with _client(handler, safety_trigger_handler=store.record_stop) as github:
+        for repository in ("example/project", "other/project"):
+            with pytest.raises(GitHubSafetyError, match=f"request-/repos/{repository}") as raised:
+                github.get_repository(repository)
+            triggers.append(raised.value.trigger)
+
+    assert triggers[0] == triggers[1]
+    assert triggers[0].scope == StopScope.GLOBAL
+    assert triggers[0].reason == (
+        "GitHub reports this account is suspended (GET /repos/{owner}/{repo})."
+    )
+    assert len(store.circuit_breaker_status().active_triggers) == 1
+
+
+@pytest.mark.parametrize(
+    ("path", "template"),
+    [
+        ("/user", "/user"),
+        ("/repos/a/b/pulls/12/reviews", "/repos/{owner}/{repo}/pulls/{number}/reviews"),
+        (
+            f"/repos/a/b/commits/{'f' * 40}/check-runs",
+            "/repos/{owner}/{repo}/commits/{sha}/check-runs",
+        ),
+        ("/repos/a/b/contents/docs/AI POLICY.md", "/repos/{owner}/{repo}/contents/{name}"),
+        ("/repos/a/b/git/ref/heads/fix/parser", "/repos/{owner}/{repo}/git/ref/{name}"),
+        (f"/repos/a/b/compare/{'a' * 40}...{'b' * 40}", "/repos/{owner}/{repo}/compare/{name}"),
+        ("/users/octocat/repos", "/users/{owner}/repos"),
+        ("/repositories/123", "/repositories/{number}"),
+    ],
+)
+def test_safety_trigger_paths_are_templated(path: str, template: str) -> None:
+    assert _path_template(path) == template
+
+
+def test_issue_search_stays_under_25_requests_a_minute(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    clock = [1_000.0]
+    waits: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr("autocontribute.github._sleep", sleep)
+    monkeypatch.setattr("autocontribute.github._monotonic", lambda: clock[0])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        clock[0] += 1.0
+        if request.url.path == "/user":
+            return httpx.Response(200, json={"login": "octocat"})
+        return httpx.Response(200, json={"total_count": 0, "items": []})
+
+    with _client(handler) as github:
+        for _ in range(25):
+            github.search_issues(
+                "example/project",
+                include_labels=["bug"],
+                exclude_labels=[],
+                unassigned=True,
+                page=1,
+                per_page=10,
+            )
+            github.authenticated_login()
+        assert waits == []
+        github.search_issues(
+            "example/project",
+            include_labels=["bug"],
+            exclude_labels=[],
+            unassigned=True,
+            page=1,
+            per_page=10,
+        )
+
+    assert waits == [10.0]
 
 
 def test_get_retries_transient_5xx_and_recovers(monkeypatch) -> None:  # type: ignore[no-untyped-def]

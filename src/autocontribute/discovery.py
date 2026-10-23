@@ -37,6 +37,7 @@ from autocontribute.exceptions import (
     AutocontributeError,
     CircuitBreakerTrigger,
     GitHubError,
+    GitHubRateLimitError,
     GitHubSafetyError,
     PolicyError,
     StateError,
@@ -346,9 +347,10 @@ _REPOSITORY_BASELINE_REASON = (
     "repository is private, archived, disabled, inactive, or below the star floor"
 )
 _SUMMARY_BLOCKER_KINDS = 3
-# Safety stops and local state failures (the breaker, leases, store integrity) end discovery.
-# Every other failure belongs to one repository or one issue and must not hide the rest.
-_FATAL_ERRORS = (GitHubSafetyError, StateError)
+# Safety stops, rate limits (more requests would only extend them) and local state failures (the
+# breaker, leases, store integrity) end discovery. Every other failure belongs to one repository
+# or one issue and must not hide the rest.
+_FATAL_ERRORS = (GitHubSafetyError, GitHubRateLimitError, StateError)
 _ISOLATED_ERRORS = (AutocontributeError, ValueError)
 
 MAX_POLICY_FILES_PER_REPOSITORY = 128
@@ -1058,7 +1060,7 @@ class DiscoveryService:
                     repository.full_name,
                     issue.number,
                 )
-            except GitHubSafetyError:
+            except _FATAL_ERRORS:
                 raise
             except GitHubError as exc:
                 blockers.append(
@@ -1348,7 +1350,7 @@ class DiscoveryService:
 
         try:
             listed, vouched = self._list_policy_paths(repository, ref)
-        except GitHubSafetyError:
+        except _FATAL_ERRORS:
             raise
         except GitHubError as exc:
             return _PolicySource(
@@ -1424,7 +1426,7 @@ class DiscoveryService:
                     ref=ref,
                     max_bytes=MAX_POLICY_FILE_BYTES,
                 )
-            except GitHubSafetyError:
+            except _FATAL_ERRORS:
                 raise
             except GitHubError as exc:
                 problems.append(f"policy file {repository}/{path} could not be read: {exc}")
