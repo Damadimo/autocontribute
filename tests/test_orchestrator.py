@@ -37,7 +37,12 @@ from autocontribute.providers import ModelResult, ModelUsage
 from autocontribute.redaction import MAX_ARTIFACT_CHARACTERS, MODEL_INPUT_REDACTION
 from autocontribute.repository import RepositoryWorkspace
 from autocontribute.sandbox import SandboxRunner
-from autocontribute.store import CandidateRetryAuthorization, Lease, RunStore
+from autocontribute.store import (
+    CandidateAttemptState,
+    CandidateRetryAuthorization,
+    Lease,
+    RunStore,
+)
 
 REPRODUCTION_COMMAND = "python -c 'from app import value; assert value() == 2'"
 TRUSTED_COMMAND = "python -m pytest"
@@ -1380,8 +1385,7 @@ def test_nonmanual_invocation_cannot_supply_retry_authorization_without_an_issue
     assert all(provider.calls == 0 for provider in providers.values())
 
 
-def test_run_recovers_stale_work_and_releases_singleton_lease(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    now = datetime.now(UTC)
+def test_run_recovers_stale_work_and_releases_singleton_lease(tmp_path: Path) -> None:
     config = AutocontributeConfig.model_validate(
         {
             "github": {"repositories": ["example/project"]},
@@ -1390,10 +1394,9 @@ def test_run_recovers_stale_work_and_releases_singleton_lease(tmp_path: Path, mo
         }
     )
     store = RunStore(config.storage.path)
-    monkeypatch.setattr("autocontribute.store.utc_now", lambda: now - timedelta(hours=3))
+    # Moments old: only the lease holder prepares runs, so the age of a run says nothing.
     abandoned = store.create_run()
     store.transition(abandoned, RunStatus.DISCOVERING, reason="worker started")
-    monkeypatch.setattr("autocontribute.store.utc_now", lambda: now)
     providers = _providers()
 
     with Orchestrator(
@@ -1415,6 +1418,46 @@ def test_run_recovers_stale_work_and_releases_singleton_lease(tmp_path: Path, mo
     lease = store.acquire_lease("autocontribute.run", "next-worker", ttl=timedelta(minutes=1))
     assert lease is not None
     assert store.release_lease("autocontribute.run", "next-worker", lease.generation)
+
+
+def test_an_interrupted_run_fails_and_releases_its_issue_and_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted_clone(cls: type[RepositoryWorkspace], *_: object, **__: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(interrupted_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    issue = _issue()
+
+    with (
+        Orchestrator(
+            config,
+            store=store,
+            github=FakeGitHub(issue, _repository("a" * 40), "a" * 40),  # type: ignore[arg-type]
+            providers=_providers(),  # type: ignore[arg-type]
+            sandbox=PassingSandbox(),  # type: ignore[arg-type]
+        ) as orchestrator,
+        pytest.raises(KeyboardInterrupt),
+    ):
+        orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
+
+    [persisted] = store.list()
+    assert persisted.status == RunStatus.FAILED
+    assert persisted.candidate is not None
+    assert persisted.error == "The run was interrupted before it finished"
+    assert store.candidate_attempt_disposition(issue).state == CandidateAttemptState.AVAILABLE
+    lease = store.acquire_lease("autocontribute.run", "next-worker", ttl=timedelta(minutes=1))
+    assert lease is not None
 
 
 @pytest.mark.parametrize("provider_fails", [False, True])

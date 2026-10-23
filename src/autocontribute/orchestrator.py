@@ -106,7 +106,6 @@ ProviderFactory = Callable[[object], ModelProvider]
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{2,}")
 _RUN_LEASE_TTL = timedelta(minutes=5)
 _RUN_HEARTBEAT_INTERVAL = timedelta(minutes=1)
-_STALE_RUN_AGE = timedelta(hours=2)
 _MAX_GUIDANCE_FILES = 30
 _MAX_GUIDANCE_CHARACTERS = 80_000
 _MODEL_CALL_ATTEMPTS = 3
@@ -251,8 +250,10 @@ class Orchestrator:
             self._lease_guard = guard
             try:
                 self._assert_operational()
+                # Only the holder of this lease prepares runs, so every run still in flight now
+                # belongs to a worker that stopped.
                 self.store.recover_stale_runs(
-                    stale_before=utc_now() - _STALE_RUN_AGE,
+                    stale_before=utc_now(),
                     reason="A previous worker stopped before completing this preparation run.",
                 )
                 self.store.remove_finished_workspaces()
@@ -267,29 +268,37 @@ class Orchestrator:
                         commands=commands,
                     )
                 except Exception as exc:
-                    self._assert_run_lease_owned()
-                    durable_manifest = self.store.get(manifest.run_id)
-                    if durable_manifest.candidate is None and manifest.candidate is not None:
-                        # A failed atomic claim must not attach candidate evidence through the
-                        # generic failure path. Keep the durable pre-claim identity authoritative.
-                        manifest.candidate = None
-                        manifest.repository = durable_manifest.repository
-                    safe_error = self._safe_error(exc)
-                    manifest.error = safe_error
-                    allowed = RunStatus.FAILED in self._allowed_targets(manifest)
-                    if allowed:
-                        self._assert_run_lease_owned()
-                        self.store.transition(manifest, RunStatus.FAILED, reason=safe_error)
-                    else:
-                        manifest.status = RunStatus.FAILED
-                        self._assert_run_lease_owned()
-                        self.store.save(manifest, event="run.failed", details={"error": safe_error})
+                    self._record_failure(manifest, self._safe_error(exc))
+                except BaseException:
+                    # Ctrl-C, or SIGTERM through the CLI's handler: release the issue now, not
+                    # when the next run recovers this one. The interruption itself goes on.
+                    with suppress(AutocontributeError):
+                        self._record_failure(manifest, "The run was interrupted before it finished")
+                    raise
                 finally:
                     self._assert_run_lease_owned()
                     self._write_artifacts(manifest, commands)
                 return manifest
             finally:
                 self._lease_guard = None
+
+    def _record_failure(self, manifest: RunManifest, error: str) -> None:
+        self._assert_run_lease_owned()
+        durable_manifest = self.store.get(manifest.run_id)
+        if durable_manifest.candidate is None and manifest.candidate is not None:
+            # A failed atomic claim must not attach candidate evidence through the
+            # generic failure path. Keep the durable pre-claim identity authoritative.
+            manifest.candidate = None
+            manifest.repository = durable_manifest.repository
+        manifest.error = error
+        allowed = RunStatus.FAILED in self._allowed_targets(manifest)
+        if allowed:
+            self._assert_run_lease_owned()
+            self.store.transition(manifest, RunStatus.FAILED, reason=error)
+        else:
+            manifest.status = RunStatus.FAILED
+            self._assert_run_lease_owned()
+            self.store.save(manifest, event="run.failed", details={"error": error})
 
     def _prepare(
         self,

@@ -7,12 +7,17 @@ import json
 import os
 import re
 import shutil
+import signal
+import sys
 import tempfile
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
+from types import FrameType
 from typing import Annotated, NoReturn
 from urllib.parse import quote
 
@@ -325,7 +330,7 @@ def run_once(
         if scheduled:
             _sync_lifecycle(settings, store, github)
             store.assert_circuit_breaker_clear()
-        with Orchestrator(settings, store=store, github=github) as orchestrator:
+        with _sigterm_exits(), Orchestrator(settings, store=store, github=github) as orchestrator:
             manifest = orchestrator.run(
                 issue_reference=issue,
                 invocation_mode=(
@@ -1337,7 +1342,10 @@ def actions_prepare(
             _sync_lifecycle(settings, store, github, reconcile_submitting=False)
             attention = attention_items(store.list_open_pull_request_runs(), since=synced_from)
             store.assert_circuit_breaker_clear()
-            with Orchestrator(settings, store=store, github=github) as orchestrator:
+            with (
+                _sigterm_exits(),
+                Orchestrator(settings, store=store, github=github) as orchestrator,
+            ):
                 manifest = orchestrator.run(
                     issue_reference=None,
                     invocation_mode=RunInvocationMode.SCHEDULED,
@@ -1872,10 +1880,10 @@ def _print_lifecycle_result(result: LifecycleSyncResult) -> None:
         f"{len(result.failures)} unreadable PR(s)."
     )
     for item in result.observations:
-        for signal in item.signals:
+        for observed in item.signals:
             console.print(
-                f"- {signal.kind.value}: {signal.repository}#{signal.pull_request_number}: "
-                f"{signal.reason} ({signal.source_url})",
+                f"- {observed.kind.value}: {observed.repository}#{observed.pull_request_number}: "
+                f"{observed.reason} ({observed.source_url})",
                 markup=False,
             )
     for failure in result.failures:
@@ -1884,6 +1892,27 @@ def _print_lifecycle_result(result: LifecycleSyncResult) -> None:
             f"{failure.error}",
             markup=False,
         )
+
+
+@contextmanager
+def _sigterm_exits() -> Iterator[None]:
+    """Turn SIGTERM into ``SystemExit(143)`` while a run prepares.
+
+    Actions sends SIGTERM when a job is cancelled. As an exception it lets the run record
+    itself as failed and remove its containers; the default handler would end the process
+    with the run still in flight.
+    """
+
+    previous = signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def _exit_on_sigterm(signal_number: int, frame: FrameType | None) -> NoReturn:
+    del signal_number, frame
+    sys.exit(143)
 
 
 def _print_outcome(manifest: RunManifest, store: RunStore) -> None:
