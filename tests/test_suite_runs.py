@@ -616,3 +616,13 @@ def test_regressions_are_stable_passes_that_fail_or_vanish_unless_removed() -> N
     assert still_failing(["a"], _suite({}, failure="the sandbox container stopped")) == ["a"]
     with pytest.raises(ValueError, match="says nothing"):
         new_failures(baseline, _suite({}, timed_out=True))
+
+
+def test_a_stable_pass_that_is_now_skipped_is_a_regression() -> None:
+    baseline = summarize_baseline(
+        [_suite({"a": "passed", "b": "passed", "s": "skipped"})] * 2, base_sha=_BASE_SHA
+    )
+    run = _suite({"a": "skipped", "b": "passed", "s": "skipped"})
+
+    assert new_failures(baseline, run) == ["a"]
+    assert still_failing(["a"], _suite({"a": "skipped"})) == ["a"]
