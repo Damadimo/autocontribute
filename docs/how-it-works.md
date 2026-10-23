@@ -50,7 +50,7 @@ blockers.
 | Issue is open, updated recently, and unassigned | `github.max_issue_age_days` (365), `github.require_unassigned` (true), `policy.allow_assigned_issues` (false) |
 | Issue has an invitation label, or a maintainer comment inviting a pull request, and no excluded label | `policy.require_maintainer_signal` (true), `github.include_labels`, `github.exclude_labels`, `github.labels` ([Configuration](configuration.md#github)) |
 | Title, body, comments, and labels show no sign of a vulnerability (CVE, injection, XSS, ...) | `policy.allow_security_issues` (false) |
-| The issue does not ask contributors to stay away; no open PR in the repository links it with a closing keyword or was updated in the last 90 days; no comment from the last 30 days claims the work ("I'm working on this") unless a maintainer has since invited a PR; and no maintainer comment asks contributors to stop or hold off. A maintainer comment that turns away automated or AI contributions skips the whole repository for the run | |
+| The issue does not ask contributors to stay away; no open PR in the repository links it with a closing keyword or was updated in the last 90 days; no comment from the last 30 days claims the work ("I'm working on this") unless a maintainer has since invited a PR; and no maintainer comment asks contributors to stop or hold off. A maintainer comment that turns away automated or AI contributions [holds](#lifecycle-sync-holds-and-the-safety-stop) the whole repository | |
 | The repository takes pull requests from people who are not collaborators and has no `.github/VOUCHED.td` vouch list | |
 | Every policy file could be read; the repository or its owner's `.github` repository has contribution guidelines; the AI policy does not ban agent-made contributions and, unless you opt in, does not ask for human-written PR text; and a detected CLA or DCO has a matching attestation ([Legal attestations](configuration.md#legal-attestations)) | `policy.require_contribution_guidelines` (true), `policy.allow_conditional_ai_policy`, `policy.legal_attestations` |
 | The score below reaches 60 | |
@@ -166,49 +166,77 @@ queued → discovering → candidate_selected → eligibility_checked → planni
 | --- | --- | --- |
 | `skipped` | no eligible issue, a pinned issue fails a rule or is blocked, or the scout returns `skip` | passed over until updated |
 | `rejected` | a gate failed | passed over until updated |
-| `failed` | an error, a limit, or the safety stop; also preparation left unfinished for 2 hours | open to the next run |
-| `cancelled` | `autocontribute runs cancel` on a `ready_for_approval` or `approved` run | passed over until updated |
+| `failed` | an error, a limit, a GitHub rate limit that outlasts the run's waits, or the safety stop; also preparation left unfinished for 2 hours | open to the next run |
+| `cancelled` | `autocontribute runs cancel` on a `ready_for_approval` or `approved` run, or, at the start of each `run`, a `ready_for_approval` run nobody approved within `publishing.approval_expires_hours` plus 7 days | passed over until updated |
 
 The one repair goes back to `implementing`. A run in any other state, `pr_open` included, keeps
-other runs off its issue. To retry an unchanged issue (every rule and gate runs again; `--scheduled`
+other runs off its issue. Lifecycle sync records on a `pr_open` run whether its PR is open, merged,
+or closed. To retry an unchanged issue (every rule and gate runs again; `--scheduled`
 runs cannot do this):
 
 ```bash
 autocontribute run --issue owner/repo#123 --retry-unchanged --retry-actor NAME --retry-reason "TEXT"
 ```
 
-## Lifecycle sync and the safety stop
+## Lifecycle sync, holds, and the safety stop
 
-`autocontribute lifecycle sync` reads every PR this tool opened and re-checks runs left in
+`autocontribute lifecycle sync` reads every open PR this tool opened and re-checks runs left in
 `submitting`. It runs first in every `run --scheduled` ([Scheduling](../README.md#scheduling)) and
-`publish`, and exits with code 2 while a safety stop is active.
+`publish`, and exits with code 2 while the safety stop is active. Once a PR is merged or closed,
+sync stops reading it. A PR that GitHub cannot serve gets an `observation_failed` note, and sync
+goes on to the next one.
+
+Routine events stop nothing. Each one is noted once on its run (`pull_request_attention` in
+`manifest.json`) for you to handle:
+
+- a maintainer (owner, member, or collaborator, not a bot) requests changes in their latest review;
+- a check's latest run ends `failure`, `timed_out`, or `startup_failure`, or a commit status fails
+  (`action_required`, `cancelled`, `neutral`, `skipped`, and `stale` are ignored);
+- another GitHub account adds commits on top of the prepared commit.
+
+A hold stops work on one repository, PR, or issue, or stops all publication, until it expires or
+you release it. Discovery skips held repositories and issues. `publish` refuses held repositories
+and PRs, and refuses everything while publication is held.
+
+| Event | Hold |
+| --- | --- |
+| The PR is closed without being merged | repository, 30 days |
+| A maintainer asks to close or stop this PR | the PR, and the repository for 30 days |
+| A maintainer turns away automated, AI, or bot contributions, or says outside contributions are not accepted, on a PR or on a candidate issue | repository, until released |
+| The PR is reverted | repository and all publication, until released |
+| GitHub blocks the account from creating content | all publication, until released |
 
 The safety stop is one global switch that never clears itself: while it is on, `run` and
 `publish` refuse for every repository, though a cleanup that an earlier `publish` started
 (deleting its branch or closing its PR) still finishes. It turns on when:
 
-- a published PR's head no longer matches the prepared commit, including after your own push;
-- a maintainer (owner, member, or collaborator, not a bot) requests changes in their latest review,
-  or asks in a PR review or comment to stop or close;
-- a check's latest run ends `failure`, `cancelled`, `timed_out`, `action_required`, `stale`, or
-  `startup_failure`, a commit status fails, or a PR is closed unmerged or reverted;
-- the secret scanner finds credential-like text in a patch, GitHub reports the account suspended or
-  repeats an abuse-limit response, or publishing cannot confirm what GitHub did;
+- a published PR's head changed, and either the prepared commit is gone or a new commit comes from
+  your account or from no known GitHub account (this tool never pushes to an open PR);
+- maintainers of two repositories turn away automated contributions within 30 days, counting only
+  holds you have not released;
+- the secret scanner finds credential-like text in a patch, GitHub reports the account suspended,
+  or publishing cannot confirm what GitHub did;
 - you run `autocontribute safety stop --actor NAME --reason "TEXT"`.
 
+GitHub rate limits stop nothing. After a secondary rate limit, a command waits at least 1, then 2,
+then 4 minutes, and 10 minutes at most in total. If GitHub still refuses, the command ends with an
+error (a run ends `failed`), and the next run retries.
+
 ```bash
-autocontribute safety status   # review each active trigger on GitHub and deal with it
+autocontribute safety status   # the safety stop, its triggers, and every active hold
 autocontribute safety resume --actor NAME --reason "TEXT" --expected-trigger-hash REVISION
+autocontribute safety release HOLD_ID --actor NAME --reason "TEXT"
 ```
 
 `REVISION` is the active trigger-set revision from `safety status`; a newer trigger changes it and
-`resume` refuses. A trigger you resumed does not fire again; new or edited evidence does.
+`resume` refuses. A trigger you resumed or a hold you released does not fire again; new or edited
+evidence does.
 
 ## Where evidence is written
 
 | Path under `storage.path` (default `.autocontribute`, next to the config file) | Contents |
 | --- | --- |
-| `state.sqlite3` | run records and audit events, approvals, safety-stop state and history, the reservations behind the daily limit and cooldown |
+| `state.sqlite3` | run records and audit events, approvals, safety-stop state and history, holds, the reservations behind the daily limit and cooldown |
 | `runs/<run-id>/manifest.json` | the full run record: issue and comments, eligibility evidence, plan, proposal, command results, gate results, approval, PR URL |
 | `runs/<run-id>/contribution.patch` | the exact diff that gets committed |
 | `runs/<run-id>/validation.json` | baseline and patched command results, with stdout and stderr |
