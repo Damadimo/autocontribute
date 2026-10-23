@@ -31,6 +31,8 @@ _FIRST_BACKOFF_SECONDS: Final = 10.0
 _BACKOFF_FACTOR: Final = 3.0
 _JITTER_FRACTION: Final = 0.25
 MAX_RETRY_WAIT_SECONDS: Final = 120.0
+# Attempts per turn (§3.4); each one is reserved and may be billed.
+MAX_ATTEMPTS: Final = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,8 +72,9 @@ def retry_decision(
 ) -> RetryDecision:
     """Decide whether to repeat a failed model request and how long to wait first.
 
-    ``attempt`` is the number of failed attempts so far and sets the exponential backoff when the
-    provider sent no Retry-After. ``jitter`` is a uniform sample from [0, 1) that lengthens the
+    ``attempt`` is the number of failed attempts so far; after ``MAX_ATTEMPTS`` there is no
+    retry, and before that it sets the exponential backoff when the provider sent no
+    Retry-After. ``jitter`` is a uniform sample from [0, 1) that lengthens the
     wait by up to a quarter, so parallel runs do not retry in step.
     """
 
@@ -86,6 +89,10 @@ def retry_decision(
         failure = f"HTTP {status_code}"
     else:
         return RetryDecision(retry=False, wait_seconds=0.0, reason=f"HTTP {status_code}")
+    if attempt >= MAX_ATTEMPTS:
+        return RetryDecision(
+            retry=False, wait_seconds=0.0, reason=f"{failure} after {MAX_ATTEMPTS} attempts"
+        )
     if retry_after is None:
         delay = _FIRST_BACKOFF_SECONDS * _BACKOFF_FACTOR ** (attempt - 1)
     elif retry_after > MAX_RETRY_WAIT_SECONDS:
@@ -104,6 +111,7 @@ def retry_decision(
 
 
 __all__ = [
+    "MAX_ATTEMPTS",
     "MAX_RETRY_WAIT_SECONDS",
     "PROVIDER_ERROR_CODES",
     "RetryDecision",
