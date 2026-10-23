@@ -600,7 +600,6 @@ def test_signals_record_stops_at_their_scope(tmp_path) -> None:  # type: ignore[
         assert hold.expires_at - hold.created_at == pytest.approx(
             REPOSITORY_COOLDOWN, abs=timedelta(seconds=5)
         )
-    assert store.active_holds(now=datetime.now(UTC) + REPOSITORY_COOLDOWN + timedelta(minutes=1))
 
 
 def test_revert_holds_the_repository_and_all_publication(tmp_path) -> None:  # type: ignore[no-untyped-def]

@@ -2835,7 +2835,9 @@ def _hold(
     )
 
 
-def test_scoped_stops_become_holds_and_leave_the_breaker_untouched(tmp_path: Path) -> None:
+def test_scoped_stops_become_holds_and_leave_the_breaker_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "state"
     store = RunStore(root)
     now = datetime.now(UTC)
@@ -2850,7 +2852,12 @@ def test_scoped_stops_become_holds_and_leave_the_breaker_untouched(tmp_path: Pat
         )
     )
     assert store.record_stop(
-        _hold(StopScope.ISSUE, "example/project#42", "hold-c", expires_at=now - timedelta(days=1))
+        _hold(
+            StopScope.REPOSITORY,
+            "example/cooled",
+            "hold-c",
+            expires_at=now - timedelta(days=1),
+        )
     )
     assert not store.record_stop(_hold(StopScope.REPOSITORY, "example/project", "hold-a"))
     with pytest.raises(StateError, match="reused"):
@@ -2861,16 +2868,14 @@ def test_scoped_stops_become_holds_and_leave_the_breaker_untouched(tmp_path: Pat
     reopened = RunStore(root)
     assert not reopened.circuit_breaker_status().is_tripped
     assert [hold.trigger_hash for hold in reopened.active_holds()] == ["hold-a", "hold-b"]
-    assert [
-        hold.trigger_hash for hold in reopened.active_holds(StopScope.REPOSITORY, "Example/Project")
-    ] == ["hold-a"]
-    assert reopened.active_holds(StopScope.ISSUE) == []
-    assert [
-        hold.trigger_hash
-        for hold in reopened.active_holds(StopScope.ISSUE, now=now - timedelta(days=2))
-    ] == ["hold-c"]
-    assert reopened.active_holds(now=now + timedelta(days=31))[0].trigger_hash == "hold-a"
-    assert len(reopened.active_holds(now=now + timedelta(days=31))) == 1
+    monkeypatch.setattr(store_module, "utc_now", lambda: now - timedelta(days=2))
+    assert [hold.trigger_hash for hold in reopened.active_holds()] == [
+        "hold-a",
+        "hold-b",
+        "hold-c",
+    ]
+    monkeypatch.setattr(store_module, "utc_now", lambda: now + timedelta(days=31))
+    assert [hold.trigger_hash for hold in reopened.active_holds()] == ["hold-a"]
 
 
 def test_global_stop_trips_the_breaker_and_rejects_hold_fields(tmp_path: Path) -> None:
@@ -2898,10 +2903,10 @@ def test_global_stop_trips_the_breaker_and_rejects_hold_fields(tmp_path: Path) -
     [
         (StopScope.REPOSITORY, "example"),
         (StopScope.REPOSITORY, " example/project"),
-        (StopScope.ISSUE, "example/project"),
+        (StopScope.REPOSITORY, "example/project#42"),
         (StopScope.PULL_REQUEST, "example/project#7"),
         (StopScope.PUBLICATION, "api.github.com"),
-        (StopScope.RUN, ""),
+        (StopScope.PULL_REQUEST, ""),
     ],
 )
 def test_holds_require_a_canonical_key_for_their_scope(
@@ -2940,7 +2945,7 @@ def test_maintainer_stops_in_a_second_repository_escalate_to_a_global_stop(
         _hold(StopScope.REPOSITORY, "example/released", "released", counts_toward_escalation=True)
     )
     assert store.release_hold(
-        store.active_holds(StopScope.REPOSITORY, "example/released")[0].hold_id,
+        store.active_holds()[0].hold_id,
         actor="operator",
         reason="the comment was about a different bot",
     )
@@ -2964,7 +2969,7 @@ def test_maintainer_stops_in_a_second_repository_escalate_to_a_global_stop(
         "Maintainers of 2 repositories turned away automated contributions within 30 days, "
         "most recently example/second"
     )
-    assert len(store.active_holds(StopScope.REPOSITORY)) == 4
+    assert len(store.active_holds()) == 4
 
 
 def test_escalating_holds_older_than_thirty_days_do_not_escalate(
@@ -2992,7 +2997,6 @@ def test_publication_refuses_held_repositories_pull_requests_and_publication(
     pull_request_url = "https://github.com/example/project/pull/7"
     store.record_stop(_hold(StopScope.REPOSITORY, "example/held", "repository"))
     store.record_stop(_hold(StopScope.PULL_REQUEST, pull_request_url, "pull-request"))
-    store.record_stop(_hold(StopScope.ISSUE, "example/project#42", "issue"))
     store.record_stop(
         _hold(
             StopScope.REPOSITORY,

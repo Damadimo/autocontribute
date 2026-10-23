@@ -521,7 +521,6 @@ class DiscoveryOutcome:
     selection: DiscoverySelection | None
     active_candidates: int = 0
     suppressed_candidates: int = 0
-    held_candidates: int = 0
     evaluations: tuple[IssueEvaluation, ...] = ()
     skipped_repositories: tuple[tuple[str, str], ...] = ()
     repository_errors: tuple[tuple[str, str], ...] = ()
@@ -580,14 +579,6 @@ class DiscoveryOutcome:
                     self.active_candidates,
                     singular="candidate already has an active run",
                     plural="candidates already have active runs",
-                )
-            )
-        if self.held_candidates:
-            explanations.append(
-                _counted_reason(
-                    self.held_candidates,
-                    singular="issue is held",
-                    plural="issues are held",
                 )
             )
         if self.ineligible_candidates:
@@ -677,18 +668,17 @@ class DiscoveryService:
             for manifest in self.store.list_open_pull_request_runs()
             if manifest.candidate is not None
         }
-        holds = self.store.active_holds()
         held_repositories = {
-            hold.scope_key.casefold(): hold for hold in holds if hold.scope is StopScope.REPOSITORY
+            hold.scope_key.casefold(): hold
+            for hold in self.store.active_holds()
+            if hold.scope is StopScope.REPOSITORY
         }
-        held_issues = {hold.scope_key.casefold() for hold in holds if hold.scope is StopScope.ISSUE}
         evaluations: list[IssueEvaluation] = []
         eligible: list[IssueEvaluation] = []
         skipped_repositories: list[tuple[str, str]] = []
         issue_errors: list[tuple[str, str]] = []
         active_candidates = 0
         suppressed_candidates = 0
-        held_candidates = 0
         candidate_limit = self.config.budget.max_candidates_per_run
         for repository in repositories:
             if len(eligible) >= candidate_limit:
@@ -749,9 +739,6 @@ class DiscoveryService:
             for snapshot in found:
                 if len(eligible) >= candidate_limit:
                     break
-                if snapshot.reference.casefold() in held_issues:
-                    held_candidates += 1
-                    continue
                 try:
                     # Search results omit the discussion and may contain a shortened body. Fetch
                     # the canonical issue before spending model budget or deciding that work is
@@ -797,7 +784,6 @@ class DiscoveryService:
             ),
             active_candidates=active_candidates,
             suppressed_candidates=suppressed_candidates,
-            held_candidates=held_candidates,
             evaluations=tuple(evaluations),
             skipped_repositories=tuple(skipped_repositories),
             repository_errors=tuple(repository_errors),

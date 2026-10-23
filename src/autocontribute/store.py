@@ -43,7 +43,6 @@ _MAX_RUN_CORPUS: Final = 10_000
 _CANDIDATE_REPOSITORY: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _SHA256: Final = re.compile(r"^[0-9a-f]{64}$")
-_ISSUE_KEY: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$")
 _HTTPS_KEY: Final = re.compile(r"^https://[^\s/]+(?:/\S*)?$")
 # Escalating holds in this many repositories within the window stop everything.
 _ESCALATION_REPOSITORIES: Final = 2
@@ -1170,7 +1169,7 @@ class RunStore:
             CREATE TABLE holds (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 scope TEXT NOT NULL CHECK(
-                    scope IN ('publication', 'repository', 'pull_request', 'issue', 'run')
+                    scope IN ('publication', 'repository', 'pull_request')
                 ),
                 scope_key TEXT NOT NULL COLLATE NOCASE,
                 source TEXT NOT NULL,
@@ -3004,31 +3003,19 @@ class RunStore:
                     )
         return True
 
-    def active_holds(
-        self,
-        scope: StopScope | None = None,
-        scope_key: str | None = None,
-        *,
-        now: datetime | None = None,
-    ) -> builtins.list[Hold]:
+    def active_holds(self) -> builtins.list[Hold]:
         """Return holds that are neither released nor expired, oldest first."""
 
-        current = _aware_utc(now or utc_now(), field="hold time")
-        conditions = ["released_at IS NULL", "(expires_at IS NULL OR expires_at > ?)"]
-        parameters: builtins.list[str] = [current.isoformat()]
-        if scope is not None:
-            conditions.append("scope = ?")
-            parameters.append(scope.value)
-        if scope_key is not None:
-            conditions.append("scope_key = ?")
-            parameters.append(scope_key)
-        # Only fixed condition strings are interpolated; every value stays a bound parameter.
-        query = (
-            "SELECT id, scope, scope_key, source, reason, trigger_hash, created_at, expires_at "
-            f"FROM holds WHERE {' AND '.join(conditions)} ORDER BY id"
-        )
         with self._connection() as connection:
-            rows = connection.execute(query, parameters).fetchall()
+            rows = connection.execute(
+                """
+                SELECT id, scope, scope_key, source, reason, trigger_hash, created_at, expires_at
+                FROM holds
+                WHERE released_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
+                ORDER BY id
+                """,
+                (utc_now().isoformat(),),
+            ).fetchall()
         return [
             Hold(
                 hold_id=int(row["id"]),
@@ -3073,7 +3060,11 @@ class RunStore:
         repository: str,
         pull_request_url: str | None = None,
     ) -> None:
-        """Refuse publication while a publication, repository, or pull-request hold applies."""
+        """Refuse publication while a publication, repository, or pull-request hold applies.
+
+        A publication hold names the API origin that blocked the account. One store serves one
+        GitHub instance, so it holds every publication.
+        """
 
         for hold in self.active_holds():
             if (
@@ -4503,11 +4494,10 @@ def _hold_key(scope: StopScope, value: str) -> str:
     key = _lease_identity(value, field=f"{scope.value} hold key")
     pattern = {
         StopScope.REPOSITORY: _CANDIDATE_REPOSITORY,
-        StopScope.ISSUE: _ISSUE_KEY,
         StopScope.PULL_REQUEST: _HTTPS_KEY,
         StopScope.PUBLICATION: _HTTPS_KEY,
-    }.get(scope)
-    if key != value or (pattern is not None and pattern.fullmatch(key) is None):
+    }[scope]
+    if key != value or pattern.fullmatch(key) is None:
         raise ValueError(f"{scope.value} hold key is not canonical: {value!r}")
     return key
 
