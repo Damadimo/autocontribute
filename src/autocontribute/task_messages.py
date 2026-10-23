@@ -279,6 +279,7 @@ def setup_task(
     failed: FailedAttempt,
     *,
     allowed_hosts: Sequence[str],
+    test_time_limit_seconds: int,
     host_values: frozenset[str],
 ) -> str:
     """The setup agent's first message: the failed attempt and the repository's signals."""
@@ -295,7 +296,8 @@ def setup_task(
     }
     sections = [
         f"Set up the test environment of {repository}. The container runs {recipe.base_image} "
-        "with the repository at /workspace. The attempt below failed.",
+        "with the repository at /workspace. The attempt below failed. The test command must "
+        f"finish within {test_time_limit_seconds} seconds.",
         _section(
             "The failed attempt",
             untrusted_block("failed attempt", attempt, host_values=host_values),
