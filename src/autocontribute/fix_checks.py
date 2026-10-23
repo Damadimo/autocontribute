@@ -345,13 +345,16 @@ class FixChecks:
         runs: list[SuiteRunEvidence] = []
         related = related_test_command(self._recipe, paths, self._tree(patch.files))
         related_ran = False
+        # Why the related run says nothing; the full suite decides, or the check fails.
+        related_unusable: str | None = None
         if related is not None:
             outcome = self._regression_run("related", related, runs)
             if outcome is not None and outcome.new_failures:
                 detail = _new_failures_detail(outcome.new_failures)
                 return _regression("failed", detail, False, outcome.new_failures, runs)
-            # A related run that says nothing leaves the decision to the full suite.
-            related_ran = outcome is not None and outcome.unusable is None
+            if outcome is not None:
+                related_ran = outcome.unusable is None
+                related_unusable = outcome.unusable
         full_duration = max(self._baseline.durations_seconds, default=0.0)
         timeout = self._timeout()
         if self._baseline.timed_out:
@@ -370,6 +373,12 @@ class FixChecks:
                 return _regression("failed", detail, True, outcome.new_failures, runs)
             else:
                 return _regression("passed", "the full suite shows no new failure", True, [], runs)
+        if related_unusable is not None:
+            detail = (
+                f"the related tests did not run: {related_unusable}; the full suite was not "
+                f"run: {skipped}"
+            )
+            return _regression("failed", detail, False, [], runs)
         if not related_ran:
             return _regression("not_run", f"not run: {skipped}", False, [], runs)
         detail = f"related tests show no new failure; the full suite was not run: {skipped}"

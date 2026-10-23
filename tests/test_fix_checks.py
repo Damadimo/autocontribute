@@ -401,3 +401,42 @@ def test_out_of_time_fails_the_red_green_step(harness: Harness) -> None:
 
     assert not result.passed
     assert result.red_green is not None and result.red_green.detail == "the run is out of time"
+
+
+class BrokenRelatedSandbox(FakeSandbox):
+    """The build of the related run fails once the patch breaks the source."""
+
+    def run_suite(
+        self, source: Path, *, timeout_seconds: int, test_command: str | None = None
+    ) -> SuiteRun:
+        if test_command is not None and "raise" in (source / "src" / "calc.py").read_text():
+            self.runs.append((source.name, test_command))
+            failure = "the build command failed with exit 2: make"
+            return SuiteRun(2, False, 3.0, {}, False, failure, "error: x")
+        return super().run_suite(source, timeout_seconds=timeout_seconds, test_command=test_command)
+
+
+def test_an_unusable_related_run_fails_unless_the_full_suite_decides(tmp_path: Path) -> None:
+    slow = Harness(tmp_path).baseline.model_copy(update={"durations_seconds": [600.0, 600.0]})
+    skipped = Harness(tmp_path / "skipped", baseline=slow)
+    skipped.checks._sandbox = BrokenRelatedSandbox()
+    skipped.seconds_left = 500.0
+    skipped.write("src/calc.py", "def add(a, b):\n    raise RuntimeError\n")
+
+    result = skipped.check()
+
+    assert not result.passed
+    assert result.regression is not None and result.regression.status == "failed"
+    assert result.regression.detail == (
+        "the related tests did not run: the build command failed with exit 2: make; the full "
+        "suite was not run: the full suite takes about 600 s and 500 s are left"
+    )
+
+    decided = Harness(tmp_path / "decided")
+    decided.checks._sandbox = BrokenRelatedSandbox()
+    decided.write("src/calc.py", "def add(a, b):\n    raise RuntimeError\n    return a + b\n")
+
+    full = decided.check()
+
+    assert full.regression is not None and full.regression.status == "passed"
+    assert [run.kind for run in full.regression.runs] == ["related", "full_suite"]
