@@ -15,6 +15,7 @@ from autocontribute.sandbox import SessionCommandResult
 from autocontribute.suite_results import CaseResult, CaseStatus, parse_report
 from autocontribute.suite_runs import (
     SUITE_TEST_ID,
+    CheckRun,
     Reproduction,
     SuiteRun,
     acceptance_failure,
@@ -22,6 +23,7 @@ from autocontribute.suite_runs import (
     new_failures,
     reproduction,
     run_baseline,
+    run_check,
     run_suite,
     still_failing,
     summarize_baseline,
@@ -220,6 +222,43 @@ def test_suite_without_a_report_counts_as_one_test(
 
     assert not run.per_test
     assert run.results == {SUITE_TEST_ID: CaseResult(SUITE_TEST_ID, "failed", 2.0, "FAILED")}
+
+
+def test_a_check_runs_after_the_build_on_its_own_removed_copy(
+    tmp_path: Path, fake_container: type[_FakeContainer]
+) -> None:
+    fake_container.outcomes = [
+        SessionCommandResult(_command(), None, False),
+        SessionCommandResult(_command(1, output="AssertionError"), None, False),
+    ]
+
+    def check(source: Path) -> CheckRun:
+        return run_check(
+            SandboxConfig(),
+            image_id=_IMAGE,
+            recipe=_recipe(),
+            source=source,
+            run_id="run1",
+            store_root=tmp_path / "state",
+            command="python -c 'assert False'",
+            timeout_seconds=60,
+        )
+
+    failing = check(_snapshot(tmp_path / "1"))
+
+    container = fake_container.instances[0]
+    assert container.options["workspace"].name.startswith("workspace.snapshot.check-")
+    assert not container.options["workspace"].exists()
+    assert [command for command, _ in container.commands] == [
+        "make generated",
+        "python -c 'assert False'",
+    ]
+    assert container.commands[1][1]["UV_OFFLINE"] == "1"
+    assert failing == CheckRun(1, False, None, "AssertionError")
+
+    fake_container.outcomes = [SessionCommandResult(_command(2), None, False)]
+    broken = check(_snapshot(tmp_path / "2"))
+    assert broken.failure == "the build command failed with exit 2: make generated"
 
 
 def test_timed_out_suite_has_no_results(
@@ -446,6 +485,25 @@ def test_red_step_finds_new_and_newly_failing_tests_and_what_they_reproduce() ->
     )
     assert reproduction(baseline, _suite({}, timed_out=True)) == Reproduction((), (), ())
     assert reproduction(baseline, _suite({"x": "failed"}, per_test=False)).targets == ()
+
+
+def test_without_per_test_results_the_suite_is_the_one_target() -> None:
+    baseline = summarize_baseline(
+        [_suite({SUITE_TEST_ID: "passed"}, per_test=False)] * 2, base_sha=_BASE_SHA
+    )
+
+    def red(message: str) -> SuiteRun:
+        result = CaseResult(SUITE_TEST_ID, "failed", 1.0, message)
+        return _suite({}, results={SUITE_TEST_ID: result}, per_test=False)
+
+    assert reproduction(baseline, red("AssertionError: 2 != 3")) == Reproduction(
+        (SUITE_TEST_ID,), (SUITE_TEST_ID,), ()
+    )
+    assert reproduction(baseline, red("ImportError: cannot import name 'add'")) == Reproduction(
+        (SUITE_TEST_ID,), (), ()
+    )
+    passing = _suite({SUITE_TEST_ID: "passed"}, per_test=False)
+    assert reproduction(baseline, passing) == Reproduction((SUITE_TEST_ID,), (), ())
 
 
 def test_green_step_needs_every_target_to_pass_in_every_run() -> None:
