@@ -121,11 +121,7 @@ class PublicationCheck:
 class PublicationHolds(Protocol):
     """A store that also records scoped holds that refuse publication."""
 
-    def assert_publication_not_held(
-        self,
-        repository: str,
-        pull_request_url: str | None = None,
-    ) -> None: ...
+    def assert_publication_not_held(self, repository: str) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -1162,12 +1158,69 @@ class Publisher:
         lease_guard.assert_owned()
         self._wait_for_fork(fork, manifest.repository.default_branch)
 
+    def _publication_gates(
+        self,
+        manifest: RunManifest,
+        *,
+        login: str,
+        branch: str,
+        patch: Callable[[], bytes],
+    ) -> list[tuple[str, Callable[[], None], str]]:
+        """What ``publish`` proves before its intent, in order: name, check, what passing means.
+
+        Holds apply only with stores that record them. A run waiting for approval has no bound
+        head yet, so its check binds the one its review would bind now.
+        """
+
+        assert manifest.candidate is not None
+        repository = manifest.candidate.repository
+        gates: list[tuple[str, Callable[[], None], str]] = []
+        store = self.store
+        if isinstance(store, PublicationHolds):
+            gates.append(
+                (
+                    "holds",
+                    lambda: store.assert_publication_not_held(repository),
+                    "no hold applies to this repository",
+                )
+            )
+
+        def check_head_repository() -> None:
+            contribution = patch()
+            if manifest.status == RunStatus.READY_FOR_APPROVAL:
+                manifest.head_repository = _review_head_repository(
+                    self.config,
+                    self.github,
+                    repository,
+                    login=login,
+                    patch=contribution,
+                )
+            self._check_head_repository(manifest, contribution)
+
+        gates += [
+            (
+                "head_repository",
+                check_head_repository,
+                "the branch and pull request can go where the review says",
+            ),
+            (
+                "limits",
+                lambda: self._check_account_limits(login, manifest, branch=branch),
+                "every publication limit has room",
+            ),
+            (
+                "freshness",
+                lambda: self._check_freshness(manifest),
+                "the issue, base branch and policy files still allow publishing",
+            ),
+        ]
+        return gates
+
     def check(self, run_id: str) -> tuple[PublicationCheck, ...]:
         """Report whether a prepared or approved run could publish now.
 
-        It runs the limit and freshness checks ``publish`` runs and changes nothing on GitHub or
-        in the run; a maintainer stop it reads still trips the breaker, as in discovery. Holds
-        are reported only by stores that record them.
+        It runs the checks ``publish`` runs before its intent and changes nothing on GitHub or
+        in the run; a maintainer stop it reads still trips the breaker, as in discovery.
         """
 
         manifest = self.store.get(run_id)
@@ -1188,16 +1241,6 @@ class Publisher:
                 else "no safety stop is active",
             )
         ]
-        store = self.store
-        repository = manifest.candidate.repository
-        if isinstance(store, PublicationHolds):
-            checks.append(
-                _policy_check(
-                    "holds",
-                    lambda: store.assert_publication_not_held(repository),
-                    passed="no hold applies to this repository",
-                )
-            )
         checks.append(_approval_check(manifest))
         # A run waiting for approval has no bound login yet; the review would bind this one.
         login = (
@@ -1205,21 +1248,18 @@ class Publisher:
             or publishing_account(self.config, self.github).login.strip().casefold()
         )
         subject = manifest.model_copy(update={"publishing_login": login})
-        branch = manifest.branch_name or self._branch_name(manifest)
-        checks.append(
-            _policy_check(
-                "limits",
-                lambda: self._check_account_limits(login, subject, branch=branch),
-                passed="every publication limit has room",
-            )
+        gates = self._publication_gates(
+            subject,
+            login=login,
+            branch=manifest.branch_name or self._branch_name(manifest),
+            patch=lambda: _read_approval_artifact(
+                self.store,
+                run_id,
+                "contribution.patch",
+                description="Contribution patch",
+            ),
         )
-        checks.append(
-            _policy_check(
-                "freshness",
-                lambda: self._check_freshness(subject),
-                passed="the issue, base branch and policy files still allow publishing",
-            )
-        )
+        checks.extend(_policy_check(name, gate, passed=passed) for name, gate, passed in gates)
         return tuple(checks)
 
     def abandon(self, run_id: str, *, reason: str) -> RunManifest:
@@ -1512,9 +1552,13 @@ class Publisher:
         branch = manifest.branch_name or self._branch_name(manifest)
 
         if not recovering:
-            self._check_head_repository(manifest, patch)
-            self._check_account_limits(login, manifest, branch=branch)
-            self._check_freshness(manifest)
+            for _, gate, _ in self._publication_gates(
+                manifest,
+                login=login,
+                branch=branch,
+                patch=lambda: patch,
+            ):
+                gate()
         workspace_path = self.store.workspace_dir(run_id) / "repository"
 
         self.store.assert_circuit_breaker_clear()
