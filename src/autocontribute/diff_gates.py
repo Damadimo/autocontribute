@@ -80,15 +80,19 @@ _LOCK_FILES: Final = frozenset(
 _WORKFLOW_FILES: Final = frozenset({".gitlab-ci.yml", "azure-pipelines.yml", "jenkinsfile"})
 _SYMLINK_MODE: Final = "120000"
 _SUBMODULE_MODE: Final = "160000"
-# A test that a patch removes: Python functions and classes, Go functions, JavaScript tests.
+# A JavaScript test or describe block, skipped, focused or table-driven: `it(`, `xit(`,
+# `describe.skip(`, `test.skip.each([...])(`.
+_JAVASCRIPT_TEST: Final = (
+    r"(?:(?:it|test|describe)(?:\.(?:only|skip|todo|concurrent))*|x(?:it|test|describe)"
+    r"|f(?:it|describe))(?:\.each\s*\(.*\)\s*)?"
+)
+# A test that a patch removes: Python functions and classes, Go functions, JavaScript tests
+# and describe blocks.
 _TEST_DEFINITIONS: Final = (
     re.compile(r"^\s*(?:async\s+)?def\s+(?P<name>test\w*)\s*\("),
     re.compile(r"^\s*class\s+(?P<name>Test\w*)\b"),
     re.compile(r"^func\s+(?P<name>Test\w*)\s*\("),
-    re.compile(
-        r"^\s*(?:it|test)(?:\.(?:only|skip|todo|concurrent))?\s*\(\s*"
-        r"(?P<quote>['\"`])(?P<name>.+?)(?P=quote)"
-    ),
+    re.compile(rf"^\s*{_JAVASCRIPT_TEST}\s*\(\s*(?P<quote>['\"`])(?P<name>.+?)(?P=quote)"),
 )
 _RUST_TEST_ATTRIBUTE: Final = re.compile(r"^\s*#\[\s*(?:tokio::)?test\b")
 # Markers that keep a test from running, or that focus a file on one test so the rest do not.
@@ -100,15 +104,19 @@ _CALL_SKIPS: Final = re.compile(
     r"\bpytest\.(?:skip|xfail)\s*\(|\.skipTest\s*\(|\braise\s+(?:unittest\.)?SkipTest\b"
     r"|\bt\.Skip(?:f|Now)?\s*\("
 )
+# Unindented, it skips every test of the module; inside a class, the class's tests.
+_PYTEST_MARK_SKIP: Final = re.compile(
+    r"^(?P<indent>\s*)pytestmark\s*=.*\bpytest\.mark\.(?:skip|skipif|xfail)\b"
+)
 _JAVASCRIPT_SKIP: Final = re.compile(
-    r"^\s*(?:(?:it|test|describe)\.(?:skip|todo)|x(?:it|test|describe))\s*\(\s*"
-    r"(?P<quote>['\"`])(?P<name>.+?)(?P=quote)"
+    r"^\s*(?P<kind>(?:it|test|describe)(?:\.concurrent)?\.(?:skip|todo)|x(?:it|test|describe))"
+    r"(?:\.each\s*\(.*\)\s*)?\s*\(\s*(?P<quote>['\"`])(?P<name>.+?)(?P=quote)"
 )
 _JAVASCRIPT_FOCUS: Final = re.compile(r"^\s*(?:(?:it|test|describe)\.only|f(?:it|describe))\s*\(")
 # A line that starts a function, class or test, for finding which test a marker belongs to.
 _DEFINITION: Final = re.compile(
     r"^\s*(?:(?:async\s+)?def\s|class\s|func\s|(?:pub\s+)?(?:async\s+)?fn\s"
-    r"|(?:it|test|describe)(?:\.\w+)?\s*\()"
+    rf"|{_JAVASCRIPT_TEST}\s*\()"
 )
 
 
@@ -364,31 +372,39 @@ def _test_name(code: str) -> str | None:
 def _skipped_existing(file: FilePatch, removed: Sequence[str]) -> Iterator[str]:
     """Yield the added lines that skip or focus a test the patch did not add.
 
-    A decorator belongs to the next definition and a call such as ``pytest.skip()`` to the one
-    before it; a definition on an added line is new. When the hunk shows no definition, the
-    test is taken to exist already.
+    A decorator, and a skipped describe block, belongs to the next definition, and a call such
+    as ``pytest.skip()`` or a class's ``pytestmark`` to the one before it; a definition on an
+    added line is new. When the hunk shows no definition, the test is taken to exist already.
+    A module's ``pytestmark`` skips every test of a file the patch did not create.
     """
 
+    new_file = "\nnew file mode " in file.header
     for lines in _hunk_lines(file):
         for index, line in enumerate(lines):
             if not line.startswith("+"):
                 continue
             code = line[1:]
+            following = (other for other in lines[index + 1 :] if not other.startswith("-"))
+            preceding = (other for other in reversed(lines[:index]) if not other.startswith("-"))
+            module_mark = _PYTEST_MARK_SKIP.match(code)
             if _JAVASCRIPT_FOCUS.match(code):
                 yield code.strip()
                 continue
             javascript = _JAVASCRIPT_SKIP.match(code)
             if javascript is not None:
-                if javascript.group("name") in removed:
+                wraps = "describe" in javascript.group("kind")
+                inner = next((other for other in following if _DEFINITION.match(other[1:])), None)
+                existing = inner is None or not inner.startswith("+")
+                if javascript.group("name") in removed or (wraps and existing):
+                    yield code.strip()
+                continue
+            if module_mark is not None and not module_mark.group("indent"):
+                if not new_file:
                     yield code.strip()
                 continue
             if _DECORATOR_SKIPS.match(code):
-                following = (other for other in lines[index + 1 :] if not other.startswith("-"))
                 owner = next((other for other in following if _DEFINITION.match(other[1:])), None)
-            elif _CALL_SKIPS.search(code):
-                preceding = (
-                    other for other in reversed(lines[:index]) if not other.startswith("-")
-                )
+            elif _CALL_SKIPS.search(code) or module_mark is not None:
                 owner = next((other for other in preceding if _DEFINITION.match(other[1:])), None)
             else:
                 continue
