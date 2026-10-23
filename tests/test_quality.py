@@ -10,7 +10,6 @@ from autocontribute.quality import (
     QualityEvaluator,
     actionable_validation_failure_reason,
     infrastructure_failure_reason,
-    secret_findings,
 )
 
 
@@ -199,27 +198,6 @@ def test_unsafe_diff_fails_file_and_policy_gates_without_leaking_secret() -> Non
     assert not gates["secret_scan"]
     serialized = report.model_dump_json()
     assert "ghp_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ" not in serialized
-
-
-def test_secret_findings_use_the_shared_credential_patterns() -> None:
-    # Assembled at runtime so the repository secret scan does not report this file.
-    tokens = {
-        "GitHub token": "ghp_" + "a1" * 12,
-        "GitLab token": "glpat-" + "c" * 20,
-        "npm token": "npm_" + "d" * 36,
-        "JSON Web Token": ".".join(("eyJ" + "a" * 12, "eyJ" + "b" * 12, "c" * 12)),
-    }
-    added = "".join(f"+value = '{token}'\n" for token in tokens.values())
-    diff = (
-        "diff --git a/tests/fixtures.py b/tests/fixtures.py\n"
-        "new file mode 100644\n"
-        "--- /dev/null\n"
-        "+++ b/tests/fixtures.py\n"
-        f"@@ -0,0 +1,{len(tokens)} @@\n"
-        f"{added}"
-    )
-
-    assert secret_findings(diff) == sorted(f"{label} in tests/fixtures.py" for label in tokens)
 
 
 def test_policy_can_allow_dependency_and_workflow_changes_explicitly() -> None:

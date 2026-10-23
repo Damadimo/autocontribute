@@ -19,7 +19,8 @@ MAX_ARTIFACT_CHARACTERS: Final = 100_000
 # Shorter environment values match ordinary text too often to be treated as secrets.
 _MIN_SECRET_VALUE_LENGTH: Final = 8
 
-# The one credential pattern set shared by scrubbing, the diff scanner and publication checks.
+# The credential patterns shared by model-input scrubbing, artifact redaction and publication
+# checks. The diff scanner keeps its own set while any of its hits trips the global breaker.
 HIGH_CONFIDENCE_TOKEN_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     (
         "GitHub token",
