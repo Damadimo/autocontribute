@@ -3,13 +3,11 @@
 System prompts stay byte-stable for a run, so every per-run fact goes in the first user message:
 the issue, the project's guidance, the environment, and for the critic the change and the
 controller's results. Text that the repository, the issue, its commenters or a model wrote is
-untrusted. It goes into an ``<untrusted_data>`` block of JSON whose ``<``, ``>`` and ``&`` are
-escaped, so nothing inside can close the block, after the host's secret values are scrubbed.
+untrusted, and goes into an :func:`autocontribute.untrusted.untrusted_block`.
 """
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -26,12 +24,10 @@ from autocontribute.environments import EnvironmentBaseline, EnvironmentRecipe
 from autocontribute.exceptions import PolicyError
 from autocontribute.fix_checks import FixCheckResult, SuiteRunEvidence
 from autocontribute.pr_template import is_pull_request_template, select_pull_request_template
-from autocontribute.redaction import scrub_for_model
 from autocontribute.repository import RepositoryWorkspace
 from autocontribute.submissions import AgentSubmission, ReviewBlocker
+from autocontribute.untrusted import untrusted_block
 
-UNTRUSTED_OPEN: Final = '<untrusted_data encoding="json">'
-UNTRUSTED_CLOSE: Final = "</untrusted_data>"
 # Each guidance file, each policy file and the issue body is cut to this (DESIGN §6.4).
 FILE_CHARACTERS: Final = 20_000
 # What all guidance files may take together; later files are named, not quoted.
@@ -91,16 +87,6 @@ class RunFacts:
     baseline: EnvironmentBaseline
     # The repository's AI-contribution policy as discovery read it; None when not read.
     ai_policy: RepositoryAiPolicy | None
-
-
-def untrusted_block(label: str, value: JsonValue, *, host_values: frozenset[str]) -> str:
-    """Wrap text from outside the controller so the model reads it as data."""
-
-    payload = {"label": label, "trust": "untrusted", "data": _scrubbed(value, host_values)}
-    encoded = json.dumps(payload, ensure_ascii=False, indent=2)
-    # JSON leaves angle brackets alone; escaped, nothing inside can close the block.
-    encoded = encoded.replace("&", r"\u0026").replace("<", r"\u003c").replace(">", r"\u003e")
-    return f"{UNTRUSTED_OPEN}\n{encoded}\n{UNTRUSTED_CLOSE}"
 
 
 def read_guidance(
@@ -195,7 +181,7 @@ def agent_task(
     policy = _policy_text(facts.ai_policy, host_values)
     if policy is not None:
         sections.append(_section("The repository's AI policy", policy))
-    sections.append(_section("Environment", _environment_text(facts)))
+    sections.append(_section("Environment", _environment_text(facts, host_values)))
     return "\n\n".join(sections) + "\n"
 
 
@@ -260,7 +246,7 @@ def critic_task(
                 host_values=host_values,
             ),
         ),
-        _section("The controller's results", _check_text(check)),
+        _section("The controller's results", _check_text(check, host_values)),
     ]
     if check.test_waiver_needed:
         sections.append(
@@ -465,7 +451,7 @@ def _policy_text(policy: RepositoryAiPolicy | None, host_values: frozenset[str])
     )
 
 
-def _environment_text(facts: RunFacts) -> str:
+def _environment_text(facts: RunFacts, host_values: frozenset[str]) -> str:
     baseline = facts.baseline
     lines = [
         "- A Linux container with no network access; the dependencies are installed.",
@@ -473,12 +459,13 @@ def _environment_text(facts: RunFacts) -> str:
         f"- Before any change, that command reported: {baseline_summary(baseline)}",
     ]
     if baseline.fail_before:
-        listed = ", ".join(baseline.fail_before[:_LISTED_TESTS])
         more = len(baseline.fail_before) - _LISTED_TESTS
+        listed: list[JsonValue] = [*baseline.fail_before[:_LISTED_TESTS]]
+        if more > 0:
+            listed.append(f"and {more} more")
         lines.append(
-            "- These tests already failed before any change; they are not yours to fix: "
-            + listed
-            + (f" and {more} more" if more > 0 else "")
+            "- These tests already failed before any change; they are not yours to fix:\n"
+            + untrusted_block("tests failing before any change", listed, host_values=host_values)
         )
     if baseline.timed_out:
         lines.append(
@@ -488,37 +475,44 @@ def _environment_text(facts: RunFacts) -> str:
     return "\n".join(lines)
 
 
-def _check_text(check: FixCheckResult) -> str:
-    lines = [
-        "Gates:",
-        *(
-            f"- {'pass' if gate.passed else 'FAIL'} {gate.gate}: {gate.evidence}"
-            for gate in check.gates
-        ),
-    ]
+def _check_text(check: FixCheckResult, host_values: frozenset[str]) -> str:
+    """Return the statuses as controller text and the details as untrusted data.
+
+    The details name the repository's tests and files.
+    """
+
+    failed = [gate.gate for gate in check.gates if not gate.passed]
+    lines = ["Gates: " + (f"failed: {', '.join(failed)}." if failed else "all passed.")]
+    data: dict[str, JsonValue] = {
+        "gates": [gate.model_dump(mode="json") for gate in check.gates],
+        "red_green": None,
+        "regression": None,
+    }
     red_green = check.red_green
     if red_green is not None:
-        lines += ["", f"Red/green: {red_green.status}: {red_green.detail}."]
-        if red_green.reproduced:
-            lines.append("Failing without the fix: " + ", ".join(red_green.reproduced))
-        lines += [_run_line(run) for run in red_green.runs]
+        lines.append(f"Red/green: {red_green.status}.")
+        data["red_green"] = {
+            "detail": red_green.detail,
+            "targets": list(red_green.targets),
+            "reproduced": list(red_green.reproduced),
+            "uncollected": list(red_green.uncollected),
+            "runs": [_run_data(run) for run in red_green.runs],
+        }
     regression = check.regression
     if regression is not None:
-        lines += [
-            "",
-            f"Patched suite against the baseline: {regression.status}: {regression.detail}.",
-        ]
-        lines += [_run_line(run) for run in regression.runs]
+        lines.append(f"Patched suite against the baseline: {regression.status}.")
+        data["regression"] = {
+            "detail": regression.detail,
+            "full_suite": regression.full_suite,
+            "new_failures": list(regression.new_failures),
+            "runs": [_run_data(run) for run in regression.runs],
+        }
+    lines.append(untrusted_block("controller results", data, host_values=host_values))
     return "\n".join(lines)
 
 
-def _run_line(run: SuiteRunEvidence) -> str:
-    timed_out = " (timed out)" if run.timed_out else ""
-    failure = f"; {run.failure}" if run.failure else ""
-    return (
-        f"- {run.kind} run `{run.command}`: {run.passed} passed, {run.failed} failed, "
-        f"{run.skipped} skipped{timed_out}{failure}"
-    )
+def _run_data(run: SuiteRunEvidence) -> dict[str, JsonValue]:
+    return run.model_dump(mode="json", exclude={"output_tail"})
 
 
 def _signals_text(signals: RepositorySignals, host_values: frozenset[str]) -> str:
@@ -596,20 +590,8 @@ def _chosen_templates(templates: tuple[GuidanceFile, ...]) -> tuple[GuidanceFile
     return tuple(file for file in templates if file.path == selected[0])
 
 
-def _scrubbed(value: JsonValue, host_values: frozenset[str]) -> JsonValue:
-    if isinstance(value, str):
-        return scrub_for_model(value, host_values)
-    if isinstance(value, list):
-        return [_scrubbed(item, host_values) for item in value]
-    if isinstance(value, dict):
-        return {key: _scrubbed(item, host_values) for key, item in value.items()}
-    return value
-
-
 __all__ = [
     "FILE_CHARACTERS",
-    "UNTRUSTED_CLOSE",
-    "UNTRUSTED_OPEN",
     "Guidance",
     "GuidanceFile",
     "RunFacts",
@@ -621,5 +603,4 @@ __all__ = [
     "read_guidance",
     "setup_task",
     "triage_task",
-    "untrusted_block",
 ]

@@ -954,6 +954,7 @@ def test_critic_blockers_continue_the_same_transcript_in_a_new_round(
     assert after[: len(before) - 1] == before[:-1]
     message = next(text for text in _texts(solver.loop.transcript) if "reviewer" in text)
     assert message.startswith("A reviewer checked the change you submitted")
+    assert '<untrusted_data encoding="json">' in message
     assert '"fix_hint": "Add a test for add(2, 2)."' in message
     assert solver.loop.turns == 6
 
