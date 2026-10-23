@@ -1,13 +1,16 @@
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from autocontribute.ai_policy import AiPolicyQuote, PolicyFile, RepositoryAiPolicy
 from autocontribute.config import (
     CLA_ATTESTATION_STATEMENT,
     DCO_ATTESTATION_STATEMENT,
     AutocontributeConfig,
 )
 from autocontribute.discovery import (
+    AI_POLICY_EVIDENCE_KEY,
     LEGAL_ATTESTATION_EVIDENCE_KEY,
     LEGAL_POLICY_EVIDENCE_KEY,
     MAX_POLICY_FILE_BYTES,
@@ -25,6 +28,7 @@ from autocontribute.discovery import (
     validate_legal_publication,
 )
 from autocontribute.domain import (
+    EligibilityResult,
     IssueCandidate,
     IssueComment,
     RepositoryInfo,
@@ -1711,7 +1715,210 @@ def test_organization_ai_prohibition_fails_closed(tmp_path) -> None:
     result = service.evaluate(_issue(), _repository())
 
     assert not result.eligible
-    assert "prohibit AI-assisted" in " ".join(result.blockers)
+    assert result.blockers == [
+        "the repository's AI policy bans agent-made contributions: \"AI-assisted or generated "
+        'code is not accepted and will be closed." (example/.github/AI_POLICY.md)'
+    ]
+
+
+class PolicyCandidateGitHub(PolicyGitHub, CandidateDiscoveryGitHub):
+    """Serves issues for discovery and policy files from a map."""
+
+    def __init__(self, issues: list[IssueCandidate], files: dict[tuple[str, str], str]) -> None:
+        CandidateDiscoveryGitHub.__init__(self, issues)
+        PolicyGitHub.__init__(self, files)
+
+
+class RecordingClassifier:
+    def __init__(self, result: RepositoryAiPolicy) -> None:
+        self.result = result
+        self.calls: list[list[str]] = []
+
+    def classify(
+        self, repository: RepositoryInfo, files: Sequence[PolicyFile]
+    ) -> RepositoryAiPolicy:
+        del repository
+        self.calls.append([file.path for file in files])
+        return self.result
+
+
+def _ai_policy_evidence(result: EligibilityResult) -> RepositoryAiPolicy:
+    return RepositoryAiPolicy.model_validate_json(result.evidence[AI_POLICY_EVIDENCE_KEY])
+
+
+def test_ai_policy_ban_skips_the_repository_with_its_quote(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyCandidateGitHub(
+        [_issue()],
+        {
+            ("example/project", "CONTRIBUTING.rst"): (
+                "Thanks for helping.\n\nPurely agentic contributions are not accepted.\n"
+            )
+        },
+    )
+    service = DiscoveryService(_discovery_config("example/project"), github, RunStore(tmp_path))  # type: ignore[arg-type]
+
+    outcome = service.discover()
+
+    assert outcome.selection is None
+    assert github.fetched == []
+    assert outcome.skipped_repositories == (
+        (
+            "example/project",
+            "the repository's AI policy bans agent-made contributions: \"Purely agentic "
+            'contributions are not accepted." (example/project/CONTRIBUTING.rst)',
+        ),
+    )
+
+
+def test_human_written_text_policy_blocks_unless_the_repository_opts_in(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): "Contribution guidelines.",
+            ("example/project", "doc/ai_policy.rst"): "Unread: nested outside docs/.",
+            ("example/project", "docs/ai_policy.rst"): (
+                "AI tools may help you write code. You must not use AI to speak for you."
+            ),
+        }
+    )
+    blocked = DiscoveryService(AutocontributeConfig(), github, RunStore(tmp_path / "a"))._assess(  # type: ignore[arg-type]
+        _issue(), _repository()
+    )
+    opted_in = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig.model_validate(
+            {"policy": {"allow_conditional_ai_policy": ["Example/Project"]}}
+        ),
+        github,
+        RunStore(tmp_path / "b"),
+    ).evaluate(_issue(), _repository())
+
+    assert blocked.blocker_kinds == ("AI policy",)
+    assert "policy.allow_conditional_ai_policy" in blocked.eligibility.blockers[0]
+    assert opted_in.eligible
+    policy = _ai_policy_evidence(opted_in)
+    assert policy.stance == "conditional"
+    assert policy.requires_human_written_text
+    assert [quote.text for quote in policy.quotes] == ["You must not use AI to speak for you."]
+
+
+def test_linked_policy_pages_decide_like_the_guide_itself(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    llvm = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "See the [AI tool policy](llvm/docs/AIToolPolicy.md)."
+            ),
+            ("example/project", "llvm/docs/AIToolPolicy.md"): (
+                "Using AI tools to fix issues labelled as 'good first issues' is forbidden. "
+                "Contributors must read and review all LLM-generated code. Add an "
+                "`Assisted-by: <name of code assistant>` trailer."
+            ),
+        }
+    )
+    qemu = PolicyGitHub(
+        {
+            ("example/project", "README.rst"): "Contributors read ``docs/devel``.",
+            ("example/project", "docs/CONTRIBUTING.rst"): (
+                "Read `code provenance <devel/code-provenance.rst>`_ first."
+            ),
+            ("example/project", "docs/devel/code-provenance.rst"): (
+                "Current QEMU project policy is to DECLINE any contributions which are believed "
+                "to include or derive from AI generated content."
+            ),
+        }
+    )
+
+    allowed = DiscoveryService(AutocontributeConfig(), llvm, RunStore(tmp_path / "a")).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository()
+    )
+    declined = DiscoveryService(AutocontributeConfig(), qemu, RunStore(tmp_path / "b"))._assess(  # type: ignore[arg-type]
+        _issue(), _repository()
+    )
+
+    assert allowed.eligible, allowed.blockers
+    assert _ai_policy_evidence(allowed).requires_disclosure
+    assert declined.blocker_kinds == ("AI policy",)
+    assert "docs/devel/code-provenance.rst" in declined.eligibility.blockers[0]
+
+
+def test_verified_classifier_reading_replaces_the_deterministic_one_and_is_cached(
+    tmp_path,
+) -> None:  # type: ignore[no-untyped-def]
+    files = {
+        ("example/project", "CONTRIBUTING.md"): (
+            "We do not accept pull requests generated by AI without disclosure."
+        )
+    }
+    github = PolicyGitHub(files)
+    store = RunStore(tmp_path)
+    reading = RepositoryAiPolicy(
+        stance="conditional",
+        requires_disclosure=True,
+        quotes=[
+            AiPolicyQuote(
+                repository="example/project",
+                path="CONTRIBUTING.md",
+                text="We do not accept pull requests generated by AI without disclosure.",
+            )
+        ],
+    )
+    classifier = RecordingClassifier(reading)
+
+    classified = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, store, policy_classifier=classifier
+    ).evaluate(_issue(), _repository())
+    reused = DiscoveryService(AutocontributeConfig(), github, store).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository()
+    )
+    files[("example/project", "CONTRIBUTING.md")] += " Such pull requests will be closed."
+    changed = DiscoveryService(AutocontributeConfig(), github, store).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository()
+    )
+
+    assert classifier.calls == [["CONTRIBUTING.md"]]
+    assert classified.eligible
+    assert _ai_policy_evidence(classified) == reading
+    assert reused.eligible
+    assert _ai_policy_evidence(reused) == reading
+    assert not changed.eligible
+    assert _ai_policy_evidence(changed).stance == "ban"
+
+
+def test_classifier_ban_that_fails_verification_skips_the_repository(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub(
+        {("example/project", "CONTRIBUTING.md"): "AI-assisted contributions are welcome."}
+    )
+    classifier = RecordingClassifier(
+        RepositoryAiPolicy(
+            stance="ban",
+            quotes=[
+                AiPolicyQuote(
+                    repository="example/project",
+                    path="CONTRIBUTING.md",
+                    text="AI contributions are banned.",
+                )
+            ],
+        )
+    )
+
+    result = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, RunStore(tmp_path), policy_classifier=classifier
+    ).evaluate(_issue(), _repository())
+
+    assert result.blockers == [
+        "the repository's AI policy could not be verified: no quoted passage appears in its "
+        "policy files"
+    ]
+
+
+def test_classifier_is_not_asked_about_policies_that_never_mention_ai(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    classifier = RecordingClassifier(RepositoryAiPolicy(stance="ban"))
+
+    result = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), FakeGitHub(), RunStore(tmp_path), policy_classifier=classifier
+    ).evaluate(_issue(), _repository())
+
+    assert result.eligible
+    assert classifier.calls == []
+    assert _ai_policy_evidence(result) == RepositoryAiPolicy(stance="none")
 
 
 def test_unresolved_dco_attestation_fails_closed(tmp_path) -> None:
@@ -2116,7 +2323,7 @@ def test_organization_automation_prohibition_fails_closed(tmp_path) -> None:
         {
             ("example/project", "CONTRIBUTING.md"): "Ordinary contribution guidance.",
             ("example/.github", "AI-CONTRIBUTIONS.md"): (
-                "Automated contributions are not allowed and will be closed."
+                "Fully automated contributions are not allowed and will be closed."
             ),
         }
     )
@@ -2125,7 +2332,7 @@ def test_organization_automation_prohibition_fails_closed(tmp_path) -> None:
     result = service.evaluate(_issue(), _repository())
 
     assert not result.eligible
-    assert "automated" in " ".join(result.blockers)
+    assert "AI policy bans agent-made contributions" in " ".join(result.blockers)
 
 
 def test_organization_dco_attestation_fails_closed(tmp_path) -> None:
@@ -2183,7 +2390,7 @@ def test_policy_source_fingerprint_detects_benign_organization_policy_change(
                     "We reject AI-generated contributions."
                 ),
             },
-            "AI-assisted",
+            "docs/CONTRIBUTION_POLICY.md",
         ),
         (
             {
@@ -2192,7 +2399,7 @@ def test_policy_source_fingerprint_detects_benign_organization_policy_change(
                     "Bot-authored pull requests are forbidden."
                 ),
             },
-            "automated",
+            "example/.github/PULL_REQUEST_TEMPLATE.md",
         ),
     ],
 )
@@ -2309,7 +2516,7 @@ def test_policy_surface_reads_fixed_directories_and_organization_template_direct
     assert snapshot.repository_paths == ("CONTRIBUTING.md", "docs/ai-contributions.md")
     assert snapshot.organization_paths == (".github/PULL_REQUEST_TEMPLATE/verification.md",)
     assert not result.eligible
-    assert "AI-assisted" in " ".join(result.blockers)
+    assert "docs/ai-contributions.md" in " ".join(result.blockers)
     assert service.organization_pull_request_templates("example/project") == {
         ".github/PULL_REQUEST_TEMPLATE/verification.md": "## Verification\n"
     }

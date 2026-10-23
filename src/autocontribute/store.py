@@ -18,6 +18,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final, cast
 
+from autocontribute.ai_policy import RepositoryAiPolicy
 from autocontribute.domain import (
     ALLOWED_TRANSITIONS,
     TERMINAL_STATUSES,
@@ -36,6 +37,7 @@ _MAX_ACTIVE_CIRCUIT_BREAKER_TRIGGERS: Final = 10_000
 _MAX_RUN_CORPUS: Final = 10_000
 _CANDIDATE_REPOSITORY: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_SHA256: Final = re.compile(r"^[0-9a-f]{64}$")
 _INITIAL_EVENT_HASH: Final = "0" * 64
 _METADATA_COLUMNS: Final = {"singleton", "schema_version", "migrated_at"}
 _RUN_COLUMNS: Final = {
@@ -110,6 +112,12 @@ _CANDIDATE_RETRY_AUTHORIZATION_COLUMNS: Final = {
     "actor",
     "reason",
     "authorized_at",
+}
+_REPOSITORY_POLICY_COLUMNS: Final = {
+    "repository",
+    "policy_sha256",
+    "policy_json",
+    "recorded_at",
 }
 _REQUIRED_INDEXES: Final = {
     "runs_status_idx",
@@ -917,6 +925,7 @@ class RunStore:
             "publication_reservations",
             "manifest_artifact_sync",
             "candidate_retry_authorizations",
+            "repository_policies",
         }:
             raise StateError(f"Refusing to inspect unexpected state table: {table}")
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -1106,6 +1115,17 @@ class RunStore:
                 CHECK(run_id <> prior_run_id)
             )
             """,
+            """
+            CREATE TABLE repository_policies (
+                repository TEXT PRIMARY KEY COLLATE NOCASE,
+                policy_sha256 TEXT NOT NULL CHECK(
+                    length(policy_sha256) = 64
+                    AND policy_sha256 NOT GLOB '*[^0-9a-f]*'
+                ),
+                policy_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL
+            )
+            """,
         )
         for statement in statements:
             connection.execute(statement)
@@ -1178,6 +1198,7 @@ class RunStore:
             "publication_reservations": _PUBLICATION_RESERVATION_COLUMNS,
             "manifest_artifact_sync": _MANIFEST_ARTIFACT_SYNC_COLUMNS,
             "candidate_retry_authorizations": _CANDIDATE_RETRY_AUTHORIZATION_COLUMNS,
+            "repository_policies": _REPOSITORY_POLICY_COLUMNS,
         }
         tables = cls._table_names(connection)
         if tables != set(expected):
@@ -1259,6 +1280,49 @@ class RunStore:
                 "SELECT manifest_json FROM runs ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [RunManifest.model_validate_json(row["manifest_json"]) for row in rows]
+
+    def repository_ai_policy(
+        self, repository: str, policy_sha256: str
+    ) -> RepositoryAiPolicy | None:
+        """Return the AI-policy reading cached for exactly these policy files, if there is one."""
+
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT policy_json FROM repository_policies
+                WHERE repository = ? AND policy_sha256 = ?
+                """,
+                (repository, policy_sha256),
+            ).fetchone()
+        if row is None:
+            return None
+        return RepositoryAiPolicy.model_validate_json(row["policy_json"])
+
+    def record_repository_ai_policy(
+        self,
+        repository: str,
+        policy_sha256: str,
+        policy: RepositoryAiPolicy,
+    ) -> None:
+        """Cache an AI-policy reading, replacing the one for the repository's older files."""
+
+        if not _CANDIDATE_REPOSITORY.fullmatch(repository) or not _SHA256.fullmatch(policy_sha256):
+            raise StateError(
+                "Repository policy cache keys must be an owner/name and a SHA-256 hex digest"
+            )
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO repository_policies(
+                    repository, policy_sha256, policy_json, recorded_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(repository) DO UPDATE SET
+                    policy_sha256 = excluded.policy_sha256,
+                    policy_json = excluded.policy_json,
+                    recorded_at = excluded.recorded_at
+                """,
+                (repository, policy_sha256, policy.model_dump_json(), utc_now().isoformat()),
+            )
 
     def list_open_pull_request_runs(self, *, limit: int = 1_000) -> builtins.list[RunManifest]:
         """Return every lifecycle-managed PR, failing instead of truncating the set."""
