@@ -1,14 +1,15 @@
 """Provider-native transcripts for multi-turn tool calling.
 
-A transcript is bound to one model, one tool set and one set of instructions, and it only grows.
+A transcript is bound to one model and effort, one tool set and one set of instructions, and it
+only grows.
 Every request replays all of its items byte for byte: that keeps the provider's prompt cache warm
 and keeps earlier Anthropic thinking blocks valid, and editing an earlier item breaks both.
 Callers truncate and scrub text before they append it; nothing here rewrites it later.
 
 A conversation runs in this order:
 
-1. ``start_transcript`` fixes the model, the kind (and with it the tools) and the instructions,
-   and adds the task.
+1. ``start_transcript`` fixes the model, the effort, the kind (and with it the tools) and the
+   instructions, and adds the task.
 2. Reserve ``next_input_reservation(transcript)`` input tokens and the turn's output cap, then
    call ``TurnProvider.step``. A turn that stopped at ``max_output_tokens`` is not appended:
    send the same transcript again with a larger cap.
@@ -29,7 +30,7 @@ from typing import Final, Literal, TypeVar
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 
 from autocontribute.domain import DomainModel
-from autocontribute.pricing import MODELS, ModelUsage, Provider
+from autocontribute.pricing import MODELS, Effort, ModelUsage, Provider
 from autocontribute.submissions import (
     AgentSubmission,
     PolicySubmission,
@@ -259,6 +260,8 @@ class Transcript(DomainModel):
     """
 
     model: str
+    # Fixed per conversation like the model: a change of effort misses the prompt cache.
+    effort: Effort
     kind: TranscriptKind
     # Names the run in the provider's prompt cache key.
     run_id: str = Field(pattern=_RUN_ID_PATTERN)
@@ -279,6 +282,12 @@ class Transcript(DomainModel):
             raise ValueError("model must be an id from the built-in model table")
         return value
 
+    @model_validator(mode="after")
+    def model_supports_the_effort(self) -> Transcript:
+        if self.effort not in MODELS[self.model].efforts:
+            raise ValueError(f"{self.model} does not support reasoning effort {self.effort}")
+        return self
+
     @property
     def provider(self) -> Provider:
         return MODELS[self.model].provider
@@ -293,6 +302,7 @@ class Transcript(DomainModel):
 def start_transcript(
     *,
     model: str,
+    effort: Effort,
     kind: TranscriptKind,
     run_id: str,
     instructions: str,
@@ -300,12 +310,14 @@ def start_transcript(
 ) -> Transcript:
     """Start a conversation of one kind with ``model``, with ``task`` as its first message.
 
-    ``model`` is an id from the built-in table, and ``run_id`` names the run in the provider's
-    prompt cache key. ``instructions`` must stay byte-stable for the whole conversation, so
-    per-run facts belong in ``task``.
+    ``model`` is an id from the built-in table and ``effort`` one of its reasoning efforts, and
+    ``run_id`` names the run in the provider's prompt cache key. ``instructions`` must stay
+    byte-stable for the whole conversation, so per-run facts belong in ``task``.
     """
 
-    transcript = Transcript(model=model, kind=kind, run_id=run_id, instructions=instructions)
+    transcript = Transcript(
+        model=model, effort=effort, kind=kind, run_id=run_id, instructions=instructions
+    )
     append_user_text(transcript, task)
     return transcript
 

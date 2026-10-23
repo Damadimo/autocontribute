@@ -88,7 +88,9 @@ _ANTHROPIC_BASH_CALL: dict[str, JsonValue] = {
 
 
 def _transcript(model: str = "gpt-5.6-sol", kind: TranscriptKind = "agent") -> Transcript:
-    return Transcript(model=model, kind=kind, run_id=_RUN_ID, instructions="Fix the issue.")
+    return Transcript(
+        model=model, effort="high", kind=kind, run_id=_RUN_ID, instructions="Fix the issue."
+    )
 
 
 def _openai_turn(*items: dict[str, JsonValue]) -> Turn:
@@ -215,13 +217,19 @@ def test_tool_definitions_are_byte_stable_and_returned_as_copies() -> None:
     )
 
 
-def test_transcript_is_bound_to_a_table_model_and_a_safe_run_id() -> None:
+def test_transcript_is_bound_to_a_table_model_its_effort_and_a_safe_run_id() -> None:
     assert _transcript().provider == "openai"
     assert _transcript("claude-sonnet-5-5").provider == "anthropic"
     with pytest.raises(ValidationError, match="built-in model table"):
         _transcript("gpt-5.6")
     with pytest.raises(ValidationError, match="run_id"):
-        Transcript(model="gpt-5.6-sol", kind="agent", run_id="../x", instructions="Fix it.")
+        Transcript(
+            model="gpt-5.6-sol", effort="high", kind="agent", run_id="../x", instructions="Fix it."
+        )
+    with pytest.raises(ValidationError, match=r"gpt-5\.5 does not support reasoning effort max"):
+        Transcript(
+            model="gpt-5.5", effort="max", kind="agent", run_id=_RUN_ID, instructions="Fix it."
+        )
 
 
 @pytest.mark.parametrize(
@@ -672,14 +680,16 @@ def test_tool_call_ids_are_bounded_identifiers(call_id: str) -> None:
 def test_start_transcript_binds_the_conversation_and_adds_the_task() -> None:
     transcript = start_transcript(
         model="claude-sonnet-5-5",
+        effort="medium",
         kind="setup",
         run_id=_RUN_ID,
         instructions="Set up the test environment.",
         task="Repository: octo/widgets.",
     )
 
-    assert (transcript.model, transcript.kind, transcript.run_id) == (
+    assert (transcript.model, transcript.effort, transcript.kind, transcript.run_id) == (
         "claude-sonnet-5-5",
+        "medium",
         "setup",
         _RUN_ID,
     )

@@ -17,7 +17,7 @@ from autocontribute.exceptions import (
     ModelRequestError,
     ModelTimeoutError,
 )
-from autocontribute.pricing import API_KEY_ENVS, MODELS, ModelUsage
+from autocontribute.pricing import API_KEY_ENVS, MODELS, Effort, ModelUsage
 from autocontribute.providers import (
     _MODEL_TURN_PROTOCOL,
     _MODEL_WORKER_PROTOCOL,
@@ -109,8 +109,14 @@ def _reply(**overrides: object) -> dict[str, object]:
     return {**reply, **overrides}
 
 
-def _transcript(model: str = "gpt-5.6-sol", kind: TranscriptKind = "agent") -> Transcript:
-    transcript = Transcript(model=model, kind=kind, run_id=_RUN_ID, instructions="Fix the issue.")
+def _transcript(
+    model: str = "gpt-5.6-sol",
+    kind: TranscriptKind = "agent",
+    effort: Effort = "high",
+) -> Transcript:
+    transcript = Transcript(
+        model=model, effort=effort, kind=kind, run_id=_RUN_ID, instructions="Fix the issue."
+    )
     append_user_text(transcript, "Fix issue 12.")
     return transcript
 
@@ -136,7 +142,7 @@ def _provider(
         "_model_worker_command",
         lambda: (sys.executable, str(worker), reply_argument, str(record)),
     )
-    return SubprocessTurnProvider(spec, "high"), record
+    return SubprocessTurnProvider(spec), record
 
 
 def _parse(envelope: dict[str, object], kind: TranscriptKind = "agent") -> Turn:
@@ -148,7 +154,7 @@ def test_turn_round_trips_through_a_worker_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider, record = _provider(tmp_path, monkeypatch, _reply())
-    transcript = _transcript()
+    transcript = _transcript(effort="xhigh")
 
     turn = provider.step(transcript=transcript, max_output_tokens=32_000, timeout_seconds=30)
 
@@ -169,7 +175,7 @@ def test_turn_round_trips_through_a_worker_process(
     assert json.loads(record.read_text(encoding="utf-8"))["request"] == {
         "protocol": "autocontribute.model-turn.v1",
         "model_id": "gpt-5.6-sol",
-        "effort": "high",
+        "effort": "xhigh",
         "instructions": "Fix the issue.",
         "transcript": {"kind": "agent", "run_id": _RUN_ID, "items": transcript.items},
         "max_output_tokens": 32_000,
@@ -238,7 +244,9 @@ def test_step_refuses_a_transcript_that_is_not_waiting_for_the_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider, record = _provider(tmp_path, monkeypatch, _reply())
-    empty = Transcript(model="gpt-5.6-sol", kind="agent", run_id=_RUN_ID, instructions="Fix it.")
+    empty = Transcript(
+        model="gpt-5.6-sol", effort="high", kind="agent", run_id=_RUN_ID, instructions="Fix it."
+    )
     with_open_call = _transcript()
     append_turn(with_open_call, _parse(_reply()))
 
@@ -277,14 +285,11 @@ def test_oversized_request_is_refused_before_a_worker_starts(
     assert not record.exists()
 
 
-def test_provider_needs_a_supported_effort_and_its_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", _API_KEY)
-    with pytest.raises(ConfigurationError, match="does not support reasoning effort max"):
-        SubprocessTurnProvider(MODELS["gpt-5.5"], "max")
+def test_provider_needs_its_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
-    monkeypatch.delenv("OPENAI_API_KEY")
     with pytest.raises(ConfigurationError, match="OPENAI_API_KEY"):
-        SubprocessTurnProvider(MODELS["gpt-5.6-sol"], "high")
+        SubprocessTurnProvider(MODELS["gpt-5.6-sol"])
 
 
 def _oversized_arguments() -> dict[str, object]:

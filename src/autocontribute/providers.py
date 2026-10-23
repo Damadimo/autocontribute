@@ -759,14 +759,11 @@ class SubprocessTurnProvider:
     GitHub token. Transcript text is sent as appended; it was scrubbed once, when appended.
     """
 
-    def __init__(self, spec: ModelSpec, effort: Effort) -> None:
+    def __init__(self, spec: ModelSpec) -> None:
         if os.name != "posix":  # pragma: no cover - supported hosts are POSIX
             raise ModelError("Hard model deadlines require a POSIX process-group runtime")
-        if effort not in spec.efforts:
-            raise ConfigurationError(f"{spec.id} does not support reasoning effort {effort}")
         _require_api_key(API_KEY_ENVS[spec.provider])
         self.spec = spec
-        self.effort = effort
 
     def step(
         self,
@@ -786,7 +783,7 @@ class SubprocessTurnProvider:
             {
                 "protocol": _MODEL_TURN_PROTOCOL,
                 "model_id": self.spec.id,
-                "effort": self.effort,
+                "effort": transcript.effort,
                 "instructions": transcript.instructions,
                 "transcript": {
                     "kind": transcript.kind,
