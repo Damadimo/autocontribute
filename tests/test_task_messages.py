@@ -448,10 +448,12 @@ def test_the_setup_task_quotes_the_failure_and_the_signals() -> None:
         signals,
         failed,
         allowed_hosts=["pypi.org", "files.pythonhosted.org"],
+        test_time_limit_seconds=900,
         host_values=frozenset(),
     )
 
     attempt, *files = _blocks(text)
+    assert "The test command must finish within 900 seconds." in text
     assert attempt["data"]["setup_commands"] == ["pip install -e ."]
     assert attempt["data"]["log_tail"] == "error: x"
     assert [block["label"] for block in files] == [

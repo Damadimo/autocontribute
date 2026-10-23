@@ -223,6 +223,12 @@ def offline_environment(recipe: EnvironmentRecipe) -> dict[str, str]:
     return {**recipe.env, **recipe.offline_env}
 
 
+def baseline_time_limit(config: SandboxConfig) -> int:
+    """Seconds one baseline run of the test command may take."""
+
+    return min(config.command_timeout_seconds, BASELINE_TIME_LIMIT_SECONDS)
+
+
 def run_baseline(
     config: SandboxConfig,
     *,
@@ -235,7 +241,7 @@ def run_baseline(
 ) -> tuple[EnvironmentBaseline, tuple[SuiteRun, ...]]:
     """Run the unmodified base twice, and a third time when any test's result differs."""
 
-    timeout = min(config.command_timeout_seconds, BASELINE_TIME_LIMIT_SECONDS)
+    timeout = baseline_time_limit(config)
 
     def run_once() -> SuiteRun:
         return run_suite(
@@ -490,6 +496,7 @@ __all__ = [
     "Reproduction",
     "SuiteRun",
     "acceptance_failure",
+    "baseline_time_limit",
     "green_failure",
     "new_failures",
     "offline_environment",

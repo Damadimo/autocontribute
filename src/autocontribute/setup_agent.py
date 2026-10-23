@@ -38,6 +38,7 @@ from autocontribute.sandbox import ImageIdentity, inspect_image, pull_image
 from autocontribute.setup_policy import agent_recipe_violations
 from autocontribute.store import RunStore
 from autocontribute.submissions import SetupSubmission
+from autocontribute.suite_runs import baseline_time_limit
 from autocontribute.task_messages import setup_task
 from autocontribute.transcript import start_transcript
 from autocontribute.workspace_files import WorkspaceFiles
@@ -103,6 +104,7 @@ class ModelSetupAgent:
                 signals,
                 failed,
                 allowed_hosts=sorted(DEFAULT_ALLOWED_HOSTS | self._allow_hosts),
+                test_time_limit_seconds=baseline_time_limit(self._config),
                 host_values=self._host_values,
             ),
             host_values=self._host_values,
