@@ -8,7 +8,7 @@ Autocontribute finds open issues in GitHub repositories you choose, prepares a s
 ## How it works
 
 1. **Discover:** find open issues that carry your labels in your repositories, using only GitHub reads.
-2. **Filter:** fixed rules drop assigned, claimed, stale, or security-related issues, issues that already have an open PR or score below 85, and repositories whose policies appear to refuse AI contributions.
+2. **Filter:** fixed rules drop assigned, claimed, stale, or security-related issues, issues that already have an open PR or score below 60, and repositories whose policies ban agent-made contributions.
 3. **Plan:** the scout model reads the issue and the repository's contribution guidance, then plans a small change or skips.
 4. **Edit:** the builder model writes exact edits in a local checkout.
 5. **Check:** your validation commands run in Docker with no network. A bug fix also needs a reproduction that fails before the change and passes after it.
@@ -83,7 +83,7 @@ Many runs end `skipped` or `rejected`: no issue passed the rules, the plan found
 - **Isolated checks.** Repository commands run in Docker with no network, no credentials, no Linux capabilities, and CPU, memory, process, and time limits. Model calls run in a separate process that never sees your GitHub token.
 - **Disclosure.** Every PR body includes the `policy.ai_disclosure` text, and PRs open as drafts.
 - **Limits.** At most 1 new PR per UTC day and 2 open PRs, and none to a repository where your account has an open PR or a closed one updated in the last 7 days ([details](docs/configuration.md#publishing)).
-- **Repository policies.** It skips repositories whose policy files appear to prohibit AI-assisted or automated contributions, and repositories that require a CLA or DCO until you attest with `policy attest` ([details](docs/configuration.md#legal-attestations)).
+- **Repository policies.** It skips repositories whose policy files ban agent-made contributions or ask for human-written PR text (unless you opt in), repositories that take PRs only from collaborators or vouched contributors, and repositories that require a CLA or DCO until you attest with `policy attest` ([details](docs/configuration.md#legal-attestations)).
 - **Stops.** `lifecycle sync` checks the PRs Autocontribute opened and stops all work after a maintainer requests changes or asks you to stop, CI fails, the PR branch changes, or a PR is closed unmerged or reverted; `publish` syncs first. A maintainer's stop request on a candidate issue, repeated GitHub abuse-limit responses, or `safety stop --actor NAME --reason TEXT` also stop all work. `safety status` shows why; to restart work, pass the "Active trigger-set revision" it prints to `safety resume`.
 
 ## Costs
