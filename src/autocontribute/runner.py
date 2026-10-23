@@ -39,6 +39,7 @@ from autocontribute.exceptions import (
     PolicyError,
     StateError,
 )
+from autocontribute.pricing import API_KEY_ENVS
 from autocontribute.redaction import redact_text
 from autocontribute.reporting import GitHubReview, code_span, fenced_block
 from autocontribute.store import RunStore
@@ -50,7 +51,6 @@ STATE_ARCHIVE = "state.tar.gz"
 PREPARED_FILE = "prepared.json"
 PREPARE_WORKFLOW = "prepare.yml"
 PUBLISHING_TOKEN_ENV = "AUTOCONTRIBUTE_GITHUB_TOKEN"
-MODEL_KEY_ENVS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")
 TOKEN_URL = "https://github.com/settings/tokens/new?scopes=public_repo&description=autocontribute"
 DEFAULT_RUNNER_NAME = "autocontribute-runner"
 APPROVAL_SYNTAX_REPLY = (
@@ -753,22 +753,20 @@ def check_runner(
 ) -> list[DoctorCheck]:
     """Check what a runner needs before it may prepare anything."""
 
-    present = [name for name in MODEL_KEY_ENVS if environ.get(name)]
-    model_key = (
-        DoctorCheck("model API key", True, f"{' and '.join(present)} is set")
-        if present
-        else DoctorCheck(
-            "model API key",
-            False,
-            "add the repository secret OPENAI_API_KEY or ANTHROPIC_API_KEY",
-        )
-    )
+    try:
+        settings = load_runner_config(config, owner=context.owner)
+    except ConfigurationError as exc:
+        configuration = DoctorCheck("configuration", False, str(exc))
+        models = DoctorCheck("models", False, "the configuration must load first")
+    else:
+        configuration = _config_check(settings)
+        models = _models_check(settings, environ)
     return [
-        model_key,
+        models,
         publishing_token_check(
             environ.get(PUBLISHING_TOKEN_ENV, ""), context, now=now, transport=transport
         ),
-        _config_check(config, context),
+        configuration,
         _docker_check(),
         _disk_check(),
     ]
@@ -1124,11 +1122,25 @@ def _setup_checklist(checks: Sequence[DoctorCheck], *, complete: bool) -> str:
     return "\n".join(lines)
 
 
-def _config_check(path: Path, context: RunnerContext) -> DoctorCheck:
+def _models_check(settings: AutocontributeConfig, environ: Mapping[str, str]) -> DoctorCheck:
+    """Resolve the models as the prepare job will, with this job's secrets."""
+
+    keys = (API_KEY_ENVS["openai"], API_KEY_ENVS["anthropic"])
+    if not any(environ.get(key) for key in keys):
+        return DoctorCheck("models", False, f"add the repository secret {' or '.join(keys)}")
     try:
-        settings = load_runner_config(path, owner=context.owner)
+        models = settings.models.resolve(environ)
     except ConfigurationError as exc:
-        return DoctorCheck("configuration", False, str(exc))
+        return DoctorCheck("models", False, str(exc))
+    return DoctorCheck(
+        "models",
+        True,
+        f"agent {models.agent.id}, critic {models.critic.id}, setup {models.setup.id}, "
+        f"triage {models.triage.id}",
+    )
+
+
+def _config_check(settings: AutocontributeConfig) -> DoctorCheck:
     problems = starter_placeholders(settings)
     if not (settings.github.repositories or settings.github.owners):
         problems.append(
@@ -1286,7 +1298,6 @@ __all__ = [
     "APPROVAL_SYNTAX_REPLY",
     "AWAITING_LABEL",
     "DEFAULT_RUNNER_NAME",
-    "MODEL_KEY_ENVS",
     "PREPARED_FILE",
     "PUBLISHED_LABEL",
     "PUBLISHING_TOKEN_ENV",

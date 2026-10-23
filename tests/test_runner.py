@@ -626,7 +626,9 @@ def test_runner_checks_report_each_missing_piece(
 
     checks = {check.name: check for check in check_runner(config, _context(tmp_path), {}, now=_NOW)}
 
-    assert not checks["model API key"].passed
+    assert checks["models"].detail == (
+        "add the repository secret OPENAI_API_KEY or ANTHROPIC_API_KEY"
+    )
     assert not checks["publishing token"].passed
     assert "github.repositories is empty" in checks["configuration"].detail
     assert "cgroup v1" in checks["Docker"].detail
@@ -643,15 +645,61 @@ def test_runner_checks_report_each_missing_piece(
             transport=_token_response(),
         )
     }
-    assert checks["model API key"].passed and checks["publishing token"].passed
+    assert checks["models"].passed and checks["publishing token"].passed
     assert checks["Docker"].passed
+
+
+@pytest.mark.parametrize("anthropic_key", [None, ""])
+def test_runner_checks_resolve_the_models_with_the_jobs_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, anthropic_key: str | None
+) -> None:
+    monkeypatch.setattr(runner_module, "_docker_cgroup_version", lambda: "2")
+    config = _runner_config(
+        tmp_path,
+        "github:\n  auth: token\n  repositories: [psf/requests]\n"
+        "models:\n  agent: claude-opus-5-5\n",
+    )
+    environ = {"OPENAI_API_KEY": "model-key"}
+    if anthropic_key is not None:
+        # An unset Actions secret arrives as an empty variable.
+        environ["ANTHROPIC_API_KEY"] = anthropic_key
+
+    checks = {
+        check.name: check for check in check_runner(config, _context(tmp_path), environ, now=_NOW)
+    }
+
+    assert not checks["models"].passed
+    assert checks["models"].detail == (
+        "models.agent is claude-opus-5-5; set ANTHROPIC_API_KEY to use it"
+    )
+
+    environ["ANTHROPIC_API_KEY"] = "model-key"
+    checks = {
+        check.name: check for check in check_runner(config, _context(tmp_path), environ, now=_NOW)
+    }
+    assert checks["models"].passed
+    assert checks["models"].detail.startswith("agent claude-opus-5-5, critic ")
+
+
+def test_runner_checks_need_the_configuration_to_resolve_models(tmp_path: Path) -> None:
+    config = _runner_config(tmp_path, "github:\n  auth: gh\n  repositories: [psf/requests]\n")
+
+    checks = {
+        check.name: check
+        for check in check_runner(
+            config, _context(tmp_path), {"OPENAI_API_KEY": "model-key"}, now=_NOW
+        )
+    }
+
+    assert "github.auth must be token" in checks["configuration"].detail
+    assert checks["models"].detail == "the configuration must load first"
 
 
 def test_setup_turns_preparation_on_only_when_every_check_passes(tmp_path: Path) -> None:
     github = FakeRunnerGitHub()
     context = _context(tmp_path)
     missing = [
-        DoctorCheck("model API key", True, "OPENAI_API_KEY is set"),
+        DoctorCheck("models", True, "agent gpt-5.6-sol"),
         DoctorCheck("publishing token", False, "add the repository secret"),
     ]
 
@@ -937,7 +985,7 @@ def test_actions_setup_exits_zero_with_a_checklist_when_secrets_are_missing(
     monkeypatch.setattr(
         cli,
         "check_runner",
-        lambda *_, **__: [DoctorCheck("model API key", False, "add the repository secret")],
+        lambda *_, **__: [DoctorCheck("models", False, "add the repository secret")],
     )
 
     result = cli_runner.invoke(app, ["actions", "setup"])
