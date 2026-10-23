@@ -23,6 +23,7 @@ from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     ConfigurationError,
     GitHubError,
+    GitHubRateLimitError,
     GitHubSafetyError,
     StateError,
     StopScope,
@@ -538,7 +539,7 @@ def sync_open_pull_requests(
                 expected_head_sha=commit_sha,
                 publishing_login=manifest.publishing_login,
             )
-        except GitHubSafetyError:
+        except (GitHubSafetyError, GitHubRateLimitError):
             raise
         except GitHubError as exc:
             # One unreadable pull request must not hide the others or stop preparation.
