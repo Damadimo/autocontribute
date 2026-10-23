@@ -10,14 +10,14 @@ from typing import Any
 import pytest
 
 import autocontribute.providers as providers
-from autocontribute import model_worker
+from autocontribute import anthropic_adapter, model_worker
 from autocontribute.exceptions import (
     ConfigurationError,
     ModelError,
     ModelRequestError,
     ModelTimeoutError,
 )
-from autocontribute.pricing import MODELS, ModelUsage
+from autocontribute.pricing import API_KEY_ENVS, MODELS, ModelUsage
 from autocontribute.providers import (
     _MODEL_TURN_PROTOCOL,
     _MODEL_WORKER_PROTOCOL,
@@ -60,7 +60,9 @@ with open(args.record, "w", encoding="utf-8") as record:
         {
             "request": json.loads(request),
             "environment": sorted(os.environ),
-            "model_key": os.environ.get("OPENAI_API_KEY"),
+            "model_keys": {
+                name: os.environ.get(name) for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+            },
         },
         record,
     )
@@ -117,8 +119,10 @@ def _provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     reply: dict[str, object] | None = None,
+    model: str = "gpt-5.6-sol",
 ) -> tuple[SubprocessTurnProvider, Path]:
-    monkeypatch.setenv("OPENAI_API_KEY", _API_KEY)
+    spec = MODELS[model]
+    monkeypatch.setenv(API_KEY_ENVS[spec.provider], _API_KEY)
     worker = tmp_path / "turn-worker.py"
     worker.write_text(_WORKER_SOURCE, encoding="utf-8")
     record = tmp_path / "record.json"
@@ -132,7 +136,7 @@ def _provider(
         "_model_worker_command",
         lambda: (sys.executable, str(worker), reply_argument, str(record)),
     )
-    return SubprocessTurnProvider(MODELS["gpt-5.6-sol"], "high"), record
+    return SubprocessTurnProvider(spec, "high"), record
 
 
 def _parse(envelope: dict[str, object], kind: TranscriptKind = "agent") -> Turn:
@@ -173,16 +177,26 @@ def test_turn_round_trips_through_a_worker_process(
     }
 
 
+@pytest.mark.parametrize(
+    ("model", "own_key", "other_key"),
+    [
+        ("gpt-5.6-sol", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"),
+        ("claude-opus-5-5", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"),
+    ],
+)
 def test_worker_environment_holds_only_allowlisted_names_and_the_model_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    own_key: str,
+    other_key: str,
 ) -> None:
-    provider, record = _provider(tmp_path, monkeypatch, _reply())
+    provider, record = _provider(tmp_path, monkeypatch, _reply(model=model), model)
     sensitive = {
         "AUTOCONTRIBUTE_GITHUB_TOKEN": "github-token-placeholder",
         "GH_TOKEN": "gh-token-placeholder",
         "GITHUB_TOKEN": "actions-token-placeholder",
-        "ANTHROPIC_API_KEY": "other-provider-key-placeholder",
+        other_key: "other-provider-key-placeholder",
         "AWS_SECRET_ACCESS_KEY": "aws-secret-placeholder",
         "DATABASE_PASSWORD": "database-password-placeholder",
         "DOCKER_HOST": "unix:///var/run/docker.sock",
@@ -192,15 +206,15 @@ def test_worker_environment_holds_only_allowlisted_names_and_the_model_key(
     for name, value in sensitive.items():
         monkeypatch.setenv(name, value)
 
-    provider.step(transcript=_transcript(), max_output_tokens=1_000, timeout_seconds=30)
+    provider.step(transcript=_transcript(model), max_output_tokens=1_000, timeout_seconds=30)
 
     recorded = json.loads(record.read_text(encoding="utf-8"))
     # The interpreter adds LC_CTYPE when it coerces the C locale; macOS adds the last name.
     added_by_runtime = {"LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
     allowlisted = {name for name in _WORKER_ENV_ALLOWLIST if name in os.environ}
-    assert set(recorded["environment"]) - added_by_runtime == allowlisted | {"OPENAI_API_KEY"}
+    assert set(recorded["environment"]) - added_by_runtime == allowlisted | {own_key}
     assert not set(sensitive) & set(recorded["environment"])
-    assert recorded["model_key"] == _API_KEY
+    assert recorded["model_keys"] == {own_key: _API_KEY, other_key: None}
 
 
 def test_step_refuses_a_transcript_bound_to_another_model(
@@ -434,6 +448,50 @@ def test_worker_answers_a_turn_request_from_the_adapter(monkeypatch: pytest.Monk
             timeout_seconds=600.0,
         )
     ]
+
+
+def test_worker_sends_anthropic_turns_to_the_anthropic_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bash_call = {
+        "type": "tool_use",
+        "id": "toolu_01A09q90qw90lq917835lq9",
+        "name": "bash",
+        "input": {"command": "cat hello.py"},
+    }
+    expected = Turn(
+        stop="tool_use",
+        output_items=(bash_call,),
+        tool_calls=(ToolCall(call_id=bash_call["id"], name="shell", arguments=bash_call["input"]),),
+        response_id="msg_01XFDUDYJgAACzvnptvVoYEL",
+        model="claude-opus-5-5",
+        usage=ModelUsage(**_USAGE),
+    )
+    seen: list[str] = []
+
+    def step(request: providers.TurnRequest) -> Turn:
+        seen.append(request.spec.id)
+        return expected
+
+    monkeypatch.setattr(anthropic_adapter, "step", step)
+    monkeypatch.setattr(
+        model_worker.openai_adapter,
+        "step",
+        lambda _request: pytest.fail("the OpenAI adapter must not run"),
+    )
+    items = _transcript("claude-opus-5-5").items
+
+    payload = _run_worker_main(
+        monkeypatch,
+        _worker_request(
+            model_id="claude-opus-5-5",
+            transcript={"kind": "agent", "run_id": _RUN_ID, "items": items},
+            max_output_tokens=64_000,
+        ),
+    )
+
+    assert _turn_result(payload, spec=MODELS["claude-opus-5-5"], kind="agent") == expected
+    assert seen == ["claude-opus-5-5"]
 
 
 def test_worker_reports_turn_failures_in_the_turn_protocol(
