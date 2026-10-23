@@ -167,6 +167,11 @@ _INVITATION_SYNONYMS = (
     "accepted",
     "confirmed",
 )
+# Emoji, other symbols and GitHub :shortcodes: that decorate a label name. A configured name
+# keeps its * wildcard.
+_LABEL_DECORATION = re.compile(r":[a-z0-9_+-]+:|[^\w\s/:*-]")
+# A category prefix on a label key: "kind/", "status: " or a one-letter "c " from "C-bug".
+_LABEL_CATEGORY = re.compile(r"^(?:[^/:]+[/:]\s*|[a-z] (?=\S))")
 _SEARCH_PAGE_SIZE = 100
 _MAX_SEARCH_PAGES = 3
 # A search result has no discussion, and a maintainer comment there can still invite the work
@@ -836,8 +841,8 @@ class DiscoveryService:
         include, exclude = self._label_rules(repository)
         names = self.github.list_labels(repository)
         return (
-            [name for name in names if include.fullmatch(_label_key(name))],
-            [name for name in names if exclude.fullmatch(_label_key(name))],
+            [name for name in names if _label_matches(include, _label_key(name))],
+            [name for name in names if _label_matches(exclude, _label_key(name))],
         )
 
     def _label_rules(self, repository: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
@@ -960,8 +965,10 @@ class DiscoveryService:
         blockers: list[tuple[str, str]] = []
         include, exclude = self._label_rules(repository.full_name)
         labels = {_label_key(label): label for label in issue.labels}
-        invitation_labels = sorted(label for key, label in labels.items() if include.fullmatch(key))
-        excluded = sorted(label for key, label in labels.items() if exclude.fullmatch(key))
+        invitation_labels = sorted(
+            label for key, label in labels.items() if _label_matches(include, key)
+        )
+        excluded = sorted(label for key, label in labels.items() if _label_matches(exclude, key))
         maintainer_comments = [
             comment for comment in issue.discussion if _is_trusted_maintainer(comment)
         ]
@@ -1893,7 +1900,9 @@ def _suitability(
         _DOCS_TITLE.search(issue.title)
     )
 
-    if invited_in_discussion or any(_label_key(label) != "bug" for label in invitation_labels):
+    if invited_in_discussion or any(
+        _uncategorized(_label_key(label)) != "bug" for label in invitation_labels
+    ):
         invitation = 25
     elif invitation_labels:
         invitation = 15
@@ -2007,9 +2016,20 @@ def _with_triage(evaluation: IssueEvaluation, verdict: TriageVerdict) -> IssueEv
 
 
 def _label_key(name: str) -> str:
-    """Compare labels as people spell them, ignoring case, hyphens, and underscores."""
+    """Compare labels as people spell them, ignoring case, separators, emoji and :shortcodes:."""
 
-    return " ".join(re.split(r"[\s_-]+", name.casefold())).strip()
+    text = _LABEL_DECORATION.sub(" ", name.casefold())
+    return " ".join(re.split(r"[\s_-]+", text)).strip()
+
+
+def _uncategorized(key: str) -> str:
+    """Drop a label key's category prefix: kind/bug, type: bug and C-bug all become bug."""
+
+    return _LABEL_CATEGORY.sub("", key, count=1)
+
+
+def _label_matches(pattern: re.Pattern[str], key: str) -> bool:
+    return bool(pattern.fullmatch(key) or pattern.fullmatch(_uncategorized(key)))
 
 
 def _label_matcher(names: Sequence[str]) -> re.Pattern[str]:
