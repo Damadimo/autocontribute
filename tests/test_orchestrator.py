@@ -1128,7 +1128,7 @@ def test_clone_uses_the_exact_sha_used_for_repository_policy_reads(
     assert repository_policy_refs == {sha}
 
 
-def test_secret_finding_trips_global_breaker_without_retaining_value(
+def test_a_host_secret_in_the_patch_trips_global_breaker_without_retaining_value(
     tmp_path: Path,
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -1155,6 +1155,7 @@ def test_secret_finding_trips_global_breaker_without_retaining_value(
     store = RunStore(config.storage.path)
     providers = _providers()
     secret = "ghp_" + "A" * 36
+    monkeypatch.setenv(config.github.token_env, secret)
     proposal = providers["builder"].output
     assert isinstance(proposal, PatchProposal)
     providers["builder"].output = proposal.model_copy(
@@ -1202,6 +1203,69 @@ def test_secret_finding_trips_global_breaker_without_retaining_value(
             providers=_providers(),  # type: ignore[arg-type]
             sandbox=PassingSandbox(),  # type: ignore[arg-type]
         ).run(issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL)
+
+
+def test_a_token_in_the_patch_rejects_the_run_without_a_global_stop(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    source, sha = _source_repository(tmp_path)
+    original_clone = RepositoryWorkspace.clone
+
+    def local_clone(
+        cls: type[RepositoryWorkspace],
+        clone_url: str,
+        base_sha: str,
+        destination: Path,
+        **_: object,
+    ) -> RepositoryWorkspace:
+        return original_clone(str(source), base_sha, destination, allow_local_source=True)
+
+    monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project"]},
+            "validation": {"required_commands": {"example/project": [TRUSTED_COMMAND]}},
+            "storage": {"path": tmp_path / "state"},
+        }
+    )
+    store = RunStore(config.storage.path)
+    providers = _providers()
+    # A fixture token: credential-shaped, but no secret of this machine (DESIGN §3.6).
+    token = "ghp_" + "B" * 36
+    proposal = providers["builder"].output
+    assert isinstance(proposal, PatchProposal)
+    providers["builder"].output = proposal.model_copy(
+        update={
+            "edits": [
+                FileEdit(
+                    operation="replace",
+                    path="app.py",
+                    find="    return 1\n",
+                    replace=f"    return 2  # {token}\n",
+                    content=None,
+                    rationale="Match the documented boundary behavior.",
+                )
+            ]
+        }
+    )
+
+    with Orchestrator(
+        config,
+        store=store,
+        github=FakeGitHub(_issue(), _repository(sha), sha),  # type: ignore[arg-type]
+        providers=providers,  # type: ignore[arg-type]
+        sandbox=PassingSandbox(),  # type: ignore[arg-type]
+    ) as orchestrator:
+        manifest = orchestrator.run(
+            issue_reference="example/project#42", invocation_mode=RunInvocationMode.MANUAL
+        )
+
+    assert manifest.status == RunStatus.REJECTED
+    assert not store.circuit_breaker_status().is_tripped
+    assert manifest.quality is not None
+    gates = {gate.gate: gate.passed for gate in manifest.quality.gates}
+    assert gates["secret_scan"] is False
 
 
 def test_breaker_blocks_before_github_or_model_work(tmp_path: Path) -> None:
