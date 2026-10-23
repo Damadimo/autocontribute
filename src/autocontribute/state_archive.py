@@ -48,7 +48,6 @@ _REWRITABLE_TABLES = frozenset(
 @dataclass(frozen=True, slots=True)
 class StateExport:
     unfinished_runs: int
-    files: int
     sha256: str
 
 
@@ -79,7 +78,7 @@ def export_state(store: RunStore, output: Path) -> StateExport:
         _write_archive(archive, entries)
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
         archive.replace(output)
-    return StateExport(unfinished_runs=len(unfinished), files=len(entries), sha256=digest)
+    return StateExport(unfinished_runs=len(unfinished), sha256=digest)
 
 
 def import_state(
