@@ -350,7 +350,7 @@ def test_openai_shell_output_echoes_max_output_length_only_when_the_call_set_it(
     assert "max_output_length" not in transcript.items[-1]
 
 
-def test_anthropic_results_of_one_turn_share_one_user_message() -> None:
+def test_anthropic_results_and_reminder_of_one_turn_share_one_user_message() -> None:
     transcript = _transcript("claude-opus-5-5")
     append_user_text(transcript, "Fix issue 12.")
     second_call = {**_ANTHROPIC_BASH_CALL, "id": "toolu_02B", "input": {"command": "ls"}}
@@ -373,8 +373,8 @@ def test_anthropic_results_of_one_turn_share_one_user_message() -> None:
             ToolResult(call_id="toolu_01A09q90qw90lq917835lq9", output="print('hi')\n"),
             ToolResult(call_id="toolu_02B", output="ls: cannot access", is_error=True),
         ],
+        reminder="10 turns left; submit soon.",
     )
-    append_user_text(transcript, "10 turns left; submit soon.")
 
     assert transcript.items[2:] == [
         {
@@ -391,11 +391,38 @@ def test_anthropic_results_of_one_turn_share_one_user_message() -> None:
                     "content": "ls: cannot access",
                     "is_error": True,
                 },
+                {"type": "text", "text": "10 turns left; submit soon."},
             ],
         },
-        {"role": "user", "content": [{"type": "text", "text": "10 turns left; submit soon."}]},
     ]
     assert transcript.appended_items == 3
+    assert transcript.appended_bytes == len(canonical_json(transcript.items[2]))
+
+
+def test_openai_reminder_is_a_user_message_after_the_results() -> None:
+    transcript = _transcript()
+    append_user_text(transcript, "Fix issue 12.")
+    append_turn(transcript, _openai_turn(_OPENAI_SUBMIT_CALL))
+
+    append_tool_results(
+        transcript,
+        [ToolResult(call_id="call_3ef1b8c79a4d6520", output="Error: pr_title is missing.")],
+        reminder="10 turns left; submit soon.",
+    )
+
+    assert transcript.items[-2:] == [
+        {
+            "type": "function_call_output",
+            "call_id": "call_3ef1b8c79a4d6520",
+            "output": "Error: pr_title is missing.",
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "10 turns left; submit soon."}],
+        },
+    ]
+    assert transcript.appended_items == 2
 
 
 @pytest.mark.parametrize(
