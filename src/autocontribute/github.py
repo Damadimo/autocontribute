@@ -154,6 +154,14 @@ class RepositoryIdentity:
 
 
 @dataclass(frozen=True, slots=True)
+class GitHubAccount:
+    """A user account by its current login and immutable database ID."""
+
+    login: str
+    database_id: int
+
+
+@dataclass(frozen=True, slots=True)
 class ForkIdentity:
     """Immutable identities for a fork and the upstream repository GitHub reports as parent."""
 
@@ -603,6 +611,23 @@ class GitHubClient:
     def authenticated_login(self) -> str:
         data = cast("dict[str, Any]", self._request("GET", "/user"))
         return str(data["login"])
+
+    def authenticated_user(self) -> GitHubAccount:
+        """Resolve the token's owner; tokens that act for no user cannot do this."""
+
+        return _parse_account(_mapping(self._request("GET", "/user"), resource="token owner"))
+
+    def get_user(self, login: str) -> GitHubAccount:
+        """Resolve any public account, so no token of that account is needed."""
+
+        if not isinstance(login, str) or not _GITHUB_LOGIN.fullmatch(login):
+            raise ValueError("GitHub login is not a valid account name")
+        account = _parse_account(
+            _mapping(self._request("GET", f"/users/{quote(login)}"), resource="account")
+        )
+        if account.login.casefold() != login.casefold():
+            raise GitHubError("GitHub resolved the login to a different account")
+        return account
 
     def get_repository(self, full_name: str) -> RepositoryInfo:
         data = _mapping(
@@ -2331,6 +2356,13 @@ def _parse_repository_identity(
     )
 
 
+def _parse_account(data: dict[str, Any]) -> GitHubAccount:
+    login = data.get("login")
+    if not isinstance(login, str) or not _GITHUB_LOGIN.fullmatch(login):
+        raise GitHubError("GitHub returned an invalid account login")
+    return GitHubAccount(login=login, database_id=_identifier(data.get("id"), resource="account"))
+
+
 def _graphql_node_id(value: object) -> str:
     if (
         not isinstance(value, str)
@@ -2571,6 +2603,7 @@ __all__ = [
     "CommitStatusDetails",
     "DirectoryEntry",
     "ForkIdentity",
+    "GitHubAccount",
     "GitHubClient",
     "GitHubComment",
     "LinkedPullRequest",

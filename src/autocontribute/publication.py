@@ -58,7 +58,12 @@ from autocontribute.exceptions import (
     RepositoryError,
     StateError,
 )
-from autocontribute.github import GitHubClient, PullRequestDetails, RepositoryIdentity
+from autocontribute.github import (
+    GitHubAccount,
+    GitHubClient,
+    PullRequestDetails,
+    RepositoryIdentity,
+)
 from autocontribute.github_origin import canonical_api_origin, git_push_url
 from autocontribute.lifecycle import LifecycleObserver, parse_pull_request_url
 from autocontribute.pr_template import visible_markdown
@@ -236,20 +241,44 @@ def _validate_git_identity_credentials(
         raise PolicyError("Git author or committer identity appears to contain a credential")
 
 
+def publishing_account(config: AutocontributeConfig, github: GitHubClient) -> GitHubAccount:
+    """Resolve the account a review binds, without its token when ``publishing.login`` is set."""
+
+    if config.publishing.login:
+        return github.get_user(config.publishing.login)
+    return github.authenticated_user()
+
+
+def _token_account(config: AutocontributeConfig, github: GitHubClient) -> GitHubAccount:
+    """Resolve the token owner, who must be the configured publishing login."""
+
+    account = github.authenticated_user()
+    configured = config.publishing.login
+    if configured and account.login.casefold() != configured.casefold():
+        raise PolicyError(
+            f"The GitHub token belongs to {account.login}, not publishing.login {configured}"
+        )
+    return account
+
+
 def _publication_context(
     config: AutocontributeConfig,
     *,
-    login: str,
+    account: GitHubAccount,
     api_origin: str,
 ) -> _PublicationContext:
-    canonical_login = login.strip().casefold()
+    canonical_login = account.login.strip().casefold()
     if not _GITHUB_LOGIN.fullmatch(canonical_login):
         raise PolicyError("Authenticated GitHub login is not canonical")
     expected_origin = canonical_api_origin(config.github.api_url)
     if api_origin != expected_origin:
         raise PolicyError("GitHub client API origin differs from the configured API origin")
     name = config.identity.name.strip() or canonical_login
-    email = config.identity.email.strip() or f"{canonical_login}@users.noreply.github.com"
+    # GitHub links commits to accounts created after July 2017 only through the ID form.
+    email = (
+        config.identity.email.strip()
+        or f"{account.database_id}+{canonical_login}@users.noreply.github.com"
+    )
     if len(name) > 200 or not name or any(character in name for character in ("\0", "\r", "\n")):
         raise PolicyError("Configured Git author name must be a canonical single-line value")
     if (
@@ -400,10 +429,25 @@ def build_approval_review(
     store: RunStore,
     run_id: str,
     *,
-    actor: str,
+    github: GitHubClient,
 ) -> ApprovalReview:
     """Rebuild the exact human review from authoritative state and safe artifacts."""
 
+    return _build_approval_review(
+        config,
+        store,
+        run_id,
+        account=publishing_account(config, github),
+    )
+
+
+def _build_approval_review(
+    config: AutocontributeConfig,
+    store: RunStore,
+    run_id: str,
+    *,
+    account: GitHubAccount,
+) -> ApprovalReview:
     manifest = store.get(run_id)
     if manifest.status != RunStatus.READY_FOR_APPROVAL:
         raise StateError(f"Run {run_id} is {manifest.status.value}, not ready_for_approval")
@@ -431,7 +475,7 @@ def build_approval_review(
     validate_validation_artifact(manifest, artifact=validation_artifact)
     context = _publication_context(
         config,
-        login=actor,
+        account=account,
         api_origin=canonical_api_origin(config.github.api_url),
     )
     _bind_publication_context(manifest, context, allow_new=True)
@@ -465,11 +509,13 @@ def approve_run(
     store: RunStore,
     run_id: str,
     *,
-    actor: str,
+    github: GitHubClient,
     attestation: str,
     reviewed_fingerprint: str,
 ) -> RunManifest:
-    review = build_approval_review(config, store, run_id, actor=actor)
+    account = _token_account(config, github)
+    actor = account.login
+    review = _build_approval_review(config, store, run_id, account=account)
     if not hmac.compare_digest(reviewed_fingerprint, review.fingerprint):
         raise PolicyError(
             "Approval evidence changed after review; inspect the run again before approving"
@@ -1035,7 +1081,7 @@ class Publisher:
         if context is None:
             context = _publication_context(
                 self.config,
-                login=self.github.authenticated_login(),
+                account=_token_account(self.config, self.github),
                 api_origin=self.github.api_origin,
             )
             _bind_publication_context(manifest, context, allow_new=False)
@@ -4232,5 +4278,6 @@ __all__ = [
     "Publisher",
     "approve_run",
     "build_approval_review",
+    "publishing_account",
     "validate_publication_text",
 ]

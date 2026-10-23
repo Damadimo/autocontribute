@@ -19,6 +19,7 @@ from autocontribute.exceptions import (
 )
 from autocontribute.github import (
     DirectoryEntry,
+    GitHubAccount,
     GitHubClient,
     _path_template,
     resolve_github_token,
@@ -1021,6 +1022,28 @@ def test_http_error_carries_status_request_id_and_validation_detail() -> None:
     assert excinfo.value.request_id == "ABCD:1234"
     assert excinfo.value.github_message == "Validation Failed; No commits between main and fix"
     assert "returned 422" in str(excinfo.value)
+
+
+def test_account_lookups_return_login_and_immutable_id() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/user":
+            return httpx.Response(200, json={"login": "OctoCat", "id": 583231})
+        if request.url.path == "/users/octocat":
+            return httpx.Response(200, json={"login": "OctoCat", "id": 583231})
+        return httpx.Response(200, json={"login": "someone-else", "id": 9})
+
+    with _client(handler) as github:
+        assert github.authenticated_user() == GitHubAccount(login="OctoCat", database_id=583231)
+        assert github.get_user("octocat") == GitHubAccount(login="OctoCat", database_id=583231)
+        with pytest.raises(GitHubError, match="different account"):
+            github.get_user("renamed")
+        with pytest.raises(ValueError, match="not a valid account name"):
+            github.get_user("../user")
+
+    assert paths == ["/user", "/users/octocat", "/users/renamed"]
 
 
 def test_get_retries_transport_errors_and_recovers(monkeypatch) -> None:  # type: ignore[no-untyped-def]

@@ -36,7 +36,7 @@ from autocontribute.exceptions import (
     StateError,
     StopScope,
 )
-from autocontribute.github import DirectoryEntry
+from autocontribute.github import DirectoryEntry, GitHubAccount
 from autocontribute.lifecycle import LifecycleSyncResult
 from autocontribute.orchestrator import RunInvocationMode
 from autocontribute.preparation import (
@@ -69,6 +69,12 @@ class _ReviewGitHub:
 
     def authenticated_login(self) -> str:
         return "octocat"
+
+    def authenticated_user(self) -> GitHubAccount:
+        return GitHubAccount(login="octocat", database_id=583231)
+
+    def get_user(self, login: str) -> GitHubAccount:
+        return GitHubAccount(login=login, database_id=583231)
 
 
 class _PolicyGitHub(_ReviewGitHub):

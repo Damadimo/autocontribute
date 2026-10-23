@@ -150,7 +150,7 @@ or run `autocontribute runs cancel RUN_ID --reason "TEXT"` and [retry the issue]
 the way past an expired approval). Once the rechecks pass, the attempt uses that day's slot and
 starts the cooldown even if a later step fails. `publish` creates or reuses your fork
 (`<login>/<repository>`), commits as `identity.name` and `identity.email` (if empty, your login and
-`<login>@users.noreply.github.com`), and pushes the new branch
+`<account ID>+<login>@users.noreply.github.com`), and pushes the new branch
 `<publishing.branch_prefix>/issue-<number>-<run ID prefix>`, never overwriting an existing one. If
 the base, issue, or policy files changed meanwhile, it deletes the branch and the run ends `failed`;
 otherwise it opens a PR against the default branch. With `publishing.draft: true` it opens a draft

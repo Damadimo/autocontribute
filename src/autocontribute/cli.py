@@ -273,24 +273,21 @@ def approve(
     store = RunStore(settings.storage.path)
     try:
         with _github_client(settings, store) as github:
-            actor = github.authenticated_login()
-        review = build_approval_review(settings, store, run_id, actor=actor)
-        console.print(render_approval_review(review), markup=False)
-    except AutocontributeError as exc:
-        _fail(str(exc))
-    if not yes and not typer.confirm(
-        "I reviewed the exact diff, validation evidence, and PR text and authorize publication"
-    ):
-        raise typer.Abort()
-    try:
-        manifest = approve_run(
-            settings,
-            store,
-            run_id,
-            actor=actor,
-            attestation="Reviewed exact diff, validation evidence, and pull-request text.",
-            reviewed_fingerprint=review.fingerprint,
-        )
+            review = build_approval_review(settings, store, run_id, github=github)
+            console.print(render_approval_review(review), markup=False)
+            if not yes and not typer.confirm(
+                "I reviewed the exact diff, validation evidence, and PR text and authorize "
+                "publication"
+            ):
+                raise typer.Abort()
+            manifest = approve_run(
+                settings,
+                store,
+                run_id,
+                github=github,
+                attestation="Reviewed exact diff, validation evidence, and pull-request text.",
+                reviewed_fingerprint=review.fingerprint,
+            )
     except AutocontributeError as exc:
         _fail(str(exc))
     _refresh_report(store, manifest)
@@ -369,8 +366,7 @@ def show_run(
         manifest = store.get(run_id)
         if manifest.status == RunStatus.READY_FOR_APPROVAL:
             with _github_client(settings, store) as github:
-                actor = github.authenticated_login()
-            review = build_approval_review(settings, store, run_id, actor=actor)
+                review = build_approval_review(settings, store, run_id, github=github)
             console.print(render_approval_review(review), markup=False)
         else:
             _show_report(manifest)
