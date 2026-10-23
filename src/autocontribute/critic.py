@@ -48,6 +48,14 @@ QUOTED_CATEGORIES: Final[frozenset[BlockerCategory]] = frozenset(
 HANG_CATEGORIES: Final[frozenset[BlockerCategory]] = frozenset({"regression", "issue_not_fixed"})
 # A shell's "cannot execute" and "not found": the check did not run.
 _NOT_RUN_EXIT_CODES: Final = frozenset({126, 127})
+# pytest's exit codes for an interrupted run, an internal or usage error, and no tests.
+_PYTEST_NOT_RUN_EXIT_CODES: Final = frozenset({2, 3, 4, 5})
+_PYTEST: Final = re.compile(r"\bpytest\b")
+_MISSING_FILE: Final = re.compile(
+    r"can't open file|cannot open|no such file or directory|file or directory not found"
+    r"|file not found",
+    re.IGNORECASE,
+)
 # Shorter quotes match too much to prove anything.
 _MIN_QUOTE_CHARACTERS: Final = 8
 _QUOTED: Final = re.compile(r"```[^\n]*\n(.*?)```|`([^`\n]+)`|\"([^\"\n]+)\"|“([^”\n]+)”", re.S)
@@ -213,7 +221,7 @@ class Critic:
                 if timeout < 1:
                     return None
                 run = self._sandbox.run_check(validated, command, timeout_seconds=timeout)
-                reason = _check_reason(blocker.category, run)
+                reason = _check_reason(blocker.category, command, run)
             if reason is None:
                 confirmed.append(blocker)
             else:
@@ -269,15 +277,23 @@ def _decide(
     return "approve", ""
 
 
-def _check_reason(category: BlockerCategory, run: CheckRun) -> str | None:
-    """Why a blocker's check does not confirm it, or None when it fails as it should."""
+def _check_reason(category: BlockerCategory, command: str, run: CheckRun) -> str | None:
+    """Why a blocker's check does not confirm it, or None when it fails as it should.
+
+    The check runs on a clean copy in a fresh container, so a file the critic wrote under /tmp
+    is gone: a check that cannot find its file or collect its tests did not run.
+    """
 
     if run.failure is not None:
         return f"its check could not run: {run.failure}"
     if run.timed_out:
         # A check that never returns shows a hang, which is the bug for these categories.
         return None if category in HANG_CATEGORIES else "its check timed out"
-    if run.exit_code in _NOT_RUN_EXIT_CODES:
+    if (
+        run.exit_code in _NOT_RUN_EXIT_CODES
+        or (_PYTEST.search(command) and run.exit_code in _PYTEST_NOT_RUN_EXIT_CODES)
+        or _MISSING_FILE.search(run.output_tail)
+    ):
         return "its check could not run"
     if run.exit_code == 0:
         return "its check passes"
