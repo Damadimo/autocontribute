@@ -39,7 +39,6 @@ from autocontribute.exceptions import (
     PolicyError,
     StateError,
 )
-from autocontribute.lifecycle import LifecycleSyncResult, parse_pull_request_url
 from autocontribute.redaction import redact_text
 from autocontribute.reporting import GitHubReview, code_span, fenced_block
 from autocontribute.store import RunStore
@@ -67,6 +66,7 @@ _LABELS = (
     (PUBLISHED_LABEL, "0e8a16", "The pull request is open"),
 )
 _SETUP_MARKER = "<!-- autocontribute:setup -->"
+_MAX_ATTENTION_ITEMS = 200
 _RUN_MARKER = re.compile(r"<!-- autocontribute:run=([0-9a-f]{16}) -->")
 _APPROVE_COMMENT = re.compile(r"/approve ([0-9a-f]{12})\s*")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -524,7 +524,7 @@ class PreparedState(_PreparedData):
     base_state_sha256: _Sha256 | None
     state_sha256: _Sha256
     run_id: _RunId | None
-    attention: tuple[AttentionItem, ...] = Field(default=(), max_length=200)
+    attention: tuple[AttentionItem, ...] = Field(default=(), max_length=_MAX_ATTENTION_ITEMS)
 
 
 def write_prepared(output: Path, prepared: PreparedState) -> None:
@@ -558,34 +558,35 @@ def read_prepared(directory: Path) -> tuple[PreparedState, Path]:
 
 
 def attention_items(
-    result: LifecycleSyncResult, published: Sequence[RunManifest]
+    published: Sequence[RunManifest], *, since: datetime
 ) -> tuple[AttentionItem, ...]:
-    """Pair each lifecycle signal with the published run whose pull request it concerns."""
+    """The attention entries lifecycle sync recorded on published runs at or after ``since``.
 
-    runs: dict[tuple[str, int], RunManifest] = {}
-    for run in published:
-        if run.pull_request_url and run.publishing_api_origin:
-            repository, number = parse_pull_request_url(
-                run.pull_request_url, api_origin=run.publishing_api_origin
-            )
-            runs[(repository.casefold(), number)] = run
-    items: list[AttentionItem] = []
-    for observation in result.observations:
-        for signal in observation.signals:
-            manifest = runs.get((signal.repository.casefold(), signal.pull_request_number))
-            if manifest is None or manifest.pull_request_url is None:
-                continue
-            items.append(
-                AttentionItem(
-                    run_id=manifest.run_id,
-                    pull_request_url=manifest.pull_request_url,
-                    kind=signal.kind.value,
-                    reason=signal.reason,
-                    source_url=signal.source_url,
-                    key=signal.trigger_hash(),
-                )
-            )
-    return tuple(items)
+    Record posts each one once; its marker comment keeps a repeated entry from posting again.
+    """
+
+    entries = sorted(
+        (
+            (entry.observed_at, run.run_id, run.pull_request_url, entry)
+            for run in published
+            if run.pull_request_url is not None
+            for entry in run.pull_request_attention
+            if entry.observed_at >= since
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+    return tuple(
+        AttentionItem(
+            run_id=run_id,
+            pull_request_url=pull_request_url,
+            kind=entry.kind,
+            reason=entry.reason[:1_000],
+            source_url=entry.source_url,
+            key=entry.evidence_hash,
+        )
+        # The newest entries, within what the record job accepts.
+        for _, run_id, pull_request_url, entry in entries[-_MAX_ATTENTION_ITEMS:]
+    )
 
 
 @dataclass(frozen=True, slots=True)

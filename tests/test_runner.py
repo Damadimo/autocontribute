@@ -1,9 +1,10 @@
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ import autocontribute.cli as cli
 import autocontribute.runner as runner_module
 from autocontribute.cli import app
 from autocontribute.doctor import DoctorCheck
-from autocontribute.domain import RunManifest, RunStatus
+from autocontribute.domain import PullRequestAttention, RunManifest, RunStatus
 from autocontribute.exceptions import (
     ConfigurationError,
     GitHubHTTPError,
@@ -26,9 +27,6 @@ from autocontribute.exceptions import (
 )
 from autocontribute.github import RepositoryAccess, RepositoryIdentity
 from autocontribute.lifecycle import (
-    LifecycleObservation,
-    LifecycleSignal,
-    LifecycleSignalKind,
     LifecycleSyncResult,
 )
 from autocontribute.orchestrator import RunInvocationMode
@@ -476,40 +474,32 @@ def test_prepared_output_is_read_as_bounded_untrusted_data(tmp_path: Path) -> No
         read_prepared(directory)
 
 
-def test_attention_items_pair_signals_with_published_runs() -> None:
+def test_attention_items_relay_what_lifecycle_sync_recorded_since_it_started() -> None:
+    synced_from = datetime(2026, 7, 21, 12, tzinfo=UTC)
+
+    def entry(kind: str, minutes: int) -> PullRequestAttention:
+        return PullRequestAttention(
+            kind=kind,  # type: ignore[arg-type]
+            reason=f"{kind} on the pull request",
+            source_url="https://github.com/example/project/pull/9#event",
+            evidence_hash=hashlib.sha256(kind.encode()).hexdigest(),
+            observed_at=synced_from + timedelta(minutes=minutes),
+        )
+
     published = _manifest(
         "0123456789abcdef",
         RunStatus.PR_OPEN,
         pull_request_url="https://github.com/example/project/pull/9",
         publishing_api_origin="https://api.github.com",
     )
-    signal = LifecycleSignal(
-        kind=LifecycleSignalKind.CHANGES_REQUESTED,
-        repository="Example/Project",
-        pull_request_number=9,
-        evidence_key="review:1",
-        reason="A maintainer submitted a changes-requested review",
-        source_url="https://github.com/example/project/pull/9#pullrequestreview-1",
-    )
-    unrelated = LifecycleSignal(
-        kind=LifecycleSignalKind.CI_FAILED,
-        repository="example/other",
-        pull_request_number=9,
-        evidence_key="check:1",
-        reason="CI failed",
-        source_url="https://github.com/example/other/pull/9",
-    )
-    result = LifecycleSyncResult(
-        observations=(
-            LifecycleObservation(snapshot=None, signals=(signal, unrelated), newly_tripped=()),  # type: ignore[arg-type]
-        )
-    )
+    published.pull_request_attention = [entry("ci_failed", -60), entry("changes_requested", 1)]
 
-    (item,) = attention_items(result, [published])
+    (item,) = attention_items([published], since=synced_from)
 
     assert item.run_id == "0123456789abcdef"
     assert item.kind == "changes_requested"
-    assert item.key == signal.trigger_hash()
+    assert item.pull_request_url == "https://github.com/example/project/pull/9"
+    assert item.key == hashlib.sha256(b"changes_requested").hexdigest()
 
 
 def test_approval_event_is_checked_again_in_python(tmp_path: Path) -> None:
