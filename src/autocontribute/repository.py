@@ -22,6 +22,7 @@ from autocontribute.redaction import is_sensitive_path
 
 _FULL_SHA: Final = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 _GIT_TIMEOUT_SECONDS: Final = 120
+_GIT_FETCH_TIMEOUT_SECONDS: Final = 900
 _MAX_ERROR_CHARACTERS: Final = 4_000
 _DEFAULT_MAX_FILE_BYTES: Final = 1_000_000
 _FILTER_COMMAND_KEY: Final = re.compile(r"filter\..+\.(?:clean|smudge|process)", re.DOTALL)
@@ -593,6 +594,79 @@ class RepositoryWorkspace:
         self._git_bytes(["apply", "--check", "--whitespace=nowarn", "-"], input_bytes=content)
         self._git_bytes(["apply", "--whitespace=nowarn", "-"], input_bytes=content)
 
+    def fetch_tags(self, *, allow_local_source: bool = False) -> None:
+        """Fetch the history and tags that version tools such as setuptools-scm read (§B5).
+
+        The clone is shallow and tagless. History comes without trees or blobs, so the
+        repository grows by its commits only.
+        """
+
+        shallow = self._run_git(["rev-parse", "--is-shallow-repository"]).stdout.strip()
+        unshallow = ["--filter=tree:0", "--unshallow"] if shallow == "true" else []
+        self._fetch(
+            ["fetch", "--quiet", *unshallow, "--tags", "origin"],
+            allow_local_source=allow_local_source,
+        )
+
+    def fetch_submodules(self, *, allow_local_source: bool = False) -> None:
+        """Check out every submodule at the commit the base records, over HTTPS only."""
+
+        self._fetch(
+            ["submodule", "update", "--init", "--recursive", "--depth=1"],
+            allow_local_source=allow_local_source,
+        )
+
+    def restore_base(self) -> list[str]:
+        """Undo every change a patch would carry: restore tracked files, delete new ones.
+
+        Ignored files stay. Returns the paths that were restored or deleted.
+        """
+
+        with self._temporary_index() as environment:
+            output = self._git_bytes(
+                [
+                    "diff",
+                    "--cached",
+                    "--name-status",
+                    "-z",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    "HEAD",
+                    "--",
+                ],
+                environment=environment,
+            )
+        fields = [_decode_git_path(item) for item in output.split(b"\0") if item]
+        changes = list(zip(fields[::2], fields[1::2], strict=True))
+        for status, relative_path in changes:
+            if status == "A":
+                # A new symlink goes too; only its parent directories must be real ones.
+                parent = PurePosixPath(relative_path).parent
+                directory = (
+                    self.path
+                    if parent == PurePosixPath(".")
+                    else self._resolve_path(str(parent), must_exist=True)
+                )
+                try:
+                    (directory / PurePosixPath(relative_path).name).unlink()
+                except OSError as exc:
+                    raise RepositoryError(f"Could not delete {relative_path}: {exc}") from exc
+        restored = [path for status, path in changes if status != "A"]
+        if restored:
+            # A file named like a glob must restore only itself.
+            literal = {**_git_environment(), "GIT_LITERAL_PATHSPECS": "1"}
+            self._git_bytes(["checkout", "HEAD", "--", *restored], environment=literal)
+        return sorted(path for _, path in changes)
+
+    def ignored_paths(self) -> list[str]:
+        """List untracked paths Git ignores; a directory ignored as a whole ends in ``/``."""
+
+        output = self._git_bytes(
+            ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"]
+        )
+        return sorted(_decode_git_path(item) for item in output.split(b"\0") if item)
+
     def base_tree(self) -> list[TreeEntry]:
         """List every file and submodule of the base commit.
 
@@ -799,6 +873,19 @@ class RepositoryWorkspace:
             key = raw_key.decode("utf-8", errors="replace")
             if value and _FILTER_COMMAND_KEY.fullmatch(key):
                 raise RepositoryError(f"Workspace Git config defines a filter command: {key}")
+
+    def _fetch(self, arguments: list[str], *, allow_local_source: bool) -> None:
+        self._assert_base_commit()
+        self._refuse_filter_commands()
+        # Only the HTTPS remotes clones use, and a local fixture source when asked; never a
+        # submodule URL with another transport.
+        _run_git_at(
+            self.path,
+            ["-c", "protocol.allow=never", "-c", "protocol.https.allow=always", *arguments],
+            timeout_seconds=_GIT_FETCH_TIMEOUT_SECONDS,
+            environment=_git_environment(),
+            protocol="always" if allow_local_source else "never",
+        )
 
     def _run_git(
         self,
