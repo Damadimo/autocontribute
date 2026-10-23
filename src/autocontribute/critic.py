@@ -18,13 +18,13 @@ import re
 import secrets
 from collections.abc import Sequence
 from contextlib import suppress
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
 
 from autocontribute.agent_loop import AgentLoop, DidNotFinish, Finished, LoopFailure, SubmittedFix
 from autocontribute.agent_tools import MAX_AGENT_COMMAND_SECONDS, SessionTools
 from autocontribute.budget import RunBudget
+from autocontribute.domain import DomainModel
 from autocontribute.exceptions import RepositoryError
 from autocontribute.fix_checks import FixCheckResult
 from autocontribute.instructions import load_instructions
@@ -61,17 +61,15 @@ _WAIVER_BLOCKER: Final = ReviewBlocker(
 )
 
 
-@dataclass(frozen=True, slots=True)
-class DroppedBlocker:
+class DroppedBlocker(DomainModel):
     """A reported blocker the controller could not confirm, and why."""
 
     blocker: ReviewBlocker
     reason: str
 
 
-@dataclass(frozen=True, slots=True)
-class CriticRound:
-    """One round's review and what the controller made of it."""
+class CriticRound(DomainModel):
+    """One round's review and what the controller made of it, for run evidence."""
 
     number: int
     decision: Literal["approve", "request_changes", "reject"]
@@ -79,8 +77,8 @@ class CriticRound:
     reason: str
     review: ReviewSubmission
     # What goes back to the agent on request_changes.
-    confirmed: tuple[ReviewBlocker, ...]
-    dropped: tuple[DroppedBlocker, ...]
+    confirmed: list[ReviewBlocker]
+    dropped: list[DroppedBlocker]
 
 
 CriticOutcome = CriticRound | DidNotFinish | LoopFailure
@@ -180,7 +178,14 @@ class Critic:
         if check.test_waiver_needed and not review.no_test_needed:
             confirmed.append(_WAIVER_BLOCKER)
         decision, reason = _decide(number, review, confirmed, earlier)
-        result = CriticRound(number, decision, reason, review, tuple(confirmed), tuple(dropped))
+        result = CriticRound(
+            number=number,
+            decision=decision,
+            reason=reason,
+            review=review,
+            confirmed=confirmed,
+            dropped=dropped,
+        )
         self.rounds.append(result)
         return result
 
@@ -197,7 +202,7 @@ class Critic:
             if reason is None:
                 confirmed.append(blocker)
             else:
-                dropped.append(DroppedBlocker(blocker, reason))
+                dropped.append(DroppedBlocker(blocker=blocker, reason=reason))
         return confirmed, dropped
 
     def _check_passes(self, blocker: ReviewBlocker, validated: Path) -> str | None:
