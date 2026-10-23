@@ -27,7 +27,7 @@ TestFramework = Literal["pytest", "unittest", "jest", "vitest", "mocha", "go", "
 
 _REPOSITORY: Final = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _VARIABLE_NAME: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_DEBIAN_PACKAGE: Final = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
+DEBIAN_PACKAGE: Final = re.compile(r"^[a-z0-9][a-z0-9+.-]*$")
 _SHA256_HEX: Final = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_DIGEST: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ARCHITECTURE: Final = re.compile(r"^[a-z0-9][a-z0-9_./-]{0,63}$")
@@ -82,7 +82,7 @@ class EnvironmentRecipe(DomainModel):
     @field_validator("system_packages")
     @classmethod
     def system_packages_are_package_names(cls, values: list[str]) -> list[str]:
-        invalid = [value for value in values if not _DEBIAN_PACKAGE.fullmatch(value)]
+        invalid = [value for value in values if not DEBIAN_PACKAGE.fullmatch(value)]
         if invalid:
             raise ValueError(f"system_packages must be Debian package names: {invalid}")
         return values
@@ -190,6 +190,7 @@ def environment_cache_key(
 
 
 __all__ = [
+    "DEBIAN_PACKAGE",
     "RECIPE_SCHEMA_VERSION",
     "SETUP_LOGIC_VERSION",
     "TOOL_ROOT",

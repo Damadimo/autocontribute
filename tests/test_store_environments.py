@@ -74,12 +74,13 @@ def test_a_failed_environment_blocks_the_repository_for_seven_days(tmp_path: Pat
     store.save_environment(_recipe(), cache_key=_KEY, baseline=_baseline())
 
     store.mark_environment_failed(
-        "acme/demo", reason="  only 3 of 40 tests passed  ", cache_key=_KEY, recipe=_recipe()
+        "acme/demo", reason="  only 3 of 40 tests passed  ", recipe=_recipe()
     )
     stored = store.environment("acme/demo")
 
     assert stored is not None
     assert stored.status == "failed"
+    assert stored.cache_key is None
     assert stored.repository == "acme/demo"
     assert stored.recipe == _recipe()
     assert stored.baseline is None

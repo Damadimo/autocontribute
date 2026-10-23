@@ -31,7 +31,7 @@ _CONTAINER_WORKSPACE: Final = "/workspace"
 _SHM_SIZE: Final = "256m"
 _MAX_CAPTURE_BYTES: Final = 2_000_000
 _TRUNCATED_MARKER: Final = b"\n[output truncated by autocontribute]\n"
-_SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 _SESSION_SHELL: Final = "/bin/sh"
 _SESSION_TMP_SIZE: Final = "1g"
 _SESSION_MAIN_UID: Final = 65_534
@@ -39,7 +39,7 @@ _SESSION_OUTPUT_DIRECTORY: Final = "/tmp/ac-out"
 _SESSION_ENVIRONMENT: Final = (
     ("HOME", "/tmp/home"),
     ("TMPDIR", "/tmp"),
-    ("PATH", _SAFE_CONTAINER_PATH),
+    ("PATH", SAFE_CONTAINER_PATH),
     ("CI", "1"),
     ("NO_COLOR", "1"),
     ("PAGER", "cat"),
@@ -251,7 +251,7 @@ class SandboxRunner:
             "-i",
             "HOME=/tmp",
             "TMPDIR=/tmp",
-            f"PATH={_SAFE_CONTAINER_PATH}",
+            f"PATH={SAFE_CONTAINER_PATH}",
             "CI=1",
             "NO_COLOR=1",
             "GIT_TERMINAL_PROMPT=0",
@@ -300,7 +300,7 @@ class SandboxRunner:
         if not Path(shell).is_file():
             raise SandboxError("Local sandbox requires /bin/sh")
         environment = {
-            "PATH": os.environ.get("PATH", _SAFE_CONTAINER_PATH),
+            "PATH": os.environ.get("PATH", SAFE_CONTAINER_PATH),
             "HOME": str(workspace),
             "TMPDIR": tempfile.gettempdir(),
             "CI": "1",
@@ -1351,6 +1351,7 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 __all__ = [
+    "SAFE_CONTAINER_PATH",
     "SETUP_CAPABILITIES",
     "DockerDaemonMode",
     "DockerSandbox",

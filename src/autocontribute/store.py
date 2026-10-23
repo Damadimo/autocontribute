@@ -802,7 +802,7 @@ class StoredEnvironment:
 
     repository: str
     status: Literal["ok", "failed"]
-    # None only for a failure that came before the cache key could be computed.
+    # None for a failure: only a working recipe is replayed by its key.
     cache_key: str | None
     # The recipe that worked, or the one that failed when there was one.
     recipe: EnvironmentRecipe | None
@@ -3474,7 +3474,6 @@ class RunStore:
         repository: str,
         *,
         reason: str,
-        cache_key: str | None = None,
         recipe: EnvironmentRecipe | None = None,
     ) -> None:
         """Record that no environment could be built; see :meth:`environment_block`."""
@@ -3482,7 +3481,7 @@ class RunStore:
         self._put_environment(
             repository,
             status="failed",
-            cache_key=cache_key,
+            cache_key=None,
             recipe_json=None if recipe is None else recipe.model_dump_json(),
             baseline_json=None,
             failure_reason=_bounded_text(reason, field="environment failure reason", maximum=2_000),

@@ -93,6 +93,29 @@ _GENERIC_SECRET = re.compile(
 _OBVIOUS_PLACEHOLDER = re.compile(
     r"(?i)(?:example|dummy|placeholder|change[-_]?me|test|fake|your[-_]?|x{4,})"
 )
+# Tests run offline by design, so these alone do not mean the environment is broken.
+_NETWORK_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "network name resolution failed",
+        re.compile(
+            r"\b(?:temporary failure in name resolution|name or service not known|"
+            r"could not resolve host(?:name)?|getaddrinfo (?:failed|error)|gaierror|"
+            r"getaddrinfo ENOTFOUND|ENOTFOUND|EAI_AGAIN|EAI_NONAME|unknown host|"
+            r"UnknownHostException|nodename nor servname provided)\b",
+            re.I,
+        ),
+    ),
+    (
+        "the validation command failed because the network was unavailable",
+        re.compile(
+            r"\b(?:network is unreachable|failed to establish a new connection|"
+            r"could not connect to (?:the )?server|connection refused|connection timed out|"
+            r"cannot connect to proxy|ProxyError|tunnel connection failed|"
+            r"ENETUNREACH|ECONNREFUSED|ETIMEDOUT)\b",
+            re.I,
+        ),
+    ),
+)
 _INFRASTRUCTURE_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("the validation command was not installed", re.compile(r"\bcommand not found\b", re.I)),
     (
@@ -184,26 +207,7 @@ _INFRASTRUCTURE_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.I,
         ),
     ),
-    (
-        "network name resolution failed",
-        re.compile(
-            r"\b(?:temporary failure in name resolution|name or service not known|"
-            r"could not resolve host(?:name)?|getaddrinfo (?:failed|error)|gaierror|"
-            r"getaddrinfo ENOTFOUND|ENOTFOUND|EAI_AGAIN|EAI_NONAME|unknown host|"
-            r"UnknownHostException|nodename nor servname provided)\b",
-            re.I,
-        ),
-    ),
-    (
-        "the validation command failed because the network was unavailable",
-        re.compile(
-            r"\b(?:network is unreachable|failed to establish a new connection|"
-            r"could not connect to (?:the )?server|connection refused|connection timed out|"
-            r"cannot connect to proxy|ProxyError|tunnel connection failed|"
-            r"ENETUNREACH|ECONNREFUSED|ETIMEDOUT)\b",
-            re.I,
-        ),
-    ),
+    *_NETWORK_FAILURE_PATTERNS,
     (
         "the Docker validation service was unavailable",
         re.compile(
@@ -211,13 +215,6 @@ _INFRASTRUCTURE_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             re.I,
         ),
     ),
-)
-# Tests run offline by design, so these alone do not mean the environment is broken.
-_NETWORK_FAILURE_REASONS = frozenset(
-    {
-        "network name resolution failed",
-        "the validation command failed because the network was unavailable",
-    }
 )
 _ACTIONABLE_VALIDATION_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
@@ -566,7 +563,7 @@ def environment_failure_signature(output: str) -> str | None:
     """
 
     for reason, pattern in _INFRASTRUCTURE_FAILURE_PATTERNS:
-        if reason not in _NETWORK_FAILURE_REASONS and pattern.search(output):
+        if (reason, pattern) not in _NETWORK_FAILURE_PATTERNS and pattern.search(output):
             return reason
     return None
 
