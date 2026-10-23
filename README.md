@@ -114,7 +114,7 @@ cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod
 | `runs list` | List recent runs and their status; `--status S[,S] --json` lists every run in those statuses, oldest first. |
 | `runs show RUN_ID` | Show the evidence for one run. |
 | `runs review RUN_ID --format github --output-dir DIR` | Write the approval review as a GitHub issue body, plus comment parts for a long patch. |
-| `runs check RUN_ID` | Check, without writing anything, whether a ready or approved run could publish now. |
+| `runs check RUN_ID` | Check, without publishing, whether a ready or approved run could publish now; a maintainer's stop request it reads still starts a safety stop. |
 | `runs cancel RUN_ID --reason TEXT` | Cancel a run that is ready for approval or approved. |
 | `runs abandon RUN_ID --reason TEXT` | End a stuck `submitting` run `failed` after checking that GitHub has no PR from it. |
 | `state export --output FILE` | Write the state and the files of unfinished runs to one archive. |

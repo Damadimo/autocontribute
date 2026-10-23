@@ -164,9 +164,10 @@ most 168). `publish` refuses unless:
 - the issue still passes every rule with no linked PR: edits, label changes, and comments are fine
   unless they close or lock it, assign it to someone else, or add a claim or a stop request.
 
-`runs check RUN_ID` runs the safety-stop, approval, limit, and recheck steps without writing
-anything and lists each result (`--json` for scripts); it exits 3 when one fails and 5 during a
-safety stop.
+`runs check RUN_ID` runs the safety-stop and approval checks and every step `publish` runs before
+it writes anything to GitHub, and lists each result (`--json` for scripts); it exits 3 when one
+fails and 5 during a safety stop. It publishes nothing, but as in discovery, a stop request it
+reads from a maintainer starts a safety stop.
 
 A failed recheck pushes nothing and leaves the run `approved`: retry `publish` after a limit clears,
 or run `autocontribute runs cancel RUN_ID --reason "TEXT"` and [retry the issue](#run-states) (also

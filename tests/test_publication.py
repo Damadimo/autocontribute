@@ -6556,6 +6556,7 @@ def test_check_reports_an_approved_run_as_publishable_without_writing(tmp_path: 
     assert [(check.name, check.passed) for check in checks] == [
         ("safety_stop", True),
         ("approval", True),
+        ("head_repository", True),
         ("limits", True),
         ("freshness", True),
     ]
@@ -6578,6 +6579,11 @@ def test_check_reports_every_failing_check_of_a_waiting_run(tmp_path: Path) -> N
         PublicationCheck("safety_stop", False, "operator:a: stop"),
         PublicationCheck("approval", False, "the run is waiting for approval"),
         PublicationCheck(
+            "head_repository",
+            True,
+            "the branch and pull request can go where the review says",
+        ),
+        PublicationCheck(
             "limits",
             False,
             "An autocontribute pull request is already open in this repository",
@@ -6593,11 +6599,7 @@ def test_check_reports_every_failing_check_of_a_waiting_run(tmp_path: Path) -> N
 
 
 class _HeldStore(RunStore):
-    def assert_publication_not_held(
-        self,
-        repository: str,
-        pull_request_url: str | None = None,
-    ) -> None:
+    def assert_publication_not_held(self, repository: str) -> None:
         raise PolicyError(f"Publication is held for {repository}")
 
 
@@ -6608,18 +6610,50 @@ def test_check_reports_holds_when_the_store_records_them(tmp_path: Path) -> None
 
     checks = Publisher(config, held, github).check(run_id)  # type: ignore[arg-type]
 
-    assert checks[1] == PublicationCheck(
+    assert checks[2] == PublicationCheck(
         "holds",
         False,
         "Publication is held for example/project",
     )
     assert [check.name for check in checks] == [
         "safety_stop",
-        "holds",
         "approval",
+        "holds",
+        "head_repository",
         "limits",
         "freshness",
     ]
+
+
+def test_publish_refuses_a_held_repository_before_the_intent(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    held = _HeldStore(store.root)
+
+    with pytest.raises(PolicyError, match="Publication is held for example/project"):
+        Publisher(config, held, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert not github.mutated
+    assert store.get(run_id).status == RunStatus.APPROVED
+    assert "publication.intent.begun" not in {event["event_type"] for event in store.events(run_id)}
+
+
+def test_check_and_publish_refuse_the_same_head_repository(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    github.upstream_collaborators_only = True
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+
+    checks = {check.name: check for check in publisher.check(run_id)}
+    with pytest.raises(PolicyError, match="accepts pull requests only from collaborators"):
+        publisher.publish(run_id)
+
+    assert checks["head_repository"] == PublicationCheck(
+        "head_repository",
+        False,
+        "example/project accepts pull requests only from collaborators",
+    )
+    assert not github.mutated
 
 
 def test_check_refuses_runs_that_are_not_waiting_to_publish(tmp_path: Path) -> None:
