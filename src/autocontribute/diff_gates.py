@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Final
 
 from autocontribute.config import PolicyConfig, QualityConfig
@@ -20,6 +21,7 @@ from autocontribute.exceptions import RepositoryError
 from autocontribute.patches import FilePatch, Patch, PatchSplit
 from autocontribute.redaction import high_confidence_token_labels, is_sensitive_path
 from autocontribute.repository import RepositoryWorkspace
+from autocontribute.workspace_files import WorkspaceFiles
 
 # DESIGN §2: the new quality keys for non-test files.
 DEFAULT_MAX_SOURCE_FILES: Final = 3
@@ -118,6 +120,22 @@ _DEFINITION: Final = re.compile(
     r"^\s*(?:(?:async\s+)?def\s|class\s|func\s|(?:pub\s+)?(?:async\s+)?fn\s"
     rf"|{_JAVASCRIPT_TEST}\s*\()"
 )
+
+
+_HUNK_NEW_START: Final = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)")
+
+
+@dataclass(frozen=True, slots=True)
+class ChangedTests:
+    """The tests a patch adds or edits: their files, and their names as their files spell them."""
+
+    paths: frozenset[str]
+    names: frozenset[str]
+
+    def includes(self, test_id: str) -> bool:
+        """Return whether a test, as its runner reports it, is one of these."""
+
+        return _in_files(test_id, self.paths) and _named(test_id, self.names)
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,6 +267,38 @@ def diff_gates(
     return DiffGateOutcome(tuple(gates), host_secret)
 
 
+def changed_tests(tests: Patch, post_image: WorkspaceFiles) -> ChangedTests:
+    """Name the tests the test part of a patch adds or edits.
+
+    A changed line names the test it defines, or else the test whose body holds it in the file
+    after the patch, read from ``post_image``: the nearest definition above it with less
+    indentation. A change outside any test, such as to a helper, names none.
+    """
+
+    paths: set[str] = set()
+    names: set[str] = set()
+    for file in tests.files:
+        if "\ndeleted file mode " in file.header:
+            continue
+        paths.add(file.path)
+        try:
+            after = post_image.read_text(file.path).split("\n")
+        except RepositoryError:
+            after = []
+        for hunk in file.hunks:
+            start = _HUNK_NEW_START.match(hunk)
+            position = int(start.group(1)) if start is not None else 1
+            for line in hunk.split("\n")[1:]:
+                code = line[1:]
+                if line[:1] in {"+", "-"} and code.strip():
+                    name = _test_name(code) or _enclosing_test(after, position, code)
+                    if name is not None:
+                        names.add(name)
+                if line[:1] in {"+", " "}:
+                    position += 1
+    return ChangedTests(frozenset(paths), frozenset(names))
+
+
 def path_matches(path: str, pattern: str) -> bool:
     """Match a repository path against a glob; ``**/`` also matches at the root."""
 
@@ -369,6 +419,50 @@ def _test_name(code: str) -> str | None:
     return None
 
 
+def _enclosing_test(after: Sequence[str], position: int, code: str) -> str | None:
+    """Name the test whose body holds a line changed at ``position`` (1-based), if any."""
+
+    indent = len(code) - len(code.lstrip())
+    for line in reversed(after[: max(0, position - 1)]):
+        if not line.strip() or len(line) - len(line.lstrip()) >= indent:
+            continue
+        if _DEFINITION.match(line):
+            return _test_name(line)
+    return None
+
+
+def _in_files(test_id: str, paths: Collection[str]) -> bool:
+    """Whether a test belongs to one of ``paths``, by how runners name tests after files."""
+
+    for path in paths:
+        pure = PurePosixPath(path)
+        module = str(pure.with_suffix("")).replace("/", ".")
+        if test_id.startswith((f"{path}::", f"{module}::", f"{module}.")):
+            return True
+        # cargo names tests by module path, and go by the package's import path.
+        if pure.suffix == ".rs":
+            return True
+        package = test_id.split("::", 1)[0]
+        directory = str(pure.parent)
+        if pure.suffix == ".go" and (
+            directory == "." or package == directory or package.endswith(f"/{directory}")
+        ):
+            return True
+    return False
+
+
+def _named(test_id: str, names: Collection[str]) -> bool:
+    """Whether a test's reported name is one of ``names``.
+
+    pytest adds parameters in brackets, go names subtests after a slash, and Jest prefixes
+    the titles of the enclosing describe blocks.
+    """
+
+    last = test_id.rsplit("::", 1)[-1]
+    candidates = {last, last.split("[", 1)[0], last.split("/", 1)[0]}
+    return bool(candidates & set(names)) or any(last.endswith(f" {name}") for name in names)
+
+
 def _skipped_existing(file: FilePatch, removed: Sequence[str]) -> Iterator[str]:
     """Yield the added lines that skip or focus a test the patch did not add.
 
@@ -424,7 +518,9 @@ def _evidence(kind: str, paths: Sequence[str]) -> str:
 __all__ = [
     "DEFAULT_MAX_SOURCE_FILES",
     "DEFAULT_MAX_SOURCE_LINES",
+    "ChangedTests",
     "DiffGateOutcome",
+    "changed_tests",
     "diff_gates",
     "is_dependency_path",
     "is_workflow_path",

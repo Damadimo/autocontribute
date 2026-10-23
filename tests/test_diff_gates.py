@@ -10,6 +10,7 @@ import pytest
 from autocontribute.config import PolicyConfig, QualityConfig
 from autocontribute.diff_gates import (
     DiffGateOutcome,
+    changed_tests,
     diff_gates,
     is_dependency_path,
     is_workflow_path,
@@ -411,3 +412,31 @@ def test_dependency_and_workflow_paths() -> None:
     assert is_workflow_path(".github/workflows/ci.yml")
     assert is_workflow_path(".circleci/config.yml")
     assert not is_workflow_path("docs/workflows.md")
+
+
+def test_changed_tests_name_the_tests_whose_lines_change(workspace: RepositoryWorkspace) -> None:
+    _write(
+        workspace,
+        {
+            "tests/test_calc.py": _BASE["tests/test_calc.py"].replace(
+                "add(0, 0) == 0", "add(0, 1) == 1"
+            )
+            + "\n\ndef helper():\n    return 1\n",
+            "web/parse.test.js": _PARSE.replace("parse('1')).toBe(1)", "parse('2')).toBe(2)"),
+        },
+    )
+    (workspace.path / "pkg" / "sum_test.go").unlink()
+    patch = extract_patch(workspace)
+
+    changed = changed_tests(
+        split_patch(patch, WorkspaceFiles(workspace.path)).tests, WorkspaceFiles(workspace.path)
+    )
+
+    assert changed.paths == {"tests/test_calc.py", "web/parse.test.js"}
+    assert changed.names == {"test_zero", "parses numbers"}
+    assert changed.includes("tests.test_calc::test_zero")
+    assert changed.includes("tests.test_calc::test_zero[1]")
+    assert not changed.includes("tests.test_calc::test_adds")
+    assert not changed.includes("tests.test_other::test_zero")
+    assert changed.includes("web/parse.test.js::parser parses numbers")
+    assert not changed.includes("web/sum.test.js::parser parses numbers")

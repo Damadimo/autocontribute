@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import secrets
 from collections import Counter
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -331,14 +331,18 @@ def acceptance_failure(baseline: EnvironmentBaseline, runs: Sequence[SuiteRun]) 
     return None
 
 
-def reproduction(baseline: EnvironmentBaseline, red: SuiteRun) -> Reproduction:
+def reproduction(
+    baseline: EnvironmentBaseline, red: SuiteRun, *, changed: Callable[[str], bool]
+) -> Reproduction:
     """Find the tests a patch's test hunks add or break on the unpatched source.
 
     ``red`` ran on the snapshot with only the test part of the patch applied. A target that
     fails for an import, syntax or collection error, or a run that timed out, reproduces
     nothing: the test may only be failing because the code it calls does not exist yet. A
     file, module or package that fails as a whole is reported in ``uncollected`` instead.
-    Without per-test results the suite is the one target, when it passed on the base.
+    A test that passed on the base is a target only when ``changed`` says the patch edits
+    it, so an unchanged test that flakes cannot stand for the reproduction. Without per-test
+    results the suite is the one target, when it passed on the base.
     """
 
     if red.failure is not None or red.timed_out:
@@ -354,7 +358,8 @@ def reproduction(baseline: EnvironmentBaseline, red: SuiteRun) -> Reproduction:
     new = [
         (test_id, result)
         for test_id, result in sorted(red.results.items())
-        if test_id not in known or (test_id in stable and result.status in _FAILING)
+        if test_id not in known
+        or (test_id in stable and result.status in _FAILING and changed(test_id))
     ]
     targets = [test_id for test_id, result in new if not result.collection_error]
     reproduced_targets = [
