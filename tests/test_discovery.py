@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 import pytest
 
@@ -2059,6 +2060,37 @@ def test_classifier_ban_that_fails_verification_skips_the_repository(tmp_path) -
         "the repository's AI policy could not be verified: no quoted passage appears in its "
         "policy files"
     ]
+
+
+@pytest.mark.parametrize("stance", ["none", "permissive"])
+def test_unquoted_classifier_reading_cannot_reopen_a_banning_repository(
+    tmp_path,
+    stance: Literal["none", "permissive"],
+) -> None:  # type: ignore[no-untyped-def]
+    github = PolicyGitHub(
+        {
+            ("example/project", "CONTRIBUTING.md"): (
+                "Purely agentic contributions are not accepted and will be closed."
+            )
+        }
+    )
+    store = RunStore(tmp_path)
+    classifier = RecordingClassifier(RepositoryAiPolicy(stance=stance))
+
+    classified = DiscoveryService(  # type: ignore[arg-type]
+        AutocontributeConfig(), github, store, policy_classifier=classifier
+    ).evaluate(_issue(), _repository())
+    reused = DiscoveryService(AutocontributeConfig(), github, store).evaluate(  # type: ignore[arg-type]
+        _issue(), _repository()
+    )
+
+    for result in (classified, reused):
+        assert not result.eligible
+        assert _ai_policy_evidence(result).stance == "ban"
+        assert result.blockers[0].startswith(
+            "the repository's AI policy bans agent-made contributions: "
+            '"Purely agentic contributions are not accepted and will be closed."'
+        )
 
 
 def test_classifier_is_not_asked_about_policies_that_never_mention_ai(tmp_path) -> None:  # type: ignore[no-untyped-def]
