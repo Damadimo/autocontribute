@@ -23,7 +23,7 @@ A DCO attestation needs both keys set, because the `Signed-off-by` trailer must 
 | `repositories` | `[]` | Repositories to search, as `owner/name`. Each needs a `validation.required_commands` entry. |
 | `owners` | `[]` | Users or organizations whose most recently pushed public repositories are searched too. If the chosen issue's repository has no `validation.required_commands` entry, the run stops before any model call. |
 | `include_labels` | `help wanted`, `bug`, `confirmed`, `accepted`, `status: help wanted`, `contributions welcome`, `pr welcome` | Discovery searches only open issues that carry one of these labels. Labels match regardless of case, hyphens, and underscores, so `Help-Wanted` matches `help wanted`. Discovery also searches for `status: help wanted`, `sprintable`, `E-easy`, `contributions welcome`, `PR welcome`, `accepted`, and `confirmed` when a repository defines them, even if you change this list. |
-| `exclude_labels` | `security`, `breaking change`, `needs design`, `discussion`, `blocked`, `good first issue`, `first-timers-only` | Skip issues that carry any of these labels. Maintainers keep `good first issue` and `first-timers-only` issues for people making their first contribution. |
+| `exclude_labels` | `security`, `breaking change`, `needs-*`, `question`, `discussion`, `design`, `rfc`, `proposal`, `wontfix`, `duplicate`, `invalid`, `stale`, `blocked`, `good first issue`, `first-timers-only`, `beginner` | Skip issues that carry any of these labels. A `*` matches any text, so `needs-*` covers `Needs Triage` and `needs-decision`. Maintainers keep `good first issue`, `first-timers-only`, and `beginner` issues for people making their first contribution. |
 | `labels` | `{}` | Labels for one repository, as `owner/name: {include: [...], exclude: [...]}`. A list you set replaces `include_labels` or `exclude_labels` for that repository, and a set `include` list also turns off the extra labels above. |
 | `min_stars` | `0` | Skip repositories with fewer stars, including ones listed in `repositories`. |
 | `repository_limit_per_owner` | `8` | Repositories searched for each entry in `owners` (1–30). |
@@ -84,13 +84,14 @@ There is no network setting: the `docker` backend always runs checks with no net
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `require_maintainer_signal` | `true` | Issues must carry one of the `github.include_labels` (or `github.labels`) labels, or have a maintainer comment that invites a pull request. |
-| `require_contribution_guidelines` | `true` | The repository, or the owner's `.github` repository, must have a CONTRIBUTING file. |
+| `require_contribution_guidelines` | `true` | The repository, or the owner's `.github` repository, must have a contribution guide (`CONTRIBUTING`, `CONTRIBUTE`, `HOW_TO_CONTRIBUTE`, ...) in its root, `.github/`, or `docs/`. |
 | `allow_assigned_issues` | `false` | `true` allows assigned issues. |
 | `allow_security_issues` | `false` | `true` allows issues that look security-related. |
 | `allow_dependency_changes` | `false` | `true` allows changes to dependency manifests and lock files, such as `pyproject.toml` or `package-lock.json`. |
 | `allow_workflow_changes` | `false` | `true` allows changes to CI configuration. Also remove those paths from `quality.forbidden_paths`. |
 | `ai_disclosure` | `This contribution was prepared autonomously by an AI agent. Its validation evidence comes from Autocontribute's configured automated checks; no human review is implied.` | Text added to every PR body. It cannot be empty. |
 | `legal_attestations` | `{}` | See [Legal attestations](#legal-attestations). |
+| `allow_conditional_ai_policy` | `[]` | Repositories, as `owner/name`, to contribute to even though their AI policy asks for pull request text written by a person. Discovery skips such repositories unless they are listed; list one only if you will write that text yourself. |
 
 ## quality
 
@@ -142,4 +143,4 @@ Each limit applies to one run, and the run stops when it reaches a model limit.
 
 ## Legal attestations
 
-`policy.legal_attestations` is empty by default. Discovery skips a repository whose policy files mention a CLA or DCO until this map holds an entry for it that matches those files. Do not write entries by hand: run `autocontribute policy inspect owner/repo` and read every policy file it links, then run `autocontribute policy attest owner/repo` with `--cla-completed` (your account already completed the CLA, and no per-contribution signature remains), `--authorize-dco-signoff` (adds a `Signed-off-by` trailer for `identity.name` and `identity.email`), or both, as the inspection requires. Paste the entry it prints under `policy.legal_attestations`. The entry stops matching when the repository's policy files or detected requirements change, and publishing requires the same GitHub account that made the attestation.
+`policy.legal_attestations` is empty by default. Discovery skips a repository whose policy files mention a CLA or DCO until this map holds an entry for it that matches those files. Do not write entries by hand: run `autocontribute policy inspect owner/repo` and read every policy file it links, then run `autocontribute policy attest owner/repo` with `--cla-completed` (your account already completed the CLA, and no per-contribution signature remains), `--authorize-dco-signoff` (adds a `Signed-off-by` trailer for `identity.name` and `identity.email`), or both, as the inspection requires. Paste the entry it prints under `policy.legal_attestations`. The entry stops matching when a CLA or DCO file changes, when a section of another policy file that names a CLA or DCO changes, or when the detected requirements change; other policy edits leave it valid. Publishing requires the same GitHub account that made the attestation.

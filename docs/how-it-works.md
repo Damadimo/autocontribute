@@ -51,8 +51,22 @@ blockers.
 | Issue has an invitation label, or a maintainer comment inviting a pull request, and no excluded label | `policy.require_maintainer_signal` (true), `github.include_labels`, `github.exclude_labels`, `github.labels` ([Configuration](configuration.md#github)) |
 | Title, body, comments, and labels show no sign of a vulnerability (CVE, injection, XSS, ...) | `policy.allow_security_issues` (false) |
 | The issue does not ask contributors to stay away; no open PR in the repository links it with a closing keyword or was updated in the last 90 days; no comment from the last 30 days claims the work ("I'm working on this") unless a maintainer has since invited a PR; and no maintainer comment asks contributors to stop or hold off. A maintainer comment that turns away automated or AI contributions skips the whole repository for the run | |
-| The repository or its owner's `.github` repository has contribution guidelines, no policy file bans AI-assisted or automated contributions, and a detected CLA or DCO has a matching attestation ([Legal attestations](configuration.md#legal-attestations)) | `policy.require_contribution_guidelines` (true), `policy.legal_attestations` |
+| The repository takes pull requests from people who are not collaborators and has no `.github/VOUCHED.td` vouch list | |
+| Every policy file could be read; the repository or its owner's `.github` repository has contribution guidelines; the AI policy does not ban agent-made contributions and, unless you opt in, does not ask for human-written PR text; and a detected CLA or DCO has a matching attestation ([Legal attestations](configuration.md#legal-attestations)) | `policy.require_contribution_guidelines` (true), `policy.allow_conditional_ai_policy`, `policy.legal_attestations` |
 | The score below reaches 60 | |
+
+Policy files are read at the pinned commit from the root, `.github/`, and `docs/` of the
+repository and of its owner's `.github` repository: contribution guides, AI policies, `AGENTS.md`,
+`CLAUDE.md`, `GEMINI.md`, `.github/copilot-instructions.md`, PR templates, security, conduct,
+support, and governance files, CLA and DCO files, and the top-level README. Pages that a
+contribution guide links to in the same repository are read too, one link deep. A file that cannot
+be read, more than 128 files, or more than 4,000,000 bytes skips the repository.
+
+The AI policy is read sentence by sentence, HTML comments included. A sentence about contributing
+that names agentic, autonomous, or fully automated tools, or AI- or LLM-generated work, together
+with "not accepted", "will be closed", "not allowed", "prohibited", "refrain from", "ban", or
+"decline" is a ban. Rules about disclosing AI use or writing PR text yourself make the policy
+conditional; the quotes are kept with the run for the approval review.
 
 | Score part | Points | Earned by |
 | --- | ---: | --- |
@@ -61,6 +75,7 @@ blockers.
 | Smallness | 20 | a small, easy, or typo label, or "typo" in the title (10), fewer than 15 comments (5), at most one source file named (5) |
 | Freshness | 15 | created in the last 2 years (5), updated in the last 90 days (5), a maintainer comment in the last 90 days (5) |
 | Testability | 15 | a code block or reproduction steps (10; documentation and test issues get these), tests named (5) |
+| Kind of work | -15 to +15 | docs, CI, build, test, or typing work (+10); a reproduction and a named file or function (+5); performance, feature, UI, platform-specific, or concurrency work, unless a maintainer comment states the expected behavior (-15) |
 
 ## Validation
 
