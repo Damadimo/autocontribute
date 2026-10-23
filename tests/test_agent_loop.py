@@ -556,6 +556,26 @@ def test_the_confirming_submit_text_is_checked_and_used(harness: Harness) -> Non
     )
 
 
+def test_a_turn_gets_one_submit(harness: Harness) -> None:
+    (harness.workspace / "calc.py").write_text(_FIXED_SOURCE)
+    script = ScriptedProvider(
+        turn("openai", Submit(_FIX), Submit(_FIX)),
+        turn("openai", Submit(_FIX)),
+    )
+    checker = FakeChecker(harness.workspace)
+    solver = harness.solver(script, "openai", checker=checker)
+
+    outcome = solver.run()
+
+    assert isinstance(outcome, SubmittedFix)
+    assert len(script.requests) == 2 and len(checker.checked) == 1
+    texts = _texts(solver.loop.transcript)
+    assert texts[1] == (
+        "Not run: a turn may call submit once. Read the result of the first call, then call "
+        "submit again in a later turn."
+    )
+
+
 def test_the_third_failed_check_ends_the_round(harness: Harness) -> None:
     script = ScriptedProvider(*(turn("openai", Submit(_FIX)) for _ in range(3)))
     checker = FakeChecker(harness.workspace)
