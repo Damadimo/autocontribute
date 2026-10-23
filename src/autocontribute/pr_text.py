@@ -108,6 +108,12 @@ def _tests_line(check: FixCheckResult) -> str:
     if red_green is None or red_green.status == "not_applicable":
         return "Tests: no test was added or changed."
     runs = sum(1 for run in red_green.runs if run.kind == "green")
+    if not check.per_test:
+        # The suite is the one test, so the command is what failed and passed.
+        command = f"`{red_green.runs[0].command}`" if red_green.runs else "The test command"
+        if not red_green.reproduced:
+            return f"Tests: {command} passes with the changed tests ({runs} runs)."
+        return f"Tests: {command} fails before this change and passes after it ({runs} runs)."
     if not red_green.reproduced:
         return f"Tests: the tests changed in {', '.join(check.test_paths)} pass ({runs} runs)."
     one = len(red_green.reproduced) == 1
@@ -123,10 +129,17 @@ def _suite_line(check: FixCheckResult) -> str:
     if regression is None or regression.status == "not_run":
         return "Full suite: not run."
     full = next((run for run in regression.runs if run.kind == "full_suite"), None)
+    related = next((run for run in regression.runs if run.kind == "related"), None)
+    if full is not None and not check.per_test:
+        return f"Full suite: `{full.command}` passes, as it did before this change."
     if full is not None:
         before = f", {full.failed:,} failed as before this change" if full.failed else ""
         return f"Full suite: no new failures ({full.passed:,} passed{before})."
-    related = next((run for run in regression.runs if run.kind == "related"), None)
+    if related is not None and not check.per_test:
+        return (
+            f"Tests related to the change: `{related.command}` passes; the full suite was not "
+            "run in the time available."
+        )
     passed = f" ({related.passed:,} passed)" if related is not None else ""
     return (
         f"Tests related to the change: no new failures{passed}; the full suite was not run in "

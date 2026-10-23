@@ -350,6 +350,7 @@ def _check(**changes: Any) -> FixCheckResult:
             runs=[],
         ),
         "test_waiver_needed": False,
+        "per_test": True,
         "notes": [],
     }
     return FixCheckResult.model_validate({**fields, **changes})

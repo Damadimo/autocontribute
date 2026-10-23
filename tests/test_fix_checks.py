@@ -214,7 +214,7 @@ def test_a_reproduced_fix_passes_red_green_and_regression(harness: Harness) -> N
 
     result = harness.check()
 
-    assert result.passed and not result.test_waiver_needed
+    assert result.passed and not result.test_waiver_needed and result.per_test
     assert result.test_paths == ["tests/test_calc.py"] and result.source_paths == ["src/calc.py"]
     red_green = result.red_green
     assert red_green is not None and red_green.status == "passed"

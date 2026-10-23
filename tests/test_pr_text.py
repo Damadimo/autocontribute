@@ -229,3 +229,37 @@ def test_the_testing_note_says_what_ran_and_what_did_not() -> None:
         "in the time available.",
     ]
     assert render_testing_note(not_run).splitlines()[-1] == "- Full suite: not run."
+
+
+def test_the_testing_note_names_the_command_when_the_suite_reports_no_tests() -> None:
+    command = "make test"
+
+    def run(kind: str) -> SuiteRunEvidence:
+        return _run(kind, 1).model_copy(update={"command": command})
+
+    suite = _check(
+        per_test=False,
+        red_green=RedGreenEvidence(
+            status="passed",
+            detail="1 test(s) fail without the fix and pass with it, 3 runs in a row",
+            targets=["<suite>"],
+            reproduced=["<suite>"],
+            uncollected=[],
+            runs=[run("red"), *(run("green") for _ in range(3))],
+        ),
+        regression=RegressionEvidence(
+            status="passed",
+            detail="the full suite shows no new failure",
+            full_suite=True,
+            new_failures=[],
+            runs=[run("full_suite")],
+        ),
+    )
+
+    note = render_testing_note(suite)
+
+    assert "<suite>" not in note
+    assert note.splitlines()[1:] == [
+        "- Tests: `make test` fails before this change and passes after it (3 runs).",
+        "- Full suite: `make test` passes, as it did before this change.",
+    ]
