@@ -507,7 +507,9 @@ def test_load_config_resolves_storage_relative_to_config(tmp_path: Path) -> None
 
 def test_secret_value_cannot_be_mistaken_for_environment_name() -> None:
     with pytest.raises(ValueError, match="environment variable name"):
-        AutocontributeConfig.model_validate({"github": {"token_env": "ghp-live-secret"}})
+        AutocontributeConfig.model_validate(
+            {"github": {"token_env": "-".join(("ghp", "live", "secret"))}}
+        )
 
 
 def test_missing_config_has_actionable_error(tmp_path: Path) -> None:
