@@ -24,7 +24,7 @@ from autocontribute.environment_setup import (
 )
 from autocontribute.environment_signals import RepositorySignals
 from autocontribute.environments import EnvironmentRecipe
-from autocontribute.exceptions import EnvironmentSetupError
+from autocontribute.exceptions import EnvironmentSetupError, RepositoryError
 from autocontribute.repository import RepositoryWorkspace
 from autocontribute.sandbox import SETUP_CAPABILITIES, ImageIdentity, SessionCommandResult
 
@@ -116,6 +116,8 @@ class _FakeContainer:
     instances: ClassVar[list[_FakeContainer]] = []
     # Side effects and results of commands, by command text.
     effects: ClassVar[dict[str, Callable[[Path], SessionCommandResult]]] = {}
+    # Whether piping the ignored files into the image archive works.
+    archives: ClassVar[bool] = True
 
     def __init__(self, config: SandboxConfig, **options: Any) -> None:
         self.config = config
@@ -147,7 +149,7 @@ class _FakeContainer:
 
     def pipe(self, command: str, text: str, *, timeout_seconds: int) -> bool:
         self.pipes.append((command, text))
-        return True
+        return _FakeContainer.archives
 
     def commit(self, labels: Mapping[str, str]) -> str:
         self.labels = labels
@@ -159,6 +161,7 @@ def docker(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
     _FakeNetwork.instances = []
     _FakeContainer.instances = []
     _FakeContainer.effects = {}
+    _FakeContainer.archives = True
     calls: dict[str, list[Any]] = {"tag": [], "inspect": [], "removed": []}
     monkeypatch.setattr(environment_setup, "EgressNetwork", _FakeNetwork)
     monkeypatch.setattr(environment_setup, "SessionContainer", _FakeContainer)
@@ -332,6 +335,151 @@ def test_a_matching_local_image_is_reused_with_its_workspace_output(
 
     changed = _recipe(setup_commands=["npm ci --ignore-scripts"])
     assert _setup(tmp_path).reuse(workspace, changed, base=_BASE, cache_key=_KEY) is None
+
+
+def _build(tmp_path: Path, workspace: RepositoryWorkspace, recipe: EnvironmentRecipe) -> None:
+    _setup(tmp_path).build(
+        workspace, recipe, base=_BASE, cache_key=_KEY, allow_hosts=(), distribution=None
+    )
+
+
+def test_tags_and_submodules_are_fetched_before_setup_starts(
+    tmp_path: Path,
+    workspace: RepositoryWorkspace,
+    docker: dict[str, list[Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # setuptools-scm projects such as pytest install only with their tags.
+    fetched: list[tuple[str, int]] = []
+
+    def fetch(kind: str) -> Callable[..., None]:
+        return lambda _workspace, **_options: fetched.append((kind, len(_FakeNetwork.instances)))
+
+    monkeypatch.setattr(RepositoryWorkspace, "fetch_tags", fetch("tags"))
+    monkeypatch.setattr(RepositoryWorkspace, "fetch_submodules", fetch("submodules"))
+
+    _build(tmp_path, workspace, _recipe(fetch_tags=True, fetch_submodules=True))
+    assert fetched == [("tags", 0), ("submodules", 0)]
+
+    fetched.clear()
+    _build(tmp_path, workspace, _recipe())
+    assert fetched == []
+
+    def unreachable(_workspace: RepositoryWorkspace, **_options: object) -> None:
+        raise RepositoryError("Git operation failed: could not read from remote")
+
+    monkeypatch.setattr(RepositoryWorkspace, "fetch_submodules", unreachable)
+    started = len(_FakeContainer.instances)
+    with pytest.raises(EnvironmentSetupError, match="Fetching Git tags or submodules failed"):
+        _build(tmp_path, workspace, _recipe(fetch_submodules=True))
+    assert len(_FakeContainer.instances) == started
+
+
+@pytest.mark.parametrize(
+    ("outcome", "reason"),
+    [
+        # The container failed although the step exited 0.
+        (
+            SessionCommandResult(
+                CommandResult(command="", exit_code=0, duration_seconds=1.0, stdout="", stderr=""),
+                "the sandbox ran out of memory (limit 6g)",
+                restarted=True,
+            ),
+            "Setup step npm ci the sandbox ran out of memory (limit 6g)",
+        ),
+        (
+            SessionCommandResult(
+                CommandResult(
+                    command="",
+                    exit_code=124,
+                    duration_seconds=600.0,
+                    stdout="",
+                    stderr="",
+                    timed_out=True,
+                ),
+                None,
+                restarted=True,
+            ),
+            "Setup step npm ci timed out after 600 s",
+        ),
+    ],
+)
+def test_container_failures_and_timeouts_fail_the_step(
+    tmp_path: Path,
+    workspace: RepositoryWorkspace,
+    docker: dict[str, list[Any]],
+    outcome: SessionCommandResult,
+    reason: str,
+) -> None:
+    _FakeContainer.effects["npm ci"] = lambda _root: outcome
+
+    with pytest.raises(EnvironmentSetupError) as error:
+        _build(tmp_path, workspace, _recipe())
+
+    assert str(error.value) == reason
+    assert docker["tag"] == []
+
+
+def test_setup_changes_that_cannot_be_undone_fail_the_recipe(
+    tmp_path: Path,
+    workspace: RepositoryWorkspace,
+    docker: dict[str, list[Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def stuck(_workspace: RepositoryWorkspace) -> list[str]:
+        raise RepositoryError("Could not delete vendor: Operation not permitted")
+
+    monkeypatch.setattr(RepositoryWorkspace, "restore_base", stuck)
+
+    with pytest.raises(EnvironmentSetupError, match="Setup left changes that cannot be undone"):
+        _build(tmp_path, workspace, _recipe())
+    assert docker["removed"] == [_BOOTSTRAPPED]
+
+
+def test_an_image_without_its_workspace_output_is_never_labelled_for_reuse(
+    tmp_path: Path, workspace: RepositoryWorkspace, docker: dict[str, list[Any]]
+) -> None:
+    def npm_ci(root: Path) -> SessionCommandResult:
+        (root / "node_modules").mkdir()
+        return _result()
+
+    _FakeContainer.effects["npm ci"] = npm_ci
+    _FakeContainer.archives = False
+
+    _build(tmp_path, workspace, _recipe())
+
+    assert _FakeContainer.instances[-1].labels == {}
+
+
+def test_reuse_fails_over_to_a_build_when_its_output_cannot_be_put_back(
+    tmp_path: Path,
+    workspace: RepositoryWorkspace,
+    docker: dict[str, list[Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    label = environment_label(_recipe(), cache_key=_KEY, command_user="1000:1000")
+    found = ImageIdentity(_COMMITTED, _COMMITTED, {IMAGE_LABEL: label}, "linux/arm64")
+    monkeypatch.setattr(environment_setup, "inspect_image", lambda reference, **_: found)
+    extraction = (
+        "if [ -f /opt/ac/workspace-setup.tar ]; then "
+        "tar -xf /opt/ac/workspace-setup.tar -C /workspace; fi"
+    )
+
+    def broken_archive(root: Path) -> SessionCommandResult:
+        (root / "package-lock.json").write_text("overwritten\n", encoding="utf-8")
+        return _result(2, "tar: unexpected end of file")
+
+    _FakeContainer.effects[extraction] = broken_archive
+
+    assert _setup(tmp_path).reuse(workspace, _recipe(), base=_BASE, cache_key=_KEY) is None
+    assert (workspace.path / "package-lock.json").read_text(encoding="utf-8") == "{}\n"
+
+    def stuck(_workspace: RepositoryWorkspace) -> list[str]:
+        raise RepositoryError("Could not delete nested: Operation not permitted")
+
+    monkeypatch.setattr(RepositoryWorkspace, "restore_base", stuck)
+    with pytest.raises(EnvironmentSetupError, match="reused image left changes"):
+        _setup(tmp_path).reuse(workspace, _recipe(), base=_BASE, cache_key=_KEY)
 
 
 def test_no_image_means_no_reuse(

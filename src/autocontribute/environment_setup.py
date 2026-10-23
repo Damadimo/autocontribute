@@ -150,7 +150,8 @@ class EnvironmentSetup:
         """Prepare ``workspace`` with an image built earlier from the same recipe and key.
 
         Returns ``None`` when there is no such image or its workspace output cannot be put
-        back; the caller then builds one.
+        back; the caller then builds one. Raises :class:`EnvironmentSetupError` when Git
+        metadata cannot be fetched or what the archive put back cannot be undone.
         """
 
         tag = image_tag(recipe.repository, cache_key)
@@ -172,7 +173,12 @@ class EnvironmentSetup:
                 timeout_seconds=self.config.command_timeout_seconds,
             )
         # The archive holds ignored files only; anything else it put back is undone.
-        workspace.restore_base()
+        try:
+            workspace.restore_base()
+        except RepositoryError as exc:
+            raise EnvironmentSetupError(
+                f"The reused image left changes that cannot be undone: {exc}"
+            ) from exc
         if extracted.infrastructure_failure is not None or not extracted.result.passed:
             return None
         return EnvironmentImage(

@@ -15,7 +15,13 @@ from autocontribute.environment_builder import EnvironmentBuilder, FailedAttempt
 from autocontribute.environment_setup import EnvironmentImage
 from autocontribute.environment_signals import RepositorySignals
 from autocontribute.environments import EnvironmentBaseline, EnvironmentRecipe
-from autocontribute.exceptions import EnvironmentSetupError, EnvironmentUnavailable, SandboxError
+from autocontribute.exceptions import (
+    EnvironmentRecipeError,
+    EnvironmentSetupError,
+    EnvironmentUnavailable,
+    RepositoryError,
+    SandboxError,
+)
 from autocontribute.repository import RepositoryWorkspace
 from autocontribute.sandbox import ImageIdentity
 from autocontribute.store import RunStore
@@ -124,10 +130,17 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
     _FakeSetup.reusable = False
     _FakeSetup.failures = {}
     _FakeSetup.dirty = []
-    recorded: dict[str, list[Any]] = {"pulls": [], "baselines": [], "suites": []}
+    recorded: dict[str, list[Any]] = {
+        "pulls": [],
+        "baselines": [],
+        "suites": [],
+        "missing_images": [],
+    }
 
     def pull(reference: str, **_options: Any) -> ImageIdentity:
         recorded["pulls"].append(reference)
+        if reference in recorded["missing_images"]:
+            raise SandboxError(f"Could not pull image {reference}: not found")
         return _BASE
 
     def baseline(
@@ -330,3 +343,115 @@ def test_a_test_command_that_never_finishes_is_not_cached(
     assert agent.calls[0][1].log_tail == "watching for file changes"
     stored = store.environment("acme/demo")
     assert stored is not None and stored.status == "failed" and stored.baseline is None
+
+
+def test_a_base_image_that_cannot_be_pulled_fails_the_repository(
+    tmp_path: Path, workspace: RepositoryWorkspace, harness: dict[str, list[Any]]
+) -> None:
+    builder, store = _builder(tmp_path)
+    harness["missing_images"] = ["python:3.14-bookworm"]
+
+    with pytest.raises(EnvironmentUnavailable, match=r"Could not pull image python:3\.14"):
+        builder.prepare("acme/demo", workspace, None, None)
+
+    assert _FakeSetup.instances[0].built == []
+    assert store.environment_block("acme/demo") is not None
+
+
+def _cache_working_recipe(
+    tmp_path: Path, workspace: RepositoryWorkspace, **changes: Any
+) -> tuple[RunStore, EnvironmentRecipe]:
+    """Prepare once so the store holds a working recipe, changed as asked under its key."""
+
+    builder, store = _builder(tmp_path)
+    builder.prepare("acme/demo", workspace, None, None)
+    stored = store.environment("acme/demo")
+    assert stored is not None and stored.recipe is not None and stored.baseline is not None
+    assert stored.cache_key is not None
+    recipe = stored.recipe.model_copy(update=changes)
+    store.save_environment(recipe, cache_key=stored.cache_key, baseline=stored.baseline)
+    _FakeSetup.instances = []
+    return store, recipe
+
+
+def test_a_failed_cached_recipe_is_not_rebuilt_when_detection_finds_the_same(
+    tmp_path: Path, workspace: RepositoryWorkspace, harness: dict[str, list[Any]]
+) -> None:
+    store, recipe = _cache_working_recipe(tmp_path, workspace)
+    _FakeSetup.failures[recipe.setup_commands[0]] = EnvironmentSetupError(
+        "Setup step uv sync exited with 1", log_tail="error: lock outdated"
+    )
+    agent = _Agent(None)
+
+    with pytest.raises(EnvironmentUnavailable, match="exited with 1"):
+        EnvironmentBuilder(SandboxConfig(), store, run_id="run1").prepare(
+            "acme/demo", workspace, None, agent
+        )
+
+    assert [built.source for built, _ in _FakeSetup.instances[0].built] == ["cached"]
+    assert agent.calls[0][1].recipe.source == "cached"
+
+
+def test_a_different_detected_recipe_is_replayed_on_a_clean_tree(
+    tmp_path: Path, workspace: RepositoryWorkspace, harness: dict[str, list[Any]]
+) -> None:
+    store, _ = _cache_working_recipe(tmp_path, workspace, setup_commands=["uv sync --frozen"])
+    _FakeSetup.failures["uv sync --frozen"] = EnvironmentSetupError("Setup step exited with 2")
+    (workspace.path / "README.md").write_text("left by the failed attempt\n", encoding="utf-8")
+
+    prepared = EnvironmentBuilder(SandboxConfig(), store, run_id="run1").prepare(
+        "acme/demo", workspace, None, None
+    )
+
+    assert prepared.recipe.source == "detected"
+    assert [built.source for built, _ in _FakeSetup.instances[0].built] == ["cached", "detected"]
+    # The detected build saw neither the cached attempt's ignored output nor its new file.
+    assert harness["baselines"][-1][1] == ["detected.txt"]
+    assert not (workspace.path / "README.md").exists()
+
+
+def test_the_setup_agent_gets_a_cached_failure_when_detection_finds_nothing(
+    tmp_path: Path,
+    workspace: RepositoryWorkspace,
+    harness: dict[str, list[Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, recipe = _cache_working_recipe(tmp_path, workspace)
+    _FakeSetup.failures[recipe.setup_commands[0]] = EnvironmentSetupError("Setup step failed")
+
+    def no_project(*_arguments: object) -> EnvironmentRecipe:
+        raise EnvironmentRecipeError("No Python, JavaScript, Go or Rust project")
+
+    monkeypatch.setattr(environment_builder, "detect_recipe", no_project)
+    agent = _Agent(
+        lambda failed: failed.model_copy(update={"setup_commands": ["uv pip install -e ."]})
+    )
+
+    prepared = EnvironmentBuilder(SandboxConfig(), store, run_id="run1").prepare(
+        "acme/demo", workspace, None, agent
+    )
+
+    assert agent.calls[0][1].recipe.source == "cached"
+    assert agent.calls[0][1].reason == "Setup step failed"
+    assert prepared.recipe.source == "agent"
+
+
+def test_an_earlier_attempt_that_cannot_be_undone_fails_the_repository(
+    tmp_path: Path,
+    workspace: RepositoryWorkspace,
+    harness: dict[str, list[Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder, store = _builder(tmp_path)
+    harness["suites"] = [[_suite(0, 4)] * 2]
+
+    def stuck(_workspace: RepositoryWorkspace) -> list[str]:
+        raise RepositoryError("Could not delete nested: Operation not permitted")
+
+    monkeypatch.setattr(RepositoryWorkspace, "restore_base", stuck)
+    agent = _Agent(lambda failed: failed.model_copy(update={"setup_commands": ["uv sync"]}))
+
+    with pytest.raises(EnvironmentUnavailable, match="cannot be undone"):
+        builder.prepare("acme/demo", workspace, None, agent)
+
+    assert store.environment_block("acme/demo") is not None
