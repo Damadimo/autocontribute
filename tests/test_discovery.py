@@ -418,6 +418,16 @@ def test_blockers_do_not_lower_the_score(tmp_path) -> None:  # type: ignore[no-u
     assert blocked.score == 75
 
 
+def test_locked_issue_fails_closed(tmp_path) -> None:
+    config = AutocontributeConfig()
+    service = DiscoveryService(config, FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]
+
+    result = service.evaluate(_issue(locked=True), _repository())
+
+    assert not result.eligible
+    assert "issue is locked" in result.blockers
+
+
 def test_assigned_issue_fails_closed(tmp_path) -> None:
     config = AutocontributeConfig()
     service = DiscoveryService(config, FakeGitHub(), RunStore(tmp_path))  # type: ignore[arg-type]

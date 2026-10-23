@@ -1708,7 +1708,7 @@ def _issue_comment(author: str, body: str) -> IssueComment:
     [
         ("state", r"no longer passes deterministic eligibility.*issue is not open"),
         ("assignment", r"no longer passes deterministic eligibility.*already assigned"),
-        ("locked", r"Issue changed after preparation: issue is locked"),
+        ("locked", r"issue is locked"),
         ("claim", r"no longer passes deterministic eligibility.*claimed work by someone"),
     ],
 )
@@ -6827,6 +6827,7 @@ def test_check_reports_an_approved_run_as_publishable_without_writing(tmp_path: 
     assert [(check.name, check.passed) for check in checks] == [
         ("safety_stop", True),
         ("approval", True),
+        ("holds", True),
         ("head_repository", True),
         ("limits", True),
         ("freshness", True),
@@ -6849,6 +6850,7 @@ def test_check_reports_every_failing_check_of_a_waiting_run(tmp_path: Path) -> N
     assert checks == (
         PublicationCheck("safety_stop", False, "operator:a: stop"),
         PublicationCheck("approval", False, "the run is waiting for approval"),
+        PublicationCheck("holds", True, "no hold applies to this repository"),
         PublicationCheck(
             "head_repository",
             True,
@@ -6862,30 +6864,34 @@ def test_check_reports_every_failing_check_of_a_waiting_run(tmp_path: Path) -> N
         PublicationCheck(
             "freshness",
             False,
-            "Issue changed after preparation: issue is locked",
+            "Candidate no longer passes deterministic eligibility: issue is locked",
         ),
     )
     assert not github.mutated
     assert store.get(run_id).status == RunStatus.READY_FOR_APPROVAL
 
 
-class _HeldStore(RunStore):
-    def assert_publication_not_held(self, repository: str) -> None:
-        raise PolicyError(f"Publication is held for {repository}")
+def _hold_repository(store: RunStore) -> None:
+    store.record_stop(
+        CircuitBreakerTrigger(
+            source="maintainer",
+            reason="asked automation to stop",
+            trigger_hash="h" * 64,
+            scope=StopScope.REPOSITORY,
+            scope_key="example/project",
+        )
+    )
 
 
-def test_check_reports_holds_when_the_store_records_them(tmp_path: Path) -> None:
+def test_check_reports_a_repository_hold(tmp_path: Path) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
     github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
-    held = _HeldStore(store.root)
+    _hold_repository(store)
 
-    checks = Publisher(config, held, github).check(run_id)  # type: ignore[arg-type]
+    checks = Publisher(config, store, github).check(run_id)  # type: ignore[arg-type]
 
-    assert checks[2] == PublicationCheck(
-        "holds",
-        False,
-        "Publication is held for example/project",
-    )
+    assert checks[2].name == "holds" and not checks[2].passed
+    assert checks[2].detail.startswith("Publication is held by maintainer: asked automation")
     assert [check.name for check in checks] == [
         "safety_stop",
         "approval",
@@ -6899,10 +6905,10 @@ def test_check_reports_holds_when_the_store_records_them(tmp_path: Path) -> None
 def test_publish_refuses_a_held_repository_before_the_intent(tmp_path: Path) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
     github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
-    held = _HeldStore(store.root)
+    _hold_repository(store)
 
-    with pytest.raises(PolicyError, match="Publication is held for example/project"):
-        Publisher(config, held, github).publish(run_id)  # type: ignore[arg-type]
+    with pytest.raises(PolicyError, match="Publication is held by maintainer"):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
 
     assert not github.mutated
     assert store.get(run_id).status == RunStatus.APPROVED
