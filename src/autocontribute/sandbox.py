@@ -32,6 +32,7 @@ _SAFE_CONTAINER_PATH: Final = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 _SESSION_SHELL: Final = "/bin/sh"
 _SESSION_TMP_SIZE: Final = "1g"
 _SESSION_MAIN_UID: Final = 65_534
+SESSION_OUTPUT_DIRECTORY: Final = "/tmp/ac-out"
 _SESSION_ENVIRONMENT: Final = (
     ("HOME", "/tmp/home"),
     ("TMPDIR", "/tmp"),
@@ -422,6 +423,35 @@ class SessionContainer:
         self.restart()
         return SessionCommandResult(result, failure, restarted=True)
 
+    def save_output(self, number: int, text: str) -> str | None:
+        """Write a command's full output into the container for the agent to search.
+
+        Returns the container path ``/tmp/ac-out/<number>.log``, or ``None`` when it could
+        not be written. A restart empties /tmp, and the saved logs with it.
+        """
+
+        if number < 1:
+            raise SandboxError("Output log numbers start at 1")
+        path = f"{SESSION_OUTPUT_DIRECTORY}/{number}.log"
+        written = _docker_control(
+            self.docker_binary,
+            [
+                "exec",
+                "--interactive",
+                f"--user={self._command_user}",
+                self.name,
+                "/usr/bin/env",
+                "-i",
+                "PATH=/usr/bin:/bin",
+                _SESSION_SHELL,
+                "-c",
+                f"mkdir -p {SESSION_OUTPUT_DIRECTORY} && cat > {path}",
+            ],
+            self._docker_environment,
+            input_text=text,
+        )
+        return path if written is not None and written.returncode == 0 else None
+
     def restart(self) -> None:
         """Kill every process and start the container again.
 
@@ -708,13 +738,16 @@ def _docker_control(
     docker_binary: str,
     arguments: Sequence[str],
     environment: dict[str, str],
+    *,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str] | None:
     """Run one short Docker management command; ``None`` means it did not finish."""
 
     try:
         return subprocess.run(
             [docker_binary, *arguments],
-            stdin=subprocess.DEVNULL,
+            input=input_text,
+            stdin=None if input_text is not None else subprocess.DEVNULL,
             capture_output=True,
             encoding="utf-8",
             errors="replace",
@@ -893,6 +926,7 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
 
 
 __all__ = [
+    "SESSION_OUTPUT_DIRECTORY",
     "DockerDaemonMode",
     "DockerSandbox",
     "SandboxRunner",
