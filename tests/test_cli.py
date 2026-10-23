@@ -1,5 +1,8 @@
 import json
+import os
 import re
+import signal
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1649,6 +1652,33 @@ class _SkippingOrchestrator:
         manifest.skip_reason = "fixture"
         self.store.save(manifest, event="test.skipped", details={})
         return manifest
+
+
+def test_sigterm_during_a_run_exits_143_after_the_run_handles_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(f"storage:\n  path: {tmp_path / 'state'}\n", encoding="utf-8")
+    handled: list[str] = []
+
+    class TerminatedOrchestrator(_SkippingOrchestrator):
+        def run(self, **_: object):  # type: ignore[no-untyped-def]
+            try:
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(5)
+            except SystemExit:
+                handled.append("marked failed")
+                raise
+
+    before = signal.getsignal(signal.SIGTERM)
+    monkeypatch.setattr(cli, "GitHubClient", _ClosableGitHub)
+    monkeypatch.setattr(cli, "Orchestrator", TerminatedOrchestrator)
+
+    result = runner.invoke(app, ["run", "--config", str(config)])
+
+    assert result.exit_code == 143
+    assert handled == ["marked failed"]
+    assert signal.getsignal(signal.SIGTERM) is before
 
 
 class _ClosableGitHub:
