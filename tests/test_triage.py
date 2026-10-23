@@ -12,7 +12,7 @@ from test_task_messages import _issue, _repository
 from autocontribute.ai_policy import PolicyFile, RepositoryAiPolicy, checked_ai_policy
 from autocontribute.budget import RunBudget
 from autocontribute.discovery import TriageVerdict
-from autocontribute.exceptions import ModelError
+from autocontribute.exceptions import ModelError, ModelRequestError
 from autocontribute.pricing import Provider
 from autocontribute.store import RunStore
 from autocontribute.transcript import Turn
@@ -167,3 +167,27 @@ def test_a_quote_no_file_holds_fails_the_discovery_check(tmp_path: Path) -> None
     assert [(quote.repository, quote.path) for quote in policy.quotes] == [("acme/calc", "")]
     checked = checked_ai_policy(policy, _FILES, fallback=RepositoryAiPolicy(stance="none"))
     assert checked.stance == "unclear" and checked.quotes == []
+
+
+def test_a_failed_request_is_charged_so_later_questions_can_reserve(tmp_path: Path) -> None:
+    store, budget = _budget(tmp_path)
+    script = ScriptedProvider(
+        ModelRequestError("flagged", status_code=400, provider_code="cyber_policy"),
+        turn("openai", Submit(_VERDICT, name="submit_triage")),
+    )
+    triage = ModelIssueTriage(
+        provider=script,
+        model=_MODELS["openai"],
+        budget=budget,
+        store=store,
+        host_values=frozenset(),
+    )
+
+    with pytest.raises(ModelError, match="flagged"):
+        triage.triage(_issue(number=1), _repository())
+
+    assert budget.manifest.model_reservation is None
+    assert budget.manifest.model_cost_usd > 0
+    assert triage.triage(_issue(number=2), _repository()) == TriageVerdict.model_validate(_VERDICT)
+    events = [event["event_type"] for event in store.events(budget.manifest.run_id)]
+    assert events.count("model.call.failure_charged") == 1

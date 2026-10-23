@@ -313,6 +313,38 @@ def test_a_retry_charges_the_failed_reservation_in_full_before_reserving_again(
     ]
 
 
+def test_a_failed_request_the_run_outlives_is_charged_in_full(
+    store: RunStore, clock: _Clock
+) -> None:
+    budget = _budget(store, clock)
+    budget.charge_failed_request(reason="nothing pending")
+    failed = budget.reserve(
+        "triage",
+        _SOL,
+        input_tokens=2_000,
+        max_output_tokens=4_000,
+        min_output_tokens=4_000,
+        details={},
+    )
+    budget.record_failure(failed, ModelRequestError("flagged", status_code=400))
+
+    budget.charge_failed_request(reason="flagged")
+
+    saved = store.get(budget.manifest.run_id)
+    assert saved.model_reservation is None
+    assert saved.model_cost_usd == failed.cost_usd
+    assert saved.model_input_tokens == 2_000 and saved.model_output_tokens == 4_000
+    assert budget.cost_left("triage") == Decimal("1.0") - failed.cost_usd
+    event, details = _events(store, budget.manifest.run_id)[-1]
+    assert event == "model.call.failure_charged"
+    assert details == {
+        "scope": "triage",
+        "failed_call": "1",
+        "reason": "flagged",
+        "reservation_settled": "charged_in_full",
+    }
+
+
 def test_settling_needs_the_pending_reservation(store: RunStore, clock: _Clock) -> None:
     budget = _budget(store, clock)
     reservation = budget.reserve(
