@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -9,11 +10,12 @@ import pytest
 
 import autocontribute.doctor as doctor
 from autocontribute.config import AutocontributeConfig, SandboxConfig
+from autocontribute.domain import RepositoryInfo
 from autocontribute.exceptions import (
     CircuitBreakerTrigger,
     GitHubSafetyError,
 )
-from autocontribute.github import GitHubClient
+from autocontribute.github import DirectoryEntry, GitHubClient
 from autocontribute.store import RunStore
 
 
@@ -563,3 +565,81 @@ def test_offline_toolchain_fails_when_no_commands_are_configured() -> None:
 
     assert not check.passed
     assert "no validation.required_commands" in check.detail
+
+
+class _PolicyDoctorGitHub:
+    """Serves one CONTRIBUTING.md per repository at a fixed commit."""
+
+    def __init__(self, guides: dict[str, str]) -> None:
+        self.guides = guides
+
+    def get_repository(self, full_name: str) -> RepositoryInfo:
+        return RepositoryInfo(
+            full_name=full_name,
+            html_url=f"https://github.com/{full_name}",
+            clone_url=f"https://github.com/{full_name}.git",
+            default_branch="main",
+            stars=1,
+            archived=False,
+            disabled=False,
+            private=False,
+            pushed_at=datetime.now(UTC),
+            license_spdx="MIT",
+        )
+
+    def default_branch_sha(self, repository: str, branch: str) -> str:
+        return "a" * 40
+
+    def default_branch_sha_if_exists(self, repository: str) -> str | None:
+        return None
+
+    def list_directory(
+        self, repository: str, path: str, *, ref: str
+    ) -> list[DirectoryEntry] | None:
+        if path or repository not in self.guides:
+            return []
+        return [DirectoryEntry(path="CONTRIBUTING.md", kind="file")]
+
+    def get_file(
+        self, repository: str, path: str, *, ref: str, max_bytes: int = 1_000_000
+    ) -> str | None:
+        return self.guides.get(repository)
+
+
+def test_doctor_names_repositories_whose_ai_policy_rules_them_out(tmp_path: Path) -> None:
+    config = AutocontributeConfig.model_validate(
+        {
+            "github": {"repositories": ["example/project", "banning/project"]},
+            "validation": {
+                "required_commands": {
+                    "example/project": ["python -m pytest"],
+                    "banning/project": ["python -m pytest"],
+                }
+            },
+        }
+    )
+    github = _PolicyDoctorGitHub(
+        {
+            "example/project": "Run the tests before opening a pull request.",
+            "banning/project": "Purely agentic contributions are not accepted.",
+        }
+    )
+
+    check = doctor._ai_policy_check(config, github, RunStore(tmp_path / "state"))  # type: ignore[arg-type]
+    clean = doctor._ai_policy_check(
+        config.model_copy(
+            update={
+                "github": config.github.model_copy(update={"repositories": ["example/project"]})
+            }
+        ),
+        github,  # type: ignore[arg-type]
+        RunStore(tmp_path / "state"),
+    )
+
+    assert (check.name, check.passed, check.warning) == ("repository AI policies", True, True)
+    assert check.detail.startswith(
+        "discovery skips banning/project: the repository's AI policy bans agent-made "
+        'contributions: "Purely agentic contributions are not accepted."'
+    )
+    assert "example/project" not in check.detail
+    assert (clean.passed, clean.warning) == (True, False)

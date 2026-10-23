@@ -105,7 +105,7 @@ cron starts with an almost empty environment. In `~/.autocontribute.env` (`chmod
 | Command | What it does |
 | --- | --- |
 | `init` | Write a starter `autocontribute.yml` (`--path`, `--force`). |
-| `doctor` | Check config, credentials, GitHub access, Git, Docker, and the sandbox image; sends small paid model probes. |
+| `doctor` | Check config, credentials, GitHub access, Git, Docker, and the sandbox image, and warn about configured repositories whose AI policy rules this tool out; sends small paid model probes. |
 | `discover` | Show the best current candidate issue without cloning, model calls, or GitHub writes. |
 | `run` | Prepare one contribution or skip; `--issue owner/repo#N` pins an issue, `--scheduled` makes an [unattended attempt](#scheduling). |
 | `approve RUN_ID` | Show the exact diff, check output, and PR text, then record your approval. |
