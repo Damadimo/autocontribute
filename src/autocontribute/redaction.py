@@ -19,8 +19,8 @@ MAX_ARTIFACT_CHARACTERS: Final = 100_000
 # Shorter environment values match ordinary text too often to be treated as secrets.
 _MIN_SECRET_VALUE_LENGTH: Final = 8
 
-# The credential patterns shared by model-input scrubbing, artifact redaction and publication
-# checks. The diff scanner keeps its own set while any of its hits trips the global breaker.
+# The credential patterns shared by model-input scrubbing, artifact redaction, publication checks
+# and the diff scanner.
 HIGH_CONFIDENCE_TOKEN_PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     (
         "GitHub token",
@@ -121,9 +121,19 @@ def contains_high_confidence_token(text: str) -> bool:
     Publication text has no reason to quote even a bare header, so the header alone counts here.
     """
 
-    return _PRIVATE_KEY_HEADER.search(text) is not None or any(
-        pattern.search(text) for _label, pattern in HIGH_CONFIDENCE_TOKEN_PATTERNS
-    )
+    return bool(high_confidence_token_labels(text))
+
+
+def high_confidence_token_labels(text: str) -> list[str]:
+    """Name the kinds of high-confidence token in text, without the values.
+
+    A private key header alone counts, as in :func:`contains_high_confidence_token`.
+    """
+
+    labels = [label for label, pattern in HIGH_CONFIDENCE_TOKEN_PATTERNS if pattern.search(text)]
+    if "private key" not in labels and _PRIVATE_KEY_HEADER.search(text):
+        labels.append("private key")
+    return labels
 
 
 def redact_text(text: str, *, secret_env_names: Iterable[str] = ()) -> str:
@@ -217,6 +227,7 @@ __all__ = [
     "contains_credential_material",
     "contains_high_confidence_token",
     "contains_host_secret",
+    "high_confidence_token_labels",
     "host_secret_values",
     "is_sensitive_path",
     "redact_model_input",
