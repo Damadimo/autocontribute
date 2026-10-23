@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 
 from autocontribute.config import AutocontributeConfig
 from autocontribute.domain import CommandResult, CriticReview, GateResult, QualityReport
-from autocontribute.redaction import HIGH_CONFIDENCE_TOKEN_PATTERNS
 
 _DEPENDENCY_FILES = {
     "build.sbt",
@@ -69,6 +68,24 @@ _WORKFLOW_FILES = {
     "jenkinsfile",
 }
 
+_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "private key",
+        re.compile(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----"),
+    ),
+    (
+        "GitHub token",
+        re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{40,255})\b"),
+    ),
+    (
+        "OpenAI API key",
+        re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b"),
+    ),
+    ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
+    ("Google API key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("Stripe live key", re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b")),
+)
 _GENERIC_SECRET = re.compile(
     r"(?i)\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|client[_-]?secret)"
     r"\s*[:=]\s*[\"']?([A-Za-z0-9_./+=-]{16,})"
@@ -710,7 +727,7 @@ def _secret_findings(files: Sequence[_DiffFile]) -> list[str]:
     findings: set[str] = set()
     for item in files:
         for added_line in item.added_lines:
-            for label, pattern in HIGH_CONFIDENCE_TOKEN_PATTERNS:
+            for label, pattern in _SECRET_PATTERNS:
                 if pattern.search(added_line):
                     findings.add(f"{label} in {item.path}")
             generic = _GENERIC_SECRET.search(added_line)
