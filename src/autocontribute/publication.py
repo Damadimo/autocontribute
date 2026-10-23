@@ -1231,16 +1231,6 @@ class Publisher:
                     raise PolicyError(
                         "Remote publication branch does not match the stored contribution commit"
                     )
-                workspace_path = self.store.workspace_dir(run_id) / "repository"
-                if recovered_remote_sha is None and not workspace_path.is_dir():
-                    return self._finalize_absent_pre_post_publication(
-                        manifest,
-                        reason=(
-                            "verified absent remote publication state after the approved "
-                            "workspace became unavailable"
-                        ),
-                        lease_guard=lease_guard,
-                    )
             elif recovered_remote_sha is not None:
                 raise PublicationResumeRequired(
                     "The durable publication branch exists without a stored commit identity; "
@@ -1367,6 +1357,8 @@ class Publisher:
                 lease_guard=lease_guard,
             )
 
+        committed_at = self._publication_intent_time(run_id)
+        workspace: RepositoryWorkspace | None = None
         if manifest.commit_sha and not workspace_path.is_dir():
             manifest.commit_sha = _validated_git_sha(
                 manifest.commit_sha,
@@ -1378,21 +1370,31 @@ class Publisher:
                     f"heads/{branch}",
                 )
             if recovered_remote_sha is None:
-                return self._finalize_absent_pre_post_publication(
+                if not self._rebuild_committed_workspace(
                     manifest,
-                    reason=(
-                        "verified absent remote publication state after the approved workspace "
-                        "became unavailable"
-                    ),
-                    lease_guard=lease_guard,
-                )
-            if recovered_remote_sha.casefold() != manifest.commit_sha:
+                    workspace_path,
+                    patch,
+                    committed_at=committed_at,
+                ):
+                    return self._finalize_absent_pre_post_publication(
+                        manifest,
+                        reason=(
+                            "verified absent remote publication state after the approved "
+                            "workspace became unavailable and could not be rebuilt exactly"
+                        ),
+                        lease_guard=lease_guard,
+                    )
+            elif recovered_remote_sha.casefold() != manifest.commit_sha:
                 raise PolicyError(
                     "Remote publication branch does not match the stored contribution commit"
                 )
-            workspace = None
         else:
-            workspace = self._prepare_workspace(manifest, workspace_path, patch)
+            workspace = self._prepare_workspace(
+                manifest,
+                workspace_path,
+                patch,
+                committed_at=committed_at,
+            )
 
         fork = head.repository
         if not head.same_repository:
@@ -1411,7 +1413,7 @@ class Publisher:
         else:
             if workspace is None:
                 raise PolicyError("Publication workspace is missing its approved working tree")
-            commit_sha = self._commit(workspace, manifest, patch)
+            commit_sha = self._commit(workspace, manifest, patch, committed_at=committed_at)
         manifest.commit_sha = commit_sha
         self.store.assert_circuit_breaker_clear()
         lease_guard.assert_owned()
@@ -3858,12 +3860,42 @@ class Publisher:
         ):
             raise PolicyError("Repository cooldown is active for this account")
 
-    def _prepare_workspace(
+    def _publication_intent_time(self, run_id: str) -> datetime:
+        """Commit dates come from the durable intent, so a rebuilt commit has the same SHA."""
+
+        intents = [
+            event
+            for event in self.store.events(run_id)
+            if event["event_type"] == "publication.intent.begun"
+        ]
+        if len(intents) != 1:
+            raise StateError("Publication needs exactly one durable intent event")
+        try:
+            return _event_time(intents[0]["occurred_at"], field="publication intent time")
+        except ValueError as exc:
+            raise StateError("Publication intent time is not canonical") from exc
+
+    def _rebuild_committed_workspace(
         self,
         manifest: RunManifest,
         path: Path,
         patch: bytes,
-    ) -> RepositoryWorkspace | None:
+        *,
+        committed_at: datetime,
+    ) -> bool:
+        """Re-derive a lost workspace; False when the stored commit is not reproducible."""
+
+        workspace = self._clone_approved_workspace(manifest, path, patch)
+        return self._commit(workspace, manifest, patch, committed_at=committed_at) == (
+            manifest.commit_sha
+        )
+
+    def _clone_approved_workspace(
+        self,
+        manifest: RunManifest,
+        path: Path,
+        patch: bytes,
+    ) -> RepositoryWorkspace:
         assert manifest.repository and manifest.base_sha
         expected_clone_url = git_push_url(
             self.config.github.api_url,
@@ -3874,6 +3906,25 @@ class Publisher:
                 "Stored repository clone URL is outside the configured GitHub origin; "
                 "refusing workspace reconstruction"
             )
+        workspace = RepositoryWorkspace.clone(
+            manifest.repository.clone_url,
+            manifest.base_sha,
+            path,
+        )
+        _git_apply(workspace.path, patch)
+        if workspace.diff_bytes() != patch:
+            raise PolicyError("Reconstructed diff does not match the approved artifact")
+        return workspace
+
+    def _prepare_workspace(
+        self,
+        manifest: RunManifest,
+        path: Path,
+        patch: bytes,
+        *,
+        committed_at: datetime,
+    ) -> RepositoryWorkspace | None:
+        assert manifest.repository and manifest.base_sha
         if manifest.commit_sha:
             if not path.is_dir():
                 raise PolicyError(
@@ -3893,6 +3944,7 @@ class Publisher:
                 manifest,
                 patch,
                 commit_sha=commit_sha,
+                committed_at=committed_at,
             )
             manifest.commit_sha = commit_sha
             # A prior attempt committed before an uncertain push. The caller can reconcile or
@@ -3914,26 +3966,21 @@ class Publisher:
                 manifest,
                 patch,
                 commit_sha=head,
+                committed_at=committed_at,
             )
             # A crash can occur after Git creates the commit but before commit_sha is saved.
             # Recover only the unique clean commit that is exactly derivable from durable intent.
             manifest.commit_sha = head
             return None
-        workspace = RepositoryWorkspace.clone(
-            manifest.repository.clone_url,
-            manifest.base_sha,
-            path,
-        )
-        _git_apply(workspace.path, patch)
-        if workspace.diff_bytes() != patch:
-            raise PolicyError("Reconstructed diff does not match the approved artifact")
-        return workspace
+        return self._clone_approved_workspace(manifest, path, patch)
 
     def _commit(
         self,
         workspace: RepositoryWorkspace,
         manifest: RunManifest,
         patch: bytes,
+        *,
+        committed_at: datetime,
     ) -> str:
         proposal = manifest.proposal
         assert proposal is not None and manifest.base_sha is not None
@@ -3971,6 +4018,7 @@ class Publisher:
         if _git_diff_bytes(workspace.path, cached=True) != patch:
             raise PolicyError("Staged diff does not match the approved patch")
         _git(workspace.path, ["diff", "--cached", "--check"])
+        git_date = _git_date(committed_at)
         _git(
             workspace.path,
             [
@@ -3987,6 +4035,7 @@ class Publisher:
                 "--message",
                 proposal.commit_message,
             ],
+            extra_env={"GIT_AUTHOR_DATE": git_date, "GIT_COMMITTER_DATE": git_date},
         )
         commit_sha = (
             _git(
@@ -4001,6 +4050,7 @@ class Publisher:
             manifest,
             patch,
             commit_sha=commit_sha,
+            committed_at=committed_at,
         )
         return commit_sha
 
@@ -4011,6 +4061,7 @@ class Publisher:
         patch: bytes,
         *,
         commit_sha: str,
+        committed_at: datetime,
     ) -> None:
         """Bind a local commit to the exact durable publication intent."""
 
@@ -4052,6 +4103,10 @@ class Publisher:
         ]
         if identity != expected_identity:
             raise PolicyError("Contribution commit identity differs from durable intent")
+        dates = _git(workspace, ["show", "--no-patch", "--format=%at %ct", commit]).split()
+        timestamp = str(int(committed_at.timestamp()))
+        if dates != [timestamp, timestamp]:
+            raise PolicyError("Contribution commit dates differ from the publication intent time")
         if _git_diff_bytes(workspace, old=base, new=commit) != patch:
             raise PolicyError("Contribution commit diff does not match the approved patch")
         status = _git(
@@ -4323,6 +4378,10 @@ def _aware_utc(value: datetime, *, field: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field} must be timezone-aware")
     return value.astimezone(UTC)
+
+
+def _git_date(value: datetime) -> str:
+    return f"{int(value.timestamp())} +0000"
 
 
 def _git_apply(workspace: Path, patch: bytes) -> None:
