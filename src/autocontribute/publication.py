@@ -70,6 +70,7 @@ from autocontribute.github import (
     RepositoryIdentity,
 )
 from autocontribute.github_origin import canonical_api_origin, git_push_url
+from autocontribute.host_environment import proxy_environment
 from autocontribute.lifecycle import LifecycleObserver, parse_pull_request_url
 from autocontribute.pr_template import visible_markdown
 from autocontribute.preparation import (
@@ -4794,6 +4795,8 @@ def _git(
 
 def _git_environment() -> dict[str, str]:
     return {
+        # The push reaches GitHub through the operator's proxy and trust store, if any.
+        **proxy_environment(),
         "PATH": os.environ.get("PATH", ""),
         # Git's global and system configuration are disabled below.  Keep the fallback outside
         # shared temporary storage as an additional defence if a future Git invocation consults
