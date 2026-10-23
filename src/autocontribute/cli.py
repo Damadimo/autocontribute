@@ -246,6 +246,13 @@ def run_once(
     finally:
         if github is not None:
             github.close()
+            if store.record_run_rate_limits(
+                ended_on_secondary_limit=github.secondary_limit_exhausted
+            ):
+                console.print(
+                    "[red]Three runs in a row ended on a GitHub secondary rate limit; the safety "
+                    "stop is now active.[/red]"
+                )
     _print_outcome(manifest, store)
     if manifest.status == RunStatus.FAILED:
         raise typer.Exit(1)

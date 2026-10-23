@@ -295,6 +295,7 @@ class GitHubClient:
         self._token = token or resolve_github_token(config)
         self._safety_trigger_handler = safety_trigger_handler
         self._secondary_wait_seconds = 0.0
+        self._secondary_limit_exhausted = False
         self._recent_searches: deque[float] = deque()
         self._client = httpx.Client(
             base_url=str(config.api_url).rstrip("/"),
@@ -313,6 +314,12 @@ class GitHubClient:
         """Credential broker access for an approved git push only."""
 
         return self._token
+
+    @property
+    def secondary_limit_exhausted(self) -> bool:
+        """Whether GitHub kept a secondary rate limit past every wait this client allows."""
+
+        return self._secondary_limit_exhausted
 
     @property
     def api_origin(self) -> str:
@@ -405,6 +412,7 @@ class GitHubClient:
                     _sleep(wait)
                     self._secondary_wait_seconds += wait
                     continue
+                self._secondary_limit_exhausted = True
                 request_id = response.headers.get("X-GitHub-Request-Id", "unknown")
                 raise GitHubRateLimitError(
                     f"GitHub kept applying a secondary rate limit to {method} {path} "

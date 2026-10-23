@@ -1143,6 +1143,8 @@ def test_manual_retry_unchanged_is_forwarded_to_orchestrator(
     calls: list[str] = []
 
     class FakeGitHub:
+        secondary_limit_exhausted = False
+
         def __init__(self, *_: object, **__: object) -> None:
             pass
 
@@ -1210,6 +1212,8 @@ def test_scheduled_run_syncs_lifecycle_before_orchestration(tmp_path: Path, monk
     calls: list[str] = []
 
     class FakeGitHub:
+        secondary_limit_exhausted = False
+
         def __init__(self, *_: object, **__: object) -> None:
             pass
 
@@ -1287,11 +1291,35 @@ class _SkippingOrchestrator:
 
 
 class _ClosableGitHub:
+    secondary_limit_exhausted = False
+
     def __init__(self, *_: object, **__: object) -> None:
         pass
 
     def close(self) -> None:
         pass
+
+
+def test_runs_that_keep_ending_on_secondary_rate_limits_trip_the_safety_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "autocontribute.yml"
+    state = tmp_path / "state"
+    config.write_text(f"storage:\n  path: {state}\n", encoding="utf-8")
+
+    class RateLimitedGitHub(_ClosableGitHub):
+        secondary_limit_exhausted = True
+
+    monkeypatch.setattr(cli, "GitHubClient", RateLimitedGitHub)
+    monkeypatch.setattr(cli, "Orchestrator", _SkippingOrchestrator)
+
+    results = [runner.invoke(app, ["run", "--config", str(config)]) for _ in range(3)]
+
+    assert [result.exit_code for result in results] == [0, 0, 0]
+    assert "safety stop is now active" not in results[1].output
+    assert "safety stop is now active" in " ".join(results[2].output.split())
+    status = RunStore(state).circuit_breaker_status()
+    assert status.source == "escalation:secondary_rate_limits"
 
 
 def test_scheduled_preflight_gates_only_on_the_global_stop(
@@ -1385,6 +1413,8 @@ def test_scheduled_preflight_fails_after_lifecycle_when_breaker_is_active(
         )
 
     class FakeGitHub:
+        secondary_limit_exhausted = False
+
         def __init__(self, *_: object, **__: object) -> None:
             pass
 
