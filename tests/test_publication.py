@@ -43,6 +43,7 @@ from autocontribute.exceptions import (
 from autocontribute.github import (
     CheckRunDetails,
     CommitStatusDetails,
+    DirectoryEntry,
     ForkIdentity,
     GitHubComment,
     LinkedPullRequest,
@@ -127,9 +128,11 @@ class _FixtureEligibilityGitHub:
         del repository
         return "b" * 40
 
-    def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
-        del repository, ref, max_files
-        return ["CONTRIBUTING.md"]
+    def list_directory(
+        self, repository: str, path: str, *, ref: str
+    ) -> list[DirectoryEntry] | None:
+        del repository, ref
+        return None if path else [DirectoryEntry(path="CONTRIBUTING.md", kind="file")]
 
 
 def _ready_run(
@@ -655,9 +658,11 @@ class FakePublishingGitHub:
         self.calls.append("default_branch_sha_if_exists")
         return "b" * 40
 
-    def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
-        del repository, ref, max_files
-        return ["CONTRIBUTING.md"]
+    def list_directory(
+        self, repository: str, path: str, *, ref: str
+    ) -> list[DirectoryEntry] | None:
+        del repository, ref
+        return None if path else [DirectoryEntry(path="CONTRIBUTING.md", kind="file")]
 
     def ensure_fork(
         self,
@@ -2064,9 +2069,16 @@ def test_benign_policy_source_drift_stops_before_any_github_mutation(
     monkeypatch.setattr(github, "get_file", changed_policy)
     monkeypatch.setattr(
         github,
-        "list_repository_files",
-        lambda repository, *, ref, max_files: (
-            ["AI_POLICY.md"] if repository == "example/.github" else ["CONTRIBUTING.md"]
+        "list_directory",
+        lambda repository, path, *, ref: (
+            None
+            if path
+            else [
+                DirectoryEntry(
+                    path="AI_POLICY.md" if repository == "example/.github" else "CONTRIBUTING.md",
+                    kind="file",
+                )
+            ]
         ),
     )
 

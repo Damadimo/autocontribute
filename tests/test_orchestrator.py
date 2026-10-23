@@ -28,6 +28,7 @@ from autocontribute.exceptions import (
     PolicyError,
     StateError,
 )
+from autocontribute.github import DirectoryEntry
 from autocontribute.orchestrator import Orchestrator, RunInvocationMode
 from autocontribute.preparation import validate_preparation_fingerprint
 from autocontribute.providers import ModelResult, ModelUsage
@@ -134,9 +135,11 @@ class FakeGitHub:
         del repository
         return "b" * 40
 
-    def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
-        del repository, ref, max_files
-        return ["CONTRIBUTING.md"]
+    def list_directory(
+        self, repository: str, path: str, *, ref: str
+    ) -> list[DirectoryEntry] | None:
+        del repository, ref
+        return None if path else [DirectoryEntry(path="CONTRIBUTING.md", kind="file")]
 
 
 class CountingGitHub(FakeGitHub):
@@ -1811,10 +1814,14 @@ def test_organization_default_pull_request_template_is_a_hard_gate(
                 return "## Organization verification\n"
             return super().get_file(repository, path, ref=ref, max_bytes=max_bytes)
 
-        def list_repository_files(self, repository: str, *, ref: str, max_files: int) -> list[str]:
+        def list_directory(
+            self, repository: str, path: str, *, ref: str
+        ) -> list[DirectoryEntry] | None:
             if repository == "example/.github":
-                return ["PULL_REQUEST_TEMPLATE.md"]
-            return super().list_repository_files(repository, ref=ref, max_files=max_files)
+                return (
+                    None if path else [DirectoryEntry(path="PULL_REQUEST_TEMPLATE.md", kind="file")]
+                )
+            return super().list_directory(repository, path, ref=ref)
 
     monkeypatch.setattr(RepositoryWorkspace, "clone", classmethod(local_clone))
     config = AutocontributeConfig.model_validate(

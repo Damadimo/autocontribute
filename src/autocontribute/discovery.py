@@ -5,13 +5,15 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import posixpath
 import re
 from collections import Counter
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from typing import Literal, Protocol
+from urllib.parse import unquote, urlparse
 
 from autocontribute.config import AutocontributeConfig, LegalAttestation
 from autocontribute.domain import (
@@ -29,6 +31,7 @@ from autocontribute.exceptions import (
     StateError,
 )
 from autocontribute.github import GitHubClient, LinkedPullRequest
+from autocontribute.github_origin import web_origin_for_api
 from autocontribute.store import CandidateAttemptState, RunStore
 
 _DANGEROUS_TERMS = re.compile(
@@ -330,76 +333,50 @@ _ISOLATED_ERRORS = (AutocontributeError, ValueError)
 MAX_POLICY_FILES_PER_REPOSITORY = 128
 MAX_POLICY_FILE_BYTES = 256_000
 MAX_POLICY_TOTAL_BYTES = 4_000_000
-MAX_POLICY_INVENTORY_FILES = 20_000
 
-_GUIDANCE_PATHS = (
-    "CONTRIBUTING.md",
-    "CONTRIBUTING.rst",
-    "CONTRIBUTING.txt",
-    ".github/CONTRIBUTING.md",
-    ".github/CONTRIBUTING.rst",
-    "docs/CONTRIBUTING.md",
-    "docs/CONTRIBUTING.rst",
-    "CONTRIBUTION_GUIDELINES.md",
-    "docs/CONTRIBUTION_GUIDELINES.md",
+# Community files live in these directories; listing them without recursion keeps the cost of a
+# policy review independent of repository size.
+_POLICY_DIRECTORIES = frozenset({".github", "docs"})
+_TEXT_SUFFIXES = frozenset({"", ".adoc", ".markdown", ".md", ".rst", ".txt"})
+_AGENT_INSTRUCTION_FILES = frozenset(
+    {"agents.md", "claude.md", "gemini.md", "copilot-instructions.md"}
 )
-_AI_POLICY_PATHS = (
-    ".github/AI_POLICY.md",
-    ".github/AI-CONTRIBUTIONS.md",
-    ".github/AI_CONTRIBUTIONS.md",
-    ".github/AUTOMATION_POLICY.md",
-    ".github/BOT_POLICY.md",
-    "AI_POLICY.md",
-    "AI-CONTRIBUTIONS.md",
-    "AI_CONTRIBUTIONS.md",
-    "AUTOMATION_POLICY.md",
-    "BOT_POLICY.md",
-    "LLM_POLICY.md",
-    "docs/AI_POLICY.md",
-    "docs/AI-CONTRIBUTIONS.md",
-    "docs/AUTOMATION_POLICY.md",
-    "CONTRIBUTING.md",
-    ".github/CONTRIBUTING.md",
+_CONTRIBUTION_GUIDES = frozenset(
+    {
+        "contribute",
+        "contributing",
+        "contributing-guide",
+        "contribution",
+        "contribution-guide",
+        "contribution-guidelines",
+        "contributions",
+        "contributor-guide",
+        "contributors-guide",
+        "how-to-contribute",
+    }
 )
-_LEGAL_POLICY_PATHS = (
-    "CONTRIBUTING.md",
-    ".github/CONTRIBUTING.md",
-    "DCO",
-    "DCO.md",
-    ".github/DCO.md",
-    ".github/dco.yml",
-    ".github/dco.yaml",
-    "docs/DCO.md",
-    "CLA",
-    "CLA.md",
-    ".github/CLA.md",
-    ".github/cla.yml",
-    ".github/cla.yaml",
-    ".github/cla-assistant.yml",
-    ".clabot",
-    "docs/CLA.md",
-    "CONTRIBUTOR_LICENSE_AGREEMENT.md",
-    "DEVELOPER_CERTIFICATE_OF_ORIGIN.md",
+_POLICY_NAME = re.compile(
+    r"(?:code[-_]of[-_]conduct|security|support|governance"
+    r"|[^.]*ai[^.]*polic[^.]*|[^.]*llm[^.]*polic[^.]*"
+    r"|ai[-_](?:contributions?|usage|use|assistance|tools?)"
+    r"|(?:generative|responsible)[-_]ai|(?:automation|bot)[-_]polic[^.]*"
+    r"|contribut(?!ors\b)[^.]*)(?:\..*)?"
 )
-_SECURITY_POLICY_PATHS = (
-    "SECURITY.md",
-    ".github/SECURITY.md",
-    "docs/SECURITY.md",
-    "CODE_OF_CONDUCT.md",
-    ".github/CODE_OF_CONDUCT.md",
-    "SUPPORT.md",
-    ".github/SUPPORT.md",
-    "CONTRIBUTION_POLICY.md",
-    ".github/CONTRIBUTION_POLICY.md",
-    "docs/CONTRIBUTION_POLICY.md",
-    "README.md",
-    ".github/README.md",
+# A repository with this file closes pull requests from contributors its maintainers have not
+# vouched for.
+_VOUCH_FILE = ".github/vouched.td"
+_MARKDOWN_LINK = re.compile(r"\]\(\s*<?([^()\s<>]+)>?(?:\s+[\"'][^\"']*[\"'])?\s*\)")
+_REFERENCE_LINK = re.compile(r"^[ \t]{0,3}\[[^\]]+\]:[ \t]*<?([^\s<>]+)>?", re.M)
+_RST_LINK = re.compile(r"`[^`<]*<([^`<>]+)>`_{1,2}")
+_RST_TARGET = re.compile(r"^[ \t]*\.\.[ \t]+_[^:\n]+:[ \t]*(\S+)", re.M)
+_HTML_LINK = re.compile(r"\bhref\s*=\s*[\"']([^\"']+)[\"']", re.I)
+# Contribution guides link to release notes and license texts, which hold no policy and can be
+# large enough to exceed the byte caps.
+_UNLINKED_DOCUMENT = re.compile(
+    r"(?:change[-_]?log|changes|history|news|release[-_]?notes?|releases|authors|contributors"
+    r"|licen[cs]e|copying|notice)(?:\..*)?"
 )
-_PULL_REQUEST_TEMPLATE_PATHS = (
-    "PULL_REQUEST_TEMPLATE.md",
-    ".github/PULL_REQUEST_TEMPLATE.md",
-    "docs/PULL_REQUEST_TEMPLATE.md",
-)
+
 POLICY_SOURCES_EVIDENCE_KEY = "policy_sources_sha256"
 POLICY_REPOSITORY_REF_EVIDENCE_KEY = "policy_repository_ref"
 POLICY_ORGANIZATION_REF_EVIDENCE_KEY = "policy_organization_ref"
@@ -411,15 +388,38 @@ _LEGAL_POLICY_FINGERPRINT_DOMAIN = b"autocontribute.legal-policy-surface.v1\x00"
 
 
 @dataclass(frozen=True, slots=True)
+class PolicyFile:
+    """One policy file read at a pinned ref, as raw text with any HTML comments."""
+
+    repository: str
+    path: str
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PolicySource:
+    """The policy files of one repository, and why reading them was incomplete if it was."""
+
+    files: tuple[PolicyFile, ...] = ()
+    vouched: bool = False
+    problems: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class PolicySnapshot:
-    """One bounded repository and organization policy view at immutable refs."""
+    """One bounded repository and organization policy view at immutable refs.
+
+    Problems name files that could not be read or caps that were exceeded; a repository with
+    problems is skipped, because its policy is not fully known.
+    """
 
     repository: str
     repository_ref: str
     organization_repository: str
     organization_ref: str | None
-    repository_paths: tuple[str, ...]
-    organization_paths: tuple[str, ...]
+    files: tuple[PolicyFile, ...]
+    vouched: bool
+    problems: tuple[str, ...]
     policy_sources_sha256: str
     legal_policy_sha256: str
     legal_requirements: tuple[str, ...]
@@ -427,6 +427,24 @@ class PolicySnapshot:
     @property
     def organization_ref_evidence(self) -> str:
         return self.organization_ref or "absent"
+
+    @property
+    def repository_paths(self) -> tuple[str, ...]:
+        return tuple(file.path for file in self.files if file.repository == self.repository)
+
+    @property
+    def organization_paths(self) -> tuple[str, ...]:
+        return tuple(
+            file.path for file in self.files if file.repository == self.organization_repository
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _RepositoryReview:
+    """What the policy files of one repository mean for every issue in it."""
+
+    blockers: tuple[tuple[str, str], ...]
+    evidence: tuple[tuple[str, str], ...]
 
 
 DiscoverySelection = tuple[IssueCandidate, RepositoryInfo, EligibilityResult]
@@ -583,8 +601,9 @@ class DiscoveryService:
         self.github = github
         self.store = store
         self.triage = triage
-        self._remote_file_cache: dict[tuple[str, str, str], str | None] = {}
-        self._policy_path_cache: dict[tuple[str, str], tuple[str, ...]] = {}
+        self._policy_sources: dict[tuple[str, str], _PolicySource] = {}
+        self._policy_snapshots: dict[tuple[str, str], PolicySnapshot] = {}
+        self._repository_reviews: dict[tuple[str, str], _RepositoryReview] = {}
         self._repository_policy_refs: dict[str, str] = {}
         self._organization_policy_refs: dict[str, str | None] = {}
 
@@ -639,6 +658,10 @@ class DiscoveryService:
             if not self._repository_baseline(repository):
                 skipped_repositories.append((repository.full_name, _REPOSITORY_BASELINE_REASON))
                 continue
+            restriction = _pull_request_restriction(repository)
+            if restriction is not None:
+                skipped_repositories.append((repository.full_name, restriction))
+                continue
             open_pull_request = open_pull_requests.get(repository.full_name.casefold())
             if open_pull_request is not None:
                 skipped_repositories.append(
@@ -657,14 +680,22 @@ class DiscoveryService:
                     continue
                 repository_ref = self._pin_repository_ref(repository)
                 found, rejected = self._search(repository, include_labels, exclude_labels)
-                if found:
-                    # Read the policy surface once here so that a failure is reported against
-                    # the repository, not retried and repeated for each of its issues.
-                    self.policy_snapshot(repository, repository_ref=repository_ref)
+                # Policy blockers hold for every issue, so they skip the repository before any
+                # issue is fetched.
+                review = (
+                    self._repository_review(repository, repository_ref=repository_ref)
+                    if found
+                    else None
+                )
             except _FATAL_ERRORS:
                 raise
             except _ISOLATED_ERRORS as exc:
                 repository_errors.append((repository.full_name, str(exc)))
+                continue
+            if review is not None and review.blockers:
+                skipped_repositories.append(
+                    (repository.full_name, "; ".join(reason for _, reason in review.blockers))
+                )
                 continue
             evaluations.extend(rejected)
             for snapshot in found:
@@ -865,6 +896,9 @@ class DiscoveryService:
 
         if not self._repository_baseline(repository):
             blockers.append(("repository", _REPOSITORY_BASELINE_REASON))
+        restriction = _pull_request_restriction(repository)
+        if restriction is not None:
+            blockers.append(("pull requests restricted", restriction))
         if issue.state.casefold() != "open":
             blockers.append(("closed", "issue is not open"))
         if (
@@ -955,84 +989,9 @@ class DiscoveryService:
             )
 
         if check_remote_policy:
-            snapshot = self.policy_snapshot(
-                repository,
-                repository_ref=repository_ref,
-            )
-            evidence[POLICY_SOURCES_EVIDENCE_KEY] = snapshot.policy_sources_sha256
-            evidence[POLICY_REPOSITORY_REF_EVIDENCE_KEY] = snapshot.repository_ref
-            evidence[POLICY_ORGANIZATION_REF_EVIDENCE_KEY] = snapshot.organization_ref_evidence
-            evidence[LEGAL_POLICY_EVIDENCE_KEY] = snapshot.legal_policy_sha256
-            contribution_policy = self._first_existing_file(
-                repository.full_name,
-                snapshot.repository_ref,
-                tuple(
-                    path for path in snapshot.repository_paths if _is_contribution_guidance(path)
-                ),
-            )
-            organization_contribution_policy = self._first_existing_file(
-                snapshot.organization_repository,
-                snapshot.organization_ref,
-                tuple(
-                    path for path in snapshot.organization_paths if _is_contribution_guidance(path)
-                ),
-            )
-            if (
-                self.config.policy.require_contribution_guidelines
-                and contribution_policy is None
-                and organization_contribution_policy is None
-            ):
-                blockers.append(
-                    (
-                        "no contribution guidelines",
-                        "no repository or organization contribution guidelines were found",
-                    )
-                )
-            ai_policy = self._combined_existing_files(
-                repository.full_name,
-                snapshot.repository_ref,
-                snapshot.repository_paths,
-            )
-            organization_ai_policy = self._combined_existing_files(
-                snapshot.organization_repository,
-                snapshot.organization_ref,
-                snapshot.organization_paths,
-            )
-            combined_ai_policy = f"{ai_policy}\n{organization_ai_policy}"
-            if combined_ai_policy and _AI_PROHIBITION.search(combined_ai_policy):
-                blockers.append(
-                    (
-                        "AI policy",
-                        "repository policy appears to prohibit AI-assisted contributions",
-                    )
-                )
-            elif combined_ai_policy and _AUTOMATION_PROHIBITION.search(combined_ai_policy):
-                blockers.append(
-                    (
-                        "automation policy",
-                        "repository policy appears to prohibit automated contributions",
-                    )
-                )
-
-            if snapshot.legal_requirements:
-                evidence[LEGAL_REQUIREMENTS_EVIDENCE_KEY] = ",".join(snapshot.legal_requirements)
-                attestation = self.config.policy.legal_attestation_for(repository.full_name)
-                mismatch = _legal_attestation_mismatch(snapshot, attestation)
-                if mismatch is None:
-                    assert attestation is not None
-                    evidence[LEGAL_ATTESTATION_EVIDENCE_KEY] = legal_attestation_fingerprint(
-                        repository.full_name, attestation
-                    )
-                else:
-                    blockers.append(
-                        (
-                            "CLA/DCO",
-                            "CLA/DCO requirements lack an exact current repository attestation: "
-                            + mismatch,
-                        )
-                    )
-            else:
-                evidence[LEGAL_REQUIREMENTS_EVIDENCE_KEY] = "none"
+            review = self._repository_review(repository, repository_ref=repository_ref)
+            blockers.extend(review.blockers)
+            evidence.update(review.evidence)
 
         notes: list[str] = []
         # The linked-PR search costs several GitHub calls; skip it once the issue is blocked.
@@ -1084,6 +1043,85 @@ class DiscoveryService:
             repository_hold=repository_hold,
         )
 
+    def _repository_review(
+        self,
+        repository: RepositoryInfo,
+        *,
+        repository_ref: str | None = None,
+    ) -> _RepositoryReview:
+        """Turn the repository's policy files into the blockers that hold for all its issues."""
+
+        snapshot = self.policy_snapshot(repository, repository_ref=repository_ref)
+        key = (repository.full_name.casefold(), snapshot.repository_ref)
+        cached = self._repository_reviews.get(key)
+        if cached is not None:
+            return cached
+        blockers = [("policy files", problem) for problem in snapshot.problems]
+        evidence = {
+            POLICY_SOURCES_EVIDENCE_KEY: snapshot.policy_sources_sha256,
+            POLICY_REPOSITORY_REF_EVIDENCE_KEY: snapshot.repository_ref,
+            POLICY_ORGANIZATION_REF_EVIDENCE_KEY: snapshot.organization_ref_evidence,
+            LEGAL_POLICY_EVIDENCE_KEY: snapshot.legal_policy_sha256,
+        }
+        if snapshot.vouched:
+            blockers.append(
+                (
+                    "vouch",
+                    "the repository closes pull requests from contributors its maintainers have "
+                    "not vouched for (.github/VOUCHED.td)",
+                )
+            )
+        # Guidelines can only be missing once every policy file has been read.
+        if (
+            self.config.policy.require_contribution_guidelines
+            and not snapshot.problems
+            and not any(
+                file.text and _is_contribution_guidance(file.path) for file in snapshot.files
+            )
+        ):
+            blockers.append(
+                (
+                    "no contribution guidelines",
+                    "no repository or organization contribution guidelines were found",
+                )
+            )
+        if any(_AI_PROHIBITION.search(file.text) for file in snapshot.files):
+            blockers.append(
+                (
+                    "AI policy",
+                    "repository policy appears to prohibit AI-assisted contributions",
+                )
+            )
+        elif any(_AUTOMATION_PROHIBITION.search(file.text) for file in snapshot.files):
+            blockers.append(
+                (
+                    "automation policy",
+                    "repository policy appears to prohibit automated contributions",
+                )
+            )
+        if snapshot.legal_requirements:
+            evidence[LEGAL_REQUIREMENTS_EVIDENCE_KEY] = ",".join(snapshot.legal_requirements)
+            attestation = self.config.policy.legal_attestation_for(repository.full_name)
+            mismatch = _legal_attestation_mismatch(snapshot, attestation)
+            if mismatch is None:
+                assert attestation is not None
+                evidence[LEGAL_ATTESTATION_EVIDENCE_KEY] = legal_attestation_fingerprint(
+                    repository.full_name, attestation
+                )
+            else:
+                blockers.append(
+                    (
+                        "CLA/DCO",
+                        "CLA/DCO requirements lack an exact current repository attestation: "
+                        + mismatch,
+                    )
+                )
+        else:
+            evidence[LEGAL_REQUIREMENTS_EVIDENCE_KEY] = "none"
+        result = _RepositoryReview(blockers=tuple(blockers), evidence=tuple(evidence.items()))
+        self._repository_reviews[key] = result
+        return result
+
     def _repository_baseline(self, repository: RepositoryInfo) -> bool:
         pushed_at = repository.pushed_at
         active = (
@@ -1105,97 +1143,43 @@ class DiscoveryService:
         *,
         repository_ref: str | None = None,
     ) -> PolicySnapshot:
-        """Read and hash the complete bounded policy surface at immutable refs."""
+        """Read and hash the bounded repository and organization policy files at immutable refs.
+
+        A file that cannot be read, or a cap that is exceeded, does not raise; the snapshot
+        names it as a problem instead.
+        """
 
         pinned_repository_ref = self._pin_repository_ref(
             repository,
             repository_ref=repository_ref,
         )
+        key = (repository.full_name.casefold(), pinned_repository_ref)
+        cached = self._policy_snapshots.get(key)
+        if cached is not None:
+            return cached
         owner_policy_repository = f"{repository.full_name.split('/', 1)[0]}/.github"
         organization_ref = self._organization_policy_ref(owner_policy_repository)
-        repository_paths = self._policy_paths(
-            repository.full_name,
-            pinned_repository_ref,
+        repository_source = self._policy_source(repository.full_name, pinned_repository_ref)
+        organization_source = self._policy_source(owner_policy_repository, organization_ref)
+        sources: tuple[_SourceAtRef, ...] = (
+            (repository.full_name, pinned_repository_ref, repository_source),
+            (owner_policy_repository, organization_ref, organization_source),
         )
-        organization_paths = self._policy_paths(
-            owner_policy_repository,
-            organization_ref,
-        )
-        policy_sources_sha256 = self._policy_sources_fingerprint(
-            repository.full_name,
-            pinned_repository_ref,
-            owner_policy_repository,
-            organization_ref,
-            repository_paths,
-            organization_paths,
-        )
-        legal_policy_sha256 = self._legal_policy_fingerprint(
-            repository.full_name,
-            pinned_repository_ref,
-            owner_policy_repository,
-            organization_ref,
-            repository_paths,
-            organization_paths,
-        )
-        legal_policy = "\n".join(
-            (
-                self._combined_existing_files(
-                    repository.full_name,
-                    pinned_repository_ref,
-                    repository_paths,
-                ),
-                self._combined_existing_files(
-                    owner_policy_repository,
-                    organization_ref,
-                    organization_paths,
-                ),
-            )
-        )
-        legal_requirements: list[str] = []
-        policy_sources = (
-            (repository.full_name, pinned_repository_ref, repository_paths),
-            (owner_policy_repository, organization_ref, organization_paths),
-        )
-
-        def explicit_policy_requires_review(
-            path_matches: Callable[[str], bool],
-            reference: re.Pattern[str],
-        ) -> bool:
-            for source_repository, ref, paths in policy_sources:
-                for path in paths:
-                    if not path_matches(path):
-                        continue
-                    content = self._remote_file(source_repository, path, ref)
-                    if content is not None and (
-                        reference.search(content) is None
-                        or _legal_reference_requires_review(content, reference)
-                    ):
-                        return True
-            return False
-
-        explicit_cla_policy = explicit_policy_requires_review(
-            _is_explicit_cla_policy_path,
-            _CLA_REFERENCE,
-        )
-        explicit_dco_policy = explicit_policy_requires_review(
-            _is_explicit_dco_policy_path,
-            _DCO_REFERENCE,
-        )
-        if _legal_reference_requires_review(legal_policy, _CLA_REFERENCE) or explicit_cla_policy:
-            legal_requirements.append("cla")
-        if _legal_reference_requires_review(legal_policy, _DCO_REFERENCE) or explicit_dco_policy:
-            legal_requirements.append("dco")
-        return PolicySnapshot(
+        files = (*repository_source.files, *organization_source.files)
+        snapshot = PolicySnapshot(
             repository=repository.full_name,
             repository_ref=pinned_repository_ref,
             organization_repository=owner_policy_repository,
             organization_ref=organization_ref,
-            repository_paths=repository_paths,
-            organization_paths=organization_paths,
-            policy_sources_sha256=policy_sources_sha256,
-            legal_policy_sha256=legal_policy_sha256,
-            legal_requirements=tuple(legal_requirements),
+            files=files,
+            vouched=repository_source.vouched,
+            problems=(*repository_source.problems, *organization_source.problems),
+            policy_sources_sha256=_policy_sources_fingerprint(sources),
+            legal_policy_sha256=_legal_policy_fingerprint(sources),
+            legal_requirements=_legal_requirements(files),
         )
+        self._policy_snapshots[key] = snapshot
+        return snapshot
 
     def pinned_repository_ref(self, repository: str) -> str:
         """Return the immutable policy/base ref already selected for this service."""
@@ -1240,199 +1224,232 @@ class DiscoveryService:
         self._organization_policy_refs[key] = immutable_ref
         return immutable_ref
 
-    def _first_existing_file(
-        self,
-        repository: str,
-        ref: str | None,
-        paths: tuple[str, ...],
-    ) -> str | None:
-        for path in paths:
-            content = self._remote_file(repository, path, ref)
-            if content:
-                return content
-        return None
-
-    def _combined_existing_files(
-        self,
-        repository: str,
-        ref: str | None,
-        paths: tuple[str, ...],
-    ) -> str:
-        contents = [self._remote_file(repository, path, ref) for path in paths]
-        return "\n".join(content for content in contents if content)
-
-    def _remote_file(self, repository: str, path: str, ref: str | None) -> str | None:
-        if ref is None:
-            return None
-        key = (repository.casefold(), ref, path.casefold())
-        if key not in self._remote_file_cache:
-            content = self.github.get_file(
-                repository,
-                path,
-                ref=ref,
-                max_bytes=MAX_POLICY_FILE_BYTES,
-            )
-            if content is not None and len(content.encode("utf-8")) > MAX_POLICY_FILE_BYTES:
-                raise GitHubError(
-                    f"Repository policy file exceeds the {MAX_POLICY_FILE_BYTES}-byte limit: "
-                    f"{repository}/{path}"
-                )
-            self._remote_file_cache[key] = content
-        return self._remote_file_cache[key]
-
     def organization_pull_request_templates(self, repository: str) -> dict[str, str]:
-        """Return bounded organization-default templates using normal GitHub precedence paths."""
+        """Return the owner's default pull-request templates from its .github repository."""
 
         owner_policy_repository = f"{repository.split('/', 1)[0]}/.github"
-        organization_ref = self._organization_policy_ref(owner_policy_repository)
-        result: dict[str, str] = {}
-        total_bytes = 0
-        for path in self._policy_paths(owner_policy_repository, organization_ref):
-            if not _is_pull_request_template(path):
-                continue
-            content = self._remote_file(owner_policy_repository, path, organization_ref)
-            if content is not None:
-                total_bytes += len(path.encode("utf-8")) + len(content.encode("utf-8"))
-                if total_bytes > MAX_POLICY_TOTAL_BYTES:
-                    raise GitHubError(
-                        "Organization pull-request templates exceed the aggregate policy byte limit"
-                    )
-                result[path] = content
-        return result
+        source = self._policy_source(
+            owner_policy_repository,
+            self._organization_policy_ref(owner_policy_repository),
+        )
+        if source.problems:
+            raise GitHubError("; ".join(source.problems))
+        return {
+            file.path: file.text for file in source.files if _is_pull_request_template(file.path)
+        }
 
-    def _policy_paths(self, repository: str, ref: str | None) -> tuple[str, ...]:
+    def _policy_source(self, repository: str, ref: str | None) -> _PolicySource:
         if ref is None:
-            return ()
+            return _PolicySource()
         key = (repository.casefold(), ref)
-        if key in self._policy_path_cache:
-            return self._policy_path_cache[key]
-        listed = self.github.list_repository_files(
-            repository,
-            ref=ref,
-            max_files=MAX_POLICY_INVENTORY_FILES,
-        )
-        if not isinstance(listed, list) or any(not isinstance(path, str) for path in listed):
-            raise GitHubError("GitHub returned an invalid repository policy-file inventory")
-        if len(listed) > MAX_POLICY_INVENTORY_FILES:
-            raise GitHubError(
-                "Repository policy-file inventory exceeds the safe repository file limit"
+        if key not in self._policy_sources:
+            self._policy_sources[key] = self._read_policy_source(repository, ref)
+        return self._policy_sources[key]
+
+    def _read_policy_source(self, repository: str, ref: str) -> _PolicySource:
+        """Read the policy files in the root, .github/ and docs/, and the pages guides link to.
+
+        Projects often keep their AI or provenance rules on a developer-guide page that the
+        contribution guide links to, so relative links from guides are followed one hop.
+        """
+
+        try:
+            listed, vouched = self._list_policy_paths(repository, ref)
+        except GitHubSafetyError:
+            raise
+        except GitHubError as exc:
+            return _PolicySource(
+                problems=(f"the policy files of {repository} could not be listed: {exc}",)
             )
-        paths = tuple(
-            sorted(
-                (path for path in listed if _is_policy_path(path)),
-                key=str.casefold,
-            )
-        )
-        folded = [path.casefold() for path in paths]
+        files, problems = self._read_policy_files(repository, ref, listed, read=())
+        web_origin = web_origin_for_api(self.config.github.api_url)
+        known = {path.casefold() for path in listed}
+        linked: list[str] = []
+        for guide in files:
+            if not _is_contribution_guidance(guide.path):
+                continue
+            for path in _linked_paths(guide, web_origin=web_origin):
+                if path.casefold() not in known:
+                    known.add(path.casefold())
+                    linked.append(path)
+        linked_files, linked_problems = self._read_policy_files(repository, ref, linked, read=files)
+        folded = [path.casefold() for path in listed]
         if len(folded) != len(set(folded)):
-            raise GitHubError(
-                "Repository policy paths differ only by case; policy precedence is ambiguous"
+            linked_problems += (
+                f"policy paths of {repository} differ only by case; their precedence is ambiguous",
             )
-        if len(paths) > MAX_POLICY_FILES_PER_REPOSITORY:
-            raise GitHubError(
-                f"Repository has more than {MAX_POLICY_FILES_PER_REPOSITORY} policy files; "
-                "bounded policy review is incomplete"
-            )
-        self._policy_path_cache[key] = paths
-        return paths
+        return _PolicySource(
+            files=(*files, *linked_files),
+            vouched=vouched,
+            problems=(*problems, *linked_problems),
+        )
 
-    def _policy_sources_fingerprint(
+    def _list_policy_paths(self, repository: str, ref: str) -> tuple[list[str], bool]:
+        """List the policy files in the root, .github/ and docs/, and see if a vouch file exists."""
+
+        paths: list[str] = []
+        vouched = False
+        pending = [""]
+        while pending:
+            directory = pending.pop(0)
+            for entry in self.github.list_directory(repository, directory, ref=ref) or []:
+                name = PurePosixPath(entry.path).name
+                if entry.kind == "dir":
+                    if (
+                        not directory and name in _POLICY_DIRECTORIES
+                    ) or name.casefold() == "pull_request_template":
+                        pending.append(entry.path)
+                elif entry.path.casefold() == _VOUCH_FILE:
+                    vouched = True
+                elif entry.kind != "submodule" and _is_policy_path(entry.path):
+                    paths.append(entry.path)
+        return paths, vouched
+
+    def _read_policy_files(
         self,
         repository: str,
-        repository_ref: str,
-        organization_repository: str,
-        organization_ref: str | None,
-        repository_paths: tuple[str, ...],
-        organization_paths: tuple[str, ...],
-    ) -> str:
-        """Hash every bounded repository/organization policy input, including absences."""
+        ref: str,
+        paths: Sequence[str],
+        *,
+        read: Sequence[PolicyFile],
+    ) -> tuple[tuple[PolicyFile, ...], tuple[str, ...]]:
+        """Read paths within the file-count and byte caps that already-read files count toward."""
 
-        sources: dict[str, str | None] = {}
-        total_bytes = 0
-        for source_repository, ref, paths in (
-            (repository, repository_ref, repository_paths),
-            (organization_repository, organization_ref, organization_paths),
+        if len(read) + len(paths) > MAX_POLICY_FILES_PER_REPOSITORY:
+            return (), (
+                f"{repository} has more than {MAX_POLICY_FILES_PER_REPOSITORY} policy files",
+            )
+        total_bytes = sum(len(file.text.encode("utf-8")) for file in read)
+        files: list[PolicyFile] = []
+        problems: list[str] = []
+        for path in paths:
+            try:
+                text = self.github.get_file(
+                    repository,
+                    path,
+                    ref=ref,
+                    max_bytes=MAX_POLICY_FILE_BYTES,
+                )
+            except GitHubSafetyError:
+                raise
+            except GitHubError as exc:
+                problems.append(f"policy file {repository}/{path} could not be read: {exc}")
+                continue
+            if text is None:
+                continue
+            size = len(text.encode("utf-8"))
+            if size > MAX_POLICY_FILE_BYTES:
+                problems.append(
+                    f"policy file {repository}/{path} exceeds the "
+                    f"{MAX_POLICY_FILE_BYTES}-byte limit"
+                )
+                continue
+            total_bytes += size
+            if total_bytes > MAX_POLICY_TOTAL_BYTES:
+                problems.append(
+                    f"policy files of {repository} exceed the {MAX_POLICY_TOTAL_BYTES}-byte limit"
+                )
+                break
+            files.append(PolicyFile(repository=repository, path=path, text=text))
+        return tuple(files), tuple(problems)
+
+
+_SourceAtRef = tuple[str, str | None, _PolicySource]
+
+
+def _policy_sources_fingerprint(sources: Sequence[_SourceAtRef]) -> str:
+    """Hash every policy file read, the refs they were read at, and the vouch file's presence."""
+
+    payload = {
+        repository.casefold(): {
+            "ref": ref,
+            "vouched": source.vouched,
+            "files": {file.path: file.text for file in source.files},
+        }
+        for repository, ref, source in sources
+    }
+    return hashlib.sha256(_canonical_json(payload)).hexdigest()
+
+
+def _legal_policy_fingerprint(sources: Sequence[_SourceAtRef]) -> str:
+    """Hash policy presence and contents without moving commit refs."""
+
+    payload = {
+        repository.casefold(): {
+            "present": ref is not None,
+            "files": {file.path: file.text for file in source.files},
+        }
+        for repository, ref, source in sources
+    }
+    return hashlib.sha256(_LEGAL_POLICY_FINGERPRINT_DOMAIN + _canonical_json(payload)).hexdigest()
+
+
+def _legal_requirements(files: Sequence[PolicyFile]) -> tuple[str, ...]:
+    """Name each legal requirement that a file states or that a CLA or DCO file implies."""
+
+    requirements: list[str] = []
+    for requirement, reference, explicit in (
+        ("cla", _CLA_REFERENCE, _is_explicit_cla_policy_path),
+        ("dco", _DCO_REFERENCE, _is_explicit_dco_policy_path),
+    ):
+        if any(
+            _legal_reference_requires_review(file.text, reference)
+            or (explicit(file.path) and reference.search(file.text) is None)
+            for file in files
         ):
-            source_key = source_repository.casefold()
-            entries: tuple[tuple[str, str | None], ...] = (
-                (f"{source_key}:__policy_ref__", ref),
-                (
-                    f"{source_key}:__policy_path_inventory__",
-                    json.dumps(paths, ensure_ascii=False, separators=(",", ":")),
-                ),
-            )
-            for key, value in entries:
-                total_bytes = _bounded_policy_source_size(total_bytes, key, value)
-                sources[key] = value
-            for path in paths:
-                key = f"{source_key}:{path.casefold()}"
-                value = self._remote_file(source_repository, path, ref)
-                total_bytes = _bounded_policy_source_size(total_bytes, key, value)
-                sources[key] = value
-        payload = json.dumps(
-            sources,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(payload) > MAX_POLICY_TOTAL_BYTES:
-            raise GitHubError(
-                f"Repository policy evidence exceeds the {MAX_POLICY_TOTAL_BYTES}-byte limit"
-            )
-        return hashlib.sha256(payload).hexdigest()
+            requirements.append(requirement)
+    return tuple(requirements)
 
-    def _legal_policy_fingerprint(
-        self,
-        repository: str,
-        repository_ref: str,
-        organization_repository: str,
-        organization_ref: str | None,
-        repository_paths: tuple[str, ...],
-        organization_paths: tuple[str, ...],
-    ) -> str:
-        """Hash policy presence, inventories, and contents without moving commit refs."""
 
-        sources: dict[str, str | None] = {}
-        total_bytes = 0
-        for source_repository, ref, paths in (
-            (repository, repository_ref, repository_paths),
-            (organization_repository, organization_ref, organization_paths),
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _linked_paths(guide: PolicyFile, *, web_origin: str) -> list[str]:
+    """Resolve the guide's links to text files in its own repository, in document order."""
+
+    blob_prefix = f"{web_origin}/{guide.repository}/blob/".casefold()
+    targets = sorted(
+        (match.start(), match.group(1))
+        for pattern in (_MARKDOWN_LINK, _REFERENCE_LINK, _RST_LINK, _RST_TARGET, _HTML_LINK)
+        for match in pattern.finditer(guide.text)
+    )
+    paths: list[str] = []
+    for _, raw_target in targets:
+        target = raw_target.strip()
+        if target.casefold().startswith(blob_prefix):
+            # A blob URL names a branch; the page is read at the pinned ref like every other.
+            target = "/" + target[len(blob_prefix) :].partition("/")[2]
+        elif urlparse(target).scheme or target.startswith(("#", "//")):
+            continue
+        target = unquote(target.partition("#")[0].partition("?")[0])
+        if not target or "\\" in target or not target.isprintable():
+            continue
+        base = "" if target.startswith("/") else posixpath.dirname(guide.path)
+        path = posixpath.normpath(posixpath.join(base, target.lstrip("/")))
+        name = PurePosixPath(path).name.casefold()
+        if (
+            path in {".", ".."}
+            or path.startswith("../")
+            or PurePosixPath(name).suffix not in _TEXT_SUFFIXES - {""}
+            or _UNLINKED_DOCUMENT.fullmatch(name)
         ):
-            source_key = source_repository.casefold()
-            entries: tuple[tuple[str, str | None], ...] = (
-                (
-                    f"{source_key}:__policy_repository_presence__",
-                    "present" if ref is not None else "absent",
-                ),
-                (
-                    f"{source_key}:__policy_path_inventory__",
-                    json.dumps(paths, ensure_ascii=False, separators=(",", ":")),
-                ),
-            )
-            for key, value in entries:
-                total_bytes = _bounded_policy_source_size(total_bytes, key, value)
-                sources[key] = value
-            for path in paths:
-                key = f"{source_key}:{path.casefold()}"
-                value = self._remote_file(source_repository, path, ref)
-                total_bytes = _bounded_policy_source_size(total_bytes, key, value)
-                sources[key] = value
-        payload = json.dumps(
-            sources,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(payload) > MAX_POLICY_TOTAL_BYTES:
-            raise GitHubError(
-                f"Repository legal-policy evidence exceeds the {MAX_POLICY_TOTAL_BYTES}-byte limit"
-            )
-        return hashlib.sha256(_LEGAL_POLICY_FINGERPRINT_DOMAIN + payload).hexdigest()
+            continue
+        paths.append(path)
+    return list(dict.fromkeys(paths))
 
 
 def _is_contribution_guidance(path: str) -> bool:
     name = PurePosixPath(path.casefold()).name
-    return name.startswith(("contributing", "contribution_guideline"))
+    stem = name.split(".", 1)[0].replace("_", "-")
+    return PurePosixPath(name).suffix in _TEXT_SUFFIXES and (
+        stem in _CONTRIBUTION_GUIDES or stem.startswith("contributing")
+    )
 
 
 def _is_explicit_cla_policy_path(path: str) -> bool:
@@ -1631,18 +1648,12 @@ def _immutable_ref(value: object, *, field: str) -> str:
     return value.casefold()
 
 
-def _bounded_policy_source_size(
-    current: int,
-    key: str,
-    value: str | None,
-) -> int:
-    size = current + len(key.encode("utf-8"))
-    size += len(value.encode("utf-8")) if value is not None else 4
-    if size > MAX_POLICY_TOTAL_BYTES:
-        raise GitHubError(
-            f"Repository policy evidence exceeds the {MAX_POLICY_TOTAL_BYTES}-byte limit"
-        )
-    return size
+def _pull_request_restriction(repository: RepositoryInfo) -> str | None:
+    if not repository.has_pull_requests:
+        return "the repository has pull requests turned off"
+    if repository.pull_request_creation_policy == "collaborators_only":
+        return "the repository takes pull requests only from collaborators"
+    return None
 
 
 def _is_security_sensitive(text: str) -> bool:
@@ -1869,38 +1880,23 @@ def _is_pull_request_template(path: str) -> bool:
 
 
 def _is_policy_path(path: str) -> bool:
-    lowered = path.casefold().strip("/")
+    """Whether a file in the root, .github/ or docs/ can hold contribution or AI policy."""
+
+    lowered = path.casefold()
     name = PurePosixPath(lowered).name
     if _is_explicit_cla_policy_path(path) or _is_explicit_dco_policy_path(path):
         return True
-    if not name.endswith((".md", ".markdown", ".rst", ".txt")):
+    if PurePosixPath(name).suffix not in _TEXT_SUFFIXES:
         return False
-    if _is_pull_request_template(path):
-        return True
-    if name.startswith(("ai.", "ai-", "ai_", "policy.", "readme.", "support.")):
-        return True
-    markers = (
-        "ai-policy",
-        "ai_policy",
-        "ai-contribution",
-        "ai_contribution",
-        "automation",
-        "bot-policy",
-        "bot_policy",
-        "cla",
-        "code_of_conduct",
-        "code-of-conduct",
-        "contribut",
-        "developer_certificate",
-        "dco",
-        "generative-ai",
-        "license_agreement",
-        "llm-policy",
-        "llm_policy",
-        "responsible-ai",
-        "security",
+    if name == "readme" or name.startswith("readme."):
+        # Only the top-level README speaks for the whole repository.
+        return "/" not in lowered
+    return (
+        name in _AGENT_INSTRUCTION_FILES
+        or _is_contribution_guidance(path)
+        or _is_pull_request_template(path)
+        or _POLICY_NAME.fullmatch(name) is not None
     )
-    return any(marker in name for marker in markers)
 
 
 def competing_pull_requests(
@@ -1937,7 +1933,6 @@ __all__ = [
     "LEGAL_REQUIREMENTS_EVIDENCE_KEY",
     "MAX_POLICY_FILES_PER_REPOSITORY",
     "MAX_POLICY_FILE_BYTES",
-    "MAX_POLICY_INVENTORY_FILES",
     "MAX_POLICY_TOTAL_BYTES",
     "POLICY_ORGANIZATION_REF_EVIDENCE_KEY",
     "POLICY_REPOSITORY_REF_EVIDENCE_KEY",
@@ -1947,6 +1942,7 @@ __all__ = [
     "DiscoveryService",
     "IssueEvaluation",
     "IssueTriage",
+    "PolicyFile",
     "PolicySnapshot",
     "TriageVerdict",
     "apply_legal_commit_message",

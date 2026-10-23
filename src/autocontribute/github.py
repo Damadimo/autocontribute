@@ -75,6 +75,8 @@ _MAX_TOTAL_WAIT_SECONDS = 180.0
 _TRANSIENT_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
 _TRANSIENT_STATUS_CODES = frozenset({500, 502, 503, 504})
 _MAX_REPOSITORY_LABELS = 1_000
+# The contents API returns at most this many entries of one directory, without saying so.
+_MAX_DIRECTORY_ENTRIES = 1_000
 # Issues with this many comments are usually contested or need a design decision.
 _SEARCH_MAX_COMMENTS = 40
 
@@ -180,6 +182,14 @@ class CommitStatusDetails:
     target_url: str
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class DirectoryEntry:
+    """One entry of a repository directory listing; kind is file, dir, symlink, or submodule."""
+
+    path: str
+    kind: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -522,6 +532,7 @@ class GitHubClient:
             field="repository clone URL",
         )
         license_data = data.get("license") or {}
+        creation_policy = data.get("pull_request_creation_policy")
         return RepositoryInfo(
             full_name=canonical_name,
             html_url=html_url,
@@ -537,6 +548,8 @@ class GitHubClient:
                 if license_data.get("spdx_id") not in {None, "NOASSERTION"}
                 else None
             ),
+            has_pull_requests=bool(data.get("has_pull_requests", True)),
+            pull_request_creation_policy=None if creation_policy is None else str(creation_policy),
         )
 
     def get_repository_identity(self, full_name: str) -> RepositoryIdentity:
@@ -1134,58 +1147,56 @@ class GitHubClient:
                 f"GitHub policy file could not be decoded safely: {repository}/{path}"
             ) from exc
 
-    def list_repository_files(
+    def list_directory(
         self,
         repository: str,
+        path: str,
         *,
         ref: str,
-        max_files: int = 20_000,
-    ) -> list[str]:
-        """List every blob path, rejecting GitHub's silently truncated recursive trees."""
+    ) -> list[DirectoryEntry] | None:
+        """List one directory at an immutable ref without descending into subdirectories.
 
-        if max_files < 1:
-            raise ValueError("max_files must be positive")
-        immutable_ref = _input_nonempty(ref, field="repository tree ref").casefold()
+        Returns None when the path is absent or is not a directory.
+        """
+
+        immutable_ref = _input_nonempty(ref, field="repository directory ref").casefold()
         if not _GIT_SHA.fullmatch(immutable_ref):
-            raise ValueError("repository tree ref must be a full immutable git SHA")
+            raise ValueError("repository directory ref must be a full immutable git SHA")
+        directory = path.strip("/")
+        suffix = f"/{quote(directory, safe='/')}" if directory else ""
         data = self._request(
             "GET",
-            f"/repos/{quote(repository, safe='/')}/git/trees/{immutable_ref}",
-            params={"recursive": 1},
+            f"/repos/{quote(repository, safe='/')}/contents{suffix}",
+            params={"ref": immutable_ref},
             allow_not_found=True,
         )
-        if data is None:
-            return []
-        payload = _mapping(data, resource="repository tree")
-        if payload.get("truncated") is not False:
+        if not isinstance(data, list):
+            return None
+        if len(data) >= _MAX_DIRECTORY_ENTRIES:
             raise GitHubError(
-                "GitHub repository tree is truncated; policy discovery would be incomplete"
+                f"GitHub lists at most {_MAX_DIRECTORY_ENTRIES} entries of a directory; the "
+                f"listing of {repository}/{directory} may be incomplete"
             )
-        paths: list[str] = []
+        entries: list[DirectoryEntry] = []
         seen: set[str] = set()
-        for entry in _mapping_list(payload.get("tree"), resource="repository tree entries"):
-            entry_type = _nonempty(entry.get("type"), field="repository tree entry type")
-            if entry_type not in {"blob", "tree", "commit"}:
-                raise GitHubError("GitHub returned an unsupported repository tree entry type")
-            if entry_type != "blob":
-                continue
-            path = _nonempty(entry.get("path"), field="repository tree path")
+        for item in _mapping_list(data, resource="repository directory entries"):
+            kind = _nonempty(item.get("type"), field="repository directory entry type")
+            if kind not in {"file", "dir", "symlink", "submodule"}:
+                raise GitHubError("GitHub returned an unsupported repository directory entry type")
+            entry_path = _nonempty(item.get("path"), field="repository directory entry path")
+            parent, _, name = entry_path.rpartition("/")
             if (
-                path.startswith("/")
-                or "\\" in path
-                or any(ord(character) < 32 for character in path)
-                or any(part in {"", ".", ".."} for part in path.split("/"))
+                parent != directory
+                or name in {"", ".", ".."}
+                or "\\" in entry_path
+                or any(ord(character) < 32 for character in entry_path)
             ):
-                raise GitHubError("GitHub returned an unsafe repository tree path")
-            if path in seen:
-                raise GitHubError("GitHub returned a duplicate repository tree path")
-            seen.add(path)
-            paths.append(path)
-            if len(paths) > max_files:
-                raise GitHubError(
-                    f"Repository has more than {max_files} files; policy discovery is incomplete"
-                )
-        return sorted(paths, key=str.casefold)
+                raise GitHubError("GitHub returned an unsafe repository directory entry path")
+            if entry_path in seen:
+                raise GitHubError("GitHub returned a duplicate repository directory entry")
+            seen.add(entry_path)
+            entries.append(DirectoryEntry(path=entry_path, kind=kind))
+        return sorted(entries, key=lambda entry: entry.path.casefold())
 
     def default_branch_sha(self, repository: str, branch: str) -> str:
         data = _mapping(
@@ -2384,6 +2395,7 @@ def _rate_limit_wait_seconds(response: httpx.Response, attempt: int) -> float:
 __all__ = [
     "CheckRunDetails",
     "CommitStatusDetails",
+    "DirectoryEntry",
     "ForkIdentity",
     "GitHubClient",
     "GitHubComment",

@@ -28,7 +28,8 @@ from autocontribute.domain import (
     ReviewScores,
     RunStatus,
 )
-from autocontribute.exceptions import PublicationResumeRequired, StateError
+from autocontribute.exceptions import GitHubError, PublicationResumeRequired, StateError
+from autocontribute.github import DirectoryEntry
 from autocontribute.lifecycle import LifecycleSyncResult
 from autocontribute.orchestrator import RunInvocationMode
 from autocontribute.preparation import (
@@ -86,15 +87,13 @@ class _PolicyGitHub(_ReviewGitHub):
         del repository
         return None
 
-    def list_repository_files(
-        self,
-        repository: str,
-        *,
-        ref: str,
-        max_files: int,
-    ) -> list[str]:
-        del ref, max_files
-        return ["CONTRIBUTING.md"] if repository == "example/project" else []
+    def list_directory(
+        self, repository: str, path: str, *, ref: str
+    ) -> list[DirectoryEntry] | None:
+        del ref
+        if repository == "example/project" and not path:
+            return [DirectoryEntry(path="CONTRIBUTING.md", kind="file")]
+        return None
 
     def get_file(
         self,
@@ -726,6 +725,54 @@ def test_policy_inspection_and_explicit_cla_attestation_preview(
     assert "legal_requirements:" in attested.output
     assert "attested_by: octocat" in attested.output
     assert "statement:" in attested.output
+
+
+def test_policy_attestation_refuses_policy_files_that_could_not_be_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _UnreadablePolicyGitHub(_PolicyGitHub):
+        def get_file(
+            self,
+            repository: str,
+            path: str,
+            *,
+            ref: str,
+            max_bytes: int = 1_000_000,
+        ) -> str | None:
+            del repository, path, ref, max_bytes
+            raise GitHubError("GitHub policy file could not be decoded safely")
+
+    config = tmp_path / "autocontribute.yml"
+    config.write_text(
+        "github:\n"
+        "  repositories: [example/project]\n"
+        "validation:\n"
+        "  required_commands:\n"
+        "    example/project: [python -m pytest]\n"
+        f"storage:\n  path: {tmp_path / 'state'}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "_github_client", lambda *_: _UnreadablePolicyGitHub())
+
+    attested = runner.invoke(
+        app,
+        [
+            "policy",
+            "attest",
+            "example/project",
+            "--cla-completed",
+            "--yes",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert attested.exit_code == 1
+    assert (
+        "Problem: policy file example/project/CONTRIBUTING.md could not be read" in attested.output
+    )
+    assert "no attestation can cover them" in attested.output
 
 
 def test_policy_attestation_requires_interactive_personal_confirmation(
