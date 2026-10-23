@@ -521,7 +521,7 @@ def test_fresh_database_has_current_version_and_all_tables(tmp_path: Path) -> No
             ).fetchall()
         ]
 
-    assert store.schema_version == CURRENT_SCHEMA_VERSION == 9
+    assert store.schema_version == CURRENT_SCHEMA_VERSION == 10
     assert "issue_revision" in run_columns
     assert [row[2] for row in revision_index] == [
         "repository",
@@ -935,7 +935,7 @@ def test_future_older_or_malformed_schema_fails_closed(tmp_path: Path) -> None:
         RunStore(malformed_root)
 
 
-@pytest.mark.parametrize("schema_version", (7, 8))
+@pytest.mark.parametrize("schema_version", (7, 8, 9))
 def test_older_development_state_asks_for_a_fresh_state_directory(
     tmp_path: Path,
     schema_version: int,
