@@ -474,7 +474,7 @@ def sync_open_pull_requests(
     if reported_api_origin != current_api_origin:
         raise StateError("Lifecycle GitHub client returned a non-canonical API origin")
     manifests = store.list_open_pull_request_runs(limit=max_runs)
-    targets: list[tuple[RunManifest, str, int, str]] = []
+    targets: list[tuple[RunManifest, str, str, int, str]] = []
     seen: set[tuple[str, int]] = set()
     for manifest in manifests:
         if manifest.status != RunStatus.PR_OPEN:
@@ -523,15 +523,14 @@ def sync_open_pull_requests(
         if identity in seen:
             raise StateError("Multiple durable runs refer to the same open pull request")
         seen.add(identity)
-        targets.append((manifest, repository, number, commit_sha))
+        targets.append((manifest, manifest.pull_request_url, repository, number, commit_sha))
 
     observer = LifecycleObserver(github, store, assert_owned=assert_owned)
     observations: list[LifecycleObservation] = []
     failures: list[LifecycleFailure] = []
-    for manifest, repository, number, commit_sha in targets:
+    for manifest, pull_request_url, repository, number, commit_sha in targets:
         if assert_owned is not None:
             assert_owned()
-        pull_request_url = manifest.pull_request_url or ""
         try:
             observation = observer.observe(
                 repository=repository,
@@ -954,6 +953,8 @@ def _hash_payload(value: object) -> str:
 
 __all__ = [
     "MAX_LIFECYCLE_RUNS",
+    "REPOSITORY_COOLDOWN",
+    "LifecycleFailure",
     "LifecycleGitHub",
     "LifecycleObservation",
     "LifecycleObserver",

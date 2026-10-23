@@ -4537,6 +4537,7 @@ __all__ = [
     "CandidateAttemptState",
     "CandidateRetryAuthorization",
     "CircuitBreakerStatus",
+    "Hold",
     "Lease",
     "PublicationReservation",
     "RunStore",
