@@ -1159,6 +1159,34 @@ def test_compare_commits_reports_status_and_old_and_new_paths() -> None:
     assert comparison.complete
 
 
+def test_recent_commit_titles_are_first_lines_of_the_commits_before_the_base() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/repos/upstream/project/commits"
+        assert dict(request.url.params) == {"sha": "a" * 40, "per_page": "20"}
+        return httpx.Response(
+            200,
+            json=[
+                {"sha": "a" * 40, "commit": {"message": "Fix parser crash (#12)\n\nBody"}},
+                {"sha": "b" * 40, "commit": {"message": "docs: explain options"}},
+                {"sha": "c" * 40, "commit": {"message": "\n"}},
+            ],
+        )
+
+    with _client(handler) as github:
+        titles = github.recent_commit_titles("upstream/project", "a" * 40)
+
+    assert titles == ["Fix parser crash (#12)", "docs: explain options"]
+
+
+def test_recent_commit_titles_refuse_a_ref_and_malformed_commits() -> None:
+    with _client(lambda request: httpx.Response(200, json=[{"commit": None}])) as github:
+        with pytest.raises(GitHubError, match="commit SHA"):
+            github.recent_commit_titles("upstream/project", "main")
+        with pytest.raises(GitHubError, match="malformed commit"):
+            github.recent_commit_titles("upstream/project", "a" * 40)
+
+
 def test_compare_commits_marks_a_full_file_list_incomplete() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         files = [{"filename": f"file{index}.txt"} for index in range(300)]

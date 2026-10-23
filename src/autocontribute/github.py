@@ -74,6 +74,8 @@ _AUTHORED_PULL_REQUESTS_QUERY = (
     "nodes { ... on PullRequest { number url headRefName createdAt updatedAt } } } }"
 )
 _COMPARE_FILE_LIMIT = 300
+# Enough titles to show a project's commit-title convention.
+_RECENT_COMMITS = 20
 _GITHUB_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _GIT_SHA = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _REPOSITORY_NAME = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -1398,6 +1400,29 @@ class GitHubClient:
             payload.get("default_branch"), field="optional policy repository default branch"
         )
         return self.default_branch_sha(full_name, branch)
+
+    def recent_commit_titles(self, repository: str, sha: str) -> list[str]:
+        """Return the titles of the last commits reachable from ``sha``, newest first.
+
+        A title is the first line of a commit message. Workspaces are shallow clones, so this
+        is where an agent sees the project's commit-title convention.
+        """
+
+        commit = _full_git_sha(sha, field="commit SHA")
+        commits = _mapping_list(
+            self._request(
+                "GET",
+                f"/repos/{quote(repository, safe='/')}/commits",
+                params={"sha": commit, "per_page": _RECENT_COMMITS},
+            ),
+            resource="commit list",
+        )
+        titles = []
+        for item in commits[:_RECENT_COMMITS]:
+            details = _mapping(item.get("commit"), resource="commit")
+            message = _optional_string(details.get("message"), field="commit message")
+            titles.append(message.split("\n", 1)[0].strip())
+        return [title for title in titles if title]
 
     def compare_commits(self, repository: str, base: str, head: str) -> CommitComparison:
         """Compare two commits by SHA; renames report both their old and new paths."""
