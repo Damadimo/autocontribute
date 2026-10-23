@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
+import tempfile
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -37,7 +41,7 @@ from autocontribute.coordination import (
     LeaseHeartbeatGuard,
 )
 from autocontribute.discovery import DiscoveryOutcome, DiscoveryService, PolicySnapshot
-from autocontribute.doctor import run_doctor
+from autocontribute.doctor import DoctorCheck, run_doctor
 from autocontribute.domain import RunManifest, RunStatus
 from autocontribute.exceptions import (
     ApprovalMismatchError,
@@ -55,9 +59,32 @@ from autocontribute.lifecycle import LifecycleSyncResult, sync_open_pull_request
 from autocontribute.orchestrator import Orchestrator, RunInvocationMode
 from autocontribute.publication import Publisher, approve_run, build_approval_review
 from autocontribute.reporting import (
+    GitHubReview,
+    code_span,
+    fenced_block,
     render_approval_review,
     render_github_review,
     render_run_report,
+)
+from autocontribute.runner import (
+    APPROVAL_SYNTAX_REPLY,
+    STATE_ARCHIVE,
+    AttentionItem,
+    PreparedState,
+    RunnerContext,
+    RunnerRepository,
+    StateBranch,
+    apply_setup,
+    attention_items,
+    check_runner,
+    confirm_comment_unchanged,
+    load_runner_config,
+    read_approval_event,
+    read_prepared,
+    report_approval,
+    runner_token,
+    sync_issues,
+    write_prepared,
 )
 from autocontribute.state_archive import export_state, import_state
 from autocontribute.store import CandidateRetryAuthorization, RunStore
@@ -89,8 +116,13 @@ state_app = typer.Typer(
     help="Copy the local state to and from one archive, for runners without a disk.",
     no_args_is_help=True,
 )
+actions_app = typer.Typer(
+    help="Run autocontribute in GitHub Actions; the runner template's workflows call these.",
+    no_args_is_help=True,
+)
 app.add_typer(policy_app, name="policy")
 app.add_typer(state_app, name="state")
+app.add_typer(actions_app, name="actions")
 
 console = Console()
 DEFAULT_CONFIG = Path("autocontribute.yml")
@@ -110,6 +142,9 @@ _UNAPPROVED_RUN_GRACE = timedelta(days=7)
 _APPROVAL_RECORDED_STATUSES = frozenset(
     {RunStatus.APPROVED, RunStatus.SUBMITTING, RunStatus.PR_OPEN}
 )
+_APPROVAL_ATTESTATION = "Reviewed exact diff, validation evidence, and pull-request text."
+# Runs that wait for an approval or for its publication; prepare checks each one.
+_MAX_WAITING_RUNS = 200
 
 
 @app.command()
@@ -146,16 +181,7 @@ def doctor(
     del non_interactive  # The doctor never prompts; the flag documents CI intent.
     settings = _actionable_config(config)
     checks = run_doctor(settings, store=RunStore(settings.storage.path))
-    table = Table("Check", "Result", "Detail")
-    for check in checks:
-        if check.passed and check.warning:
-            result = "[yellow]WARN[/yellow]"
-        elif check.passed:
-            result = "[green]PASS[/green]"
-        else:
-            result = "[red]FAIL[/red]"
-        table.add_row(check.name, result, check.detail)
-    console.print(table)
+    _print_checks(checks)
     if any(not check.passed for check in checks):
         raise typer.Exit(1)
 
@@ -373,7 +399,7 @@ def approve(
                     store,
                     run_id,
                     github=github,
-                    attestation="Reviewed exact diff, validation evidence, and pull-request text.",
+                    attestation=_APPROVAL_ATTESTATION,
                     reviewed_fingerprint=reviewed,
                     source=source,
                 )
@@ -446,17 +472,7 @@ def publish(
         raise typer.Abort()
     try:
         with _github_client(settings, store) as github:
-            _sync_lifecycle(
-                settings,
-                store,
-                github,
-                publication_retry_run_id=(
-                    manifest.run_id if manifest.status == RunStatus.SUBMITTING else None
-                ),
-            )
-            manifest = store.get(run_id)
-            if manifest.status != RunStatus.PR_OPEN:
-                manifest = Publisher(settings, store, github).publish(run_id)
+            manifest = _publish_approved(settings, store, github, run_id)
     except AutocontributeError as exc:
         state = _publication_state(store, run_id)
         outcome, exit_code = _publication_failure(
@@ -1213,6 +1229,235 @@ def state_import(
     )
 
 
+@actions_app.command(name="setup")
+def actions_setup(config: ConfigOption = DEFAULT_CONFIG) -> None:
+    """Check the secrets, configuration and Docker, then turn preparation on or off.
+
+    Anything missing goes to a "Finish setup" issue and the job summary, and the command still
+    exits 0, so a new runner shows a checklist instead of a failed run.
+    """
+
+    try:
+        context = RunnerContext.from_environment(os.environ)
+        checks = check_runner(config, context, os.environ, now=datetime.now(UTC))
+        with RunnerRepository(context, runner_token(os.environ)) as repository:
+            complete = apply_setup(repository, context, checks)
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    # Doctor details are Rich markup; these are plain text, from the config and GitHub too.
+    _print_checks([replace(check, detail=escape(check.detail)) for check in checks])
+    console.print(
+        "Preparation is on."
+        if complete
+        else "Preparation stays off until the Finish setup issue is complete."
+    )
+
+
+@actions_app.command(name="prepare")
+def actions_prepare(
+    state: Annotated[Path, typer.Option("--state", help="Checkout of the state branch.")],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            help="New or empty directory for state.tar.gz, prepared.json and evidence/.",
+        ),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Restore the state, make one scheduled attempt, and write the result for `actions record`.
+
+    Needs only read access to GitHub and never publishes. Exit codes: 0 the attempt ended
+    without failing, 1 it failed or could not start; the state is written whenever it was
+    restored.
+    """
+
+    target = output.expanduser().resolve()
+    if target.exists() and (not target.is_dir() or any(target.iterdir())):
+        _fail(f"{target} must be a new or empty directory")
+    try:
+        context = RunnerContext.from_environment(os.environ)
+        settings = load_runner_config(config, owner=context.owner)
+    except ConfigurationError as exc:
+        _fail(str(exc))
+    _refuse_placeholders(config, settings)
+    branch = StateBranch(state, token=None)
+    try:
+        base = branch.archive_sha256()
+        if base is not None:
+            # Jobs never overlap on the state, so leases saved by an earlier job are stale.
+            import_state(branch.archive, settings.storage.path, release_leases=True)
+        store = RunStore(settings.storage.path)
+    except (AutocontributeError, OSError) as exc:
+        _fail(str(exc))
+    manifest: RunManifest | None = None
+    attention: tuple[AttentionItem, ...] = ()
+    error: str | None = None
+    try:
+        with _github_client(settings, store) as github:
+            lifecycle = _sync_lifecycle(settings, store, github, scheduled_preflight=True)
+            attention = attention_items(lifecycle, store.list_open_pull_request_runs())
+            store.assert_circuit_breaker_clear()
+            with Orchestrator(settings, store=store, github=github) as orchestrator:
+                manifest = orchestrator.run(
+                    issue_reference=None,
+                    invocation_mode=RunInvocationMode.SCHEDULED,
+                    retry_authorization=None,
+                )
+            _retire_unpublishable(settings, store, github)
+    except (AutocontributeError, ValueError) as exc:
+        error = str(exc)
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        exported = export_state(store, target / STATE_ARCHIVE)
+        if manifest is not None:
+            shutil.copytree(
+                store.artifact_dir(manifest.run_id),
+                target / "evidence" / manifest.run_id,
+                symlinks=True,
+            )
+        write_prepared(
+            target,
+            PreparedState(
+                base_state_sha256=base,
+                state_sha256=exported.sha256,
+                run_id=None if manifest is None else manifest.run_id,
+                attention=attention,
+            ),
+        )
+    except (AutocontributeError, OSError) as exc:
+        _fail(f"The state could not be written: {exc}")
+    context.summarize(_preparation_summary(manifest, error))
+    if manifest is not None:
+        _print_outcome(manifest, store)
+    if error is not None:
+        _fail(error)
+    if manifest is None or manifest.status == RunStatus.FAILED:
+        raise typer.Exit(1)
+
+
+@actions_app.command(name="record")
+def actions_record(
+    input_dir: Annotated[
+        Path,
+        typer.Option("--input", help="The prepare job's output: state.tar.gz and prepared.json."),
+    ],
+    state: Annotated[Path, typer.Option("--state", help="Checkout of the state branch.")],
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Check the prepare job's output, save it as the state, and update the approval issues.
+
+    The output is read as untrusted data and nothing in it runs. Issue bodies are rendered here,
+    from the checked state, so they show exactly what an approval binds. Exit codes: 0 saved and
+    updated, 1 anything else, including a state that changed while the preparation ran.
+    """
+
+    try:
+        context = RunnerContext.from_environment(os.environ)
+        token = runner_token(os.environ)
+        settings = load_runner_config(config, owner=context.owner)
+        prepared, archive = read_prepared(input_dir)
+        branch = StateBranch(state, token=token)
+        if branch.archive_sha256() not in {prepared.base_state_sha256, prepared.state_sha256}:
+            raise StateError(
+                "An approval or setup saved the state while this preparation ran, so its result "
+                "is not saved; the next preparation starts from the new state"
+            )
+        import_state(archive, settings.storage.path, release_leases=True)
+        store = RunStore(settings.storage.path)
+        saved = branch.save(
+            archive,
+            message=f"Save the state after preparing run {prepared.run_id}"
+            if prepared.run_id
+            else "Save the state after a preparation without a run",
+        )
+        with (
+            _github_client(settings, store) as github,
+            RunnerRepository(context, token) as repository,
+        ):
+
+            def review(run_id: str) -> GitHubReview:
+                return render_github_review(
+                    build_approval_review(settings, store, run_id, github=github),
+                    approval_expires_hours=settings.publishing.approval_expires_hours,
+                )
+
+            lines = sync_issues(repository, store, review=review, attention=prepared.attention)
+    except (AutocontributeError, OSError) as exc:
+        _fail(str(exc))
+    report = "\n".join(
+        ["### Record", "", "Saved the state." if saved else "The state was already saved.", *lines]
+    )
+    context.summarize(report)
+    console.print(report, markup=False)
+
+
+@actions_app.command(name="approve")
+def actions_approve(
+    issue: Annotated[int, typer.Option("--issue", min=1, help="The approval issue's number.")],
+    comment_id: Annotated[int, typer.Option("--comment-id", min=1, help="The comment's ID.")],
+    state: Annotated[Path, typer.Option("--state", help="Checkout of the state branch.")],
+    config: ConfigOption = DEFAULT_CONFIG,
+) -> None:
+    """Approve and publish the run that the owner's /approve comment names, then save the state.
+
+    Every condition of the workflow is checked again from $GITHUB_EVENT_PATH, and the comment is
+    read again from GitHub. Exit codes as for `publish`, and 3 also when the fingerprint does not
+    match the run.
+    """
+
+    try:
+        context = RunnerContext.from_environment(os.environ)
+        token = runner_token(os.environ)
+        approval = read_approval_event(
+            Path(os.environ.get("GITHUB_EVENT_PATH", "")),
+            context,
+            issue_number=issue,
+            comment_id=comment_id,
+        )
+    except AutocontributeError as exc:
+        _fail(str(exc))
+    with RunnerRepository(context, token) as repository:
+        try:
+            confirm_comment_unchanged(repository, approval, owner_id=context.owner_id)
+            if approval.fingerprint_prefix is None:
+                repository.comment(issue, APPROVAL_SYNTAX_REPLY)
+                raise PolicyError("The comment is not /approve and a 12-character fingerprint")
+            settings = load_runner_config(config, owner=context.owner)
+            branch = StateBranch(state, token=token)
+            import_state(branch.archive, settings.storage.path, release_leases=True)
+            store = RunStore(settings.storage.path)
+        except (AutocontributeError, OSError) as exc:
+            _fail(str(exc))
+        outcome, exit_code, message = _approve_and_publish(
+            settings,
+            store,
+            approval.run_id,
+            fingerprint=approval.fingerprint_prefix,
+            source=approval.url,
+        )
+        save_error = _save_state(
+            store, branch, f"Save the state after the approval of run {approval.run_id}"
+        )
+        try:
+            report_approval(
+                repository,
+                issue,
+                store,
+                approval.run_id,
+                outcome=outcome,
+                message=message,
+                save_error=save_error,
+            )
+        except AutocontributeError as exc:
+            _fail(str(exc))
+    if save_error is not None:
+        _fail(f"The state was not saved: {save_error}", exit_code=exit_code or 1)
+    if exit_code:
+        _fail(message, exit_code=exit_code)
+    console.print(f"Published run {approval.run_id}.", markup=False)
+
+
 @app.command()
 def version() -> None:
     """Print the installed version."""
@@ -1310,6 +1555,13 @@ def _actionable_config(path: Path, *, json_output: bool = False) -> Autocontribu
     """Load a configuration that commands may act on: no starter placeholder may remain."""
 
     settings = _config(path, json_output=json_output)
+    _refuse_placeholders(path, settings, json_output=json_output)
+    return settings
+
+
+def _refuse_placeholders(
+    path: Path, settings: AutocontributeConfig, *, json_output: bool = False
+) -> None:
     placeholders = starter_placeholders(settings)
     if placeholders:
         _fail(
@@ -1317,7 +1569,6 @@ def _actionable_config(path: Path, *, json_output: bool = False) -> Autocontribu
             "command again:\n" + "\n".join(f"  - {placeholder}" for placeholder in placeholders),
             json_output=json_output,
         )
-    return settings
 
 
 def _github_client(
@@ -1412,6 +1663,138 @@ def _sync_lifecycle(
             + details
         ) from reconciliation_failures[0][1]
     return result
+
+
+def _publish_approved(
+    settings: AutocontributeConfig,
+    store: RunStore,
+    github: GitHubClient,
+    run_id: str,
+) -> RunManifest:
+    """Sync lifecycle first, then publish the run unless its pull request is already open."""
+
+    manifest = store.get(run_id)
+    _sync_lifecycle(
+        settings,
+        store,
+        github,
+        publication_retry_run_id=(
+            manifest.run_id if manifest.status == RunStatus.SUBMITTING else None
+        ),
+    )
+    manifest = store.get(run_id)
+    if manifest.status != RunStatus.PR_OPEN:
+        manifest = Publisher(settings, store, github).publish(run_id)
+    return manifest
+
+
+def _print_checks(checks: list[DoctorCheck]) -> None:
+    table = Table("Check", "Result", "Detail")
+    for check in checks:
+        if check.passed and check.warning:
+            result = "[yellow]WARN[/yellow]"
+        elif check.passed:
+            result = "[green]PASS[/green]"
+        else:
+            result = "[red]FAIL[/red]"
+        table.add_row(check.name, result, check.detail)
+    console.print(table)
+
+
+def _retire_unpublishable(
+    settings: AutocontributeConfig,
+    store: RunStore,
+    github: GitHubClient,
+) -> None:
+    """Cancel runs that can never publish, so their issues close and the upstream issues free up."""
+
+    now = datetime.now(UTC)
+    for manifest in store.list_with_statuses(
+        {RunStatus.APPROVED}, limit=_MAX_WAITING_RUNS, resource="approved"
+    ):
+        if manifest.approval is not None and manifest.approval.expires_at <= now:
+            store.transition(
+                manifest,
+                RunStatus.CANCELLED,
+                reason=f"the approval expired at {manifest.approval.expires_at.isoformat()}",
+            )
+    for manifest in store.list_with_statuses(
+        {RunStatus.READY_FOR_APPROVAL}, limit=_MAX_WAITING_RUNS, resource="ready"
+    ):
+        try:
+            render_github_review(
+                build_approval_review(settings, store, manifest.run_id, github=github),
+                approval_expires_hours=settings.publishing.approval_expires_hours,
+            )
+        except PolicyError as exc:
+            store.transition(
+                manifest,
+                RunStatus.CANCELLED,
+                reason=f"its approval review cannot be built: {exc}",
+            )
+
+
+def _approve_and_publish(
+    settings: AutocontributeConfig,
+    store: RunStore,
+    run_id: str,
+    *,
+    fingerprint: str,
+    source: str,
+) -> tuple[str, int, str]:
+    """Approve the fingerprint unless that approval is on record, then publish.
+
+    Returns the outcome, its exit code, and a message, named as `publish --json` names them.
+    """
+
+    try:
+        with _github_client(settings, store) as github:
+            if not _already_approved(store.get(run_id), fingerprint):
+                approve_run(
+                    settings,
+                    store,
+                    run_id,
+                    github=github,
+                    attestation=_APPROVAL_ATTESTATION,
+                    reviewed_fingerprint=fingerprint,
+                    source=source,
+                )
+            manifest = _publish_approved(settings, store, github, run_id)
+    except ApprovalMismatchError as exc:
+        return "fingerprint_mismatch", 3, str(exc)
+    except AutocontributeError as exc:
+        submitting = _publication_state(store, run_id)["status"] == RunStatus.SUBMITTING.value
+        outcome, exit_code = _publication_failure(store, exc, submitting=submitting)
+        return outcome, exit_code, str(exc)
+    return "pr_open", 0, f"Pull request opened: {manifest.pull_request_url}"
+
+
+def _save_state(store: RunStore, branch: StateBranch, message: str) -> str | None:
+    """Export the state and commit it to the state branch; return the error, if any."""
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="autocontribute-state-") as work:
+            snapshot = Path(work) / STATE_ARCHIVE
+            export_state(store, snapshot)
+            branch.save(snapshot, message=message)
+    except (AutocontributeError, OSError) as exc:
+        return str(exc)
+    return None
+
+
+def _preparation_summary(manifest: RunManifest | None, error: str | None) -> str:
+    lines = ["### Preparation", ""]
+    if manifest is not None:
+        issue = manifest.candidate.reference if manifest.candidate else "no issue"
+        lines.append(
+            f"Run {code_span(manifest.run_id)} is **{manifest.status.value}** ({code_span(issue)})."
+        )
+        reason = manifest.error or manifest.skip_reason
+        if reason:
+            lines += ["", fenced_block(reason, "text")]
+    if error is not None:
+        lines += ["", "The preparation stopped:", "", fenced_block(error, "text")]
+    return "\n".join(lines)
 
 
 def _print_lifecycle_result(result: LifecycleSyncResult) -> None:

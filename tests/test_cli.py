@@ -143,19 +143,25 @@ class _PolicyGitHub(_ReviewGitHub):
         return None
 
 
-def _ready_review_run(tmp_path: Path) -> tuple[Path, RunStore, str]:
+def _ready_review_run(
+    tmp_path: Path, *, runner_owner: str | None = None
+) -> tuple[Path, RunStore, str]:
+    """A run ready for approval; with ``runner_owner``, under an Actions runner's configuration."""
+
     config_path = tmp_path / "autocontribute.yml"
     state = tmp_path / "state"
+    runner_settings = f"publishing:\n  login: {runner_owner}\n" if runner_owner is not None else ""
     config_path.write_text(
         "identity:\n"
         "  name: Review Author Exact Marker\n"
         "  email: review-author@example.invalid\n"
         "github:\n"
+        f"  auth: {'gh' if runner_owner is None else 'token'}\n"
         "  repositories: [example/project]\n"
         "validation:\n"
         "  required_commands:\n"
         "    example/project: [python -m pytest]\n"
-        f"storage:\n  path: {state}\n",
+        f"storage:\n  path: {state}\n" + runner_settings,
         encoding="utf-8",
     )
     settings = load_config(config_path)
