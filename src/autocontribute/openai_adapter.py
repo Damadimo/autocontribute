@@ -34,6 +34,7 @@ from autocontribute.providers import (
     _validate_usage,
 )
 from autocontribute.transcript import (
+    NATIVE_CALL_NAMES,
     SUBMIT_TOOLS,
     ToolCall,
     TranscriptKind,
@@ -427,13 +428,17 @@ def _tool_call(item: dict[str, JsonValue], kind: TranscriptKind) -> ToolCall | N
         return None
     if item_type == "shell_call":
         return ToolCall.model_validate(
-            {"call_id": item.get("call_id"), "name": "shell", "arguments": item.get("action")}
+            {
+                "call_id": item.get("call_id"),
+                "name": NATIVE_CALL_NAMES["openai"]["shell"],
+                "arguments": item.get("action"),
+            }
         )
     if item_type == "apply_patch_call":
         return ToolCall.model_validate(
             {
                 "call_id": item.get("call_id"),
-                "name": "apply_patch",
+                "name": NATIVE_CALL_NAMES["openai"]["edit"],
                 "arguments": item.get("operation"),
             }
         )

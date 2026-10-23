@@ -25,7 +25,6 @@ from autocontribute.providers import (
     _validate_usage,
 )
 from autocontribute.transcript import (
-    SUBMIT_TOOLS,
     ToolCall,
     TranscriptKind,
     Turn,
@@ -35,10 +34,6 @@ from autocontribute.transcript import (
 
 # Retries stay with the orchestrator, so every billable attempt gets its own reservation.
 _SDK_MAX_RETRIES: Final = 0
-# The names the shell and edit tools are declared with, and the names their calls carry.
-_CALL_NAMES: Final[Mapping[str, str]] = MappingProxyType(
-    {"bash": "shell", "str_replace_based_edit_tool": "edit"}
-)
 _CONTENT_BLOCK_TYPES: Final = frozenset({"text", "thinking", "redacted_thinking", "tool_use"})
 # Refusal categories that may be named in the run's error; other values are not echoed.
 _REFUSAL_CATEGORIES: Final = frozenset(
@@ -120,6 +115,7 @@ def _turn(message: Message, *, kind: TranscriptKind) -> Turn:
         raise ModelError("Model response did not complete: model_context_window_exceeded")
     if stop_reason not in ("tool_use", "end_turn"):
         raise ModelError("Model response did not complete")
+    allowed_names = tool_call_names("anthropic", kind)
     output_items: list[dict[str, JsonValue]] = []
     tool_calls: list[ToolCall] = []
     try:
@@ -127,13 +123,11 @@ def _turn(message: Message, *, kind: TranscriptKind) -> Turn:
             if block.type not in _CONTENT_BLOCK_TYPES:
                 raise ModelError("Model response contained an unsupported content block")
             if block.type == "tool_use":
+                if block.name not in allowed_names:
+                    raise ModelError("Model called a tool outside its tool set")
                 tool_calls.append(
                     ToolCall.model_validate(
-                        {
-                            "call_id": block.id,
-                            "name": _call_name(block.name, kind),
-                            "arguments": block.input,
-                        }
+                        {"call_id": block.id, "name": block.name, "arguments": block.input}
                     )
                 )
             # Dumped as the SDK sends a content block back, so thinking signatures and every
@@ -154,14 +148,6 @@ def _turn(message: Message, *, kind: TranscriptKind) -> Turn:
         model=model,
         usage=usage,
     )
-
-
-def _call_name(declared: str, kind: TranscriptKind) -> str:
-    submit_name = SUBMIT_TOOLS[kind].name
-    name = submit_name if declared == submit_name else _CALL_NAMES.get(declared)
-    if name not in tool_call_names("anthropic", kind):
-        raise ModelError("Model called a tool outside its tool set")
-    return name
 
 
 def _messages_usage(raw_usage: Usage) -> ModelUsage:

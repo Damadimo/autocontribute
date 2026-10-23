@@ -269,8 +269,12 @@ def test_calls_are_normalized_and_content_is_kept_as_received(
     assert turn.stop == "tool_use"
     assert turn.output_items == blocks
     assert turn.tool_calls == (
-        ToolCall(call_id=_BASH_CALL["id"], name="shell", arguments={"command": "cat hello.py"}),
-        ToolCall(call_id=_EDIT_CALL["id"], name="edit", arguments=_EDIT_CALL["input"]),
+        ToolCall(call_id=_BASH_CALL["id"], name="bash", arguments={"command": "cat hello.py"}),
+        ToolCall(
+            call_id=_EDIT_CALL["id"],
+            name="str_replace_based_edit_tool",
+            arguments=_EDIT_CALL["input"],
+        ),
         ToolCall(call_id=_SUBMIT_CALL["id"], name="submit", arguments=_SUBMIT_CALL["input"]),
     )
     assert (turn.response_id, turn.model) == (_MESSAGE_ID, "claude-opus-5-5")
@@ -455,7 +459,7 @@ def test_other_stop_reasons_fail_the_turn(
         "foreign-submit",
         "edit-for-critic",
         "bash-for-triage",
-        "normalized-name",
+        "openai-tool-name",
         "unsafe-call-id",
         "tool-use-without-calls",
         "end-turn-with-calls",
@@ -480,7 +484,7 @@ def test_critic_declares_its_tools_and_submits_a_review(monkeypatch: pytest.Monk
 
     turn = anthropic_adapter.step(_request("critic"))
 
-    assert [call.name for call in turn.tool_calls] == ["shell", "submit_review"]
+    assert [call.name for call in turn.tool_calls] == ["bash", "submit_review"]
     assert _body(requests[0])["tools"] == tool_definitions("anthropic", "critic")
 
 

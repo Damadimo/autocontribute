@@ -9,6 +9,7 @@ from pydantic import BaseModel, JsonValue, ValidationError
 from autocontribute.pricing import ModelUsage
 from autocontribute.submissions import AgentSubmission, ReviewSubmission, strict_json_schema
 from autocontribute.transcript import (
+    NATIVE_CALL_NAMES,
     SUBMIT_TOOLS,
     ShellChunk,
     ToolCall,
@@ -120,7 +121,7 @@ def _anthropic_turn() -> Turn:
         tool_calls=(
             ToolCall(
                 call_id="toolu_01A09q90qw90lq917835lq9",
-                name="shell",
+                name="bash",
                 arguments={"command": "cat hello.py"},
             ),
         ),
@@ -183,10 +184,20 @@ def test_each_kind_declares_its_tools_in_a_fixed_order(
     assert [tool["name"] for tool in tool_definitions("anthropic", kind)] == anthropic_names
 
 
-def test_tool_call_names_are_normalized_per_provider() -> None:
+def test_tool_calls_keep_the_native_tool_names() -> None:
+    assert dict(NATIVE_CALL_NAMES["openai"]) == {"shell": "shell", "edit": "apply_patch"}
+    assert dict(NATIVE_CALL_NAMES["anthropic"]) == {
+        "shell": "bash",
+        "edit": "str_replace_based_edit_tool",
+    }
     assert tool_call_names("openai", "agent") == {"shell", "apply_patch", "submit"}
-    assert tool_call_names("anthropic", "agent") == {"shell", "edit", "submit"}
+    assert tool_call_names("anthropic", "agent") == {
+        "bash",
+        "str_replace_based_edit_tool",
+        "submit",
+    }
     assert tool_call_names("openai", "critic") == {"shell", "submit_review"}
+    assert tool_call_names("anthropic", "critic") == {"bash", "submit_review"}
     assert tool_call_names("anthropic", "triage") == {"submit_triage"}
     assert tool_call_names("openai", "policy") == {"submit_policy"}
 
@@ -360,8 +371,8 @@ def test_anthropic_results_and_reminder_of_one_turn_share_one_user_message() -> 
         stop="tool_use",
         output_items=(_ANTHROPIC_BASH_CALL, second_call),
         tool_calls=(
-            ToolCall(call_id="toolu_01A09q90qw90lq917835lq9", name="shell", arguments={}),
-            ToolCall(call_id="toolu_02B", name="shell", arguments={}),
+            ToolCall(call_id="toolu_01A09q90qw90lq917835lq9", name="bash", arguments={}),
+            ToolCall(call_id="toolu_02B", name="bash", arguments={}),
         ),
         response_id="msg_01",
         model="claude-opus-5-5",
