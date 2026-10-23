@@ -5,6 +5,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -186,6 +187,7 @@ class _AccountGitHub:
 def _ready_run(
     tmp_path: Path,
     *,
+    draft: bool = True,
     ready_for_review: bool = False,
     legal_policy: str | None = None,
     approved: bool = True,
@@ -195,7 +197,7 @@ def _ready_run(
         {
             "github": {"repositories": ["example/project"]},
             "validation": {"required_commands": {"example/project": ["python -m pytest"]}},
-            "publishing": {"draft": True, "ready_for_review": ready_for_review},
+            "publishing": {"draft": draft, "ready_for_review": ready_for_review},
             "storage": {"path": tmp_path / "state"},
         }
     )
@@ -504,6 +506,8 @@ class FakePublishingGitHub:
         self.upstream_push = False
         self.upstream_has_pull_requests = True
         self.upstream_collaborators_only = False
+        # GitHub answers 404 for a fork that ensure_fork has not created yet.
+        self.fork_exists = False
         self.open_authored: list[AuthoredPullRequest] = []
         self.recent_authored: list[AuthoredPullRequest] = []
         # A newer base that touches the patched file keeps the strict "base moved" behavior.
@@ -693,6 +697,8 @@ class FakePublishingGitHub:
                 has_pull_requests=self.upstream_has_pull_requests,
                 pull_requests_from_collaborators_only=self.upstream_collaborators_only,
             )
+        if not self.fork_exists:
+            return None
         return RepositoryAccess(
             identity=RepositoryIdentity(
                 full_name=full_name,
@@ -785,6 +791,7 @@ class FakePublishingGitHub:
             before_mutation()
         self.calls.append("ensure_fork")
         self.mutated = True
+        self.fork_exists = True
         return fork
 
     def ref_sha(self, repository: str, ref: str) -> str | None:
@@ -986,6 +993,26 @@ def test_abandon_refuses_when_github_has_the_branch(
     assert store.events(run_id) == events
 
 
+def test_abandon_refuses_a_run_whose_cleanup_already_started(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, store, run_id, github, publisher = _strand_review_publication_after_intent(
+        tmp_path,
+        monkeypatch,
+    )
+    stranded = store.get(run_id)
+    stranded.publication_compensation_reason = "pre_pr_policy_stale"
+    store.save(stranded, event="fixture.compensation_started", details={})
+    events = store.events(run_id)
+
+    with pytest.raises(PublicationResumeRequired, match="already started cleaning up"):
+        publisher.abandon(run_id, reason="Stuck")
+
+    assert store.events(run_id) == events
+    assert github.calls == []
+
+
 def test_abandon_refuses_runs_that_are_not_submitting_and_blank_reasons(tmp_path: Path) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
     github = FakePublishingGitHub(issue, "")
@@ -1035,6 +1062,42 @@ def test_publisher_commits_and_opens_exact_approved_artifact(tmp_path: Path, mon
         "pull_request.creation.started"
     )
     assert publisher.publish(run_id).pull_request_url == published.pull_request_url
+
+
+def test_default_publishing_settings_open_a_ready_pull_request_directly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path, draft=False, ready_for_review=True)
+    defaults = AutocontributeConfig().publishing
+    assert (config.publishing.draft, config.publishing.ready_for_review) == (
+        defaults.draft,
+        defaults.ready_for_review,
+    )
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert (published.publication_draft, published.publication_ready_for_review) == (False, False)
+    intent = next(
+        json.loads(event["details"])
+        for event in store.events(run_id)
+        if event["event_type"] == "publication.intent.begun"
+    )
+    assert (intent["draft"], intent["ready_for_review"]) == ("false", "false")
+    assert github.created_pull_request_draft is False
+    assert "mark_pull_request_ready_for_review" not in github.calls
 
 
 def test_publisher_commits_exact_authorized_dco_trailer(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1788,6 +1851,23 @@ def test_base_drift_is_unsafe_unless_policy_and_patch_paths_provably_stayed(
         changed_paths=frozenset({changed_path}),
         complete=complete,
     )
+
+    with pytest.raises(PolicyError, match="changed a path the patch touches"):
+        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+    assert not github.mutated
+
+
+def test_base_drift_that_adds_a_policy_file_is_unsafe(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    newer_base = "f" * 40
+    github = FakePublishingGitHub(issue, newer_base)
+    github.base_changed_paths = frozenset({"AI_POLICY.md"})
+
+    def files_at(repository: str, *, ref: str, max_files: int) -> list[str]:
+        return ["CONTRIBUTING.md", "AI_POLICY.md"] if ref == newer_base else ["CONTRIBUTING.md"]
+
+    github.list_repository_files = files_at  # type: ignore[method-assign]
 
     with pytest.raises(PolicyError, match="changed a path the patch touches"):
         Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
@@ -4118,6 +4198,32 @@ def test_ambiguous_submitting_run_is_reconciled_without_remote_mutation(tmp_path
     assert not github.mutated
 
 
+def test_reconciliation_adopts_a_pull_request_github_opened_on_a_safe_newer_base(
+    tmp_path: Path,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    manifest = store.get(run_id)
+    manifest.commit_sha = "c" * 40
+    store.save(manifest, event="fixture.commit_stored", details={})
+    manifest = _begin_review_publication(config, store, manifest)
+    github = FakePublishingGitHub(
+        issue,
+        "f" * 40,
+        existing_pr="https://github.com/example/project/pull/7",
+        branch_sha=manifest.commit_sha,
+    )
+    github.pull_request_base_sha = "f" * 40
+    github.base_changed_paths = frozenset({"README.md"})
+
+    reconciled = Publisher(config, store, github).reconcile_submitting(run_id)  # type: ignore[arg-type]
+
+    assert reconciled.status == RunStatus.PR_OPEN
+    assert reconciled.base_sha == manifest.base_sha
+    assert "compare_commits" in github.calls
+    assert not github.mutated
+    assert not store.circuit_breaker_status().is_tripped
+
+
 def test_submitting_reconciliation_fails_closed_when_remote_pr_is_missing(
     tmp_path: Path,
 ) -> None:
@@ -4679,6 +4785,35 @@ def test_definitive_pull_request_refusal_removes_branch_and_fails_only_the_run(
         "publication.compensation.verified",
         "run.transitioned",
     ]
+
+
+def test_refusal_stays_ambiguous_when_the_pull_request_lookup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refusal = GitHubHTTPError(
+        "GitHub returned 422",
+        status_code=422,
+        request_id="ABCD:1234",
+        github_message="Validation Failed",
+    )
+    store, run_id, github, publisher, deleted = _refusing_publisher(tmp_path, monkeypatch, refusal)
+    original_find = github.find_pull_request
+
+    def find_fails_after_post(repository: str, *, head: str) -> str | None:
+        if "create_pull_request" in github.calls:
+            raise GitHubError("GitHub is unavailable")
+        return original_find(repository, head=head)
+
+    monkeypatch.setattr(github, "find_pull_request", find_fails_after_post)
+
+    with pytest.raises(PublicationResumeRequired, match="will not send a second POST"):
+        publisher.publish(run_id)
+
+    durable = store.get(run_id)
+    assert durable.status == RunStatus.SUBMITTING
+    assert durable.pull_request_creation_started
+    assert deleted == []
 
 
 def test_refused_pull_request_that_already_exists_is_adopted(
@@ -6222,16 +6357,110 @@ def test_same_repository_compensation_deletes_only_the_exact_upstream_branch(
     assert "create_pull_request" not in github.calls
 
 
+def test_first_publication_creates_the_fork_and_binds_its_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(
+        publisher,
+        "_push",
+        lambda workspace, fork, branch, commit_sha, *, before_mutation: (
+            before_mutation(),
+            setattr(github, "branch_sha", commit_sha),
+        )[-1],
+    )
+
+    published = publisher.publish(run_id)
+
+    assert published.status == RunStatus.PR_OPEN
+    assert github.calls.count("ensure_fork") == 1
+    assert github.calls.index("get_repository_access") < github.calls.index("ensure_fork")
+    assert (published.fork_repository_id, published.fork_repository_node_id) == (
+        github.fork_repository_id,
+        github.fork_repository_node_id,
+    )
+
+
+def test_same_repository_publication_needs_push_access_before_the_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, run_id, github, publisher, pushes = _same_repository_publisher(
+        tmp_path, monkeypatch, login="example"
+    )
+    github.upstream_push = False
+
+    with pytest.raises(PolicyError, match="can no longer push to example/project"):
+        publisher.publish(run_id)
+
+    assert pushes == []
+    assert not github.mutated
+    assert store.get(run_id).status == RunStatus.APPROVED
+
+
+def test_same_repository_push_stops_when_push_access_ends_after_the_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, run_id, github, publisher, pushes = _same_repository_publisher(
+        tmp_path, monkeypatch, login="example"
+    )
+    push = publisher._push
+
+    def revoke_then_push(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        github.upstream_push = False
+        push(*args, **kwargs)
+
+    monkeypatch.setattr(publisher, "_push", revoke_then_push)
+
+    with pytest.raises(GitHubError, match="can no longer push to the upstream repository"):
+        publisher.publish(run_id)
+
+    assert pushes == []
+    assert store.get(run_id).status == RunStatus.SUBMITTING
+
+
+def test_same_repository_publication_rechecks_ci_configuration_changes(tmp_path: Path) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    github.upstream_push = True
+    manifest = store.get(run_id).model_copy(update={"head_repository": "example/project"})
+    workflow_patch = (
+        b"diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml\n"
+        b"--- a/.github/workflows/ci.yml\n"
+        b"+++ b/.github/workflows/ci.yml\n"
+        b"@@ -1 +1 @@\n"
+        b"-name: ci\n"
+        b"+name: changed\n"
+    )
+
+    with pytest.raises(PolicyError, match="cannot change CI configuration"):
+        Publisher(config, store, github)._check_head_repository(  # type: ignore[arg-type]
+            manifest, workflow_patch
+        )
+
+    assert not github.mutated
+
+
 def test_branch_compensation_refuses_a_branch_the_run_did_not_create(tmp_path: Path) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
     manifest = _begin_review_publication(config, store, store.get(run_id))
     github = FakePublishingGitHub(issue, manifest.base_sha or "")
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
 
-    for branch in ("main", f"autocontribute/issue-43-{run_id[:8]}"):
+    for bound, branch in (
+        (manifest.branch_name, "main"),
+        (manifest.branch_name, f"autocontribute/issue-43-{run_id[:8]}"),
+        ("main", "main"),
+        ("autocontribute/feature", "autocontribute/feature"),
+    ):
         with pytest.raises(StateError, match="did not create"):
             publisher._compensate_branch_only(
-                manifest,
+                manifest.model_copy(update={"branch_name": bound}),
                 fork="example/project",
                 branch=branch,
                 commit_sha="c" * 40,
@@ -6358,6 +6587,7 @@ def test_head_repository_checks_fail_before_the_publication_intent(
         github.upstream_collaborators_only = True
         expected = "accepts pull requests only from collaborators"
     else:
+        github.fork_exists = True
         original_access = github.get_repository_access
 
         def changed_fork(full_name: str) -> RepositoryAccess | None:
@@ -6495,31 +6725,38 @@ def _authored(
     )
 
 
+def _earlier_today() -> timedelta:
+    """An age that keeps a pull request inside the current UTC day, even just after midnight."""
+
+    now = datetime.now(UTC)
+    return min(timedelta(minutes=5), now - now.replace(hour=0, minute=0, second=0, microsecond=0))
+
+
 @pytest.mark.parametrize(
     ("open_authored", "recent_authored", "expected"),
     [
         (
-            [
+            lambda: [
                 _authored("a/one", "autocontribute/issue-1-aaaaaaaa", number=1),
                 _authored("b/two", "autocontribute/issue-2-bbbbbbbb", number=2),
                 _authored("c/three", "autocontribute/issue-3-cccccccc", number=3),
             ],
-            [],
+            list,
             "Maximum number of open autocontribute pull requests",
         ),
         (
-            [_authored("example/project", "autocontribute/issue-9-dddddddd")],
-            [],
+            lambda: [_authored("example/project", "autocontribute/issue-9-dddddddd")],
+            list,
             "already open in this repository",
         ),
         (
-            [],
-            [_authored("a/one", "autocontribute/issue-1-aaaaaaaa", age=timedelta(minutes=5))],
+            list,
+            lambda: [_authored("a/one", "autocontribute/issue-1-aaaaaaaa", age=_earlier_today())],
             "Daily new pull-request limit",
         ),
         (
-            [],
-            [
+            list,
+            lambda: [
                 _authored(
                     "example/project", "autocontribute/issue-9-dddddddd", age=timedelta(days=2)
                 )
@@ -6530,17 +6767,20 @@ def _authored(
 )
 def test_account_limits_count_autocontribute_pull_requests(
     tmp_path: Path,
-    open_authored: list[AuthoredPullRequest],
-    recent_authored: list[AuthoredPullRequest],
+    monkeypatch: pytest.MonkeyPatch,
+    open_authored: Callable[[], list[AuthoredPullRequest]],
+    recent_authored: Callable[[], list[AuthoredPullRequest]],
     expected: str,
 ) -> None:
     config, store, run_id, issue = _ready_run(tmp_path)
     github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
-    github.open_authored = open_authored
-    github.recent_authored = recent_authored
+    github.open_authored = open_authored()
+    github.recent_authored = recent_authored()
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
 
     with pytest.raises(PublicationLimitError, match=expected):
-        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+        publisher.publish(run_id)
 
     assert not github.mutated
     assert store.get(run_id).status == RunStatus.APPROVED
@@ -6559,7 +6799,10 @@ def test_account_limits_ignore_other_pull_requests_and_this_runs_own_branch(
         _authored("octocat/site", "redesign", age=timedelta(minutes=5), number=3),
     ]
     github.open_authored = [*personal, _authored("example/project", own_branch, number=4)]
-    github.recent_authored = [*personal, _authored("example/project", own_branch, number=4)]
+    github.recent_authored = [
+        *personal,
+        _authored("example/project", own_branch, age=_earlier_today(), number=4),
+    ]
     publisher = Publisher(config, store, github)  # type: ignore[arg-type]
     monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
     monkeypatch.setattr(
@@ -6695,26 +6938,67 @@ def test_check_refuses_runs_that_are_not_waiting_to_publish(tmp_path: Path) -> N
     assert github.calls == []
 
 
-def test_account_limits_count_local_runs_still_submitting(tmp_path: Path) -> None:
-    config, store, run_id, issue = _ready_run(tmp_path)
-    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
-    github.open_authored = [
-        _authored("a/one", "autocontribute/issue-1-aaaaaaaa", number=1),
-        _authored("b/two", "autocontribute/issue-2-bbbbbbbb", number=2),
-    ]
+def _still_submitting(
+    store: RunStore,
+    run_id: str,
+    repository: str,
+    pull_request_url: str | None = None,
+) -> None:
+    """Make the store report one other run of ``repository`` that is still submitting."""
+
     manifest = store.get(run_id)
     assert manifest.candidate is not None
     in_flight = manifest.model_copy(
         update={
             "run_id": "in-flight-run",
             "status": RunStatus.SUBMITTING,
-            "candidate": manifest.candidate.model_copy(update={"repository": "c/three"}),
+            "candidate": manifest.candidate.model_copy(update={"repository": repository}),
+            "pull_request_url": pull_request_url,
         }
     )
     store.list_submitting_runs = lambda *, limit=100: [in_flight]  # type: ignore[method-assign]
 
-    with pytest.raises(PolicyError, match="Maximum number of open autocontribute"):
-        Publisher(config, store, github).publish(run_id)  # type: ignore[arg-type]
+
+@pytest.mark.parametrize(
+    ("repository", "pull_request_url", "passed", "detail"),
+    [
+        ("c/three", None, False, "Maximum number of open autocontribute pull requests reached"),
+        ("a/one", "https://github.com/a/one/pull/1", True, "every publication limit has room"),
+    ],
+)
+def test_account_limits_count_each_run_still_submitting_once(
+    tmp_path: Path,
+    repository: str,
+    pull_request_url: str | None,
+    passed: bool,
+    detail: str,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    github.open_authored = [
+        _authored("a/one", "autocontribute/issue-1-aaaaaaaa", number=1),
+        _authored("b/two", "autocontribute/issue-2-bbbbbbbb", number=2),
+    ]
+    _still_submitting(store, run_id, repository, pull_request_url)
+
+    checks = {check.name: check for check in Publisher(config, store, github).check(run_id)}  # type: ignore[arg-type]
+
+    assert (checks["limits"].passed, checks["limits"].detail) == (passed, detail)
+    assert not github.mutated
+
+
+def test_account_limits_refuse_a_repository_with_a_run_still_submitting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    _still_submitting(store, run_id, "example/project")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+
+    with pytest.raises(PublicationLimitError, match="already open in this repository"):
+        publisher.publish(run_id)
 
     assert not github.mutated
 
@@ -6750,6 +7034,40 @@ def test_commit_dates_come_from_the_publication_intent_time(
     )
     timestamp = str(int(datetime.fromisoformat(intent["occurred_at"]).timestamp()))
     assert dates == [f"{timestamp} {timestamp}"]
+
+
+def test_a_recovered_commit_must_carry_the_publication_intent_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, store, run_id, issue = _ready_run(tmp_path)
+    github = FakePublishingGitHub(issue, store.get(run_id).base_sha or "")
+    publisher = Publisher(config, store, github)  # type: ignore[arg-type]
+
+    def crash_before_push(*args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        raise RuntimeError("simulated job loss before the push")
+
+    monkeypatch.setattr(publisher, "_wait_for_fork", lambda *args: None)
+    monkeypatch.setattr(publisher, "_push", crash_before_push)
+    with pytest.raises(RuntimeError, match="job loss before the push"):
+        publisher.publish(run_id)
+    manifest = store.get(run_id)
+    assert manifest.commit_sha is not None
+    workspace = store.workspace_dir(run_id) / "repository"
+    patch = (store.artifact_dir(run_id) / "contribution.patch").read_bytes()
+    intent_time = publisher._publication_intent_time(run_id)
+
+    publisher._validate_exact_commit(
+        workspace, manifest, patch, commit_sha=manifest.commit_sha, committed_at=intent_time
+    )
+    with pytest.raises(PolicyError, match="dates differ from the publication intent time"):
+        publisher._validate_exact_commit(
+            workspace,
+            manifest,
+            patch,
+            commit_sha=manifest.commit_sha,
+            committed_at=intent_time + timedelta(seconds=1),
+        )
 
 
 def test_lost_workspace_before_push_is_rebuilt_to_the_same_commit(
