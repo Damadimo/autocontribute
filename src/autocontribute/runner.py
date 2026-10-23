@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -76,6 +77,7 @@ _EXPIRY_WARNING = timedelta(days=14)
 _MAX_LISTED_PAGES = 10
 _MAX_READY_RUNS = 200
 _PUSH_ATTEMPTS = 3
+_PUSH_RETRY_SECONDS = 5
 _MAX_PREPARED_BYTES = 1 << 20
 # GitHub refuses files over 100 MiB, and the state branch keeps the archive as one file.
 _MAX_ARCHIVE_BYTES = 90 << 20
@@ -431,7 +433,7 @@ class StateBranch:
         shutil.copyfile(archive, self.archive)
         self._git("add", "--", STATE_ARCHIVE)
         self._git("commit", "--quiet", "--message", message)
-        for _ in range(_PUSH_ATTEMPTS):
+        for attempt in range(1, _PUSH_ATTEMPTS + 1):
             try:
                 self._git("push", "--quiet", "origin", f"HEAD:refs/heads/{STATE_BRANCH}")
             except _PushRejected:
@@ -444,6 +446,12 @@ class StateBranch:
                         "Another job saved the state while this one ran, so this job's state "
                         "was not saved; run this job again"
                     ) from exc
+            except StateError:
+                # The state may record a pull request that is already open; a re-run cannot
+                # record it again, so a dropped connection gets more tries.
+                if attempt == _PUSH_ATTEMPTS:
+                    raise
+                time.sleep(_PUSH_RETRY_SECONDS)
             else:
                 return True
         raise StateError(f"The {STATE_BRANCH} branch kept changing; the state was not saved")
@@ -724,11 +732,14 @@ def report_approval(
             repository.remove_label(number, AWAITING_LABEL)
             repository.close_issue(number, completed=False)
     if save_error is not None:
-        repository.comment(
-            number,
-            "The runner's state was not saved, so re-run this approve job from the Actions tab:"
-            f"\n\n{fenced_block(save_error, 'text')}",
+        note = (
+            "The pull request is open, but the runner could not save its state, so it will not "
+            "watch the pull request or count it in its limits; answer it yourself."
+            if manifest is not None and manifest.status == RunStatus.PR_OPEN
+            else "The runner's state was not saved, so re-run this approve job from the Actions "
+            "tab."
         )
+        repository.comment(number, f"{note}\n\n{fenced_block(save_error, 'text')}")
 
 
 def check_runner(
@@ -1041,9 +1052,10 @@ def _open_approval_issue(
         # Plain words, so the title links to nothing upstream.
         title += f": {candidate.repository} issue {candidate.number}"
     number = repository.create_issue(title, review.body)
+    # Locked before the patch parts, so nobody else can comment a forged part between them.
+    repository.lock_issue(number)
     for part in review.parts:
         repository.comment(number, part)
-    repository.lock_issue(number)
     # The approve workflow acts only on labelled issues, so the label goes on once the issue is
     # complete.
     repository.add_label(number, AWAITING_LABEL)
