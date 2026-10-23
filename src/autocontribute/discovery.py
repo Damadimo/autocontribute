@@ -983,6 +983,9 @@ class DiscoveryService:
             blockers.append(("pull requests restricted", restriction))
         if issue.state.casefold() != "open":
             blockers.append(("closed", "issue is not open"))
+        if issue.locked:
+            # Publication refuses a locked issue, so preparing one only spends model calls.
+            blockers.append(("locked", "issue is locked"))
         if (
             self.config.policy.require_maintainer_signal
             and not invitation_labels

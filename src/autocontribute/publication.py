@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, NoReturn, Protocol, cast, runtime_checkable
+from typing import Literal, NoReturn, cast
 
 from autocontribute.approval import (
     FINGERPRINT_PREFIX,
@@ -115,13 +115,6 @@ class PublicationCheck:
     name: str
     passed: bool
     detail: str
-
-
-@runtime_checkable
-class PublicationHolds(Protocol):
-    """A store that also records scoped holds that refuse publication."""
-
-    def assert_publication_not_held(self, repository: str) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -1168,22 +1161,21 @@ class Publisher:
     ) -> list[tuple[str, Callable[[], None], str]]:
         """What ``publish`` proves before its intent, in order: name, check, what passing means.
 
-        Holds apply only with stores that record them. A run waiting for approval has no bound
-        head yet, so its check binds the one its review would bind now.
+        A run waiting for approval has no bound head yet, so its check binds the one its review
+        would bind now.
         """
 
         assert manifest.candidate is not None
         repository = manifest.candidate.repository
-        gates: list[tuple[str, Callable[[], None], str]] = []
-        store = self.store
-        if isinstance(store, PublicationHolds):
-            gates.append(
-                (
-                    "holds",
-                    lambda: store.assert_publication_not_held(repository),
-                    "no hold applies to this repository",
-                )
+        gates: list[tuple[str, Callable[[], None], str]] = [
+            (
+                "holds",
+                lambda: self.store.assert_publication_not_held(
+                    repository, pull_request_url=manifest.pull_request_url
+                ),
+                "no hold applies to this repository",
             )
+        ]
 
         def check_head_repository() -> None:
             contribution = patch()

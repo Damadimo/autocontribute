@@ -800,9 +800,9 @@ def test_content_creation_block_on_a_mutation_holds_publication(tmp_path, monkey
 
     with _client(handler, safety_trigger_handler=store.record_stop) as github:
         with pytest.raises(GitHubSafetyError, match="Publication is held") as first:
-            github.ensure_fork("upstream/project", "octocat")
+            github.ensure_fork("upstream/project", "octocat/project", upstream_repository_id=1001)
         with pytest.raises(GitHubSafetyError) as second:
-            github.ensure_fork("other/project", "octocat")
+            github.ensure_fork("other/project", "octocat/project", upstream_repository_id=1002)
 
     trigger = first.value.trigger
     assert trigger.scope == StopScope.PUBLICATION
@@ -891,7 +891,7 @@ def test_a_released_block_holds_again_on_a_later_day(tmp_path, monkeypatch) -> N
             _client(handler, safety_trigger_handler=store.record_stop) as github,
             pytest.raises(GitHubSafetyError) as raised,
         ):
-            github.ensure_fork("upstream/project", "octocat")
+            github.ensure_fork("upstream/project", "octocat/project", upstream_repository_id=1001)
         return raised.value.trigger
 
     first = block()
