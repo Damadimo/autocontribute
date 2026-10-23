@@ -369,6 +369,11 @@ def test_pull_request_text_is_checked_with_the_diff(harness: Harness) -> None:
 
     assert not result.passed and not _gate(result, "pull_request_text")
     assert "the title must be one line of at most 200 characters" in harness.text
+    assert harness.checks.check_text(submission) == (
+        "the title must be one line of at most 200 characters; the text must not mention "
+        "@everyone or @here"
+    )
+    assert harness.checks.check_text(_SUBMISSION) is None
     assert "submit lists test files the diff does not change: tests/t.py" in harness.text
 
 

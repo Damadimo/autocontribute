@@ -519,6 +519,13 @@ class FixChecker(Protocol):
         """Check the workspace's current diff and the submission's text."""
         ...
 
+    def check_text(self, submission: AgentSubmission) -> str | None:
+        """Say why the submission's pull request text cannot be published, or return None.
+
+        The confirming submit of an unchanged diff goes through this check only.
+        """
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class SubmittedFix:
@@ -617,10 +624,23 @@ class Solver:
             return SubmitReply("accept", "Skip recorded.")
         self._submits += 1
         passed = self._passed
-        if passed is not None and self._checker.diff_sha256() == passed.diff_sha256:
-            self._accepted = passed
-            return SubmitReply("accept", "Fix confirmed.")
         left = MAX_FIX_SUBMITS - self._submits
+        if passed is not None and self._checker.diff_sha256() == passed.diff_sha256:
+            # The confirming submit's text is the one the pull request gets.
+            problem = self._checker.check_text(submission)
+            if problem is None:
+                self._accepted = passed
+                return SubmitReply("accept", "Fix confirmed.")
+            reply = (
+                f"The diff is unchanged, but the pull request text cannot be published: {problem}."
+            )
+            if left == 0:
+                return SubmitReply(
+                    "stop", f"{reply} No submits are left, so the attempt ends here."
+                )
+            return SubmitReply(
+                "continue", f"{reply} Correct it and call submit again. Submits left: {left}."
+            )
         if left == 0:
             return SubmitReply(
                 "stop",

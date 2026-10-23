@@ -309,6 +309,11 @@ class FakeChecker:
             text=f"Checks {'passed' if passed else 'failed'} (check {len(self.checked)}).",
         )
 
+    def check_text(self, submission: AgentSubmission) -> str | None:
+        if "@everyone" in (submission.pr_body or ""):
+            return "the text must not mention @everyone or @here"
+        return None
+
 
 class Clock:
     def __init__(self) -> None:
@@ -526,6 +531,29 @@ def test_a_changed_diff_is_checked_again_before_it_can_be_confirmed(harness: Har
     assert isinstance(outcome, SubmittedFix)
     assert len(checker.checked) == 2
     assert outcome.check.text == "Checks passed (check 2)."
+
+
+def test_the_confirming_submit_text_is_checked_and_used(harness: Harness) -> None:
+    (harness.workspace / "calc.py").write_text(_FIXED_SOURCE)
+    broadcast = {**_FIX, "pr_body": "@everyone please review.\n\nFixes #1"}
+    final = {**_FIX, "pr_body": "add now adds.\n\nFixes #1"}
+    script = ScriptedProvider(
+        turn("openai", Submit(_FIX)),
+        turn("openai", Submit(broadcast)),
+        turn("openai", Submit(final)),
+    )
+    checker = FakeChecker(harness.workspace)
+    solver = harness.solver(script, "openai", checker=checker)
+
+    outcome = solver.run()
+
+    assert isinstance(outcome, SubmittedFix)
+    assert len(checker.checked) == 1
+    assert outcome.submission.pr_body == "add now adds.\n\nFixes #1"
+    assert _texts(solver.loop.transcript)[1] == (
+        "The diff is unchanged, but the pull request text cannot be published: the text must "
+        "not mention @everyone or @here. Correct it and call submit again. Submits left: 2."
+    )
 
 
 def test_the_third_failed_check_ends_the_round(harness: Harness) -> None:
