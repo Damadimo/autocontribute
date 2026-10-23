@@ -43,7 +43,6 @@ _SESSION_ENVIRONMENT: Final = (
     ("TMPDIR", CONTAINER_TMP),
     ("PATH", SAFE_CONTAINER_PATH),
     ("CI", "1"),
-    ("NO_COLOR", "1"),
     ("PAGER", "cat"),
     ("GIT_PAGER", "cat"),
     ("GIT_TERMINAL_PROMPT", "0"),
@@ -252,7 +251,6 @@ class SandboxRunner:
             "TMPDIR=/tmp",
             f"PATH={SAFE_CONTAINER_PATH}",
             "CI=1",
-            "NO_COLOR=1",
             "GIT_TERMINAL_PROMPT=0",
             "AUTOCONTRIBUTE_SANDBOX=1",
             # A login shell (-l) would source /etc/profile, which resets PATH.
