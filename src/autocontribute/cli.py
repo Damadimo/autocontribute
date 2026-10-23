@@ -458,13 +458,14 @@ def publish(
             if manifest.status != RunStatus.PR_OPEN:
                 manifest = Publisher(settings, store, github).publish(run_id)
     except AutocontributeError as exc:
-        outcome, exit_code = _publication_failure(store, exc)
+        state = _publication_state(store, run_id)
+        outcome, exit_code = _publication_failure(
+            store,
+            exc,
+            submitting=state["status"] == RunStatus.SUBMITTING.value,
+        )
         _fail(
-            str(exc),
-            exit_code=exit_code,
-            json_output=json_output,
-            outcome=outcome,
-            context=_publication_state(store, run_id),
+            str(exc), exit_code=exit_code, json_output=json_output, outcome=outcome, context=state
         )
     _refresh_report(store, manifest)
     if json_output:
@@ -655,7 +656,7 @@ def check_run(
             checks = Publisher(settings, store, github).check(run_id)
         manifest = store.get(run_id)
     except AutocontributeError as exc:
-        outcome, exit_code = _publication_failure(store, exc)
+        outcome, exit_code = _publication_failure(store, exc, submitting=False)
         _fail(
             str(exc),
             exit_code=exit_code,
@@ -1470,12 +1471,21 @@ def _refresh_report(store: RunStore, manifest: RunManifest) -> None:
     )
 
 
-def _publication_failure(store: RunStore, error: AutocontributeError) -> tuple[str, int]:
-    """Name a failed publication and its exit code, so a runner knows whether to wait."""
+def _publication_failure(
+    store: RunStore,
+    error: AutocontributeError,
+    *,
+    submitting: bool,
+) -> tuple[str, int]:
+    """Name a failed publication and its exit code, so a runner knows whether to wait.
+
+    Lifecycle sync can report another run's interrupted publication; only this run being
+    ``submitting`` makes it this run's to resume.
+    """
 
     if store.circuit_breaker_status().is_tripped:
         return "safety_stop", 5
-    if isinstance(error, PublicationResumeRequired):
+    if isinstance(error, PublicationResumeRequired) and submitting:
         return "resume_required", 4
     if isinstance(error, PublicationLimitError):
         return "limit", 3
