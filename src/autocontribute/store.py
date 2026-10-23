@@ -36,7 +36,7 @@ from autocontribute.exceptions import (
 from autocontribute.issue_revision import compute_issue_revision
 from autocontribute.lifecycle import parse_pull_request_url
 
-CURRENT_SCHEMA_VERSION: Final = 9
+CURRENT_SCHEMA_VERSION: Final = 10
 _MAX_GENERATION: Final = 2**63 - 1
 _MAX_ACTIVE_CIRCUIT_BREAKER_TRIGGERS: Final = 10_000
 _MAX_RUN_CORPUS: Final = 10_000
