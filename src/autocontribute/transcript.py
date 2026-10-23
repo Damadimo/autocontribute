@@ -130,7 +130,7 @@ _EDIT_TOOLS: Final[Mapping[Provider, dict[str, JsonValue]]] = MappingProxyType(
 
 
 def canonical_json(value: object) -> bytes:
-    """Encode ``value`` as the worker IPC does; its length bounds the tokens it costs."""
+    """Encode ``value`` as the worker IPC does: ASCII, with sorted keys."""
 
     return json.dumps(
         value,
@@ -139,6 +139,23 @@ def canonical_json(value: object) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("ascii")
+
+
+def json_size(value: object) -> int:
+    """Return the UTF-8 bytes of ``value`` as compact JSON, which bound the tokens it costs.
+
+    Non-ASCII text counts as its UTF-8 bytes; the worker IPC's ASCII escapes, six bytes for a
+    CJK character, are no measure of tokens.
+    """
+
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return len(encoded.encode("utf-8"))
 
 
 def tool_definitions(provider: Provider, kind: TranscriptKind) -> list[dict[str, JsonValue]]:
@@ -354,7 +371,7 @@ def append_user_text(transcript: Transcript, text: str, *, host_values: frozense
     content = cast("list[JsonValue]", message["content"])
     joined: dict[str, JsonValue] = {"role": "user", "content": [*content, block]}
     transcript.items[-1] = joined
-    transcript.appended_bytes += len(canonical_json(joined)) - len(canonical_json(message))
+    transcript.appended_bytes += json_size(joined) - json_size(message)
     transcript.appended_items += 1
 
 
@@ -422,16 +439,16 @@ def read_submission(call: ToolCall, submission: type[SubmissionT]) -> Submission
 def next_input_reservation(transcript: Transcript) -> int:
     """Return an upper bound on the input tokens of the transcript's next request.
 
-    JSON bytes bound tokens. The first request sends the instructions, the tools and the items.
-    A later request replays the previous one, billed as that turn's input, and the turn's
-    output, plus what was appended since; every replayed output item and every appended item
-    may also cost framing tokens beyond its bytes.
+    The UTF-8 bytes of JSON bound tokens. The first request sends the instructions, the tools
+    and the items. A later request replays the previous one, billed as that turn's input, and
+    the turn's output, plus what was appended since; every replayed output item and every
+    appended item may also cost framing tokens beyond its bytes.
     """
 
     if transcript.prior_input_tokens is None:
         tools = tool_definitions(transcript.provider, transcript.kind)
         sent: tuple[object, ...] = (transcript.instructions, tools, transcript.items)
-        return sum(len(canonical_json(part)) for part in sent) + _RESERVATION_SLACK_TOKENS
+        return sum(json_size(part) for part in sent) + _RESERVATION_SLACK_TOKENS
     return (
         transcript.prior_input_tokens
         + transcript.prior_output_tokens
@@ -445,7 +462,7 @@ def _append(
     transcript: Transcript, items: list[dict[str, JsonValue]], *, counted_items: int
 ) -> None:
     transcript.items.extend(items)
-    transcript.appended_bytes += sum(len(canonical_json(item)) for item in items)
+    transcript.appended_bytes += sum(json_size(item) for item in items)
     transcript.appended_items += counted_items
 
 
@@ -541,6 +558,7 @@ __all__ = [
     "append_turn",
     "append_user_text",
     "canonical_json",
+    "json_size",
     "next_input_reservation",
     "read_submission",
     "start_transcript",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from typing import Any
 
 import pytest
@@ -22,6 +23,7 @@ from autocontribute.transcript import (
     append_turn,
     append_user_text,
     canonical_json,
+    json_size,
     next_input_reservation,
     read_submission,
     start_transcript,
@@ -86,6 +88,10 @@ _ANTHROPIC_BASH_CALL: dict[str, JsonValue] = {
     "name": "bash",
     "input": {"command": "cat hello.py"},
 }
+
+
+def _encoded(value: object) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
 def _transcript(model: str = "gpt-5.6-sol", kind: TranscriptKind = "agent") -> Transcript:
@@ -257,7 +263,7 @@ def test_user_text_is_a_provider_native_user_message(model: str, item: dict[str,
 
     assert transcript.items == [item]
     assert transcript.appended_items == 1
-    assert transcript.appended_bytes == len(canonical_json(item))
+    assert transcript.appended_bytes == json_size(item)
     assert transcript.awaiting_model
 
 
@@ -348,7 +354,7 @@ def test_openai_tool_results_become_native_call_outputs() -> None:
     ]
     assert transcript.pending_calls == []
     assert transcript.appended_items == 3
-    assert transcript.appended_bytes == sum(len(canonical_json(item)) for item in appended)
+    assert transcript.appended_bytes == sum(json_size(item) for item in appended)
     assert transcript.awaiting_model
 
 
@@ -421,7 +427,7 @@ def test_anthropic_results_of_one_turn_and_the_text_after_them_share_one_user_me
         },
     ]
     assert transcript.appended_items == 3
-    assert transcript.appended_bytes == len(canonical_json(transcript.items[2]))
+    assert transcript.appended_bytes == json_size(transcript.items[2])
 
 
 def test_anthropic_user_text_joins_the_user_content_added_since_the_last_turn() -> None:
@@ -439,7 +445,7 @@ def test_anthropic_user_text_joins_the_user_content_added_since_the_last_turn() 
         }
     ]
     assert transcript.appended_items == 2
-    assert transcript.appended_bytes == len(canonical_json(transcript.items[0]))
+    assert transcript.appended_bytes == json_size(transcript.items[0])
 
     text = {"type": "text", "text": "The fix is ready."}
     turn = Turn(
@@ -467,7 +473,7 @@ def test_anthropic_user_text_joins_the_user_content_added_since_the_last_turn() 
             ],
         },
     ]
-    assert transcript.appended_bytes == len(canonical_json(transcript.items[2]))
+    assert transcript.appended_bytes == json_size(transcript.items[2])
 
 
 def test_openai_text_after_the_results_is_a_user_message_of_its_own() -> None:
@@ -639,10 +645,10 @@ def test_turns_alternate_with_the_callers_side() -> None:
 def test_appending_never_changes_earlier_items() -> None:
     transcript = _transcript()
     append_user_text(transcript, "Fix issue 12.", host_values=frozenset())
-    snapshots = [canonical_json(transcript.items)]
+    snapshots = [_encoded(transcript.items)]
     turn = _openai_turn(_OPENAI_REASONING, _OPENAI_SHELL_CALL)
     append_turn(transcript, turn)
-    snapshots.append(canonical_json(transcript.items))
+    snapshots.append(_encoded(transcript.items))
     append_tool_results(
         transcript,
         [
@@ -653,11 +659,11 @@ def test_appending_never_changes_earlier_items() -> None:
         ],
         host_values=frozenset(),
     )
-    snapshots.append(canonical_json(transcript.items))
+    snapshots.append(_encoded(transcript.items))
     append_turn(transcript, _openai_turn(_OPENAI_SUBMIT_CALL))
     turn.output_items[0]["encrypted_content"] = "tampered"
 
-    final = canonical_json(transcript.items)
+    final = _encoded(transcript.items)
     for snapshot in snapshots:
         assert final.startswith(snapshot[:-1])
     assert transcript.items[1]["encrypted_content"] == "gAAAAABo-opaque-reasoning"
@@ -668,12 +674,29 @@ def test_first_reservation_counts_instructions_tools_and_items() -> None:
     append_user_text(transcript, "Assess issue 12.", host_values=frozenset())
 
     expected = (
-        len(canonical_json("Fix the issue."))
-        + len(canonical_json(tool_definitions("openai", "triage")))
-        + len(canonical_json(transcript.items))
+        json_size("Fix the issue.")
+        + json_size(tool_definitions("openai", "triage"))
+        + json_size(transcript.items)
         + 1_024
     )
     assert next_input_reservation(transcript) == expected
+
+
+def test_reservations_count_utf8_bytes_so_text_in_any_script_fits() -> None:
+    # 40,000 characters of CJK guidance: 120,000 UTF-8 bytes, but 240,000 as ASCII escapes.
+    guidance = ("贡献指南请在提交之前运行所有测试" * 2_600)[:40_000]
+    transcript = _transcript("claude-opus-5-5")
+    append_user_text(transcript, guidance, host_values=frozenset())
+
+    reserved = next_input_reservation(transcript)
+
+    assert reserved < 125_000
+    assert reserved == (
+        len(json.dumps("Fix the issue.", ensure_ascii=False).encode())
+        + len(json.dumps(tool_definitions("anthropic", "agent"), separators=(",", ":")).encode())
+        + len(json.dumps(transcript.items, ensure_ascii=False, separators=(",", ":")).encode())
+        + 1_024
+    )
 
 
 def test_later_reservations_add_the_last_turn_and_what_followed_it() -> None:
@@ -686,7 +709,7 @@ def test_later_reservations_add_the_last_turn_and_what_followed_it() -> None:
         host_values=frozenset(),
     )
     append_user_text(transcript, "10 turns left.", host_values=frozenset())
-    appended_bytes = len(canonical_json(transcript.items[2]))
+    appended_bytes = json_size(transcript.items[2])
 
     assert len(transcript.items) == 3
     assert transcript.appended_bytes == appended_bytes
