@@ -6,6 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from autocontribute.environments import (
+    EnvironmentOverride,
     EnvironmentRecipe,
     dependency_digest,
     environment_cache_key,
@@ -113,3 +114,37 @@ def test_cache_key_rejects_malformed_inputs(arch: str, base_image_digest: str, d
             base_image_digest=base_image_digest,
             dependency_digest=digest,
         )
+
+
+def test_environment_overrides_are_normalized() -> None:
+    override = EnvironmentOverride.model_validate(
+        {
+            "image": "python:3.12-bookworm",
+            "setup": ["  pip install -e .[test]  "],
+            "test": "python -m pytest -q",
+            "allow_hosts": ["Files.Example.org", "files.example.org"],
+        }
+    )
+
+    assert override.setup == ["pip install -e .[test]"]
+    assert override.allow_hosts == ["files.example.org"]
+    assert EnvironmentOverride() == EnvironmentOverride(allow_hosts=[])
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"image": "--privileged"}, "one Docker image reference"),
+        ({"image": "python:3.12 bash"}, "one Docker image reference"),
+        ({"setup": [" "]}, "non-empty"),
+        ({"test": "x" * 20_001}, "exceeds 20,000"),
+        ({"allow_hosts": ["https://example.org"]}, "DNS host names"),
+        ({"allow_hosts": ["10.0.0.1"]}, "DNS host names"),
+        ({"network": True}, "Extra inputs"),
+    ],
+)
+def test_environment_overrides_reject_unsafe_values(
+    override: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValidationError, match=message):
+        EnvironmentOverride.model_validate(override)

@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from autocontribute.config import EnvironmentOverride
 from autocontribute.environment_detection import detect_recipe
 from autocontribute.environment_signals import RepositorySignals, read_signals
+from autocontribute.environments import EnvironmentOverride
 from autocontribute.exceptions import EnvironmentRecipeError
 from autocontribute.repository import RepositoryWorkspace
 

@@ -22,7 +22,7 @@ from typing import Final, Literal
 
 from autocontribute.config import SandboxConfig
 from autocontribute.domain import CommandResult
-from autocontribute.egress_proxy import LISTEN_PORT, READY_MESSAGE
+from autocontribute.egress_proxy import LISTEN_PORT, READY_MESSAGE, is_host_name
 from autocontribute.exceptions import SandboxError
 from autocontribute.host_environment import proxy_environment
 from autocontribute.repository import RepositoryWorkspace
@@ -60,9 +60,6 @@ _DOCKER_NAME: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _IMAGE_ID: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
 _LABEL_NAME: Final = re.compile(r"^[a-z0-9][a-z0-9.-]{0,127}$")
 _LABEL_VALUE: Final = re.compile(r"^[A-Za-z0-9._:/@-]{0,256}$")
-_ALLOWED_HOST: Final = re.compile(
-    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
-)
 _IMAGE_PULL_TIMEOUT_SECONDS: Final = 1_800
 _EGRESS_PROXY_IMAGE: Final = (
     "python:3.12-alpine@sha256:b658b05ce9c4eb97ec6fc19424818a1f31993659c2b505a532f470e83807815d"
@@ -760,7 +757,7 @@ class EgressNetwork:
             raise SandboxError("Run identifier cannot label a sandbox network")
         if not docker_binary or "\0" in docker_binary:
             raise SandboxError("Docker binary is invalid")
-        invalid = sorted(host for host in allowed_hosts if not _ALLOWED_HOST.fullmatch(host))
+        invalid = sorted(host for host in allowed_hosts if not is_host_name(host))
         if invalid:
             raise SandboxError(f"Egress allowlist entries must be host names: {invalid}")
         self.allowed_hosts = tuple(sorted(set(allowed_hosts)))

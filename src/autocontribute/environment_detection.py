@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Final
 
-from autocontribute.config import EnvironmentOverride
 from autocontribute.environment_ci import (
     CiJob,
     CiSources,
@@ -37,6 +36,7 @@ from autocontribute.environment_signals import RepositorySignals
 from autocontribute.environments import (
     DEBIAN_PACKAGE,
     TOOL_ROOT,
+    EnvironmentOverride,
     EnvironmentRecipe,
     Language,
     TestFramework,

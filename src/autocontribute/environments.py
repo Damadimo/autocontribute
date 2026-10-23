@@ -11,8 +11,9 @@ from typing import Final, Literal
 
 from pydantic import Field, field_validator
 
-from autocontribute.config import validate_environment_command, validate_image_reference
+from autocontribute.config import StrictModel
 from autocontribute.domain import DomainModel
+from autocontribute.egress_proxy import is_host_name
 
 # Setup installs tools, homes and caches here: an image path that later containers keep, unlike
 # /tmp, which they mount a tmpfs over. Test and agent containers get it as a writable volume.
@@ -32,6 +33,49 @@ _SHA256_HEX: Final = re.compile(r"^[0-9a-f]{64}$")
 _IMAGE_DIGEST: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
 _ARCHITECTURE: Final = re.compile(r"^[a-z0-9][a-z0-9_./-]{0,63}$")
 _GIT_SHA: Final = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_MAX_COMMAND_CHARACTERS: Final = 20_000
+
+
+class EnvironmentOverride(StrictModel):
+    """Operator-chosen environment fields for one repository; detection fills the rest.
+
+    The configuration's ``environments.<owner/repo>`` entries take this shape (DESIGN §2).
+    """
+
+    # Base image for setup, by tag; setup records the digest it resolves to.
+    image: str | None = None
+    # Run with network through the setup proxy; an empty list means nothing to install.
+    setup: list[str] | None = None
+    # Runs offline; a recognised test runner gets a structured reporter added.
+    test: str | None = None
+    # Hosts the setup proxy allows on top of the package registries.
+    allow_hosts: list[str] = Field(default_factory=list)
+
+    @field_validator("image")
+    @classmethod
+    def image_is_a_single_reference(cls, value: str | None) -> str | None:
+        return None if value is None else _image_reference(value)
+
+    @field_validator("setup")
+    @classmethod
+    def setup_commands_are_safe(cls, values: list[str] | None) -> list[str] | None:
+        return None if values is None else [_environment_command(value) for value in values]
+
+    @field_validator("test")
+    @classmethod
+    def test_command_is_safe(cls, value: str | None) -> str | None:
+        return None if value is None else _environment_command(value)
+
+    @field_validator("allow_hosts")
+    @classmethod
+    def allow_hosts_are_host_names(cls, values: list[str]) -> list[str]:
+        normalized = [value.strip().casefold() for value in values]
+        invalid = [value for value in normalized if not is_host_name(value)]
+        if invalid:
+            raise ValueError(
+                f"allow_hosts must be DNS host names, not URLs or addresses: {invalid}"
+            )
+        return list(dict.fromkeys(normalized))
 
 
 class EnvironmentRecipe(DomainModel):
@@ -77,7 +121,7 @@ class EnvironmentRecipe(DomainModel):
     @field_validator("base_image")
     @classmethod
     def base_image_is_a_single_reference(cls, value: str) -> str:
-        return validate_image_reference(value)
+        return _image_reference(value)
 
     @field_validator("system_packages")
     @classmethod
@@ -90,12 +134,12 @@ class EnvironmentRecipe(DomainModel):
     @field_validator("setup_commands", "build_commands")
     @classmethod
     def commands_are_safe(cls, values: list[str]) -> list[str]:
-        return [validate_environment_command(value) for value in values]
+        return [_environment_command(value) for value in values]
 
     @field_validator("test_command")
     @classmethod
     def test_command_is_safe(cls, value: str) -> str:
-        return validate_environment_command(value)
+        return _environment_command(value)
 
     @field_validator("env", "offline_env")
     @classmethod
@@ -189,12 +233,37 @@ def environment_cache_key(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _image_reference(value: str) -> str:
+    """Return one Docker image reference that cannot be read as an option or a second word."""
+
+    if (
+        not value
+        or value.startswith("-")
+        or "\0" in value
+        or any(character.isspace() for character in value)
+    ):
+        raise ValueError("image must be one Docker image reference")
+    return value
+
+
+def _environment_command(value: str) -> str:
+    """Return one stripped shell command for a repository's environment, or reject it."""
+
+    command = value.strip()
+    if not command or "\0" in command:
+        raise ValueError("environment commands must be non-empty and NUL-free")
+    if len(command) > _MAX_COMMAND_CHARACTERS:
+        raise ValueError(f"environment command exceeds {_MAX_COMMAND_CHARACTERS:,} characters")
+    return command
+
+
 __all__ = [
     "DEBIAN_PACKAGE",
     "RECIPE_SCHEMA_VERSION",
     "SETUP_LOGIC_VERSION",
     "TOOL_ROOT",
     "EnvironmentBaseline",
+    "EnvironmentOverride",
     "EnvironmentRecipe",
     "Language",
     "TestFramework",

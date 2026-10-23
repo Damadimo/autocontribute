@@ -18,6 +18,7 @@ import asyncio
 import base64
 import ipaddress
 import os
+import re
 import socket
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
@@ -37,6 +38,10 @@ _IDLE_CHECK_SECONDS: Final = 5.0
 _CHUNK_BYTES: Final = 65_536
 _DEFAULT_MAX_CONNECTIONS: Final = 64
 _MAX_LOGGED_CHARACTERS: Final = 300
+# A DNS name with a letter-led top-level label, so no IP literal can be allowlisted.
+_HOST_NAME: Final = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
 _TUNNEL_PORT: Final = 443
 _PLAIN_HTTP_PORT: Final = 80
 _HOP_BY_HOP_HEADERS: Final = frozenset(
@@ -61,6 +66,12 @@ _REASONS: Final = {
     503: "Service Unavailable",
     504: "Gateway Timeout",
 }
+
+
+def is_host_name(name: str) -> bool:
+    """Whether ``name`` is a lowercase DNS host name that the allowlist can hold."""
+
+    return _HOST_NAME.fullmatch(name) is not None
 
 
 class ProxyRefusal(Exception):
