@@ -1,6 +1,6 @@
 name: E2E
 
-# Prepares one real issue with the stored OpenAI key, from issue to approval review, and keeps
+# Prepares one real issue with the stored model keys, from issue to approval review, and keeps
 # the run's evidence. It never publishes: the only GitHub token is this workflow's read-only
 # token. Name an issue to prepare it, or name repositories to let discovery and triage pick one,
 # as the runner's daily job does. Start it by hand, or push a branch under e2e/ with
@@ -105,11 +105,12 @@ jobs:
         env:
           ISSUE: ${{ steps.target.outputs.issue }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # Read-only: enough for public reads and search, never for publishing.
           AUTOCONTRIBUTE_GITHUB_TOKEN: ${{ github.token }}
         run: |
-          if [ -z "$OPENAI_API_KEY" ]; then
-            echo "::error::Set OPENAI_API_KEY as a repository secret"
+          if [ -z "$OPENAI_API_KEY" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::Set OPENAI_API_KEY or ANTHROPIC_API_KEY as a repository secret"
             exit 1
           fi
           if [ -n "$ISSUE" ]; then

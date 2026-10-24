@@ -520,8 +520,9 @@ def test_e2e_workflow_prepares_with_read_only_tokens_and_keeps_the_evidence() ->
         assert "${{" not in str(step.get("run", ""))
     assert run["env"]["AUTOCONTRIBUTE_GITHUB_TOKEN"] == "${{ github.token }}"
     assert run["env"]["OPENAI_API_KEY"] == "${{ secrets.OPENAI_API_KEY }}"
+    assert run["env"]["ANTHROPIC_API_KEY"] == "${{ secrets.ANTHROPIC_API_KEY }}"
     secrets = re.findall(r"secrets\.([A-Z_]+)", (ROOT / ".github/workflows/e2e.yml").read_text())
-    assert set(secrets) == {"OPENAI_API_KEY"}
+    assert set(secrets) == {"OPENAI_API_KEY", "ANTHROPIC_API_KEY"}
     assert "autocontribute run" in run["run"] and "--json" in run["run"]
     assert "publish" not in run["run"] and "approve" not in run["run"]
     assert evidence["if"] == "${{ always() }}"
