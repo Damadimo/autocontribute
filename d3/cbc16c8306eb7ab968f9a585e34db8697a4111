@@ -1,0 +1,21 @@
+.github/workflows/e2e.yml
+  s_fe8b2f74f70870::t_bfe8e9145a6b88 3,108,112-113
+tests/test_workflows.py
+  s_fe8b2f74f70870::t_bfe8e9145a6b88 523,525
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d3cbc16c8306eb7ab968f9a585e34db8697a4111",
+  "prompts": {},
+  "sessions": {
+    "s_fe8b2f74f70870": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "399538e9-65f1-4415-ab4c-77488483916e",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Adam Abdalla <adam1.abdalla@gmail.com>"
+    }
+  }
+}
